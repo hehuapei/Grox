@@ -5,7 +5,7 @@
    edit → inline diff, terminal → console, read/search → locations.
    ───────────────────────────────────────────────────────────────────────── */
 
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { SessionBlock, ToolCall, ToolKind } from "../../bridge/types";
 import { fmtDuration } from "../../lib/format";
 import { Icon, type IconProps } from "../fx/Icon";
@@ -14,6 +14,21 @@ import { useDesktop } from "../../state/store";
 import { useI18n } from "../../lib/i18n";
 
 type ToolBlock = Extract<SessionBlock, { type: "tool" }>;
+
+type SearchTool = {
+  name: string;
+  description?: string;
+};
+
+type SearchToolGroup = {
+  server: string;
+  tools: SearchTool[];
+};
+
+type SearchToolsPreview = {
+  resultCount: number;
+  groups: SearchToolGroup[];
+};
 
 const kindMeta: Partial<Record<ToolKind, { icon: IconProps["name"]; tone: string }>> = {
   read: { icon: "file", tone: "text-mute" },
@@ -61,6 +76,7 @@ export function ToolCallCard({ block }: { block: ToolBlock }) {
   const { call } = block;
   const busy = call.status === "running" || call.status === "awaiting_permission";
   const [open, setOpen] = useState(false);
+  const searchTools = useMemo(() => parseSearchTools(call.output), [call.output]);
   const meta = kindMeta[call.kind] ?? { icon: "bolt" as const, tone: "text-dim" };
   const duration = call.endedAt ? call.endedAt - call.startedAt : Date.now() - call.startedAt;
   const title = language === "zh-CN"
@@ -105,7 +121,8 @@ export function ToolCallCard({ block }: { block: ToolBlock }) {
             {call.terminal && <TerminalView call={call} />}
             {!call.diff && !call.terminal && call.locations && <Locations paths={call.locations} />}
             {call.images && <ToolImages images={call.images} />}
-            {!call.diff && !call.terminal && !call.locations && call.output && (
+            {!call.diff && !call.terminal && !call.locations && searchTools && <SearchToolsSummary preview={searchTools} />}
+            {!call.diff && !call.terminal && !call.locations && !searchTools && call.output && (
               <pre className="max-h-48 overflow-auto whitespace-pre-wrap font-mono text-[10.5px] leading-relaxed text-mute select-text">{call.output}</pre>
             )}
             {!call.diff && !call.terminal && !call.output && !call.locations && busy && (
@@ -116,7 +133,7 @@ export function ToolCallCard({ block }: { block: ToolBlock }) {
               </p>
             )}
             {call.input && <RawPayload label={language === "zh-CN" ? "输入" : "INPUT"} value={call.input} />}
-            {call.output && (call.diff || call.terminal || call.locations) && (
+            {call.output && (call.diff || call.terminal || call.locations || searchTools) && (
               <RawPayload label={language === "zh-CN" ? "原始输出" : "RAW OUTPUT"} value={call.output} />
             )}
           </div>
@@ -124,6 +141,100 @@ export function ToolCallCard({ block }: { block: ToolBlock }) {
       </div>
     </div>
   );
+}
+
+function SearchToolsSummary({ preview }: { preview: SearchToolsPreview }) {
+  const { language } = useI18n();
+  const displayedTools = preview.groups.flatMap((group) => group.tools).slice(0, 24);
+  const omitted = preview.groups.reduce((count, group) => count + group.tools.length, 0) - displayedTools.length;
+
+  return (
+    <div className="rounded-[5px] border border-line2 bg-void/70 px-2.5 py-2">
+      <p className="mb-2 font-mono text-[10px] font-medium text-fg2">
+        {language === "zh-CN" ? `发现 ${preview.resultCount} 个搜索工具` : `Found ${preview.resultCount} search tools`}
+      </p>
+      <div className="space-y-2">
+        {preview.groups.map((group) => {
+          const tools = displayedTools.filter((tool) => group.tools.includes(tool));
+          if (tools.length === 0) return null;
+          return (
+            <section key={group.server}>
+              <p className="mb-1 font-mono text-[9px] tracking-[0.1em] text-faint">{group.server}</p>
+              <div className="space-y-1">
+                {tools.map((tool) => (
+                  <div key={tool.name} className="rounded-[3px] border border-line bg-raise/35 px-2 py-1.5">
+                    <p className="font-mono text-[10px] text-fg2 select-text">{tool.name}</p>
+                    {tool.description && <p className="mt-0.5 text-[10px] leading-relaxed text-mute">{tool.description}</p>}
+                  </div>
+                ))}
+              </div>
+            </section>
+          );
+        })}
+      </div>
+      {omitted > 0 && <p className="mt-2 text-[9.5px] text-faint">{language === "zh-CN" ? `另有 ${omitted} 个工具，请展开原始输出查看。` : `${omitted} more tools are available in raw output.`}</p>}
+    </div>
+  );
+}
+
+function parseSearchTools(output: string | undefined): SearchToolsPreview | undefined {
+  if (!output) return undefined;
+  const outer = asRecord(parseJson(output));
+  if (!outer) return undefined;
+  const nested = asRecord(parseJson(outer.content));
+  const results = Array.isArray(nested?.results) ? nested.results : Array.isArray(outer.results) ? outer.results : undefined;
+  if (!results) return undefined;
+
+  const groups = results.flatMap((entry, index) => {
+    const value = asRecord(entry);
+    if (!value || !Array.isArray(value.tools)) return [];
+    const tools = value.tools.flatMap((tool) => {
+      const item = asRecord(tool);
+      const name = asText(item?.tool_name) ?? asText(item?.toolName) ?? asText(item?.name);
+      if (!name) return [];
+      const description = searchToolDescription(asText(item?.description));
+      return [{ name, ...(description ? { description } : {}) }];
+    });
+    if (tools.length === 0) return [];
+    return [{ server: asText(value.server) ?? `server-${index + 1}`, tools }];
+  });
+  if (groups.length === 0) return undefined;
+
+  const counted = asNumber(outer.result_count) ?? asNumber(outer.resultCount);
+  return { resultCount: counted ?? groups.reduce((count, group) => count + group.tools.length, 0), groups };
+}
+
+function parseJson(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  const text = value.trim();
+  if (!text || (!text.startsWith("{") && !text.startsWith("["))) return value;
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    return value;
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
+}
+
+function asText(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim() ? value : undefined;
+}
+
+function asNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function searchToolDescription(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const firstParagraph = value.trim().split(/\r?\n\s*\r?\n/, 1)[0]
+    .replace(/\*\*|__|`/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!firstParagraph) return undefined;
+  return firstParagraph.length > 240 ? `${firstParagraph.slice(0, 239)}…` : firstParagraph;
 }
 
 function toolFailureSummary(output: string, language: "zh-CN" | "en-US") {
