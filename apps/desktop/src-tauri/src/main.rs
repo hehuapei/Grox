@@ -36,6 +36,7 @@ use tokio::{
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GROX_BUILD_COMMIT: &str = env!("GROX_BUILD_COMMIT");
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/dandandujie/Grox/releases/latest";
+const RELEASES_URL: &str = "https://api.github.com/repos/dandandujie/Grox/releases";
 const GROK_INSTALL_PS1_URL: &str = "https://x.ai/cli/install.ps1";
 const GROK_INSTALL_SH_URL: &str = "https://x.ai/cli/install.sh";
 // The upstream built-in workflow has early `complete()` branches for empty
@@ -51,6 +52,7 @@ const UPSTREAM_CLI_CLIENT_NAME: &str = "grok-shell";
 const GROX_MANAGED_PROVIDER_START: &str = "# >>> Grox managed provider";
 const GROX_MANAGED_PROVIDER_END: &str = "# <<< Grox managed provider";
 const GROX_PROVIDER_AUTH_OVERRIDES_FILE: &str = "grox-provider-auth-overrides.json";
+const GROX_PROVIDER_BACKEND_OVERRIDES_FILE: &str = "grox-provider-backend-overrides.json";
 const GROX_NETWORK_PROXY_FILE: &str = "grox-network-proxy.json";
 const DEFAULT_NETWORK_PROXY_URL: &str = "http://127.0.0.1:1080";
 const PROXY_ENV_KEYS: [&str; 6] = [
@@ -62,11 +64,13 @@ const PROXY_ENV_KEYS: [&str; 6] = [
     "all_proxy",
 ];
 const NO_PROXY_VALUE: &str = "localhost,127.0.0.1,::1";
-const PROVIDER_ENV_KEYS: [&str; 4] = [
+// These are the three documented Grok Build custom-endpoint environment
+// variables. Protocol selection belongs in `[model.*].api_backend` so it
+// survives CLI upgrades instead of depending on an undocumented env var.
+const PROVIDER_ENV_KEYS: [&str; 3] = [
     "XAI_API_KEY",
     "GROK_MODELS_BASE_URL",
     "GROK_MODELS_LIST_URL",
-    "GROK_MODELS_API_BACKEND",
 ];
 
 struct AgentProcess {
@@ -202,7 +206,7 @@ struct ComputerSessionExtensions {
     lease_id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct GitHubRelease {
     tag_name: String,
     name: Option<String>,
@@ -210,10 +214,14 @@ struct GitHubRelease {
     html_url: String,
     published_at: Option<String>,
     #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    prerelease: bool,
+    #[serde(default)]
     assets: Vec<GitHubAsset>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 struct GitHubAsset {
     name: String,
     browser_download_url: String,
@@ -233,6 +241,25 @@ struct UpdateInfo {
     installable: bool,
     asset_name: Option<String>,
     requires_xattr: bool,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ReleaseSummary {
+    version: String,
+    title: String,
+    notes: String,
+    release_url: String,
+    published_at: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateStatus {
+    current_version: String,
+    update_available: bool,
+    latest: UpdateInfo,
+    history: Vec<ReleaseSummary>,
 }
 
 #[derive(Clone, Serialize)]
@@ -309,36 +336,6 @@ enum ProviderApiBackend {
     ChatCompletions,
 }
 
-impl ProviderApiBackend {
-    fn resolved(self, name: &str, base_url: &str) -> &'static str {
-        match self {
-            Self::Responses => "responses",
-            Self::ChatCompletions => "chat_completions",
-            Self::Auto => {
-                let identity = format!("{name} {base_url}").to_ascii_lowercase();
-                if [
-                    "grok2api",
-                    "chenyme",
-                    "cliproxyapi",
-                    "cli-proxy-api",
-                    "cli proxy",
-                    "router-for-me",
-                    "newapi",
-                    "new-api",
-                    "new api",
-                ]
-                .iter()
-                .any(|marker| identity.contains(marker))
-                {
-                    "responses"
-                } else {
-                    "chat_completions"
-                }
-            }
-        }
-    }
-}
-
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredProviderProfile {
@@ -367,10 +364,9 @@ struct ProviderProfilesFile {
     profiles: Vec<StoredProviderProfile>,
 }
 
-/// Grox only changes `env_key` for an active compatible provider.  Keep the
-/// exact prior TOML item so switching back to OAuth or the official API key
-/// restores the user's own model configuration rather than leaving a stale
-/// gateway credential rule behind.
+/// Grox changes only the endpoint, credential source, and request protocol
+/// for an active compatible provider. Keep the exact prior TOML items so
+/// switching back to OAuth or the official API restores user configuration.
 #[derive(Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ProviderAuthOverridesFile {
@@ -385,6 +381,36 @@ struct ProviderModelAuthBackup {
     /// The original TOML representation (for example `"OPENAI_API_KEY"` or
     /// `["FIRST", "SECOND"]`). It is a variable name, never a secret.
     env_key: Option<String>,
+    /// An inline key outranks `env_key` in Grok Build, so it must be restored
+    /// after a profile switch rather than left pointing at the old provider.
+    #[serde(default)]
+    api_key: Option<String>,
+    /// Per-model endpoints outrank the global endpoint configuration.
+    #[serde(default)]
+    base_url: Option<String>,
+    /// The original TOML representation (for example `"responses"`).
+    #[serde(default)]
+    api_backend: Option<String>,
+}
+
+/// Grok Build's built-in aliases do not inherit a dynamic endpoint's
+/// credential route consistently. For the active gateway, add the documented
+/// per-model route (never a literal key), then restore every prior field when
+/// the user leaves that provider.
+#[derive(Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderBackendOverridesFile {
+    models: BTreeMap<String, ProviderBackendBackup>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ProviderBackendBackup {
+    model_existed: bool,
+    env_key: Option<String>,
+    base_url: Option<String>,
+    api_backend: Option<String>,
+    model: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1906,6 +1932,12 @@ fn read_config_documents(cwd: String) -> Result<Vec<ConfigDocument>, String> {
 fn write_config_document(request: WriteConfigDocument) -> Result<ConfigDocument, String> {
     let cwd = checked_workspace(&request.cwd)?;
     let (path, label, language) = config_path(&request.id, &cwd)?;
+    if request.id == "config" {
+        // This is the same TOML parser used before Grox mutates provider
+        // settings. Reject malformed TOML at the editor boundary so a save can
+        // never silently leave the CLI with an unreadable global config.
+        parse_grok_config_document(&request.content)?;
+    }
     atomic_write(&path, &request.content)?;
     let id: &'static str = match request.id.as_str() {
         "config" => "config",
@@ -2179,6 +2211,30 @@ fn restore_grox_provider_auth_overrides() -> Result<(), String> {
                 model.remove("env_key");
             }
         }
+        match backup.api_key.as_deref() {
+            Some(raw) => {
+                model.insert("api_key", config_value_item(raw)?);
+            }
+            None => {
+                model.remove("api_key");
+            }
+        }
+        match backup.base_url.as_deref() {
+            Some(raw) => {
+                model.insert("base_url", config_value_item(raw)?);
+            }
+            None => {
+                model.remove("base_url");
+            }
+        }
+        match backup.api_backend.as_deref() {
+            Some(raw) => {
+                model.insert("api_backend", config_value_item(raw)?);
+            }
+            None => {
+                model.remove("api_backend");
+            }
+        }
     }
 
     // Remove model tables that Grox itself created only when they have not
@@ -2197,25 +2253,146 @@ fn restore_grox_provider_auth_overrides() -> Result<(), String> {
             models.remove(&model_id);
         }
     }
+    let remove_models_root = models.is_empty();
+    if remove_models_root {
+        root.remove("model");
+    }
 
     atomic_write(&path, &document.to_string())?;
     restrict_private_file(&path)?;
     write_provider_auth_overrides(&ProviderAuthOverridesFile::default())
 }
 
-fn apply_grox_provider_auth_overrides(model_ids: &[String]) -> Result<(), String> {
-    // Always restore before applying the next provider. This keeps the backup
-    // chain one level deep and lets every switch begin from the user's config.
-    restore_grox_provider_auth_overrides()?;
-    let mut model_ids: Vec<String> = model_ids
+fn provider_backend_overrides_path() -> Result<PathBuf, String> {
+    Ok(grok_home()?.join(GROX_PROVIDER_BACKEND_OVERRIDES_FILE))
+}
+
+fn read_provider_backend_overrides() -> Result<ProviderBackendOverridesFile, String> {
+    let path = provider_backend_overrides_path()?;
+    if !path.exists() {
+        return Ok(ProviderBackendOverridesFile::default());
+    }
+    let content = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
+    serde_json::from_str(&content).map_err(|error| {
+        format!(
+            "无法读取 Grox 兼容服务协议还原信息 {}：{error}",
+            path.display()
+        )
+    })
+}
+
+fn write_provider_backend_overrides(value: &ProviderBackendOverridesFile) -> Result<(), String> {
+    let path = provider_backend_overrides_path()?;
+    if value.models.is_empty() {
+        if path.exists() {
+            fs::remove_file(&path)
+                .map_err(|error| format!("无法移除 Grox 兼容服务协议还原信息：{error}"))?;
+        }
+        return Ok(());
+    }
+    let content = serde_json::to_string_pretty(value)
+        .map_err(|error| format!("无法序列化 Grox 兼容服务协议还原信息：{error}"))?;
+    atomic_write(&path, &content)?;
+    restrict_private_file(&path)
+}
+
+fn restore_grox_provider_backend_overrides() -> Result<(), String> {
+    let overrides = read_provider_backend_overrides()?;
+    if overrides.models.is_empty() {
+        return Ok(());
+    }
+    let home = grok_home()?;
+    let path = home.join("config.toml");
+    let content = if path.exists() {
+        read_bounded_text(&path, MAX_CONFIG_BYTES)?
+    } else {
+        String::new()
+    };
+    let mut document = parse_grok_config_document(&content)?;
+    let root = document.as_table_mut();
+    let Some(models) = root.get_mut("model").and_then(Item::as_table_like_mut) else {
+        write_provider_backend_overrides(&ProviderBackendOverridesFile::default())?;
+        return Ok(());
+    };
+
+    for (model_id, backup) in &overrides.models {
+        let Some(model) = models.get_mut(model_id).and_then(Item::as_table_like_mut) else {
+            continue;
+        };
+        match backup.env_key.as_deref() {
+            Some(raw) => {
+                model.insert("env_key", config_value_item(raw)?);
+            }
+            None => {
+                model.remove("env_key");
+            }
+        }
+        match backup.base_url.as_deref() {
+            Some(raw) => {
+                model.insert("base_url", config_value_item(raw)?);
+            }
+            None => {
+                model.remove("base_url");
+            }
+        }
+        match backup.api_backend.as_deref() {
+            Some(raw) => {
+                model.insert("api_backend", config_value_item(raw)?);
+            }
+            None => {
+                model.remove("api_backend");
+            }
+        }
+        match backup.model.as_deref() {
+            Some(raw) => {
+                model.insert("model", config_value_item(raw)?);
+            }
+            None => {
+                model.remove("model");
+            }
+        }
+    }
+
+    let created = overrides
+        .models
+        .iter()
+        .filter_map(|(id, backup)| (!backup.model_existed).then_some(id.clone()))
+        .collect::<Vec<_>>();
+    for model_id in created {
+        let remove = models
+            .get(&model_id)
+            .and_then(Item::as_table_like)
+            .is_some_and(|model| model.is_empty());
+        if remove {
+            models.remove(&model_id);
+        }
+    }
+    if models.is_empty() {
+        root.remove("model");
+    }
+    atomic_write(&path, &document.to_string())?;
+    restrict_private_file(&path)?;
+    write_provider_backend_overrides(&ProviderBackendOverridesFile::default())
+}
+
+fn apply_grox_provider_backend_overrides(
+    model_ids: &[String],
+    base_url: &str,
+    primary_model: &str,
+) -> Result<(), String> {
+    // Switches are transactional at the config level: first restore the
+    // previous profile's exact values, then add Chat Completions only for the
+    // selected models advertised by the new profile.
+    restore_grox_provider_backend_overrides()?;
+    let mut ids = model_ids
         .iter()
         .map(|id| id.trim())
         .filter(|id| !id.is_empty())
         .map(ToOwned::to_owned)
-        .collect();
-    model_ids.sort();
-    model_ids.dedup();
-    if model_ids.is_empty() {
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
         return Ok(());
     }
 
@@ -2228,43 +2405,77 @@ fn apply_grox_provider_auth_overrides(model_ids: &[String]) -> Result<(), String
     };
     let mut document = parse_grok_config_document(&content)?;
     let mut backups = BTreeMap::new();
-    for model_id in model_ids {
-        let (model, existed) = model_table_mut(&mut document, &model_id)?;
+    for model_id in ids {
+        let is_title_alias = model_id == "grok-4.5";
+        let (model, model_existed) = model_table_mut(&mut document, &model_id)?;
         backups.insert(
             model_id,
-            ProviderModelAuthBackup {
-                model_existed: existed,
+            ProviderBackendBackup {
+                model_existed,
                 env_key: model.get("env_key").map(ToString::to_string),
+                base_url: model.get("base_url").map(ToString::to_string),
+                api_backend: model.get("api_backend").map(ToString::to_string),
+                model: model.get("model").map(ToString::to_string),
             },
         );
-        // Upstream's documented highest-precedence credential selector. This
-        // prevents an already logged-in OAuth token from being sent to a
-        // compatible endpoint in place of that provider's API key.
+        // A named env key is the documented credential selector; the actual
+        // secret remains solely in the ACP child's managed environment.
         model.insert("env_key", toml_value("XAI_API_KEY"));
+        model.insert("base_url", toml_value(base_url));
+        model.insert("api_backend", toml_value("chat_completions"));
+        if is_title_alias && primary_model != "grok-4.5" {
+            // Grok Build uses this alias to generate a title before the first
+            // reply. Route that internal request to the profile's actual
+            // model so a gateway that exposes only the selected model does
+            // not abort the whole prompt during title generation.
+            model.insert("model", toml_value(primary_model));
+        } else {
+            model.remove("model");
+        }
     }
     atomic_write(&path, &document.to_string())?;
     restrict_private_file(&path)?;
-    write_provider_auth_overrides(&ProviderAuthOverridesFile { models: backups })
+    write_provider_backend_overrides(&ProviderBackendOverridesFile { models: backups })
 }
 
-fn compatible_profile_model_ids(profile: &StoredProviderProfile) -> Vec<String> {
-    let mut models = profile.available_models.clone();
-    models.extend(profile.resident_models.clone());
-    if let Some(model) = profile.model.as_ref() {
-        models.push(model.clone());
+fn canonical_model_id(model: &str, available_models: &[String]) -> String {
+    available_models
+        .iter()
+        .find(|available| available.eq_ignore_ascii_case(model))
+        .cloned()
+        .unwrap_or_else(|| model.to_string())
+}
+
+fn canonicalize_resident_models(resident_models: &mut Vec<String>, available_models: &[String]) {
+    let mut canonical = Vec::new();
+    for model in resident_models.drain(..) {
+        let model = canonical_model_id(model.trim(), available_models);
+        if !model.is_empty() && !canonical.iter().any(|existing: &String| existing == &model) {
+            canonical.push(model);
+        }
     }
-    checked_model_ids(models).unwrap_or_default()
+    *resident_models = canonical;
 }
 
-fn default_compatible_model_ids() -> Vec<String> {
-    // The one-off compatible form has no persisted model catalogue. Cover the
-    // standard Grok model ids so an existing Grox session does not fall back
-    // to its cached OAuth token before the user opens a named provider profile.
-    vec![
-        "grok-build".to_string(),
-        "grok-4.5".to_string(),
-        "grok-4.3-fast".to_string(),
-    ]
+fn compatible_profile_backend_model_ids(profile: &StoredProviderProfile) -> Vec<String> {
+    let mut models = profile.resident_models.clone();
+    if models.is_empty() {
+        if let Some(model) = profile.model.as_ref() {
+            models.push(model.clone());
+        } else if let Some(model) = profile.available_models.first() {
+            models.push(model.clone());
+        }
+    }
+    canonicalize_resident_models(&mut models, &profile.available_models);
+    // Grok Build 0.2.x still uses grok-4.5 for session-title generation even
+    // when a dynamic provider selected another model. It inherits the active
+    // endpoint, so it needs the same Chat Completions transport declaration;
+    // otherwise a failed title request triggers auth recovery for the entire
+    // prompt before the selected model can answer.
+    if !models.iter().any(|model| model == "grok-4.5") {
+        models.push("grok-4.5".to_string());
+    }
+    models
 }
 
 fn provider_profile_summary(profile: &StoredProviderProfile) -> ProviderProfileSummary {
@@ -2274,6 +2485,10 @@ fn provider_profile_summary(profile: &StoredProviderProfile) -> ProviderProfileS
             resident_models.push(model.clone());
         }
     }
+    // The `/models` catalog is the source of truth for the spelling sent to a
+    // gateway. A case-only mismatch is enough for many gateways to return a
+    // misleading 503 "model unavailable" response.
+    canonicalize_resident_models(&mut resident_models, &profile.available_models);
     ProviderProfileSummary {
         id: profile.id.clone(),
         name: profile.name.clone(),
@@ -2321,8 +2536,6 @@ fn checked_model_ids(models: Vec<String>) -> Result<Vec<String>, String> {
 fn compatible_provider_env(
     api_key: &str,
     base_url: &str,
-    provider_name: &str,
-    api_backend: ProviderApiBackend,
 ) -> Result<String, String> {
     let key = checked_api_key(api_key.trim())?;
     if key.is_empty() {
@@ -2336,19 +2549,45 @@ fn compatible_provider_env(
             "GROK_MODELS_LIST_URL={}",
             env_value(&compatible_models_url(&base)?)
         ),
-        format!(
-            "GROK_MODELS_API_BACKEND={}",
-            env_value(api_backend.resolved(provider_name, &base))
-        ),
     ];
     Ok(lines.join("\n"))
+}
+
+fn active_profile_for_managed_environment(value: &ProviderProfilesFile) -> Option<StoredProviderProfile> {
+    let managed = parse_grox_managed_provider_env(&grok_home().ok()?.join(".env"));
+    let base = managed.get("GROK_MODELS_BASE_URL")?.trim_end_matches('/');
+    let id = value.active_id.as_deref()?;
+    value
+        .profiles
+        .iter()
+        .find(|profile| profile.id == id && profile.base_url.trim_end_matches('/') == base)
+        .cloned()
+}
+
+fn synchronize_active_provider_backend() -> Result<(), String> {
+    let profiles = read_provider_profiles_file()?;
+    if let Some(profile) = active_profile_for_managed_environment(&profiles) {
+        let model_ids = compatible_profile_backend_model_ids(&profile);
+        let primary_model = model_ids
+            .first()
+            .ok_or("当前供应商没有可用模型，无法配置请求协议")?;
+        apply_grox_provider_backend_overrides(&model_ids, &profile.base_url, primary_model)
+    } else {
+        // OAuth and official API mode should never retain a custom endpoint's
+        // Chat Completions override after a process restart.
+        restore_grox_provider_backend_overrides()
+    }
 }
 
 #[tauri::command]
 fn list_provider_profiles() -> Result<ProviderProfilesResponse, String> {
     let value = read_provider_profiles_file()?;
+    // A profile is active only when the process environment actually points
+    // at it. This avoids a stale persisted id briefly labelling OAuth as an
+    // OpenAI-compatible provider while the ACP child is being replaced.
+    let active_id = active_profile_for_managed_environment(&value).map(|profile| profile.id);
     Ok(ProviderProfilesResponse {
-        active_id: value.active_id,
+        active_id,
         profiles: value
             .profiles
             .iter()
@@ -2375,9 +2614,14 @@ fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfile
         .filter(|key| !key.is_empty())
         .or_else(|| existing.map(|profile| profile.api_key.as_str()))
         .ok_or("API Key 不能为空")?;
-    compatible_provider_env(key, &request.base_url, name, request.api_backend)?;
-    let resident_models = checked_model_ids(request.resident_models)?;
+    compatible_provider_env(key, &request.base_url)?;
+    let mut resident_models = checked_model_ids(request.resident_models)?;
     let base_url = checked_service_url(&request.base_url, "服务地址")?;
+    let available_models = existing
+        .filter(|profile| profile.base_url == base_url && profile.api_key == key)
+        .map(|profile| profile.available_models.clone())
+        .unwrap_or_default();
+    canonicalize_resident_models(&mut resident_models, &available_models);
     let id = request.id.unwrap_or_else(|| {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -2401,10 +2645,7 @@ fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfile
         api_backend: request.api_backend,
         models_url: None,
         model: resident_models.first().cloned(),
-        available_models: existing
-            .filter(|profile| profile.base_url == base_url && profile.api_key == key)
-            .map(|profile| profile.available_models.clone())
-            .unwrap_or_default(),
+        available_models,
         resident_models,
     };
     if let Some(index) = value.profiles.iter().position(|entry| entry.id == id) {
@@ -2466,6 +2707,13 @@ async fn refresh_provider_models(id: String) -> Result<ProviderProfileSummary, S
         .find(|stored| stored.id == profile.id)
         .ok_or("供应商档案已被删除")?;
     stored.available_models = models;
+    canonicalize_resident_models(&mut stored.resident_models, &stored.available_models);
+    if stored.resident_models.is_empty() {
+        if let Some(model) = stored.available_models.first() {
+            stored.resident_models.push(model.clone());
+        }
+    }
+    stored.model = stored.resident_models.first().cloned();
     let summary = provider_profile_summary(stored);
     write_provider_profiles_file(&value)?;
     Ok(summary)
@@ -2480,13 +2728,17 @@ fn activate_provider_profile(id: String) -> Result<(), String> {
         .find(|profile| profile.id == id)
         .cloned()
         .ok_or("供应商档案不存在")?;
-    let replacement = compatible_provider_env(
-        &profile.api_key,
-        &profile.base_url,
-        &profile.name,
-        profile.api_backend,
-    )?;
-    apply_grox_provider_auth_overrides(&compatible_profile_model_ids(&profile))?;
+    // Custom-model endpoints are configured exclusively through Grok Build's
+    // documented process environment. Older Grox versions wrote a generated
+    // `[model.*]` block for every built-in model; restore those tracked edits
+    // once, then leave the user's config.toml entirely under their control.
+    restore_grox_provider_auth_overrides()?;
+    let model_ids = compatible_profile_backend_model_ids(&profile);
+    let primary_model = model_ids
+        .first()
+        .ok_or("供应商没有可用模型；请先获取模型目录并选择一个模型")?;
+    apply_grox_provider_backend_overrides(&model_ids, &profile.base_url, primary_model)?;
+    let replacement = compatible_provider_env(&profile.api_key, &profile.base_url)?;
     let path = grok_home()?.join(".env");
     let current = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
     atomic_write(&path, &replace_managed_env_block(&current, &replacement))?;
@@ -2505,6 +2757,7 @@ fn delete_provider_profile(id: String) -> Result<(), String> {
     }
     if value.active_id.as_deref() == Some(id.as_str()) {
         restore_grox_provider_auth_overrides()?;
+        restore_grox_provider_backend_overrides()?;
         let path = grok_home()?.join(".env");
         let current = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
         atomic_write(&path, &replace_managed_env_block(&current, ""))?;
@@ -2557,23 +2810,23 @@ fn configure_provider(request: ProviderConfig) -> Result<(), String> {
     let replacement = match request.kind.as_str() {
         "oauth" => {
             restore_grox_provider_auth_overrides()?;
+            restore_grox_provider_backend_overrides()?;
             String::new()
         }
         "official" => {
             restore_grox_provider_auth_overrides()?;
+            restore_grox_provider_backend_overrides()?;
             let key = requested_key.or(saved_key).ok_or("API Key 不能为空")?;
             let key = checked_api_key(key)?;
             format!("XAI_API_KEY={}", env_value(key))
         }
         "compatible" => {
-            apply_grox_provider_auth_overrides(&default_compatible_model_ids())?;
+            let base_url = request.base_url.as_deref().unwrap_or_default();
             let key = requested_key.or(saved_key).ok_or("API Key 不能为空")?;
-            compatible_provider_env(
-                key,
-                request.base_url.as_deref().unwrap_or_default(),
-                "compatible",
-                ProviderApiBackend::ChatCompletions,
-            )?
+            let replacement = compatible_provider_env(key, base_url)?;
+            restore_grox_provider_auth_overrides()?;
+            restore_grox_provider_backend_overrides()?;
+            replacement
         }
         _ => return Err("未知账户接入类型".into()),
     };
@@ -3202,6 +3455,80 @@ async fn latest_release() -> Result<GitHubRelease, String> {
         .map_err(|error| format!("无法读取更新信息：{error}"))
 }
 
+async fn release_history() -> Result<Vec<GitHubRelease>, String> {
+    let releases = reqwest::Client::builder()
+        .user_agent(format!("Grox/{CLIENT_VERSION}"))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|error| format!("无法创建更新客户端：{error}"))?
+        .get(RELEASES_URL)
+        .query(&[("per_page", "8")])
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|error| format!("无法检查更新历史：{error}"))?
+        .error_for_status()
+        .map_err(|error| format!("更新历史服务返回错误：{error}"))?
+        .json::<Vec<GitHubRelease>>()
+        .await
+        .map_err(|error| format!("无法读取更新历史：{error}"))?;
+    Ok(releases
+        .into_iter()
+        .filter(|release| !release.draft && !release.prerelease)
+        .take(8)
+        .collect())
+}
+
+fn update_info(release: &GitHubRelease) -> UpdateInfo {
+    let asset_name = update_asset(release).map(|asset| asset.name.clone());
+    let latest_version = release.tag_name.trim().trim_start_matches(['v', 'V']);
+    let notes = release
+        .body
+        .as_deref()
+        .unwrap_or_default()
+        .chars()
+        .take(12_000)
+        .collect::<String>();
+    UpdateInfo {
+        current_version: CLIENT_VERSION.to_string(),
+        latest_version: latest_version.to_string(),
+        title: release
+            .name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| latest_version)
+            .to_string(),
+        notes,
+        release_url: release.html_url.clone(),
+        published_at: release.published_at.clone(),
+        installable: asset_name.is_some(),
+        asset_name,
+        requires_xattr: cfg!(target_os = "macos"),
+    }
+}
+
+fn release_summary(release: &GitHubRelease) -> ReleaseSummary {
+    let version = release.tag_name.trim().trim_start_matches(['v', 'V']);
+    ReleaseSummary {
+        version: version.to_string(),
+        title: release
+            .name
+            .as_deref()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| version)
+            .to_string(),
+        notes: release
+            .body
+            .as_deref()
+            .unwrap_or_default()
+            .chars()
+            .take(3_000)
+            .collect(),
+        release_url: release.html_url.clone(),
+        published_at: release.published_at.clone(),
+    }
+}
+
 #[tauri::command]
 async fn check_for_update() -> Result<Option<UpdateInfo>, String> {
     let release = latest_release().await?;
@@ -3209,29 +3536,29 @@ async fn check_for_update() -> Result<Option<UpdateInfo>, String> {
     if !update_available(CLIENT_VERSION, &release.tag_name)? {
         return Ok(None);
     }
+    Ok(Some(update_info(&release)))
+}
 
-    let asset_name = update_asset(&release).map(|asset| asset.name.clone());
-    let latest_version = release.tag_name.trim().trim_start_matches(['v', 'V']);
-    let notes = release
-        .body
-        .unwrap_or_default()
-        .chars()
-        .take(12_000)
-        .collect::<String>();
-    Ok(Some(UpdateInfo {
+#[tauri::command]
+async fn get_update_status() -> Result<UpdateStatus, String> {
+    // This desktop target intentionally uses a minimal Tokio feature set, so
+    // keep the two lightweight GitHub requests sequential instead of relying
+    // on `tokio::try_join!` (which is not compiled into this build).
+    let latest = latest_release().await?;
+    let history = release_history().await?;
+    let mut history = history
+        .iter()
+        .map(release_summary)
+        .collect::<Vec<_>>();
+    if !history.iter().any(|release| release.version == latest.tag_name.trim().trim_start_matches(['v', 'V'])) {
+        history.insert(0, release_summary(&latest));
+    }
+    Ok(UpdateStatus {
         current_version: CLIENT_VERSION.to_string(),
-        latest_version: latest_version.to_string(),
-        title: release
-            .name
-            .filter(|name| !name.trim().is_empty())
-            .unwrap_or_else(|| format!("Grox {latest_version}")),
-        notes,
-        release_url: release.html_url,
-        published_at: release.published_at,
-        installable: asset_name.is_some(),
-        asset_name,
-        requires_xattr: cfg!(target_os = "macos"),
-    }))
+        update_available: update_available(CLIENT_VERSION, &latest.tag_name)?,
+        latest: update_info(&latest),
+        history,
+    })
 }
 
 fn update_temp_dir(version: &str) -> Result<PathBuf, String> {
@@ -3469,6 +3796,15 @@ fn main() {
         }
         return;
     }
+    // One-time repair for builds that generated per-model provider overrides.
+    // The backup contains only fields Grox touched, so this restores an
+    // existing user table exactly or removes a table Grox created from scratch.
+    if let Err(error) = restore_grox_provider_auth_overrides() {
+        eprintln!("grox: 无法迁移旧版供应商模型覆盖：{error}");
+    }
+    if let Err(error) = synchronize_active_provider_backend() {
+        eprintln!("grox: 无法同步当前供应商的协议覆盖：{error}");
+    }
     tauri::Builder::default()
         .manage(Arc::new(AcpState::default()))
         .manage(Arc::new(PreviewState::default()))
@@ -3513,6 +3849,7 @@ fn main() {
             grok_runtime_info,
             install_official_grok_cli,
             check_for_update,
+            get_update_status,
             install_update,
             open_external,
             start_project_preview,
@@ -3663,29 +4000,19 @@ mod tests {
 
     #[test]
     fn compatible_provider_environment_is_validated_and_complete() {
-        let env = compatible_provider_env(
-            "sk-test",
-            "https://gateway.example.com/v1",
-            "grok2api",
-            ProviderApiBackend::Auto,
-        )
-        .unwrap();
+        let env = compatible_provider_env("sk-test", "https://gateway.example.com/v1").unwrap();
         assert!(env.contains("XAI_API_KEY=\"sk-test\""));
         assert!(env.contains("GROK_MODELS_BASE_URL=\"https://gateway.example.com/v1\""));
         assert!(env.contains("GROK_MODELS_LIST_URL=\"https://gateway.example.com/v1/models\""));
-        assert!(env.contains("GROK_MODELS_API_BACKEND=\"responses\""));
+        assert!(!env.contains("GROK_MODELS_API_BACKEND"));
         assert!(compatible_provider_env(
             "",
             "https://gateway.example.com/v1",
-            "generic",
-            ProviderApiBackend::Auto,
         )
         .is_err());
         assert!(compatible_provider_env(
             "sk-test",
             "http://gateway.example.com/v1",
-            "generic",
-            ProviderApiBackend::Auto,
         )
         .is_err());
     }
@@ -3716,6 +4043,14 @@ mod tests {
     }
 
     #[test]
+    fn provider_models_use_the_exact_catalogue_id() {
+        let available = vec!["grok-4.3-fast".to_string(), "grok-4.5".to_string()];
+        let mut resident = vec!["Grok-4.3-fast".to_string(), "GROK-4.5".to_string()];
+        canonicalize_resident_models(&mut resident, &available);
+        assert_eq!(resident, available);
+    }
+
+    #[test]
     fn compatible_model_auth_override_wins_without_damaging_existing_toml() {
         let mut document = parse_grok_config_document(
             r#"
@@ -3724,25 +4059,44 @@ default_model = "grok-4.5"
 
 [model."grok-4.5"]
 name = "Personal model label"
+api_key = "personal-inline-key"
+base_url = "https://old-provider.example/v1"
 env_key = ["PERSONAL_GATEWAY_KEY", "FALLBACK_KEY"]
+api_backend = "responses"
 "#,
         )
         .unwrap();
         let (model, existed) = model_table_mut(&mut document, "grok-4.5").unwrap();
         assert!(existed);
         let original = model.get("env_key").map(ToString::to_string);
+        let original_key = model.get("api_key").map(ToString::to_string);
+        let original_base = model.get("base_url").map(ToString::to_string);
+        let original_backend = model.get("api_backend").map(ToString::to_string);
+        model.remove("api_key");
         model.insert("env_key", toml_value("XAI_API_KEY"));
+        model.insert("base_url", toml_value("https://new-provider.example/v1"));
+        model.insert("api_backend", toml_value("chat_completions"));
 
         let rendered = document.to_string();
         assert!(rendered.contains("name = \"Personal model label\""));
         assert!(rendered.contains("env_key = \"XAI_API_KEY\""));
+        assert!(rendered.contains("base_url = \"https://new-provider.example/v1\""));
+        assert!(!rendered.contains("personal-inline-key"));
+        assert!(rendered.contains("api_backend = \"chat_completions\""));
 
         let mut restored = parse_grok_config_document(&rendered).unwrap();
         let (model, _) = model_table_mut(&mut restored, "grok-4.5").unwrap();
         model.insert("env_key", config_value_item(&original.unwrap()).unwrap());
+        model.insert("api_key", config_value_item(&original_key.unwrap()).unwrap());
+        model.insert("base_url", config_value_item(&original_base.unwrap()).unwrap());
+        model.insert("api_backend", config_value_item(&original_backend.unwrap()).unwrap());
         let restored = restored.to_string();
         assert!(restored.contains("PERSONAL_GATEWAY_KEY"));
         assert!(restored.contains("FALLBACK_KEY"));
+        assert!(restored.contains("personal-inline-key"));
+        assert!(restored.contains("https://old-provider.example/v1"));
+        assert!(restored.contains("api_backend"));
+        assert!(restored.contains("\"responses\""));
         assert!(restored.parse::<Document>().is_ok());
     }
 
@@ -3756,7 +4110,6 @@ GROK_MODELS_BASE_URL=https://terminal.example/v1
 XAI_API_KEY="grox-key"
 GROK_MODELS_BASE_URL="https://gateway.example/v1"
 GROK_MODELS_LIST_URL="https://gateway.example/v1/models"
-GROK_MODELS_API_BACKEND="responses"
 # <<< Grox managed provider
 
 UNRELATED=value
@@ -3811,8 +4164,6 @@ UNRELATED=value
         let compatible = compatible_provider_env(
             "gateway-key",
             "https://gateway.example/v1",
-            "gateway",
-            ProviderApiBackend::Responses,
         )
         .unwrap();
         fs::write(&path, replace_managed_env_block("", &compatible)).unwrap();
@@ -3822,10 +4173,7 @@ UNRELATED=value
             gateway.get("GROK_MODELS_BASE_URL"),
             Some(&"https://gateway.example/v1".to_string())
         );
-        assert_eq!(
-            gateway.get("GROK_MODELS_API_BACKEND"),
-            Some(&"responses".to_string())
-        );
+        assert!(!gateway.contains_key("GROK_MODELS_API_BACKEND"));
         fs::remove_file(&path).unwrap();
     }
 

@@ -1,5 +1,5 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react";
-import type { Session, SessionBlock, WorkflowRun } from "../../bridge/types";
+import { memo, type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { isSessionTerminal, type Session, type SessionBlock, type WorkflowRun } from "../../bridge/types";
 import { useI18n } from "../../lib/i18n";
 import { useDesktop } from "../../state/store";
 import { Icon } from "../fx/Icon";
@@ -16,6 +16,14 @@ interface Turn {
   id: string;
   blocks: SessionBlock[];
   promptIndex: number;
+}
+
+interface RequestMarker {
+  id: string;
+  index: number;
+  position: number;
+  prompt: string;
+  response: string;
 }
 
 // Keep Zustand's selector snapshot referentially stable when this session has
@@ -107,6 +115,105 @@ function groupTurns(blocks: SessionBlock[]): Turn[] {
   return turns;
 }
 
+function compactPreview(text: string, limit: number): string {
+  const compact = text.replace(/\s+/g, " ").trim();
+  if (compact.length <= limit) return compact;
+  return `${compact.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
+}
+
+function requestPreview(turn: Turn, language: string): Omit<RequestMarker, "index" | "position"> | undefined {
+  const user = turn.blocks.find((block): block is Extract<SessionBlock, { type: "user" }> => block.type === "user");
+  if (!user) return undefined;
+  const assistant = turn.blocks.filter((block): block is Extract<SessionBlock, { type: "assistant" }> => block.type === "assistant").at(-1);
+  return {
+    id: turn.id,
+    prompt: compactPreview(user.text, 92),
+    response: assistant?.text.trim()
+      ? compactPreview(assistant.text, 128)
+      : language === "zh-CN" ? "正在等待 Grok 的回复…" : "Waiting for Grok's reply…",
+  };
+}
+
+function RequestRail({ markers, language, onJump }: { markers: RequestMarker[]; language: string; onJump(id: string): void }) {
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const markerNodes = useRef(new Map<string, HTMLButtonElement>());
+  const waveFrame = useRef<number | null>(null);
+  const pointerPosition = useRef<number | null>(null);
+
+  const updateWave = (position: number | null) => {
+    pointerPosition.current = position;
+    if (waveFrame.current !== null) return;
+    waveFrame.current = requestAnimationFrame(() => {
+      waveFrame.current = null;
+      const point = pointerPosition.current;
+      for (const marker of markers) {
+        const node = markerNodes.current.get(marker.id);
+        if (!node) continue;
+        const wave = point === null ? 0 : Math.max(0, 1 - Math.abs(marker.position - point) / 17);
+        node.style.setProperty("--request-rail-wave", wave.toFixed(3));
+      }
+    });
+  };
+
+  useEffect(() => () => {
+    if (waveFrame.current !== null) cancelAnimationFrame(waveFrame.current);
+  }, []);
+
+  if (markers.length === 0) return null;
+
+  return (
+    <nav
+      className="request-rail"
+      aria-label={language === "zh-CN" ? "请求导航" : "Request navigation"}
+      onPointerMove={(event) => {
+        const bounds = event.currentTarget.getBoundingClientRect();
+        if (bounds.height <= 0) return;
+        updateWave(Math.max(0, Math.min(100, ((event.clientY - bounds.top) / bounds.height) * 100)));
+      }}
+      onPointerLeave={() => {
+        updateWave(null);
+        setHoveredId(null);
+      }}
+    >
+      <span className="request-rail__spine" aria-hidden="true" />
+      {markers.map((marker) => {
+        const hovering = hoveredId === marker.id;
+        const style = {
+          top: `${marker.position}%`,
+          "--request-rail-hovered": hovering ? "1" : "0",
+        } as CSSProperties;
+        const label = language === "zh-CN" ? `请求 ${marker.index + 1}` : `Request ${marker.index + 1}`;
+        return (
+          <button
+            key={marker.id}
+            type="button"
+            className={`request-rail__marker ${hovering ? "is-hovered" : ""}`}
+            style={style}
+            ref={(node) => {
+              if (node) markerNodes.current.set(marker.id, node);
+              else markerNodes.current.delete(marker.id);
+            }}
+            onPointerEnter={() => setHoveredId(marker.id)}
+            onFocus={() => setHoveredId(marker.id)}
+            onBlur={() => setHoveredId(null)}
+            onClick={() => onJump(marker.id)}
+            aria-label={`${label}: ${marker.prompt}`}
+          >
+            <span className="request-rail__bar" aria-hidden="true" />
+            {hovering && (
+              <span className="request-rail__tooltip" role="tooltip">
+                <span className="request-rail__tooltip-label">{label}</span>
+                <span className="request-rail__tooltip-prompt">{marker.prompt}</span>
+                <span className="request-rail__tooltip-response">{marker.response}</span>
+              </span>
+            )}
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
 function renderBlock(block: SessionBlock, sessionId: string, processing = false) {
   switch (block.type) {
     case "user": return <UserMsg key={block.id} block={block} />;
@@ -172,7 +279,7 @@ interface TurnGroupProps {
 
 function TurnGroup({ turn, sessionId, status, active, workflow }: TurnGroupProps) {
   const { language } = useI18n();
-  const complete = !active || status === "idle";
+  const complete = !active || isSessionTerminal(status);
   // Public thought/tool events are meaningful audit trail. Start them open so
   // their timing and summaries are visible; each dense child card remains
   // independently collapsible.
@@ -288,10 +395,24 @@ export function Timeline({ session }: { session: Session }) {
   const { language } = useI18n();
   const workflows = useDesktop((state) => state.workflows[session.id] ?? EMPTY_WORKFLOWS);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const turnNodes = useRef(new Map<string, HTMLDivElement>());
   const followRef = useRef(true);
   const turns = useMemo(() => groupTurns(session.blocks), [session.blocks]);
   const lastBlock = session.blocks.at(-1);
   const signature = `${session.blocks.length}:${lastBlock?.type === "assistant" || lastBlock?.type === "thinking" ? lastBlock.text.length : lastBlock?.id ?? ""}:${session.status}`;
+
+  const markers = useMemo<RequestMarker[]>(() => {
+    const requests = turns
+      .map((turn) => requestPreview(turn, language))
+      .filter((marker): marker is Omit<RequestMarker, "index" | "position"> => Boolean(marker));
+    return requests.map((marker, index) => ({
+      ...marker,
+      index,
+      // This is a navigation index, not a miniature transcript map. Keep
+      // every request evenly distributed, like a compact table of contents.
+      position: ((index + 0.5) / requests.length) * 100,
+    }));
+  }, [language, turns]);
 
   useEffect(() => {
     const frame = requestAnimationFrame(() => {
@@ -303,8 +424,45 @@ export function Timeline({ session }: { session: Session }) {
 
   if (session.blocks.length === 0) return <div className="flex flex-1 flex-col items-center justify-center gap-4 pb-24"><BlackHole size={44} spin="slow" /><div className="text-center"><p className="text-[14px] text-mute">{language === "zh-CN" ? "任务通道已打开。" : "Mission channel open."}</p><p className="lbl mt-1.5 !text-[10px]">{language === "zh-CN" ? "输入你的第一个请求" : "TRANSMIT YOUR FIRST DIRECTIVE"}</p></div></div>;
 
-  return <div ref={scrollRef} onScroll={() => { const element = scrollRef.current; if (element) followRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80; }} className="flex-1 overflow-y-auto"><div className="mx-auto max-w-[860px] px-8 py-8">{turns.map((turn, index) => {
-    const user = turn.blocks.find((block): block is Extract<SessionBlock, { type: "user" }> => block.type === "user");
-    return <MemoTurnGroup key={turn.id} turn={turn} sessionId={session.id} status={session.status} active={index === turns.length - 1} workflow={matchingResearchRun(workflows, user)} />;
-  })}<div className="h-2" /></div></div>;
+  const jumpToTurn = (id: string) => {
+    const viewport = scrollRef.current;
+    const node = turnNodes.current.get(id);
+    if (!viewport || !node) return;
+    followRef.current = false;
+    const viewportRect = viewport.getBoundingClientRect();
+    const target = viewport.scrollTop + node.getBoundingClientRect().top - viewportRect.top - viewport.clientHeight * 0.14;
+    viewport.scrollTo({ top: Math.max(0, target), behavior: "smooth" });
+  };
+
+  return (
+    <div className="relative flex min-h-0 flex-1">
+      <div
+        ref={scrollRef}
+        onScroll={() => {
+          const element = scrollRef.current;
+          if (element) followRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+        }}
+        className="h-full min-w-0 flex-1 overflow-y-auto"
+      >
+        <div className="mx-auto max-w-[860px] px-8 py-8">
+          {turns.map((turn, index) => {
+            const user = turn.blocks.find((block): block is Extract<SessionBlock, { type: "user" }> => block.type === "user");
+            return (
+              <div
+                key={turn.id}
+                ref={(node) => {
+                  if (node) turnNodes.current.set(turn.id, node);
+                  else turnNodes.current.delete(turn.id);
+                }}
+              >
+                <MemoTurnGroup turn={turn} sessionId={session.id} status={session.status} active={index === turns.length - 1} workflow={matchingResearchRun(workflows, user)} />
+              </div>
+            );
+          })}
+          <div className="h-2" />
+        </div>
+      </div>
+      <RequestRail markers={markers} language={language} onJump={jumpToTurn} />
+    </div>
+  );
 }

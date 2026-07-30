@@ -31,14 +31,16 @@ export function StatusBar() {
           className={
             status === "running"
               ? "text-acc"
-              : status === "awaiting_permission"
+            : status === "failed"
+              ? "text-red"
+              : status === "awaiting_permission" || status === "awaiting_input"
                 ? "text-gold"
                 : "text-mute"
           }
         >
           {language === "zh-CN"
-            ? status === "running" ? "处理中" : status === "awaiting_permission" ? "等待批准" : status === "awaiting_input" ? "等待输入" : "就绪"
-            : status === "running" ? "WORKING" : status === "awaiting_permission" ? "AWAITING APPROVAL" : status === "awaiting_input" ? "AWAITING INPUT" : "READY"}
+            ? status === "running" ? "处理中" : status === "failed" ? "失败" : status === "awaiting_permission" ? "等待批准" : status === "awaiting_input" ? "等待输入" : "已完成"
+            : status === "running" ? "WORKING" : status === "failed" ? "FAILED" : status === "awaiting_permission" ? "AWAITING APPROVAL" : status === "awaiting_input" ? "AWAITING INPUT" : "COMPLETED"}
         </span>
         {activeId && (
           <>

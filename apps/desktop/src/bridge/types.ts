@@ -245,7 +245,10 @@ export interface Usage {
   turns: number;
 }
 
-export type SessionStatus = "idle" | "running" | "awaiting_permission" | "awaiting_input";
+export type SessionStatus = "idle" | "running" | "awaiting_permission" | "awaiting_input" | "failed";
+
+/** A terminal turn accepts a new prompt; `failed` remains visible until then. */
+export const isSessionTerminal = (status: SessionStatus) => status === "idle" || status === "failed";
 
 export interface SessionMeta {
   id: string;
@@ -254,6 +257,10 @@ export interface SessionMeta {
   createdAt: number;
   updatedAt: number;
   model: string;
+  /** Last live state observed by Grox, persisted only for the session list. */
+  lastStatus?: SessionStatus;
+  /** A successful completion that has not yet been opened in the UI. */
+  completionUnread?: boolean;
   parentId?: string;
   /** true for sessions fabricated by MockBridge for the demo workspace */
   demo?: boolean;

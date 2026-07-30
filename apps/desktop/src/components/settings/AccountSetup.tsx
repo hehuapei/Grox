@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { ProviderApiBackend, ProviderKind } from "../../bridge/types";
+import type { ProviderKind } from "../../bridge/types";
 import { bridge } from "../../bridge";
 import { useDesktop } from "../../state/store";
 import { useI18n } from "../../lib/i18n";
@@ -21,7 +21,6 @@ export function AccountSetup() {
   const [apiKeyHidden, setApiKeyHidden] = useState(false);
   const [providerName, setProviderName] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
-  const [apiBackend, setApiBackend] = useState<ProviderApiBackend>("auto");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [proxyEnabled, setProxyEnabled] = useState(false);
@@ -99,7 +98,10 @@ export function AccountSetup() {
           name: providerName,
           apiKey,
           baseUrl,
-          apiBackend,
+          // Grok Build's documented custom-model endpoint is OpenAI
+          // Chat Completions. Responses-only routing belongs in a user-owned
+          // custom model declaration, not an app-generated config override.
+          apiBackend: "chat_completions",
           residentModels: [],
         });
         localStorage.setItem("grox.accountSetupComplete", "1");
@@ -156,15 +158,7 @@ export function AccountSetup() {
               <>
                 <Field label={language === "zh-CN" ? "供应商名称" : "Provider name"} value={providerName} onChange={setProviderName} placeholder={language === "zh-CN" ? "例如：公司中转 / OpenRouter" : "e.g. Company gateway / OpenRouter"} />
                 <Field label={t("baseUrl")} value={baseUrl} onChange={setBaseUrl} placeholder="https://example.com/v1" />
-                <label className="block">
-                  <span className="mb-1 block text-[9px] text-dim">{language === "zh-CN" ? "接口协议" : "API protocol"}</span>
-                  <select value={apiBackend} onChange={(event) => setApiBackend(event.target.value as ProviderApiBackend)} className="h-9 w-full rounded-[4px] border border-line2 bg-void px-3 font-mono text-[10px] text-fg2 outline-none focus:border-acc-dim">
-                    <option value="responses">Responses · {language === "zh-CN" ? "完整搜索/思考事件" : "full search/reasoning events"}</option>
-                    <option value="chat_completions">Chat Completions · {language === "zh-CN" ? "兼容回退" : "compatibility fallback"}</option>
-                    <option value="auto">AUTO · grok2api / CLIProxyAPI / NewAPI</option>
-                  </select>
-                </label>
-                <p className="rounded-[5px] border border-line bg-raise px-3 py-2 text-[10px] leading-relaxed text-dim">{language === "zh-CN" ? "保存后会自动从 Base URL /models 获取可用模型；之后可在账户设置中选择常驻模型或添加自定义模型。" : "Grox will fetch Base URL /models automatically. Resident and custom models can be managed later in Account settings."}</p>
+                <p className="rounded-[5px] border border-line bg-raise px-3 py-2 text-[10px] leading-relaxed text-dim">{language === "zh-CN" ? "仅接入标准 OpenAI Chat Completions 服务：保存后会从 Base URL /models 获取模型，并为当前模型写入 Grok 官方的 env_key、base_url 与 api_backend=chat_completions；切回 OAuth 时自动恢复。真实 Key 始终只保存在当前 ACP 子进程环境。" : "Only standard OpenAI Chat Completions endpoints are connected here. Grox fetches Base URL /models and writes the documented env_key, base_url, and api_backend=chat_completions for the active model, restoring them on OAuth. The literal key stays only in the current ACP child environment."}</p>
               </>
             )}
           </div>

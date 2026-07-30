@@ -23,6 +23,7 @@ import type {
   Session,
   SessionBlock,
   SessionMeta,
+  SessionStatus,
   TerminalIO,
   ToolCall,
   ToolKind,
@@ -944,7 +945,7 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
     case "error":
       return {
         ...session,
-        status: "idle",
+        status: "failed",
         blocks: [
           ...session.blocks,
           { type: "system", id: uid(), text: event.message, ts: Date.now(), kind: "error" },
@@ -1923,13 +1924,13 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
-  private finishTurn(sessionId: string, usageValue?: JsonObject) {
+  private finishTurn(sessionId: string, usageValue?: JsonObject, status: SessionStatus = "idle") {
     this.closeUser(sessionId);
     this.closeThinking(sessionId);
     this.closeAssistant(sessionId);
     this.flushToolPatches(sessionId);
     if (usageValue) this.emitUsage(sessionId, usageValue);
-    this.emit({ type: "status", sessionId, status: "idle" });
+    this.emit({ type: "status", sessionId, status });
   }
 
   private emitUsage(sessionId: string, usageValue: JsonObject) {
@@ -2345,11 +2346,10 @@ export class AcpBridge implements GrokBridge {
   }
 
   async configureProvider(config: ProviderConfig): Promise<void> {
-    await invoke("configure_provider", { request: config });
-    // Provider settings affect the next ACP child. Let an in-flight turn
-    // complete on the existing child before replacing it, then reload the same
-    // session so conversation continuity is preserved by the caller.
+    // Keep the old child and its environment intact for the current turn.
+    // The configuration file is intentionally not touched until it finishes.
     await this.waitForActivePrompts();
+    await invoke("configure_provider", { request: config });
     await this.restartAgent();
     if (config.kind === "oauth" && this.authState.required) await this.authenticate();
   }
@@ -2371,8 +2371,11 @@ export class AcpBridge implements GrokBridge {
   }
 
   async activateProviderProfile(id: string): Promise<void> {
-    await invoke("activate_provider_profile", { id });
+    // Profile activation also writes the endpoint and per-model transport.
+    // Do it only after the prior turn has finished so it cannot change the
+    // provider or model underneath an in-flight request.
     await this.waitForActivePrompts();
+    await invoke("activate_provider_profile", { id });
     await this.restartAgent();
   }
 
@@ -2387,6 +2390,7 @@ export class AcpBridge implements GrokBridge {
 
   async deleteProviderProfile(id: string): Promise<void> {
     const active = (await this.listProviderProfiles()).activeId === id;
+    if (active) await this.waitForActivePrompts();
     await invoke("delete_provider_profile", { id });
     if (active) await this.restartAgent();
   }
@@ -2408,9 +2412,17 @@ export class AcpBridge implements GrokBridge {
   }
 
   async writeConfigDocument(document: ConfigDocument): Promise<ConfigDocument> {
-    return invoke<ConfigDocument>("write_config_document", {
+    const saved = await invoke<ConfigDocument>("write_config_document", {
       request: { id: document.id, cwd: this.workspace, content: document.content },
     });
+    if (document.id === "config") {
+      // Grok reads its global config at agent startup. Restart only after an
+      // active prompt settles, then the settings UI reloads the idle session
+      // so a successful save has an observable effect immediately.
+      await this.waitForActivePrompts();
+      await this.restartAgent();
+    }
+    return saved;
   }
 
   async callExtension<T>(method: string, params: unknown = {}): Promise<T> {
@@ -2458,6 +2470,19 @@ export class AcpBridge implements GrokBridge {
   }
 
   async newSession(cwd: string): Promise<void> {
+    // A home-screen send creates the ACP session before it can register the
+    // real session id in `prompt`. Keep that short gap visible to provider
+    // switching so a restart cannot kill a request the user has just sent.
+    const creationLock = `session/new:${++this.requestId}`;
+    this.activePromptSessions.add(creationLock);
+    try {
+      await this.createSession(cwd);
+    } finally {
+      this.markPromptFinished(creationLock);
+    }
+  }
+
+  private async createSession(cwd: string): Promise<void> {
     const metaRequest = await this.sessionMeta(cwd);
     const preferredModel = localStorage.getItem("grok.model")?.trim();
     const computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
@@ -2521,6 +2546,19 @@ export class AcpBridge implements GrokBridge {
   }
 
   async loadSession(id: string): Promise<void> {
+    // A provider restart cannot be allowed to interrupt an in-progress
+    // session attachment; it would leave the visible conversation half bound
+    // to the old child process.
+    const loadingLock = `session/load:${id}:${++this.requestId}`;
+    this.activePromptSessions.add(loadingLock);
+    try {
+      await this.restoreSession(id);
+    } finally {
+      this.markPromptFinished(loadingLock);
+    }
+  }
+
+  private async restoreSession(id: string): Promise<void> {
     let meta = this.catalogue.get(id);
     if (!meta) {
       await this.listSessions();
@@ -2798,17 +2836,21 @@ export class AcpBridge implements GrokBridge {
   }
 
   async prompt(sessionId: string, text: string, options: PromptOptions): Promise<void> {
-    await this.ready;
-    // A new user prompt begins the new branch. It is the only event allowed
-    // to lift the rewind isolation gate.
-    this.forgetRewoundSession(sessionId);
+    // Register before any await. This is the critical Send → provider-switch
+    // race: provider activation must see this request immediately.
     this.activePromptSessions.add(sessionId);
-    this.knownSessions.add(sessionId);
-    const sessionCwd = this.catalogue.get(sessionId)?.cwd;
-    if (sessionCwd) this.sessionWorkspaces.set(sessionId, sessionCwd);
-    this.closeUser(sessionId);
-    this.emit({ type: "status", sessionId, status: "running" });
+    let terminalStatus: SessionStatus = "idle";
     try {
+      await this.ready;
+      // A new user prompt begins the new branch. It is the only event allowed
+      // to lift the rewind isolation gate.
+      this.forgetRewoundSession(sessionId);
+      this.knownSessions.add(sessionId);
+      const sessionCwd = this.catalogue.get(sessionId)?.cwd;
+      if (sessionCwd) this.sessionWorkspaces.set(sessionId, sessionCwd);
+      this.closeUser(sessionId);
+      this.emit({ type: "status", sessionId, status: "running" });
+
       const previous = this.sessionOptions.get(sessionId);
       if (
         !this.sessionSetModelUnsupported
@@ -2878,9 +2920,10 @@ export class AcpBridge implements GrokBridge {
       if (promptUsage) this.emitUsage(sessionId, promptUsage);
       await this.refreshSessionInfo(sessionId);
     } catch (error) {
+      terminalStatus = "failed";
       this.emit({ type: "error", sessionId, message: errorText(error) });
     } finally {
-      this.finishTurn(sessionId);
+      this.finishTurn(sessionId, undefined, terminalStatus);
       this.markPromptFinished(sessionId);
     }
   }

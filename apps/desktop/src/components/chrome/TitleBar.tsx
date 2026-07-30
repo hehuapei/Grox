@@ -87,6 +87,14 @@ export function TitleBar() {
           />
           {bridgeKind === "mock" ? "MOCK LINK" : "ACP LINK"}
         </span>
+        <button
+          className="chip mr-1"
+          onClick={() => window.dispatchEvent(new Event("grox:open-update-center"))}
+          title={language === "zh-CN" ? "检查更新并查看更新日志" : "Check for updates and view the changelog"}
+        >
+          <Icon name="refresh" size={11} />
+          <span>{language === "zh-CN" ? "更新日志" : "CHANGELOG"}</span>
+        </button>
 
         <button
           className="chip"

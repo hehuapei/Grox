@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useI18n } from "../../lib/i18n";
 import { Icon } from "../fx/Icon";
@@ -16,116 +16,177 @@ interface UpdateInfo {
   requiresXattr: boolean;
 }
 
+interface ReleaseSummary {
+  version: string;
+  title: string;
+  notes: string;
+  releaseUrl: string;
+  publishedAt?: string;
+}
+
+interface UpdateStatus {
+  currentVersion: string;
+  updateAvailable: boolean;
+  latest: UpdateInfo;
+  history: ReleaseSummary[];
+}
+
+const UPDATE_POLL_INTERVAL_MS = 2 * 60_000;
+const VISIBILITY_RECHECK_AFTER_MS = 30_000;
+
+const formatDate = (value: string | undefined, language: string) => value
+  ? new Intl.DateTimeFormat(language, { dateStyle: "medium" }).format(new Date(value))
+  : null;
+
+const releaseNotes = (notes: string, zh: boolean) => notes.trim() || (
+  zh ? "此版本包含功能改进与问题修复。" : "This release includes improvements and fixes."
+);
+
+/**
+ * Keeps a lightweight release heartbeat while the app is open. A new release
+ * becomes an actionable notice without requiring a full app restart; opening
+ * the title-bar changelog always performs a fresh, user-visible check.
+ */
 export function UpdateNotice() {
   const { language } = useI18n();
   const zh = language === "zh-CN";
-  const checked = useRef(false);
-  const [update, setUpdate] = useState<UpdateInfo | null>(null);
+  const [open, setOpen] = useState(false);
+  const [status, setStatus] = useState<UpdateStatus | null>(null);
+  const [checking, setChecking] = useState(false);
   const [installing, setInstalling] = useState(false);
   const [error, setError] = useState("");
+  const lastAutomaticCheck = useRef(0);
+  const inFlight = useRef(false);
 
-  useEffect(() => {
-    if (checked.current) return;
-    checked.current = true;
-    const timer = window.setTimeout(() => {
-      void invoke<UpdateInfo | null>("check_for_update")
-        .then((result) => setUpdate(result))
-        .catch(() => undefined);
-    }, 1400);
-    return () => window.clearTimeout(timer);
+  const check = useCallback(async (openWhenCurrent: boolean) => {
+    if (inFlight.current) return;
+    inFlight.current = true;
+    setChecking(true);
+    setError("");
+    try {
+      const next = await invoke<UpdateStatus>("get_update_status");
+      setStatus(next);
+      if (next.updateAvailable || openWhenCurrent) setOpen(true);
+    } catch (cause) {
+      if (openWhenCurrent) setOpen(true);
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      inFlight.current = false;
+      setChecking(false);
+    }
   }, []);
 
-  if (!update) return null;
+  useEffect(() => {
+    const automaticCheck = () => {
+      if (document.visibilityState !== "visible") return;
+      const now = Date.now();
+      if (now - lastAutomaticCheck.current < VISIBILITY_RECHECK_AFTER_MS) return;
+      lastAutomaticCheck.current = now;
+      void check(false);
+    };
+    const openCenter = () => {
+      setOpen(true);
+      void check(true);
+    };
+    automaticCheck();
+    const timer = window.setInterval(automaticCheck, UPDATE_POLL_INTERVAL_MS);
+    document.addEventListener("visibilitychange", automaticCheck);
+    window.addEventListener("grox:open-update-center", openCenter);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", automaticCheck);
+      window.removeEventListener("grox:open-update-center", openCenter);
+    };
+  }, [check]);
 
-  const notes = update.notes.trim() || (zh ? "此版本包含功能改进与问题修复。" : "This release includes improvements and fixes.");
-  const published = update.publishedAt
-    ? new Intl.DateTimeFormat(language, { dateStyle: "medium" }).format(new Date(update.publishedAt))
-    : null;
   const install = async () => {
+    if (!status?.updateAvailable) return;
     setInstalling(true);
     setError("");
     try {
-      await invoke("install_update", { version: update.latestVersion });
+      await invoke("install_update", { version: status.latest.latestVersion });
     } catch (cause) {
       setInstalling(false);
       setError(cause instanceof Error ? cause.message : String(cause));
     }
   };
 
+  if (!open) return null;
+
+  const update = status?.latest;
+  const published = formatDate(update?.publishedAt, language);
+
   return (
     <div className="fixed inset-0 z-[70] flex items-center justify-center bg-void/80 p-5 backdrop-blur-[4px]">
-      <section className="w-[min(520px,92vw)] overflow-hidden rounded-[9px] border border-line3 bg-panel shadow-2xl animate-fade-up" role="dialog" aria-modal="true" aria-labelledby="grox-update-title">
+      <section className="flex max-h-[min(720px,92vh)] w-[min(620px,94vw)] flex-col overflow-hidden rounded-[9px] border border-line3 bg-panel shadow-2xl animate-fade-up" role="dialog" aria-modal="true" aria-labelledby="grox-update-title">
         <div className="flex items-center justify-between border-b border-line bg-void px-5 py-3">
           <Wordmark size={11} withMark />
-          <span className="font-mono text-[9.5px] tracking-[0.12em] text-faint">UPDATE SIGNAL</span>
+          <div className="flex items-center gap-3">
+            {checking && <span className="flex items-center gap-1.5 font-mono text-[9px] tracking-[0.1em] text-acc"><Icon name="refresh" size={10} className="animate-orbit" />{zh ? "检查中" : "CHECKING"}</span>}
+            <button onClick={() => setOpen(false)} className="flex h-6 w-6 items-center justify-center rounded-[3px] text-faint hover:bg-high hover:text-fg" title={zh ? "关闭" : "Close"}><Icon name="x" size={10} /></button>
+          </div>
         </div>
-        <div className="p-5">
-          <div className="flex items-start gap-3">
-            <div className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full border border-acc-dim bg-acc-wash text-acc">
-              <Icon name="arrowUp" size={15} />
-            </div>
-            <div className="min-w-0 flex-1">
-              <h2 id="grox-update-title" className="text-[15px] font-semibold text-fg">{zh ? "发现新版本" : "A new version is available"}</h2>
-              <p className="mt-1 text-[11px] text-dim">
-                <span className="font-mono text-faint">v{update.currentVersion}</span>
-                <span className="mx-2 text-faint">→</span>
-                <span className="font-mono font-medium text-acc">v{update.latestVersion}</span>
-                {published && <span className="ml-2 text-faint">· {published}</span>}
-              </p>
-            </div>
-          </div>
 
-          <div className="mt-5 rounded-[6px] border border-line2 bg-raise">
-            <div className="border-b border-line px-4 py-2.5">
-              <p className="truncate text-[11.5px] font-medium text-fg2">{update.title}</p>
-            </div>
-            <pre className="max-h-56 overflow-y-auto whitespace-pre-wrap px-4 py-3 font-sans text-[11px] leading-[1.75] text-mute select-text">{notes}</pre>
-          </div>
-
-          <div className="mt-3 flex items-center gap-2 text-[10px] leading-relaxed text-faint">
-            <Icon name="refresh" size={11} className={installing ? "animate-orbit text-acc" : ""} />
-            <span>
-              {installing
-                ? (zh ? "正在下载安装包；完成后 Grox 将自动退出并重新启动。" : "Downloading and installing; Grox will quit and relaunch automatically.")
-                : (zh ? `将自动安装${update.assetName ? ` ${update.assetName}` : "适用于当前系统的安装包"}，完成后自动重启。` : `The ${update.assetName ?? "platform installer"} will be installed and Grox will relaunch automatically.`)}
-            </span>
-          </div>
-
-          {update.requiresXattr && (
-            <div className="mt-3 flex items-start gap-2 rounded-[5px] border border-gold/25 bg-gold/5 px-3 py-2 text-[10px] leading-relaxed text-gold">
-              <Icon name="alert" size={12} className="mt-0.5 shrink-0" />
-              <span>
-                {zh ? "macOS 更新时会自动运行 " : "On macOS, the updater automatically runs "}
-                <code className="font-mono text-[9px] text-fg2">xattr -dr com.apple.quarantine Grox.app</code>
-                {zh ? "，避免更新后被系统隔离而无法打开；如应用位于受保护目录，系统可能要求管理员授权。" : " so the updated app is not blocked by quarantine. macOS may request administrator approval for protected folders."}
-              </span>
-            </div>
+        <div className="min-h-0 overflow-y-auto p-5">
+          {!status && !error && (
+            <div className="flex min-h-36 flex-col items-center justify-center gap-3 text-dim"><Icon name="refresh" size={18} className="animate-orbit text-acc" /><p className="text-[11px]">{zh ? "正在检查更新…" : "Checking for updates…"}</p></div>
           )}
 
-          {error && (
-            <p role="alert" className="mt-3 rounded-[5px] border border-red/25 bg-red/5 px-3 py-2 text-[10px] leading-relaxed text-red">
-              {error}
-            </p>
+          {status && update && (
+            <>
+              <div className="flex items-start gap-3">
+                <div className={`mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-full border ${status.updateAvailable ? "border-acc-dim bg-acc-wash text-acc" : "border-line2 bg-raise text-dim"}`}>
+                  <Icon name={status.updateAvailable ? "arrowUp" : "check"} size={15} />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <h2 id="grox-update-title" className="text-[15px] font-semibold text-fg">
+                    {status.updateAvailable ? (zh ? "发现新版本" : "A new version is available") : (zh ? "当前已是最新版本" : "You are up to date")}
+                  </h2>
+                  <p className="mt-1 text-[11px] text-dim">
+                    <span className="font-mono text-faint">v{status.currentVersion}</span>
+                    {status.updateAvailable && <><span className="mx-2 text-faint">→</span><span className="font-mono font-medium text-acc">v{update.latestVersion}</span></>}
+                    {!status.updateAvailable && <span className="ml-2 text-faint">· {zh ? "最新发布" : "latest release"} v{update.latestVersion}</span>}
+                    {published && <span className="ml-2 text-faint">· {published}</span>}
+                  </p>
+                </div>
+              </div>
+
+              {status.updateAvailable && (
+                <div className="mt-5 rounded-[6px] border border-line2 bg-raise">
+                  <div className="border-b border-line px-4 py-2.5"><p className="truncate text-[11.5px] font-medium text-fg2">{update.title}</p></div>
+                  <pre className="max-h-40 overflow-y-auto whitespace-pre-wrap px-4 py-3 font-sans text-[11px] leading-[1.75] text-mute select-text">{releaseNotes(update.notes, zh)}</pre>
+                </div>
+              )}
+
+              <div className="mt-6 border-t border-line pt-4">
+                <div className="mb-2 flex items-center justify-between"><h3 className="lbl !text-[9.5px]">{zh ? "更新历史" : "RELEASE HISTORY"}</h3><span className="font-mono text-[9px] text-faint">{status.history.length}</span></div>
+                <div className="space-y-1.5">
+                  {status.history.map((release) => (
+                    <button key={`${release.version}-${release.releaseUrl}`} onClick={() => void invoke("open_external", { url: release.releaseUrl })} className="group flex w-full items-start gap-3 rounded-[5px] border border-line bg-raise px-3 py-2.5 text-left hover:border-line3 hover:bg-high/60">
+                      <span className="mt-0.5 font-mono text-[9.5px] text-acc">v{release.version}</span>
+                      <span className="min-w-0 flex-1"><span className="block truncate text-[10.5px] text-fg2">{release.title}</span><span className="mt-0.5 block line-clamp-2 text-[9.5px] leading-relaxed text-dim">{releaseNotes(release.notes, zh)}</span></span>
+                      <span className="shrink-0 font-mono text-[8.5px] text-faint">{formatDate(release.publishedAt, language) ?? ""}</span>
+                      <Icon name="external" size={10} className="mt-0.5 shrink-0 text-faint group-hover:text-fg2" />
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </>
           )}
 
-          <div className="mt-5 flex flex-wrap items-center justify-end gap-2">
-            <button disabled={installing} onClick={() => setUpdate(null)} className="h-8 rounded-[4px] border border-line2 px-3 text-[10.5px] text-mute hover:border-line3 hover:text-fg2 disabled:opacity-40">
-              {zh ? "稍后提醒" : "Later"}
-            </button>
-            <button disabled={installing} onClick={() => void invoke("open_external", { url: update.releaseUrl })} className="flex h-8 items-center gap-2 rounded-[4px] border border-line2 px-3 text-[10.5px] text-mute hover:border-line3 hover:text-fg2 disabled:opacity-40">
-              {zh ? "手动下载" : "Manual download"}
-              <Icon name="external" size={11} />
-            </button>
-            <button
-              disabled={!update.installable || installing}
-              onClick={() => void install()}
-              className="flex h-8 items-center gap-2 rounded-[4px] border border-acc-dim bg-acc-wash px-3 font-medium text-[10.5px] text-acc hover:bg-high disabled:cursor-not-allowed disabled:opacity-40"
-              title={!update.installable ? (zh ? "此版本缺少适用于当前系统的安装包" : "No installer for this platform") : undefined}
-            >
-              {installing ? (zh ? "正在更新…" : "Updating…") : (zh ? "一键更新并重启" : "Update & restart")}
-              <Icon name={installing ? "refresh" : "arrowUp"} size={11} className={installing ? "animate-orbit" : ""} />
-            </button>
-          </div>
+          {error && <p role="alert" className="mt-4 rounded-[5px] border border-red/25 bg-red/5 px-3 py-2 text-[10px] leading-relaxed text-red">{error}</p>}
+
+          {status?.updateAvailable && update?.requiresXattr && (
+            <div className="mt-3 flex items-start gap-2 rounded-[5px] border border-gold/25 bg-gold/5 px-3 py-2 text-[10px] leading-relaxed text-gold"><Icon name="alert" size={12} className="mt-0.5 shrink-0" /><span>{zh ? "macOS 更新会自动清除新应用包的隔离标记；如应用位于受保护目录，系统可能要求管理员授权。" : "macOS clears the new app bundle's quarantine marker automatically; protected directories may require administrator approval."}</span></div>
+          )}
+        </div>
+
+        <div className="flex flex-wrap items-center justify-end gap-2 border-t border-line bg-void px-5 py-3">
+          <button disabled={checking || installing} onClick={() => void check(true)} className="flex h-8 items-center gap-2 rounded-[4px] border border-line2 px-3 text-[10.5px] text-mute hover:border-line3 hover:text-fg2 disabled:opacity-40"><Icon name="refresh" size={11} className={checking ? "animate-orbit" : ""} />{zh ? "手动检查更新" : "Check again"}</button>
+          {status?.updateAvailable && update && <>
+            <button disabled={installing} onClick={() => void invoke("open_external", { url: update.releaseUrl })} className="flex h-8 items-center gap-2 rounded-[4px] border border-line2 px-3 text-[10.5px] text-mute hover:border-line3 hover:text-fg2 disabled:opacity-40">{zh ? "手动下载" : "Manual download"}<Icon name="external" size={11} /></button>
+            <button disabled={!update.installable || installing} onClick={() => void install()} className="flex h-8 items-center gap-2 rounded-[4px] border border-acc-dim bg-acc-wash px-3 font-medium text-[10.5px] text-acc hover:bg-high disabled:cursor-not-allowed disabled:opacity-40" title={!update.installable ? (zh ? "此版本缺少适用于当前系统的安装包" : "No installer for this platform") : undefined}>{installing ? (zh ? "正在更新…" : "Updating…") : (zh ? "一键更新并重启" : "Update & restart")}<Icon name={installing ? "refresh" : "arrowUp"} size={11} className={installing ? "animate-orbit" : ""} /></button>
+          </>}
         </div>
       </section>
     </div>

@@ -6,7 +6,7 @@ import { useI18n } from "../../lib/i18n";
 import { fmtBillingDate, fmtRelTime, fmtTokens } from "../../lib/format";
 import { Wordmark } from "../fx/Wordmark";
 import { Icon } from "../fx/Icon";
-import type { Session, SessionMeta } from "../../bridge/types";
+import type { Session, SessionMeta, SessionStatus } from "../../bridge/types";
 import { BlackHole } from "../fx/BlackHole";
 
 export function Sidebar() {
@@ -229,9 +229,7 @@ function ProjectGroup({
   onOpenSession(id: string): void;
   onToggle(): void;
 }) {
-  const { t } = useI18n();
   const visible = sessions.filter((session) => !session.archived);
-  const archived = sessions.filter((session) => session.archived);
   return (
     <div className="mb-1">
       <ProjectRow
@@ -241,34 +239,19 @@ function ProjectGroup({
         count={visible.length}
         onToggle={onToggle}
       />
-      {expanded && sessions.length > 0 && (
+      {expanded && visible.length > 0 && (
         <div className="ml-3 border-l border-line pl-1">
           {visible.map((meta) => (
             <MissionRow
               key={meta.id}
               meta={meta}
-              running={loadedSessions[meta.id]?.status === "running"}
-              awaiting={["awaiting_permission", "awaiting_input"].includes(loadedSessions[meta.id]?.status ?? "")}
+              status={loadedSessions[meta.id]?.status ?? meta.lastStatus ?? "idle"}
+              completionUnread={Boolean(meta.completionUnread)}
               active={meta.id === activeId}
               tokens={(loadedSessions[meta.id]?.usage.inputTokens ?? 0) + (loadedSessions[meta.id]?.usage.outputTokens ?? 0)}
               onOpen={() => onOpenSession(meta.id)}
             />
           ))}
-          {archived.length > 0 && (
-            <ArchiveGroup label={t("archived")}>
-              {archived.map((meta) => (
-                <MissionRow
-                  key={meta.id}
-                  meta={meta}
-                  running={false}
-                  awaiting={false}
-                  active={meta.id === activeId}
-                  tokens={(loadedSessions[meta.id]?.usage.inputTokens ?? 0) + (loadedSessions[meta.id]?.usage.outputTokens ?? 0)}
-                  onOpen={() => onOpenSession(meta.id)}
-                />
-              ))}
-            </ArchiveGroup>
-          )}
         </div>
       )}
     </div>
@@ -297,8 +280,10 @@ function ArchiveGroup({ label, children }: { label: string; children: React.Reac
 }
 
 function ProjectRow({ project, active, expanded, count, onToggle }: { project: ProjectMeta; active: boolean; expanded: boolean; count: number; onToggle(): void }) {
-  const { t } = useI18n();
+  const { t, language } = useI18n();
   const openProject = useDesktop((state) => state.openProject);
+  const newSession = useDesktop((state) => state.newSession);
+  const activeProjectId = useDesktop((state) => state.activeProjectId);
   const renameProject = useDesktop((state) => state.renameProject);
   const pinProject = useDesktop((state) => state.pinProject);
   const archiveProject = useDesktop((state) => state.archiveProject);
@@ -334,6 +319,20 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
         )}
       </button>
       {count > 0 && <span className="tnum text-[9px] text-faint">{count}</span>}
+      <button
+        onClick={(event) => {
+          event.stopPropagation();
+          void (async () => {
+            if (activeProjectId !== project.id) await openProject(project.id);
+            await newSession();
+          })();
+        }}
+        className="flex h-5 w-5 shrink-0 items-center justify-center rounded-[3px] text-acc transition-colors hover:bg-acc/10 hover:text-fg"
+        title={language === "zh-CN" ? "在此项目中新建会话" : "New session in this project"}
+        aria-label={language === "zh-CN" ? "在此项目中新建会话" : "New session in this project"}
+      >
+        <Icon name="plus" size={12} />
+      </button>
       <button onClick={() => setMenu((open) => !open)} className="hidden h-5 w-5 items-center justify-center text-dim hover:text-fg group-hover:flex">
         <Icon name="more" size={12} />
       </button>
@@ -350,10 +349,9 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
   );
 }
 
-function MissionRow({ meta, running, awaiting, active, tokens, onOpen }: { meta: SessionMeta; running: boolean; awaiting: boolean; active: boolean; tokens: number; onOpen(): void }) {
+function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: { meta: SessionMeta; status: SessionStatus; completionUnread: boolean; active: boolean; tokens: number; onOpen(): void }) {
   const { t } = useI18n();
   const renameSession = useDesktop((state) => state.renameSession);
-  const deleteSession = useDesktop((state) => state.deleteSession);
   const pinSession = useDesktop((state) => state.pinSession);
   const archiveSession = useDesktop((state) => state.archiveSession);
   const [editing, setEditing] = useState(false);
@@ -368,7 +366,8 @@ function MissionRow({ meta, running, awaiting, active, tokens, onOpen }: { meta:
   return (
     <div className={`group relative mb-px cursor-pointer rounded-[4px] border-l-2 px-2 py-1.5 ${active ? "border-acc bg-high" : "border-transparent hover:bg-high/60"}`} onClick={onOpen}>
       <div className="flex items-center gap-2">
-        <span className={awaiting ? "opacity-90" : running ? "" : "opacity-55"}><BlackHole size={11} spin={running ? true : awaiting ? "slow" : false} /></span>
+        <SessionStatusLight status={status} completionUnread={completionUnread} />
+        <span className={status === "running" || status.startsWith("awaiting_") ? "" : "opacity-55"}><BlackHole size={11} spin={status === "running" ? true : status.startsWith("awaiting_") ? "slow" : false} /></span>
         {editing ? (
           <input autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={commit} onKeyDown={(event) => event.key === "Enter" && commit()} onClick={(event) => event.stopPropagation()} className="min-w-0 flex-1 border border-line3 bg-void px-1 text-[11px] text-fg outline-none" />
         ) : (
@@ -386,12 +385,25 @@ function MissionRow({ meta, running, awaiting, active, tokens, onOpen }: { meta:
         <ContextMenu close={() => setMenu(false)}>
           <MenuButton icon="pin" label={meta.pinned ? t("unpin") : t("pin")} onClick={() => pinSession(meta.id)} />
           <MenuButton icon="edit" label={t("rename")} onClick={() => setEditing(true)} />
-          <MenuButton icon="archive" label={meta.archived ? t("unarchive") : t("archive")} onClick={() => archiveSession(meta.id)} />
-          <MenuButton icon="trash" label={t("delete")} tone="text-red" onClick={() => void deleteSession(meta.id)} />
+          <MenuButton icon="archive" label={t("archive")} onClick={() => archiveSession(meta.id)} />
         </ContextMenu>
       )}
     </div>
   );
+}
+
+function SessionStatusLight({ status, completionUnread }: { status: SessionStatus; completionUnread: boolean }) {
+  const { language } = useI18n();
+  const presentation = status === "running"
+    ? { tone: "bg-acc animate-pulse-dot", label: language === "zh-CN" ? "运行中" : "Running" }
+    : status === "failed"
+      ? { tone: "bg-red", label: language === "zh-CN" ? "失败" : "Failed" }
+      : status === "awaiting_permission" || status === "awaiting_input"
+        ? { tone: "bg-status-blue animate-pulse-dot", label: language === "zh-CN" ? "待确认" : "Awaiting confirmation" }
+        : completionUnread
+          ? { tone: "bg-green", label: language === "zh-CN" ? "已完成" : "Completed" }
+          : { tone: "bg-faint", label: language === "zh-CN" ? "无进行中的请求" : "No active request" };
+  return <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${presentation.tone}`} title={presentation.label} aria-label={presentation.label} />;
 }
 
 function ContextMenu({ children, close }: { children: React.ReactNode; close(): void }) {

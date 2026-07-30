@@ -16,7 +16,7 @@ export function ProviderSwitcher() {
   const activeProfile = profiles.find((profile) => profile.id === activeProfileId);
   const activeId = activeProfileId ?? provider.kind;
   const label = switching
-    ? (language === "zh-CN" ? "切换中" : "SWITCHING")
+    ? (language === "zh-CN" ? "等待本轮完成" : "WAITING FOR TURN")
     : activeProfile?.name ?? (provider.kind === "oauth" ? "GROK OAUTH" : provider.kind === "official" ? "XAI API" : "OPENAI API");
   const items = [
     { id: "oauth", label: "Grok OAuth", hint: language === "zh-CN" ? "官方账户" : "Official account" },

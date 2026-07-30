@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { bridge } from "../../bridge";
-import type { ConfigDocument, ProviderApiBackend, ProviderKind } from "../../bridge/types";
+import type { ConfigDocument, ProviderKind } from "../../bridge/types";
 import { EFFORTS } from "../../bridge/types";
 import { useDesktop } from "../../state/store";
 import { usePreferences } from "../../state/preferences";
@@ -10,7 +10,7 @@ import { fmtBillingDate, fmtBillingValue } from "../../lib/format";
 import { Icon } from "../fx/Icon";
 import { Wordmark } from "../fx/Wordmark";
 
-type Section = "general" | "account" | "appearance" | "mcp" | "skills" | "plugins" | "hooks";
+type Section = "general" | "account" | "archives" | "appearance" | "mcp" | "skills" | "plugins" | "hooks";
 type Json = Record<string, unknown>;
 
 const object = (value: unknown): Json =>
@@ -28,7 +28,7 @@ export function SettingsModal() {
   useEffect(() => {
     const openSection = (event: Event) => {
       const next = (event as CustomEvent<Section>).detail;
-      if (["general", "account", "appearance", "mcp", "skills", "plugins", "hooks"].includes(next)) setSection(next);
+      if (["general", "account", "archives", "appearance", "mcp", "skills", "plugins", "hooks"].includes(next)) setSection(next);
     };
     window.addEventListener("grox:settings-section", openSection);
     return () => window.removeEventListener("grox:settings-section", openSection);
@@ -38,6 +38,7 @@ export function SettingsModal() {
   const sections: { id: Section; label: string; icon: React.ComponentProps<typeof Icon>["name"] }[] = [
     { id: "general", label: t("settings"), icon: "gear" },
     { id: "account", label: language === "zh-CN" ? "账户与配置" : "Account & config", icon: "user" },
+    { id: "archives", label: language === "zh-CN" ? "归档管理" : "Archive manager", icon: "archive" },
     { id: "appearance", label: t("appearance"), icon: "sun" },
     { id: "mcp", label: t("mcp"), icon: "globe" },
     { id: "skills", label: t("skills"), icon: "bolt" },
@@ -62,6 +63,7 @@ export function SettingsModal() {
         <div className="min-w-0 flex-1 overflow-y-auto p-8">
           {section === "general" && <General />}
           {section === "account" && <Account />}
+          {section === "archives" && <ArchiveManager />}
           {section === "appearance" && <Appearance />}
           {section === "mcp" && <McpPanel />}
           {section === "skills" && <SkillsPanel />}
@@ -188,6 +190,54 @@ function General() {
   </div>;
 }
 
+function ArchiveManager() {
+  const { language } = useI18n();
+  const zh = language === "zh-CN";
+  const sessionIndex = useDesktop((state) => state.sessionIndex);
+  const sessions = useMemo(() => sessionIndex.filter((session) => session.archived), [sessionIndex]);
+  const restore = useDesktop((state) => state.archiveSession);
+  const remove = useDesktop((state) => state.deleteSession);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [error, setError] = useState("");
+
+  const destroy = async (id: string) => {
+    setDeletingId(id);
+    setError("");
+    try {
+      await remove(id);
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  return <div>
+    <Heading
+      title={zh ? "归档管理" : "Archive manager"}
+      description={zh ? "归档会话不会出现在侧栏。可在这里恢复，或永久删除。" : "Archived conversations stay out of the sidebar. Restore them here or permanently delete them."}
+    />
+    {error && <p className="mb-3 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{error}</p>}
+    {sessions.length === 0 ? (
+      <div className="rounded-[6px] border border-dashed border-line2 px-4 py-10 text-center text-[10.5px] text-dim">{zh ? "没有已归档的会话" : "No archived conversations"}</div>
+    ) : (
+      <div className="space-y-2">
+        {[...sessions].sort((a, b) => b.updatedAt - a.updatedAt).map((session) => (
+          <div key={session.id} className="flex items-center gap-3 rounded-[6px] border border-line2 bg-raise px-3 py-3">
+            <Icon name="archive" size={13} className="text-faint" />
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-[11px] text-fg2">{session.title}</p>
+              <p className="mt-0.5 truncate font-mono text-[9px] text-faint">{session.cwd} · {new Date(session.updatedAt).toLocaleString(language === "zh-CN" ? "zh-CN" : "en-US")}</p>
+            </div>
+            <ActionButton onClick={() => restore(session.id)}>{zh ? "恢复" : "Restore"}</ActionButton>
+            <ActionButton tone="danger" disabled={deletingId === session.id} onClick={() => void destroy(session.id)}>{deletingId === session.id ? (zh ? "删除中" : "Deleting") : (zh ? "删除" : "Delete")}</ActionButton>
+          </div>
+        ))}
+      </div>
+    )}
+  </div>;
+}
+
 function Account() {
   const { t, language } = useI18n();
   const zh = language === "zh-CN";
@@ -240,7 +290,6 @@ function ProviderAndModels() {
   const [apiKey, setApiKey] = useState("");
   const [apiKeyHidden, setApiKeyHidden] = useState(false);
   const [baseUrl, setBaseUrl] = useState(provider.kind === "compatible" ? "" : (provider.baseUrl ?? ""));
-  const [apiBackend, setApiBackend] = useState<ProviderApiBackend>("auto");
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [residentModels, setResidentModels] = useState<string[]>([]);
   const [customModel, setCustomModel] = useState("");
@@ -260,7 +309,6 @@ function ProviderAndModels() {
     setEditingProfileId(profile.id);
     setProfileName(profile.name);
     setBaseUrl(profile.baseUrl);
-    setApiBackend(profile.apiBackend);
     setAvailableModels(profile.availableModels);
     setResidentModels(profile.residentModels);
     setApiKey(profile.apiKey);
@@ -276,7 +324,6 @@ function ProviderAndModels() {
     setApiKey("");
     setApiKeyHidden(false);
     setBaseUrl("");
-    setApiBackend("auto");
     setAvailableModels([]);
     setResidentModels([]);
     setCustomModel("");
@@ -314,7 +361,7 @@ function ProviderAndModels() {
           name: profileName,
           apiKey,
           baseUrl,
-          apiBackend,
+          apiBackend: "chat_completions",
           residentModels,
         });
         setEditingProfileId(saved.id);
@@ -360,7 +407,7 @@ function ProviderAndModels() {
   };
 
   return <div className="mt-7" data-testid="provider-manager">
-    <div className="mb-4 flex items-end justify-between"><div><h3 className="text-[15px] font-medium text-fg">{zh ? "模型服务" : "Model provider"}</h3><p className="mt-1 text-[11.5px] leading-relaxed text-dim">{zh ? "供应商切换只重连后台 Grok Build ACP；密钥仅保存在本机配置与当前 WebView 内存中。" : "Provider changes reconnect only the Grok Build ACP process. Keys remain in local configuration and the current WebView memory."}</p></div><span className="chip">{provider.kind.toUpperCase()}</span></div>
+    <div className="mb-4 flex items-end justify-between"><div><h3 className="text-[15px] font-medium text-fg">{zh ? "模型服务" : "Model provider"}</h3><p className="mt-1 text-[11.5px] leading-relaxed text-dim">{zh ? "供应商或模型切换会等待当前请求完成，再重连后台 Grok Build ACP；运行中的请求始终保持原供应商与原模型。密钥仅保存在本机配置与当前 WebView 内存中。" : "Provider and model changes wait for the current request to finish before reconnecting Grok Build ACP; an active request always keeps its original provider and model. Keys remain in local configuration and the current WebView memory."}</p></div><span className="chip">{provider.kind.toUpperCase()}</span></div>
     <div className="grid grid-cols-3 gap-2">
       {(["oauth", "official", "compatible"] as ProviderKind[]).map((item) => <button key={item} onClick={() => selectProviderKind(item)} className={`min-w-0 rounded-[5px] border px-3 py-2.5 text-left transition-colors ${kind === item ? "border-acc-dim bg-acc-wash" : "border-line2 bg-raise hover:border-line3"}`}><Icon name={item === "oauth" ? "user" : item === "official" ? "bolt" : "globe"} size={12} className={kind === item ? "text-acc" : "text-dim"} /><p className="mt-2 truncate font-mono text-[9.5px] text-fg2">{item === "oauth" ? t("oauth") : item === "official" ? t("officialApi") : t("compatibleApi")}</p></button>)}
     </div>
@@ -370,7 +417,7 @@ function ProviderAndModels() {
         <button onClick={startNewProfile} className={`mb-2 flex h-8 items-center gap-2 rounded-[4px] border px-2 font-mono text-[9px] transition-colors ${editingProfileId === undefined ? "border-acc-dim bg-acc-wash text-acc" : "border-line2 text-dim hover:border-line3 hover:text-fg"}`}><Icon name="plus" size={10} /><span className="truncate">{zh ? "新建供应商" : "NEW PROVIDER"}</span></button>
         <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto pr-0.5">{profiles.map((profile) => <div key={profile.id} className={`group rounded-[5px] border px-3 py-2.5 transition-colors ${editingProfileId === profile.id ? "border-acc-dim bg-acc-wash" : "border-transparent bg-high/45 hover:border-line2"}`}>
           <button onClick={() => editProfile(profile.id)} className="block w-full min-w-0 text-left"><span className="flex items-center gap-2"><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${activeProfileId === profile.id ? "bg-acc" : "bg-faint"}`} /><span className="min-w-0 flex-1 truncate text-[11px] font-medium text-fg2" title={profile.name}>{profile.name}</span></span><span className="mt-1.5 block truncate pl-3.5 font-mono text-[9px] text-faint" title={profile.baseUrl}>{profile.baseUrl.replace(/^https?:\/\//, "")}</span></button>
-          <div className="mt-2 flex items-center justify-end gap-3 border-t border-line/70 pt-2">{activeProfileId === profile.id ? <span className="mr-auto font-mono text-[9px] text-acc">{providerSwitching ? (zh ? "切换中…" : "SWITCHING…") : (zh ? "使用中" : "ACTIVE")}</span> : <button disabled={providerSwitching} onClick={() => void activateProfile(profile.id).catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))} className="mr-auto font-mono text-[9.5px] text-acc hover:text-fg disabled:opacity-40">{zh ? "切换" : "USE"}</button>}<button onClick={() => editProfile(profile.id)} className="font-mono text-[9.5px] text-dim hover:text-fg">{zh ? "编辑" : "EDIT"}</button><button disabled={busy || providerSwitching} onClick={() => void removeProfile(profile.id, profile.name)} className="flex items-center gap-1 font-mono text-[9.5px] text-faint hover:text-red disabled:opacity-40" title={zh ? "删除" : "Delete"}><Icon name="trash" size={10} />{zh ? "删除" : "DELETE"}</button></div>
+          <div className="mt-2 flex items-center justify-end gap-3 border-t border-line/70 pt-2">{activeProfileId === profile.id ? <span className="mr-auto font-mono text-[9px] text-acc">{providerSwitching ? (zh ? "等待本轮完成…" : "WAITING FOR TURN…") : (zh ? "使用中" : "ACTIVE")}</span> : <button disabled={providerSwitching} onClick={() => void activateProfile(profile.id).catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))} className="mr-auto font-mono text-[9.5px] text-acc hover:text-fg disabled:opacity-40">{zh ? "切换" : "USE"}</button>}<button onClick={() => editProfile(profile.id)} className="font-mono text-[9.5px] text-dim hover:text-fg">{zh ? "编辑" : "EDIT"}</button><button disabled={busy || providerSwitching} onClick={() => void removeProfile(profile.id, profile.name)} className="flex items-center gap-1 font-mono text-[9.5px] text-faint hover:text-red disabled:opacity-40" title={zh ? "删除" : "Delete"}><Icon name="trash" size={10} />{zh ? "删除" : "DELETE"}</button></div>
         </div>)}</div>
       </aside>}
       <div className={kind === "compatible" ? "min-w-0 p-4" : "rounded-[6px] border border-line2 bg-raise p-3"}>
@@ -378,7 +425,7 @@ function ProviderAndModels() {
         {kind === "compatible" && <label className="block"><span className="lbl !text-[9px]">{zh ? "供应商名称" : "PROVIDER NAME"}</span><Input value={profileName} onChange={setProfileName} placeholder={zh ? "例如：公司中转 / OpenRouter" : "e.g. Company gateway / OpenRouter"} /></label>}
         <label className="block"><span className="lbl !text-[9px]">API KEY</span><SecretInput value={apiKey} onChange={(value) => { setApiKey(value); if (kind === "compatible") setAvailableModels([]); }} hidden={apiKeyHidden} onToggle={() => setApiKeyHidden((value) => !value)} placeholder="xai-…" /></label>
         {kind === "official" ? <div><span className="lbl !text-[9px]">BASE URL</span><div className="h-8 rounded-[4px] border border-line bg-void px-2.5 font-mono text-[10px] leading-8 text-dim">https://api.x.ai/v1</div></div> : <label className="block"><span className="lbl !text-[9px]">BASE URL</span><Input value={baseUrl} onChange={(value) => { setBaseUrl(value); setAvailableModels([]); setResidentModels([]); }} placeholder="https://example.com/v1" /></label>}
-        {kind === "compatible" && <label className="col-span-2 block"><span className="lbl !text-[9px]">{zh ? "接口协议" : "API PROTOCOL"}</span><select value={apiBackend} onChange={(event) => setApiBackend(event.target.value as ProviderApiBackend)} className="mt-1 h-8 w-full rounded-[4px] border border-line2 bg-void px-2.5 font-mono text-[9.5px] text-fg2 outline-none focus:border-acc-dim"><option value="responses">Responses · {zh ? "推荐，保留搜索工具与可公开的推理摘要" : "recommended; preserves search and reasoning summaries"}</option><option value="chat_completions">Chat Completions · {zh ? "旧服务兼容；代理可能丢弃托管工具事件" : "legacy compatibility; hosted tool events may be dropped"}</option><option value="auto">AUTO · grok2api / CLIProxyAPI / NewAPI → Responses</option></select></label>}
+        {kind === "compatible" && <p className="col-span-2 rounded-[4px] border border-line bg-void/60 px-2.5 py-2 text-[9.5px] leading-relaxed text-dim">{zh ? "Grox 将真实 Key 仅注入当前 ACP 子进程；对于当前模型及 CLI 标题别名，写入可追踪的官方 env_key、base_url 与 api_backend=chat_completions 声明来兼容标准 OpenAI 服务。切走供应商时会原样恢复，不会写入真实 Key 或批量模型覆盖。" : "Grox injects the literal key only into the current ACP child. For the active model and CLI title alias it adds tracked, documented env_key, base_url, and api_backend=chat_completions declarations for standard OpenAI services, restoring them on switch. It never writes the literal key or bulk model overrides."}</p>}
       </div>
       {kind === "compatible" && <div className="mt-4 grid grid-cols-2 gap-3 border-t border-line pt-4">
         <div className="min-w-0">
@@ -500,10 +547,58 @@ function MarketLinks({ kind }: { kind: "mcp" | "skills" | "plugins" }) {
 }
 
 function ConfigDocumentsPanel() {
-  const { t, language } = useI18n(); const zh = language === "zh-CN"; const cwd = useDesktop((state) => state.workspace); const activeId = useDesktop((state) => state.activeId); const activeStatus = useDesktop((state) => activeId ? state.sessions[activeId]?.status : undefined);
-  const [documents, setDocuments] = useState<ConfigDocument[]>([]); const [active, setActive] = useState<ConfigDocument["id"]>("config"); const [drafts, setDrafts] = useState<Record<string, string>>({}); const [dirty, setDirty] = useState<Record<string, boolean>>({}); const [status, setStatus] = useState("");
-  useEffect(() => { let live = true; const load = async () => { try { const next = await bridge.readConfigDocuments(cwd); if (!live) return; setDocuments(next); setDrafts((current) => { const updated = { ...current }; for (const document of next) if (!dirty[document.id]) updated[document.id] = document.content; return updated; }); } catch (cause) { if (live) setStatus(cause instanceof Error ? cause.message : String(cause)); } }; void load(); const timer = window.setInterval(load, 1500); return () => { live = false; window.clearInterval(timer); }; }, [cwd, dirty]);
+  const { t, language } = useI18n();
+  const zh = language === "zh-CN";
+  const cwd = useDesktop((state) => state.workspace);
+  const activeId = useDesktop((state) => state.activeId);
+  const activeStatus = useDesktop((state) => activeId ? state.sessions[activeId]?.status : undefined);
+  const [documents, setDocuments] = useState<ConfigDocument[]>([]);
+  const [active, setActive] = useState<ConfigDocument["id"]>("config");
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const [dirty, setDirty] = useState<Record<string, boolean>>({});
+  const [status, setStatus] = useState("");
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    let live = true;
+    const load = async () => {
+      try {
+        const next = await bridge.readConfigDocuments(cwd);
+        if (!live) return;
+        setDocuments(next);
+        setDrafts((current) => {
+          const updated = { ...current };
+          for (const document of next) if (!dirty[document.id]) updated[document.id] = document.content;
+          return updated;
+        });
+      } catch (cause) {
+        if (live) setStatus(cause instanceof Error ? cause.message : String(cause));
+      }
+    };
+    void load();
+    const timer = window.setInterval(load, 1500);
+    return () => { live = false; window.clearInterval(timer); };
+  }, [cwd, dirty]);
   const document = useMemo(() => documents.find((item) => item.id === active), [documents, active]);
-  const save = async () => { if (!document) return; try { const saved = await bridge.writeConfigDocument({ ...document, content: drafts[document.id] ?? "" }); setDocuments((items) => items.map((item) => item.id === saved.id ? saved : item)); setDirty((current) => ({ ...current, [saved.id]: false })); if (saved.id === "system-prompt" && activeId && activeStatus === "idle") { await bridge.loadSession(activeId); setStatus(zh ? "已保存并应用到当前会话" : "Saved and applied to the current session"); } else if (saved.id === "system-prompt") setStatus(zh ? "已保存；将在新会话或重新打开会话时应用" : "Saved; applies to new or reopened sessions"); else setStatus(t("saved")); } catch (cause) { setStatus(cause instanceof Error ? cause.message : String(cause)); } };
-  return <div className="flex min-h-[520px] flex-col"><Heading title={t("configuration")} description={zh ? "配置文件已并入账户模块。每 1.5 秒检查本地变动；config.toml、系统提示词和项目 AGENTS.md 均保持双向热同步。环境变量不再作为可编辑栏目暴露，API 接入统一由上方模型服务表单管理。" : "Configuration now lives with the account. config.toml, the system prompt, and project AGENTS.md stay in two-way hot sync. Raw environment variables are no longer exposed; API access is managed by the provider form above."} /><div className="flex gap-1 border-b border-line">{documents.map((item) => <button key={item.id} onClick={() => setActive(item.id)} className={`border-b px-3 py-2 font-mono text-[9.5px] ${active === item.id ? "border-acc text-acc" : "border-transparent text-dim"}`}>{item.label}{dirty[item.id] ? " •" : ""}</button>)}</div>{document ? <><div className="flex items-center gap-2 py-2"><span className="min-w-0 flex-1 truncate font-mono text-[9.5px] text-faint">{document.path}</span><span className="font-mono text-[9.5px] text-dim">{document.exists ? zh ? "已同步" : "SYNCED" : zh ? "新建" : "NEW"}</span><ActionButton tone="accent" onClick={() => void save()}>{t("save")}</ActionButton></div><textarea value={drafts[document.id] ?? ""} onChange={(event) => { setDrafts((current) => ({ ...current, [document.id]: event.target.value })); setDirty((current) => ({ ...current, [document.id]: true })); }} spellCheck={false} className="min-h-[360px] flex-1 resize-none rounded-[5px] border border-line2 bg-void p-3 font-mono text-[10.5px] leading-relaxed text-fg2 outline-none focus:border-acc-dim" /></> : <ExtensionState error={null} empty={t("loading")} />}{status && <p className="mt-2 font-mono text-[9.5px] text-dim">{status}</p>}</div>;
+  const canApply = !activeId || !activeStatus || activeStatus === "idle" || activeStatus === "failed";
+  const save = async () => {
+    if (!document || !canApply || saving) return;
+    setSaving(true);
+    setStatus(document.id === "config"
+      ? (zh ? "正在验证并重启 Grok Build…" : "Validating and restarting Grok Build…")
+      : (zh ? "正在保存并重新载入当前任务…" : "Saving and reloading the current mission…"));
+    try {
+      const saved = await bridge.writeConfigDocument({ ...document, content: drafts[document.id] ?? "" });
+      setDocuments((items) => items.map((item) => item.id === saved.id ? saved : item));
+      setDirty((current) => ({ ...current, [saved.id]: false }));
+      if (activeId) await bridge.loadSession(activeId);
+      setStatus(activeId
+        ? (zh ? "已保存并应用到当前任务" : "Saved and applied to the current mission")
+        : (zh ? "已保存；下一个任务会使用新配置" : "Saved; the next mission will use this configuration"));
+    } catch (cause) {
+      setStatus(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setSaving(false);
+    }
+  };
+  return <div className="flex min-h-[520px] flex-col"><Heading title={t("configuration")} description={zh ? "这里直接编辑 Grok Build 的真实配置：config.toml 保存前校验 TOML，保存后会重启 ACP 并重新载入空闲任务；系统提示词和项目 AGENTS.md 也会立即重新载入。每 1.5 秒同步磁盘上的外部修改。" : "Edit Grok Build's real configuration here: config.toml is validated before save, then ACP restarts and an idle mission reloads; system prompts and project AGENTS.md reload immediately too. External disk edits are synchronized every 1.5 seconds."} /><div className="flex gap-1 border-b border-line">{documents.map((item) => <button key={item.id} onClick={() => setActive(item.id)} className={`border-b px-3 py-2 font-mono text-[9.5px] ${active === item.id ? "border-acc text-acc" : "border-transparent text-dim"}`}>{item.label}{dirty[item.id] ? " •" : ""}</button>)}</div>{document ? <><div className="flex items-center gap-2 py-2"><span className="min-w-0 flex-1 truncate font-mono text-[9.5px] text-faint">{document.path}</span><span className="font-mono text-[9.5px] text-dim">{document.exists ? zh ? "已同步" : "SYNCED" : zh ? "新建" : "NEW"}</span><ActionButton tone="accent" disabled={saving || !canApply} onClick={() => void save()}>{saving ? (zh ? "应用中" : "APPLYING") : t("save")}</ActionButton></div>{!canApply && <p className="mb-2 rounded-[4px] border border-gold/25 bg-gold/5 px-3 py-2 text-[9.5px] leading-relaxed text-gold">{zh ? "为保证当前请求不被重启中断，请在任务完成后保存配置。" : "To avoid interrupting the current request, save configuration after the mission becomes idle."}</p>}<textarea disabled={saving} value={drafts[document.id] ?? ""} onChange={(event) => { setDrafts((current) => ({ ...current, [document.id]: event.target.value })); setDirty((current) => ({ ...current, [document.id]: true })); }} spellCheck={false} className="min-h-[360px] flex-1 resize-none rounded-[5px] border border-line2 bg-void p-3 font-mono text-[10.5px] leading-relaxed text-fg2 outline-none focus:border-acc-dim disabled:opacity-60" /></> : <ExtensionState error={null} empty={t("loading")} />}{status && <p className="mt-2 font-mono text-[9.5px] text-dim">{status}</p>}</div>;
 }

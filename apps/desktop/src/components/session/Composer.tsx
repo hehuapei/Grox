@@ -1,13 +1,14 @@
 /* ─────────────────────────────────────────────────────────────────────────
    Composer — the uplink. One bordered instrument: text field on top,
    control strip below (mode · model · effort · attach · voice · send).
-   Slash opens the command menu; Enter transmits; ⌘↵ too.
+   Slash opens the command menu; Enter transmits after IME composition commits.
    ───────────────────────────────────────────────────────────────────────── */
 
 import { useEffect, useRef, useState } from "react";
 import { useDesktop } from "../../state/store";
 import {
   EFFORTS,
+  isSessionTerminal,
   type PromptAttachment,
   type SlashCommand,
 } from "../../bridge/types";
@@ -41,6 +42,10 @@ export function Composer() {
   const fileRef = useRef<HTMLInputElement>(null);
   const slashMenuRef = useRef<HTMLDivElement>(null);
   const slashOptionRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  // IMEs use Enter to commit the candidate currently being composed. React's
+  // `isComposing` is not consistent across all macOS/Windows IMEs, so keep a
+  // local composition flag and also retain the native fallback below.
+  const composingRef = useRef(false);
 
   const sendPrompt = useDesktop((s) => s.sendPrompt);
   const composer = useDesktop((s) => s.activeId ? s.sessionComposers[s.activeId] : undefined);
@@ -52,6 +57,8 @@ export function Composer() {
   const emergencyStopComputer = useDesktop((s) => s.emergencyStopComputer);
   const compact = useDesktop((s) => s.compact);
   const status = useDesktop((s) => (s.activeId ? s.sessions[s.activeId]?.status : null));
+  const restoring = useDesktop((s) => Boolean(s.activeId && s.restoringSessionId === s.activeId));
+  const creating = useDesktop((s) => Boolean(s.activeId?.startsWith("pending-")));
   const computerRunning = useDesktop((s) => {
     const session = s.activeId ? s.sessions[s.activeId] : undefined;
     return session?.blocks.some((block) =>
@@ -61,6 +68,7 @@ export function Composer() {
     ) ?? false;
   });
   const model = useDesktop((s) => s.model);
+  const pendingModel = useDesktop((s) => s.activeId ? s.pendingSessionModels[s.activeId] : undefined);
   const models = useDesktop((s) => s.models);
   const effort = useDesktop((s) => s.effort);
   const permissionMode = useDesktop((s) => s.permissionMode);
@@ -81,8 +89,7 @@ export function Composer() {
     window.dispatchEvent(new CustomEvent("grox:settings-section", { detail: section }));
   };
 
-  const running =
-    status === "running" || status === "awaiting_permission" || status === "awaiting_input";
+  const running = status ? !isSessionTerminal(status) : false;
   const deepResearchAvailable = runtimeCommands.some((command) => command.name === "deep-research");
 
   const slashCommands: SlashCmd[] = [
@@ -193,7 +200,7 @@ export function Composer() {
 
   const send = () => {
     const t = text.trim();
-    if ((!t && attachments.length === 0) || running || readingFiles) return;
+    if ((!t && attachments.length === 0) || creating || running || restoring || readingFiles) return;
     if (t === "/workflow" || t === "/workflows") {
       setInspectorTab("tasks");
       setText("");
@@ -227,6 +234,9 @@ export function Composer() {
   };
 
   const onKeyDown = (e: React.KeyboardEvent) => {
+    if (composingRef.current || e.nativeEvent.isComposing || e.nativeEvent.keyCode === 229) {
+      return;
+    }
     if (slashOpen && matches.length > 0) {
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -323,9 +333,16 @@ export function Composer() {
             onChange={(e) => setText(e.target.value)}
             onKeyDown={onKeyDown}
             onPaste={onPaste}
+            onCompositionStart={() => { composingRef.current = true; }}
+            onCompositionEnd={() => { composingRef.current = false; }}
+            disabled={creating}
             rows={1}
             placeholder={
-              running
+              creating
+                ? (language === "zh-CN" ? "正在创建会话…" : "Creating conversation…")
+                : restoring
+                ? (language === "zh-CN" ? "正在同步当前会话，稍后即可发送…" : "Synchronizing this session — ready to send shortly…")
+                : running
                 ? (language === "zh-CN" ? "Grok 正在处理 — 可以准备下一条请求…" : "Grok is working — queue the next directive…")
                 : (language === "zh-CN" ? "发送给 Grok…" : "Transmit to Grok…")
             }
@@ -338,7 +355,15 @@ export function Composer() {
 
             <ChipSelect
               label={
-                <span className="text-fg2">{currentModel?.label ?? model.toUpperCase()}</span>
+                <span
+                  className="text-fg2"
+                  title={pendingModel
+                    ? (language === "zh-CN" ? `当前：${model}；本轮完成后切换至：${pendingModel}` : `Current: ${model}; switches after this turn: ${pendingModel}`)
+                    : undefined}
+                >
+                  {currentModel?.label ?? model.toUpperCase()}
+                  {pendingModel && <span className="text-gold"> · {language === "zh-CN" ? "等待" : "QUEUED"}</span>}
+                </span>
               }
               items={models.map((m) => ({ id: m.id, label: m.label, hint: m.tagline }))}
               activeId={model}
@@ -363,7 +388,7 @@ export function Composer() {
 
             <button
               onClick={() => fileRef.current?.click()}
-              disabled={running || readingFiles || attachments.length >= MAX_ATTACHMENTS}
+              disabled={creating || running || readingFiles || attachments.length >= MAX_ATTACHMENTS}
               title={language === "zh-CN" ? "上传文件；也可直接粘贴剪贴板图片" : "Upload files; clipboard images can also be pasted"}
               className="flex h-7 items-center gap-1.5 rounded-[5px] border border-line2 px-2 font-mono text-[9.5px] text-dim transition-colors hover:border-line3 hover:text-fg2 disabled:opacity-40"
             >
@@ -374,7 +399,7 @@ export function Composer() {
 
             <div className="flex-1" />
 
-            {!running && (
+            {!creating && !running && !restoring && (
               <RewindMenu onComplete={() => taRef.current?.focus()} />
             )}
 
@@ -399,7 +424,7 @@ export function Composer() {
             ) : (
               <button
                 onClick={send}
-                disabled={(!text.trim() && attachments.length === 0) || readingFiles}
+                disabled={creating || (!text.trim() && attachments.length === 0) || readingFiles}
                 title="Transmit"
                 className={`flex h-7 w-7 items-center justify-center rounded-[5px] transition-colors ${
                   text.trim() || attachments.length > 0
@@ -416,7 +441,11 @@ export function Composer() {
 
         <div className="mt-1.5 flex items-center justify-between px-1">
           <span className="lbl !text-[9.5px]">
-            {language === "zh-CN" ? "⏎ 发送 · ⇧⏎ 换行 · 粘贴图片 · / 命令" : "⏎ SEND · ⇧⏎ NEWLINE · PASTE IMAGE · / COMMANDS"}
+            {creating
+              ? (language === "zh-CN" ? "正在创建会话…" : "CREATING CONVERSATION…")
+              : restoring
+              ? (language === "zh-CN" ? "正在同步当前会话…" : "SYNCHRONIZING CURRENT SESSION…")
+              : (language === "zh-CN" ? "⏎ 发送（输入法确认后） · ⇧⏎ 换行 · 粘贴图片 · / 命令" : "⏎ SEND AFTER IME COMMIT · ⇧⏎ NEWLINE · PASTE IMAGE · / COMMANDS")}
           </span>
           <span className="lbl !text-[9.5px]">
             {language === "zh-CN"
