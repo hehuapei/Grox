@@ -1191,6 +1191,13 @@ export class AcpBridge implements GrokBridge {
     this.interactions.clear();
     this.cursors.clear();
     this.sessionOptions.clear();
+    this.streamAppends.clear();
+    this.repeatedDeltas.clear();
+    this.toolPatches.clear();
+    this.replaying.clear();
+    this.pendingCanonicalReplays.clear();
+    this.canonicalReplaySessions.clear();
+    this.lastActivity.clear();
     this.sessionSetModelUnsupported = false;
     this.knownSessions.clear();
     this.workflowChildTraces.clear();
@@ -3022,16 +3029,48 @@ export class AcpBridge implements GrokBridge {
       cwd: meta?.cwd ?? this.workspace,
       kind: "build",
     });
-    this.catalogue.delete(id);
-    this.computerLeases.delete(id);
-    this.activeComputerSessions.delete(id);
+    this.clearSessionState(id);
+  }
+
+  private clearSessionState(sessionId: string) {
+    this.catalogue.delete(sessionId);
+    this.computerLeases.delete(sessionId);
+    this.activeComputerSessions.delete(sessionId);
     for (const key of this.activeComputerToolCalls) {
-      if (key.startsWith(`${id}:`)) this.activeComputerToolCalls.delete(key);
+      if (key.startsWith(`${sessionId}:`)) this.activeComputerToolCalls.delete(key);
     }
-    this.knownSessions.delete(id);
-    this.sessionWorkspaces.delete(id);
-    this.cursors.delete(id);
-    this.usage.delete(id);
+    for (const [key, event] of this.streamAppends) {
+      if (event.sessionId === sessionId) this.streamAppends.delete(key);
+    }
+    for (const key of this.repeatedDeltas.keys()) {
+      if (key.includes(`:${sessionId}:`)) this.repeatedDeltas.delete(key);
+    }
+    for (const [key, event] of this.toolPatches) {
+      if (event.sessionId === sessionId) this.toolPatches.delete(key);
+    }
+    for (const [blockId, interaction] of this.interactions) {
+      if (interaction.sessionId === sessionId) this.interactions.delete(blockId);
+    }
+    for (const [childSessionId, child] of this.workflowChildTraces) {
+      if (childSessionId === sessionId || child.sessionId === sessionId) {
+        this.workflowChildTraces.delete(childSessionId);
+      }
+    }
+    this.cancelledWorkflowRuns.delete(sessionId);
+    this.replaying.delete(sessionId);
+    this.pendingCanonicalReplays.delete(sessionId);
+    this.canonicalReplaySessions.delete(sessionId);
+    this.lastActivity.delete(sessionId);
+    if (this.activePromptSessions.delete(sessionId) && this.activePromptSessions.size === 0) {
+      for (const resolve of this.promptDrainWaiters) resolve();
+      this.promptDrainWaiters.clear();
+    }
+    this.knownSessions.delete(sessionId);
+    this.sessionWorkspaces.delete(sessionId);
+    this.cursors.delete(sessionId);
+    this.sessionOptions.delete(sessionId);
+    this.usage.delete(sessionId);
+    this.forgetRewoundSession(sessionId);
   }
 
   private async refreshSessionInfo(sessionId: string): Promise<void> {

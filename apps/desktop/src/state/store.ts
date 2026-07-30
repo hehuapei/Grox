@@ -49,6 +49,37 @@ export type InspectorTab = "files" | "tasks" | "preview" | "usage";
 const isWorkflowTerminal = (status: string) =>
   ["complete", "failed", "cancelled", "interrupted"].includes(status);
 
+const MAX_LOADED_SESSIONS = 8;
+
+function pruneLoadedSessions(
+  sessions: Record<string, Session>,
+  activeId: string | null,
+  workflows: Record<string, WorkflowRun[]>,
+): Record<string, Session> {
+  const entries = Object.entries(sessions);
+  if (entries.length <= MAX_LOADED_SESSIONS) return sessions;
+
+  const keep = new Set<string>();
+  const idle: [string, Session][] = [];
+  for (const [id, session] of entries) {
+    const hasLiveWorkflow = (workflows[id] ?? []).some((workflow) => !isWorkflowTerminal(workflow.status));
+    if (id === activeId || id.startsWith("pending-") || session.status !== "idle" || hasLiveWorkflow) {
+      keep.add(id);
+    } else {
+      idle.push([id, session]);
+    }
+  }
+
+  const idleBudget = Math.max(0, MAX_LOADED_SESSIONS - keep.size);
+  idle
+    .sort(([, left], [, right]) => right.updatedAt - left.updatedAt)
+    .slice(0, idleBudget)
+    .forEach(([id]) => keep.add(id));
+
+  if (keep.size === entries.length) return sessions;
+  return Object.fromEntries(entries.filter(([id]) => keep.has(id)));
+}
+
 // `hideFromScrollback` is a wire-level flag, so old clients may already have
 // persisted internal workflow traffic as normal user blocks. Keep a
 // state-layer guard as well: a draft update or a late session/load must never
@@ -675,8 +706,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
         const nextSessions = Object.fromEntries(
           Object.entries(sessions).filter(([id]) => !id.startsWith("pending-")),
         );
+        const loadedSessions = pruneLoadedSessions(
+          { ...nextSessions, [readySession.id]: nextSession },
+          readySession.id,
+          state.workflows,
+        );
         set({
-          sessions: { ...nextSessions, [readySession.id]: nextSession },
+          sessions: loadedSessions,
           sessionIndex: nextIndex,
           projects,
           workspace: readySession.cwd,
@@ -942,6 +978,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       set({
         activeId: id,
         view: "session",
+        sessions: pruneLoadedSessions(state.sessions, id, state.workflows),
         ...(composer ? {
           model: composer.model,
           effort: composer.effort,
