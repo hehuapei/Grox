@@ -51,6 +51,17 @@ const UPSTREAM_CLI_CLIENT_NAME: &str = "grok-shell";
 const GROX_MANAGED_PROVIDER_START: &str = "# >>> Grox managed provider";
 const GROX_MANAGED_PROVIDER_END: &str = "# <<< Grox managed provider";
 const GROX_PROVIDER_AUTH_OVERRIDES_FILE: &str = "grox-provider-auth-overrides.json";
+const GROX_NETWORK_PROXY_FILE: &str = "grox-network-proxy.json";
+const DEFAULT_NETWORK_PROXY_URL: &str = "http://127.0.0.1:1080";
+const PROXY_ENV_KEYS: [&str; 6] = [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+];
+const NO_PROXY_VALUE: &str = "localhost,127.0.0.1,::1";
 const PROVIDER_ENV_KEYS: [&str; 4] = [
     "XAI_API_KEY",
     "GROK_MODELS_BASE_URL",
@@ -263,6 +274,22 @@ struct ProviderConfig {
     kind: String,
     api_key: Option<String>,
     base_url: Option<String>,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NetworkProxyConfig {
+    enabled: bool,
+    url: String,
+}
+
+impl Default for NetworkProxyConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            url: DEFAULT_NETWORK_PROXY_URL.into(),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -1023,6 +1050,7 @@ async fn install_official_grok_cli(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    apply_network_proxy_environment(&mut command)?;
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -1291,6 +1319,7 @@ async fn start_project_preview(
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
+    apply_network_proxy_environment(&mut command)?;
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -1353,6 +1382,7 @@ fn list_workspace_files(cwd: String) -> Result<Vec<WorkspaceEntry>, String> {
 fn git_command(root: &Path, args: &[&str]) -> Result<std::process::Output, String> {
     let mut command = std::process::Command::new("git");
     command.current_dir(root).args(args);
+    apply_network_proxy_environment_std(&mut command)?;
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
@@ -1934,6 +1964,114 @@ fn write_provider_profiles_file(value: &ProviderProfilesFile) -> Result<(), Stri
     restrict_private_file(&path)
 }
 
+fn network_proxy_path() -> Result<PathBuf, String> {
+    Ok(grok_home()?.join(GROX_NETWORK_PROXY_FILE))
+}
+
+fn checked_network_proxy(mut value: NetworkProxyConfig) -> Result<NetworkProxyConfig, String> {
+    value.url = value.url.trim().to_string();
+    if value.url.is_empty() && !value.enabled {
+        value.url = DEFAULT_NETWORK_PROXY_URL.into();
+        return Ok(value);
+    }
+    let parsed =
+        url::Url::parse(&value.url).map_err(|error| format!("无效的本地代理地址：{error}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("本地代理仅支持 http:// 或 https:// 地址".into());
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("本地代理地址不能包含用户名或密码".into());
+    }
+    if !is_loopback_host(parsed.host_str()) {
+        return Err("代理必须指向本机 localhost、127.0.0.1 或 ::1".into());
+    }
+    if parsed.port().is_none() {
+        return Err("本地代理地址必须包含端口".into());
+    }
+    if parsed.path() != "/" || parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err("本地代理地址不能包含路径、查询参数或片段".into());
+    }
+    value.url = parsed.as_str().trim_end_matches('/').to_string();
+    Ok(value)
+}
+
+fn read_network_proxy_file() -> Result<NetworkProxyConfig, String> {
+    let path = network_proxy_path()?;
+    if !path.exists() {
+        return Ok(NetworkProxyConfig::default());
+    }
+    let content = read_bounded_text(&path, 16 * 1024)?;
+    let value = serde_json::from_str(&content)
+        .map_err(|error| format!("无法读取网络代理设置 {}：{error}", path.display()))?;
+    checked_network_proxy(value)
+}
+
+fn write_network_proxy_file(value: NetworkProxyConfig) -> Result<NetworkProxyConfig, String> {
+    let value = checked_network_proxy(value)?;
+    let path = network_proxy_path()?;
+    let content = serde_json::to_string_pretty(&value)
+        .map_err(|error| format!("无法序列化网络代理设置：{error}"))?;
+    atomic_write(&path, &content)?;
+    restrict_private_file(&path)?;
+    Ok(value)
+}
+
+#[tauri::command]
+fn read_network_proxy() -> Result<NetworkProxyConfig, String> {
+    read_network_proxy_file()
+}
+
+#[tauri::command]
+fn write_network_proxy(request: NetworkProxyConfig) -> Result<NetworkProxyConfig, String> {
+    write_network_proxy_file(request)
+}
+
+fn apply_network_proxy_environment(command: &mut Command) -> Result<(), String> {
+    let value = read_network_proxy_file()?;
+    for key in PROXY_ENV_KEYS {
+        command.env_remove(key);
+    }
+    if value.enabled {
+        for key in PROXY_ENV_KEYS {
+            command.env(key, &value.url);
+        }
+        command.env("NO_PROXY", NO_PROXY_VALUE);
+        command.env("no_proxy", NO_PROXY_VALUE);
+    }
+    Ok(())
+}
+
+fn apply_network_proxy_environment_std(command: &mut std::process::Command) -> Result<(), String> {
+    let value = read_network_proxy_file()?;
+    for key in PROXY_ENV_KEYS {
+        command.env_remove(key);
+    }
+    if value.enabled {
+        for key in PROXY_ENV_KEYS {
+            command.env(key, &value.url);
+        }
+        command.env("NO_PROXY", NO_PROXY_VALUE);
+        command.env("no_proxy", NO_PROXY_VALUE);
+    }
+    Ok(())
+}
+
+fn network_http_client(timeout: Duration) -> Result<reqwest::Client, String> {
+    let value = read_network_proxy_file()?;
+    let mut builder = reqwest::Client::builder()
+        .user_agent(format!("Grox/{CLIENT_VERSION}"))
+        .timeout(timeout);
+    if value.enabled {
+        let proxy = reqwest::Proxy::all(&value.url)
+            .map_err(|error| format!("无法应用网络代理：{error}"))?
+            .no_proxy(reqwest::NoProxy::from_string(NO_PROXY_VALUE));
+        builder = builder.proxy(proxy);
+    }
+    builder
+        .build()
+        .map_err(|error| format!("无法创建网络客户端：{error}"))
+}
+
 fn provider_auth_overrides_path() -> Result<PathBuf, String> {
     Ok(grok_home()?.join(GROX_PROVIDER_AUTH_OVERRIDES_FILE))
 }
@@ -2284,11 +2422,7 @@ async fn fetch_compatible_models(api_key: &str, base_url: &str) -> Result<Vec<St
         return Err("API Key 不能为空".into());
     }
     let endpoint = compatible_models_url(base_url)?;
-    let response = reqwest::Client::builder()
-        .user_agent(format!("Grox/{CLIENT_VERSION}"))
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|error| format!("无法创建模型目录客户端：{error}"))?
+    let response = network_http_client(Duration::from_secs(15))?
         .get(endpoint)
         .bearer_auth(key)
         .header("Accept", "application/json")
@@ -2657,6 +2791,7 @@ async fn generate_media(
     // managed by Grox; OAuth gets a clean official CLI environment.
     command.env("GROK_CLIENT_NAME", UPSTREAM_CLI_CLIENT_NAME);
     apply_grox_provider_environment(&mut command);
+    apply_network_proxy_environment(&mut command)?;
     #[cfg(windows)]
     {
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -2867,6 +3002,7 @@ async fn acp_spawn(
     // eligibility gate. Preserve official CLI identity end to end.
     command.env("GROK_CLIENT_NAME", UPSTREAM_CLI_CLIENT_NAME);
     apply_grox_provider_environment(&mut command);
+    apply_network_proxy_environment(&mut command)?;
 
     #[cfg(windows)]
     {
@@ -3053,11 +3189,7 @@ fn update_asset(release: &GitHubRelease) -> Option<&GitHubAsset> {
 }
 
 async fn latest_release() -> Result<GitHubRelease, String> {
-    reqwest::Client::builder()
-        .user_agent(format!("Grox/{CLIENT_VERSION}"))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|error| format!("无法创建更新客户端：{error}"))?
+    network_http_client(Duration::from_secs(30))?
         .get(LATEST_RELEASE_URL)
         .header("Accept", "application/vnd.github+json")
         .send()
@@ -3127,11 +3259,7 @@ async fn download_update_asset(asset: &GitHubAsset, target: &Path) -> Result<(),
     if url.scheme() != "https" || url.host_str() != Some("github.com") {
         return Err("更新安装包不是来自受信任的 GitHub 发布地址".into());
     }
-    let response = reqwest::Client::builder()
-        .user_agent(format!("Grox/{CLIENT_VERSION}"))
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .map_err(|error| format!("无法创建更新下载客户端：{error}"))?
+    let response = network_http_client(Duration::from_secs(300))?
         .get(url)
         .send()
         .await
@@ -3372,6 +3500,8 @@ fn main() {
             open_in_explorer,
             read_config_documents,
             write_config_document,
+            read_network_proxy,
+            write_network_proxy,
             read_provider_status,
             configure_provider,
             list_provider_profiles,
@@ -3557,6 +3687,31 @@ mod tests {
             "generic",
             ProviderApiBackend::Auto,
         )
+        .is_err());
+    }
+
+    #[test]
+    fn local_network_proxy_requires_a_loopback_http_endpoint() {
+        let valid = checked_network_proxy(NetworkProxyConfig {
+            enabled: true,
+            url: "http://127.0.0.1:1080/".into(),
+        })
+        .expect("loopback HTTP proxy is valid");
+        assert_eq!(valid.url, "http://127.0.0.1:1080");
+        assert!(checked_network_proxy(NetworkProxyConfig {
+            enabled: true,
+            url: "socks5://127.0.0.1:1080".into(),
+        })
+        .is_err());
+        assert!(checked_network_proxy(NetworkProxyConfig {
+            enabled: true,
+            url: "http://proxy.example:1080".into(),
+        })
+        .is_err());
+        assert!(checked_network_proxy(NetworkProxyConfig {
+            enabled: true,
+            url: "http://127.0.0.1".into(),
+        })
         .is_err());
     }
 

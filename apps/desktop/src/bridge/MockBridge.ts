@@ -25,6 +25,7 @@ import type {
   ProviderConfig,
   ProviderProfileSummary,
   SaveProviderProfile,
+  NetworkProxyConfig,
   RewindMode,
   RewindResult,
 } from "./types";
@@ -46,6 +47,7 @@ export class MockBridge implements GrokBridge {
   private permissionMode: PermissionMode = "default";
   private providerProfiles: ProviderProfileSummary[] = [];
   private activeProviderProfileId: string | undefined;
+  private networkProxy: NetworkProxyConfig = { enabled: false, url: "http://127.0.0.1:1080" };
   private configDrafts: Record<ConfigDocument["id"], string> = {
     config: "# Grox mock config\nmodel = \"grok-build\"\n",
     "system-prompt": "You are Grox, a focused desktop coding agent.\n",
@@ -194,6 +196,14 @@ export class MockBridge implements GrokBridge {
   async deleteProviderProfile(id: string): Promise<void> {
     this.providerProfiles = this.providerProfiles.filter((item) => item.id !== id);
     if (this.activeProviderProfileId === id) this.activeProviderProfileId = undefined;
+  }
+
+  async getNetworkProxy(): Promise<NetworkProxyConfig> {
+    return { ...this.networkProxy };
+  }
+
+  async setNetworkProxy(config: NetworkProxyConfig): Promise<void> {
+    this.networkProxy = { ...config };
   }
 
   async readConfigDocuments(cwd: string): Promise<ConfigDocument[]> {

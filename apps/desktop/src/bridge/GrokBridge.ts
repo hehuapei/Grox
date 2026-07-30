@@ -28,6 +28,7 @@ import type {
   ProviderStatus,
   SaveProviderProfile,
   FetchProviderModels,
+  NetworkProxyConfig,
   RewindMode,
   RewindPoint,
   RewindResult,
@@ -60,6 +61,8 @@ export interface GrokBridge {
   refreshProviderModels(id: string): Promise<ProviderProfileSummary>;
   activateProviderProfile(id: string): Promise<void>;
   deleteProviderProfile(id: string): Promise<void>;
+  getNetworkProxy(): Promise<NetworkProxyConfig>;
+  setNetworkProxy(config: NetworkProxyConfig, reconnect?: boolean): Promise<void>;
 
   /** Local Grok configuration documents kept in two-way sync by the shell. */
   readConfigDocuments(cwd: string): Promise<ConfigDocument[]>;

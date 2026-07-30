@@ -131,7 +131,37 @@ function General() {
   const runtimeBusy = useDesktop((state) => state.runtimeBusy);
   const refreshRuntime = useDesktop((state) => state.refreshRuntime);
   const installOfficialRuntime = useDesktop((state) => state.installOfficialRuntime);
+  const configureNetworkProxy = useDesktop((state) => state.configureNetworkProxy);
   const [runtimeError, setRuntimeError] = useState("");
+  const [proxyEnabled, setProxyEnabled] = useState(false);
+  const [proxyUrl, setProxyUrl] = useState("http://127.0.0.1:1080");
+  const [proxyBusy, setProxyBusy] = useState(false);
+  const [proxyStatus, setProxyStatus] = useState("");
+  const [proxyError, setProxyError] = useState("");
+  useEffect(() => {
+    let current = true;
+    void bridge.getNetworkProxy().then((value) => {
+      if (!current) return;
+      setProxyEnabled(value.enabled);
+      setProxyUrl(value.url);
+    }).catch((cause) => {
+      if (current) setProxyError(cause instanceof Error ? cause.message : String(cause));
+    });
+    return () => { current = false; };
+  }, []);
+  const saveProxy = async () => {
+    setProxyBusy(true);
+    setProxyStatus("");
+    setProxyError("");
+    try {
+      await configureNetworkProxy({ enabled: proxyEnabled, url: proxyUrl });
+      setProxyStatus(zh ? "已保存并重新连接 Agent" : "Saved and reconnected the Agent");
+    } catch (cause) {
+      setProxyError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setProxyBusy(false);
+    }
+  };
   const runtimeSource = runtime?.source === "system"
     ? (zh ? "本机 CLI" : "System CLI")
     : runtime?.source === "override"
@@ -145,6 +175,16 @@ function General() {
     {runtimeError && <p className="mb-4 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{runtimeError}</p>}
     <Row label={zh ? "推理强度" : "Reasoning effort"}><div className="flex gap-1">{EFFORTS.map((item) => <button key={item} onClick={() => setEffort(item)} className={`h-7 rounded-[3px] border px-2 font-mono text-[9.5px] ${effort === item ? "border-acc-dim bg-acc-wash text-acc" : "border-line2 text-dim"}`}>{item.toUpperCase()}</button>)}</div></Row>
     <Row label={zh ? "权限模式" : "Permission mode"} hint={zh ? "Default 保留审批；Auto 交给 Agent 策略；Bypass 仅用于可信环境。" : "Default keeps approvals; Auto follows the Agent policy; use Bypass only in trusted environments."}><select value={permission} onChange={(event) => setPermission(event.target.value as typeof permission)} className="h-8 rounded-[4px] border border-line2 bg-void px-2 font-mono text-[9.5px] text-fg2"><option value="default">DEFAULT</option><option value="auto">AUTO</option><option value="bypass">BYPASS / YOLO</option></select></Row>
+    <div className="mt-8">
+      <Heading title={zh ? "网络" : "Network"} description={zh ? "为 Grox、Grok Build CLI、模型服务和应用更新统一使用本地代理；本机回环服务保持直连。" : "Use one local proxy for Grox, the Grok Build CLI, model providers, and app updates. Loopback services stay direct."} />
+      <Row label={zh ? "使用本地代理" : "Use local proxy"} hint={zh ? "支持 HTTP/HTTPS 本地代理" : "Supports local HTTP/HTTPS proxies"}><Toggle on={proxyEnabled} onChange={setProxyEnabled} /></Row>
+      <Row label={zh ? "代理地址" : "Proxy URL"} hint="localhost / 127.0.0.1 / ::1"><div className="w-[320px]"><Input value={proxyUrl} onChange={setProxyUrl} placeholder="http://127.0.0.1:1080" /></div></Row>
+      <div className="mt-3 flex min-h-8 items-center justify-end gap-3">
+        {proxyError && <p className="min-w-0 flex-1 text-[10px] text-red">{proxyError}</p>}
+        {!proxyError && proxyStatus && <p className="min-w-0 flex-1 text-[10px] text-acc">{proxyStatus}</p>}
+        <ActionButton tone="accent" disabled={proxyBusy} onClick={() => void saveProxy()}>{proxyBusy ? (zh ? "连接中" : "Connecting") : (zh ? "保存并重连" : "Save & reconnect")}</ActionButton>
+      </div>
+    </div>
   </div>;
 }
 
@@ -377,6 +417,8 @@ function Appearance() {
   const setLanguage = usePreferences((state) => state.setLanguage);
   const theme = usePreferences((state) => state.theme);
   const setTheme = usePreferences((state) => state.setTheme);
+  const fontFamily = usePreferences((state) => state.fontFamily);
+  const setFontFamily = usePreferences((state) => state.setFontFamily);
   const fontSize = usePreferences((state) => state.fontSize);
   const setFontSize = usePreferences((state) => state.setFontSize);
   const fontWeight = usePreferences((state) => state.fontWeight);
@@ -386,6 +428,7 @@ function Appearance() {
   return <div><Heading title={t("appearance")} description={uiLanguage === "zh-CN" ? "语言默认为中文，主题默认为 GrokNight 暗黑模式。" : "The default language is Chinese and the default theme is GrokNight dark."} />
     <Row label={t("language")}><div className="flex gap-1"><Choice active={language === "zh-CN"} onClick={() => setLanguage("zh-CN")}>{t("chinese")}</Choice><Choice active={language === "en-US"} onClick={() => setLanguage("en-US")}>{t("english")}</Choice></div></Row>
     <Row label={t("theme")}><div className="flex gap-1"><Choice active={theme === "dark"} onClick={() => setTheme("dark")}><Icon name="moon" size={10} /> {t("dark")}</Choice><Choice active={theme === "light"} onClick={() => setTheme("light")}><Icon name="sun" size={10} /> {t("light")}</Choice></div></Row>
+    <Row label={uiLanguage === "zh-CN" ? "界面字体" : "Interface font"} hint={uiLanguage === "zh-CN" ? "代码与终端保持等宽字体。" : "Code and terminals keep a monospaced font."}><div className="flex gap-1"><Choice active={fontFamily === "system"} onClick={() => setFontFamily("system")}>{uiLanguage === "zh-CN" ? "中文优化" : "System"}</Choice><Choice active={fontFamily === "geist"} onClick={() => setFontFamily("geist")}>Geist</Choice><Choice active={fontFamily === "serif"} onClick={() => setFontFamily("serif")}>{uiLanguage === "zh-CN" ? "宋体风格" : "Serif"}</Choice></div></Row>
     <Row label={uiLanguage === "zh-CN" ? "字体大小" : "Font size"} hint={uiLanguage === "zh-CN" ? "统一调整正文、工具信息、侧栏标签和代码字号。" : "Adjust text, tool details, sidebar labels, and code together."}><RangeControl value={fontSize} min={0} max={6} step={0.25} display={`+${fontSize.toFixed(2).replace(/\.00$/, "").replace(/0$/, "")} px`} onChange={setFontSize} label={uiLanguage === "zh-CN" ? "字体大小" : "Font size"} /></Row>
     <Row label={uiLanguage === "zh-CN" ? "字体粗细" : "Font weight"}><RangeControl value={fontWeight} min={400} max={700} step={25} display={String(fontWeight)} onChange={setFontWeight} label={uiLanguage === "zh-CN" ? "字体粗细" : "Font weight"} /></Row>
     <Row label={uiLanguage === "zh-CN" ? "减少动态效果" : "Reduce motion"} hint={uiLanguage === "zh-CN" ? "停用轨道动画和进入过渡。" : "Disable orbital animations and entrance transitions."}><Toggle on={reduceMotion} onChange={updateMotion} /></Row>

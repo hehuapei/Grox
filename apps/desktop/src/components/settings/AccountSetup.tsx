@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import type { ProviderApiBackend, ProviderKind } from "../../bridge/types";
+import { bridge } from "../../bridge";
 import { useDesktop } from "../../state/store";
 import { useI18n } from "../../lib/i18n";
 import { Icon } from "../fx/Icon";
@@ -23,6 +24,25 @@ export function AccountSetup() {
   const [apiBackend, setApiBackend] = useState<ProviderApiBackend>("auto");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [proxyEnabled, setProxyEnabled] = useState(false);
+  const [proxyUrl, setProxyUrl] = useState("http://127.0.0.1:1080");
+  const [proxyLoading, setProxyLoading] = useState(false);
+
+  useEffect(() => {
+    if (!open) return;
+    let current = true;
+    setProxyLoading(true);
+    void bridge.getNetworkProxy().then((value) => {
+      if (!current) return;
+      setProxyEnabled(value.enabled);
+      setProxyUrl(value.url);
+    }).catch((cause) => {
+      if (current) setError(cause instanceof Error ? cause.message : String(cause));
+    }).finally(() => {
+      if (current) setProxyLoading(false);
+    });
+    return () => { current = false; };
+  }, [open]);
 
   if (!open) return null;
 
@@ -71,6 +91,9 @@ export function AccountSetup() {
     setBusy(true);
     setError(null);
     try {
+      if (kind === "oauth") {
+        await bridge.setNetworkProxy({ enabled: proxyEnabled, url: proxyUrl }, false);
+      }
       if (kind === "compatible") {
         const profile = await saveProviderProfile({
           name: providerName,
@@ -148,15 +171,22 @@ export function AccountSetup() {
         )}
 
         {kind === "oauth" && (
-          <div className="mt-4 rounded-[5px] border border-line bg-raise px-3 py-2.5 text-[10.5px] leading-relaxed text-dim">
-            {t("oauth")} 会打开 Grok 官方登录页。登录后可读取订阅等级与上游实际提供的周额度；当前 Grok Build 接口没有独立五小时额度字段。
+          <div className="mt-4 rounded-[5px] border border-line bg-raise px-3 py-3 text-[10.5px] leading-relaxed text-dim">
+            <p>{t("oauth")} 会打开 Grok 官方登录页。登录后可读取订阅等级与上游实际提供的周额度；当前 Grok Build 接口没有独立五小时额度字段。</p>
+            <div className="mt-3 border-t border-line pt-3">
+              <div className="flex items-center justify-between gap-3">
+                <div><p className="text-[10.5px] text-fg2">{language === "zh-CN" ? "使用本地代理" : "Use local proxy"}</p><p className="mt-0.5 text-[9px] text-faint">{language === "zh-CN" ? "同时用于整个 Grox 应用" : "Also applies to the entire Grox app"}</p></div>
+                <ProxyToggle on={proxyEnabled} onChange={setProxyEnabled} />
+              </div>
+              <input value={proxyUrl} onChange={(event) => setProxyUrl(event.target.value)} disabled={!proxyEnabled || proxyLoading} placeholder="http://127.0.0.1:1080" autoComplete="off" spellCheck={false} className="mt-2 h-9 w-full rounded-[4px] border border-line2 bg-void px-3 font-mono text-[10.5px] text-fg outline-none placeholder:text-faint focus:border-acc-dim disabled:opacity-45" />
+            </div>
           </div>
         )}
 
         {error && <p className="mt-3 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{error}</p>}
 
         <button
-          disabled={busy}
+          disabled={busy || proxyLoading}
           onClick={() => void submit()}
           className="mt-5 flex h-9 w-full items-center justify-center gap-2 rounded-[5px] border border-acc-dim bg-acc-wash font-mono text-[10px] tracking-[0.08em] text-acc hover:bg-high disabled:opacity-50"
         >
@@ -166,6 +196,10 @@ export function AccountSetup() {
       </div>
     </div>
   );
+}
+
+function ProxyToggle({ on, onChange }: { on: boolean; onChange(value: boolean): void }) {
+  return <button type="button" onClick={() => onChange(!on)} className={`relative h-[18px] w-8 rounded-full border transition-colors ${on ? "border-acc-dim bg-acc-wash" : "border-line3 bg-high"}`}><span className={`absolute top-[2px] h-[12px] w-[12px] rounded-full transition-all ${on ? "left-[16px] bg-acc" : "left-[2px] bg-dim"}`} /></button>;
 }
 
 function RuntimeOption({ icon, title, badge, description, disabled, onClick }: { icon: "globe" | "bolt"; title: string; badge: string; description: string; disabled: boolean; onClick(): void }) {

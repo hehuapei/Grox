@@ -320,6 +320,11 @@ export interface ProviderConfig {
   baseUrl?: string;
 }
 
+export interface NetworkProxyConfig {
+  enabled: boolean;
+  url: string;
+}
+
 export interface ProviderStatus {
   kind: ProviderKind;
   hasApiKey: boolean;

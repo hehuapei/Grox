@@ -56,8 +56,8 @@
   --color-diff-del-fg: #f7768e;
   --color-diff-mute: #6c6c6c;
 
-  --font-sans: "Geist Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
-  --font-mono: "Geist Mono", ui-monospace, "SF Mono", "Cascadia Mono", monospace;
+  --font-sans: "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC", "Noto Sans CJK SC", "Segoe UI", system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", "Sarasa Mono SC", "Microsoft YaHei UI", ui-monospace, monospace;
 
   --animate-orbit: orbit 6s linear infinite;
   --animate-orbit-slow: orbit 24s linear infinite;
@@ -74,6 +74,16 @@
 html {
   --grox-font-increase: 2px;
   --grox-font-weight: 500;
+}
+
+html[data-font="geist"] {
+  --font-sans: "Geist Sans", ui-sans-serif, system-ui, -apple-system, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, "SF Mono", "Cascadia Mono", monospace;
+}
+
+html[data-font="serif"] {
+  --font-sans: "Noto Serif CJK SC", "Source Han Serif SC", "Songti SC", "STSong", Georgia, serif;
+  --font-mono: "Cascadia Mono", "Sarasa Mono SC", "Microsoft YaHei UI", ui-monospace, monospace;
 }
 
 body {

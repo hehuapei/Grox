@@ -36,6 +36,7 @@ import type {
   PromptAttachment,
   SaveProviderProfile,
   FetchProviderModels,
+  NetworkProxyConfig,
   RewindMode,
   RewindPoint,
   RewindResult,
@@ -2381,6 +2382,18 @@ export class AcpBridge implements GrokBridge {
     const active = (await this.listProviderProfiles()).activeId === id;
     await invoke("delete_provider_profile", { id });
     if (active) await this.restartAgent();
+  }
+
+  async getNetworkProxy(): Promise<NetworkProxyConfig> {
+    return invoke<NetworkProxyConfig>("read_network_proxy");
+  }
+
+  async setNetworkProxy(config: NetworkProxyConfig, reconnect = true): Promise<void> {
+    const previous = await this.getNetworkProxy();
+    const saved = await invoke<NetworkProxyConfig>("write_network_proxy", { request: config });
+    if (!reconnect || (previous.enabled === saved.enabled && previous.url === saved.url)) return;
+    await this.waitForActivePrompts();
+    await this.restartAgent();
   }
 
   async readConfigDocuments(cwd: string): Promise<ConfigDocument[]> {

@@ -2,10 +2,12 @@ import { create } from "zustand";
 
 export type Language = "zh-CN" | "en-US";
 export type Theme = "dark" | "light";
+export type FontFamily = "system" | "geist" | "serif";
 
 interface PreferencesState {
   language: Language;
   theme: Theme;
+  fontFamily: FontFamily;
   fontSize: number;
   fontWeight: number;
   sidebarWidth: number;
@@ -13,6 +15,7 @@ interface PreferencesState {
   previewWidth: number;
   setLanguage(language: Language): void;
   setTheme(theme: Theme): void;
+  setFontFamily(fontFamily: FontFamily): void;
   setFontSize(fontSize: number): void;
   setFontWeight(fontWeight: number): void;
   setSidebarWidth(width: number): void;
@@ -40,6 +43,10 @@ const persistDimension = (key: string, value: number) => {
 const initialLanguage: Language =
   localStorage.getItem("grox.language") === "en-US" ? "en-US" : "zh-CN";
 const initialTheme: Theme = localStorage.getItem("grox.theme") === "light" ? "light" : "dark";
+const initialFontFamily: FontFamily = (() => {
+  const value = localStorage.getItem("grox.fontFamily");
+  return value === "geist" || value === "serif" ? value : "system";
+})();
 const clampFontSize = (value: number) => Math.min(6, Math.max(0, Math.round(value * 4) / 4));
 const clampFontWeight = (value: number) => Math.min(700, Math.max(400, Math.round(value / 25) * 25));
 const initialFontSize = (() => {
@@ -60,6 +67,7 @@ const initialFontWeight = (() => {
 })();
 
 document.documentElement.dataset.theme = initialTheme;
+document.documentElement.dataset.font = initialFontFamily;
 document.documentElement.lang = initialLanguage;
 document.documentElement.style.setProperty("--grox-font-increase", `${initialFontSize}px`);
 document.documentElement.style.setProperty("--grox-font-weight", String(initialFontWeight));
@@ -67,6 +75,7 @@ document.documentElement.style.setProperty("--grox-font-weight", String(initialF
 export const usePreferences = create<PreferencesState>((set) => ({
   language: initialLanguage,
   theme: initialTheme,
+  fontFamily: initialFontFamily,
   fontSize: initialFontSize,
   fontWeight: initialFontWeight,
   sidebarWidth: Math.min(360, Math.max(196, numberPreference("grox.sidebarWidth", 232))),
@@ -81,6 +90,11 @@ export const usePreferences = create<PreferencesState>((set) => ({
     localStorage.setItem("grox.theme", theme);
     document.documentElement.dataset.theme = theme;
     set({ theme });
+  },
+  setFontFamily(fontFamily) {
+    localStorage.setItem("grox.fontFamily", fontFamily);
+    document.documentElement.dataset.font = fontFamily;
+    set({ fontFamily });
   },
   setFontSize(fontSize) {
     const value = clampFontSize(fontSize);
