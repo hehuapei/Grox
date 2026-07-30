@@ -26,11 +26,16 @@ export function TitleBar() {
   const activeId = useDesktop((s) => s.activeId);
   const meta = useDesktop((s) => s.sessionIndex.find((m) => m.id === s.activeId));
   const bridgeKind = useDesktop((s) => s.bridgeKind);
+  const provider = useDesktop((s) => s.provider);
+  const billing = useDesktop((s) => s.billing);
   const toggleInspector = useDesktop((s) => s.toggleInspector);
   const inspectorOpen = useDesktop((s) => s.inspectorOpen);
   const toggleTerminal = useDesktop((s) => s.toggleTerminal);
   const terminalOpen = useDesktop((s) => s.terminalOpen);
   const setPaletteOpen = useDesktop((s) => s.setPaletteOpen);
+  const quotaUsed = provider.kind === "oauth" && billing?.creditUsagePercent !== undefined
+    ? Math.min(100, Math.max(0, Math.round(billing.creditUsagePercent)))
+    : null;
 
   return (
     <header
@@ -59,6 +64,21 @@ export function TitleBar() {
 
       {/* right cluster */}
       <div className="flex shrink-0 items-center gap-1">
+        {quotaUsed !== null && (
+          <span
+            className="mr-1 flex items-center gap-1.5 font-mono text-[10px] text-dim"
+            title={language === "zh-CN" ? `订阅额度已使用 ${quotaUsed}%` : `${quotaUsed}% of plan quota used`}
+            aria-label={language === "zh-CN" ? `订阅额度已使用 ${quotaUsed}%` : `${quotaUsed}% of plan quota used`}
+          >
+            <span className="relative h-[3px] w-16 overflow-hidden bg-high">
+              <span
+                className={`absolute inset-y-0 left-0 ${quotaUsed >= 95 ? "bg-red" : quotaUsed > 80 ? "bg-gold" : "bg-acc"}`}
+                style={{ width: `${quotaUsed}%` }}
+              />
+            </span>
+            <span className={quotaUsed > 80 ? "tnum text-gold" : "tnum text-fg2"}>{quotaUsed}%</span>
+          </span>
+        )}
         <span className={`chip mr-1 ${bridgeKind === "mock" ? "" : "!text-acc !border-acc-dim"}`}>
           <span
             className={`inline-block h-1.5 w-1.5 rounded-full ${
