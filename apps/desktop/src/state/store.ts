@@ -496,6 +496,7 @@ function providerDefaultModel(profile?: ProviderProfileSummary) {
 /* StrictMode mounts effects twice in dev — subscribe once, ever. */
 let bridgeSubscribed = false;
 let workspaceWatchTimer: number | undefined;
+let billingRefreshTimer: number | undefined;
 let workspaceWatchTick = 0;
 let pendingLaunch: { text: string; attachments: PromptAttachment[] } | undefined;
 let providerRestoreGeneration = 0;
@@ -513,6 +514,7 @@ function scheduleSessionCatalog(metas: SessionMeta[]) {
 if (import.meta.hot) {
   import.meta.hot.dispose(() => {
     if (workspaceWatchTimer !== undefined) window.clearInterval(workspaceWatchTimer);
+    if (billingRefreshTimer !== undefined) window.clearInterval(billingRefreshTimer);
     if (catalogPersistTimer !== undefined) window.clearTimeout(catalogPersistTimer);
     if (composerPersistTimer !== undefined) window.clearTimeout(composerPersistTimer);
     if (workflowPersistTimer !== undefined) window.clearTimeout(workflowPersistTimer);
@@ -1027,6 +1029,19 @@ export const useDesktop = create<DesktopState>((set, get) => {
         }, 750);
         if (!auth.required) void get().refreshAccount();
         void get().refreshProviderProfiles();
+        if (billingRefreshTimer === undefined) {
+          billingRefreshTimer = window.setInterval(() => {
+            const state = get();
+            if (
+              document.visibilityState !== "visible"
+              || state.auth.inProgress
+              || state.accountLoading
+              || state.provider.kind !== "oauth"
+              || !state.account?.authenticated
+            ) return;
+            void state.refreshAccount();
+          }, 60_000);
+        }
         window.setTimeout(() => {
           if (!get().auth.inProgress && get().historySyncedAt === 0) void get().refreshHistory();
         }, 500);
