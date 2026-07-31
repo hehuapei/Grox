@@ -98,6 +98,14 @@ interface ExitPayload {
   reason: "exited" | "killed";
 }
 
+interface AcpReadFilePayload {
+  content: string;
+  contentBase64?: string;
+  size: number;
+  lineCount?: number;
+  type: string;
+}
+
 interface PendingRequest {
   resolve(value: unknown): void;
   reject(error: Error): void;
@@ -564,9 +572,14 @@ function extractImages(value: unknown): ToolCall["images"] {
   const images: NonNullable<ToolCall["images"]> = [];
   const seen = new Set<string>();
   walkJson(value, (object) => {
-    if (string(object.type) !== "image") return;
-    const data = string(object.data);
-    const mime = string(object.mimeType) ?? string(object.mime_type);
+    const type = string(object.type);
+    const mime = string(object.mimeType)
+      ?? string(object.mime_type)
+      // Grok's binary-safe fs/read_file response uses `type: "image/png"`
+      // together with `contentBase64`, rather than an MCP image block.
+      ?? (type?.startsWith("image/") ? type : undefined);
+    const data = string(object.data) ?? string(object.contentBase64) ?? string(object.content_base64);
+    if (type !== "image" && !mime?.startsWith("image/")) return;
     const signature = data && mime ? `${mime}:${data.slice(0, 96)}:${data.length}` : undefined;
     if (data && mime && signature && !seen.has(signature)) {
       seen.add(signature);
@@ -1364,7 +1377,11 @@ export class AcpBridge implements GrokBridge {
   }
 
   private onServerRequest(message: JsonRpcMessage) {
-    if (message.method === "fs/read_text_file" || message.method === "fs/write_text_file") {
+    if (
+      message.method === "fs/read_text_file"
+      || message.method === ACP_METHODS.fsRead
+      || message.method === "fs/write_text_file"
+    ) {
       void this.handleFileSystemRequest(message);
       return;
     }
@@ -1389,8 +1406,22 @@ export class AcpBridge implements GrokBridge {
 
   private async handleFileSystemRequest(message: JsonRpcMessage) {
     const params = record(message.params) ?? {};
-    const path = string(params.path);
+    // Grok's ACP adapters have used both `path` and the TUI-facing
+    // `file_path` spelling over time. Accept the aliases here while keeping
+    // the native command's canonical path boundary unchanged.
+    const path = string(params.path)
+      ?? string(params.filePath)
+      ?? string(params.file_path)
+      ?? string(params.target_file);
     const sessionId = string(params.sessionId);
+    const explicitLine = number(params.line) ?? number(params.startLine) ?? number(params.start_line);
+    const offset = number(params.offset);
+    // Grok Build's read_file schema uses a one-based line offset. ACP's
+    // standard text callback also uses one-based line numbers, so keep one
+    // interpretation here instead of silently shifting a requested image or
+    // skill document by one line.
+    const line = explicitLine ?? (offset === undefined ? undefined : Math.max(1, Math.floor(offset)));
+    const limit = number(params.limit) ?? number(params.maxLines);
     const cwd = (sessionId ? this.sessionWorkspaces.get(sessionId) ?? this.catalogue.get(sessionId)?.cwd : undefined) ?? this.workspace;
     if (!path) {
       await this.sendRaw({
@@ -1401,12 +1432,22 @@ export class AcpBridge implements GrokBridge {
       return;
     }
     try {
+      if (message.method === ACP_METHODS.fsRead) {
+        const payload = await invoke<AcpReadFilePayload>("acp_read_file", {
+          cwd,
+          path,
+          line,
+          limit,
+        });
+        await this.sendRaw({ jsonrpc: "2.0", id: message.id, result: payload });
+        return;
+      }
       if (message.method === "fs/read_text_file") {
         const content = await invoke<string>("acp_read_text_file", {
           cwd,
           path,
-          line: number(params.line),
-          limit: number(params.limit),
+          line,
+          limit,
         });
         await this.sendRaw({ jsonrpc: "2.0", id: message.id, result: { content } });
         return;
