@@ -661,6 +661,25 @@ interface ComputerSessionExtensions {
   leaseId: string;
 }
 
+interface SessionDiskPreview {
+  messages: Array<{ role: "user" | "assistant"; text: string }>;
+  truncated: boolean;
+}
+
+function sessionFromDiskPreview(meta: SessionMeta, preview: SessionDiskPreview): Session {
+  return {
+    ...meta,
+    blocks: preview.messages.map((message, index) => ({
+      type: message.role,
+      id: `preview-${meta.id}-${index}`,
+      text: message.text,
+      ts: meta.createdAt + index,
+    })),
+    usage: { ...EMPTY_USAGE },
+    status: "idle",
+  };
+}
+
 function mapAvailableCommands(value: unknown): SlashCommand[] {
   return array(value).flatMap((entry) => {
     const command = record(entry);
@@ -993,6 +1012,8 @@ export class AcpBridge implements GrokBridge {
   private activePromptSessions = new Set<string>();
   private promptDrainWaiters = new Set<() => void>();
   private knownSessions = new Set<string>();
+  private loadPromises = new Map<string, Promise<void>>();
+  private sessionMetaCache = new Map<string, { expiresAt: number; systemPromptOverride?: string }>();
   private lastActivity = new Map<string, number>();
   private unlisten: UnlistenFn[] = [];
   private streamAppends = new Map<string, Extract<BridgeEvent, { type: "assistant_append" | "thinking_append" }>>();
@@ -2273,6 +2294,13 @@ export class AcpBridge implements GrokBridge {
   }
 
   private async sessionMeta(cwd: string) {
+    const cached = this.sessionMetaCache.get(cwd);
+    if (cached && cached.expiresAt > Date.now()) {
+      return {
+        ...this.sessionPermissionMeta(),
+        ...(cached.systemPromptOverride ? { systemPromptOverride: cached.systemPromptOverride } : {}),
+      };
+    }
     let systemPromptOverride: string | undefined;
     try {
       const documents = await invoke<ConfigDocument[]>("read_config_documents", { cwd });
@@ -2282,6 +2310,10 @@ export class AcpBridge implements GrokBridge {
     } catch {
       // A missing optional prompt document must never block session creation.
     }
+    this.sessionMetaCache.set(cwd, {
+      expiresAt: Date.now() + 30_000,
+      ...(systemPromptOverride ? { systemPromptOverride } : {}),
+    });
     return {
       ...this.sessionPermissionMeta(),
       ...(systemPromptOverride ? { systemPromptOverride } : {}),
@@ -2456,6 +2488,7 @@ export class AcpBridge implements GrokBridge {
     const saved = await invoke<ConfigDocument>("write_config_document", {
       request: { id: document.id, cwd: this.workspace, content: document.content },
     });
+    if (document.id === "system-prompt") this.sessionMetaCache.delete(this.workspace);
     if (document.id === "config") {
       // Grok reads its global config at agent startup. Restart only after an
       // active prompt settles, then the settings UI reloads the idle session
@@ -2586,26 +2619,54 @@ export class AcpBridge implements GrokBridge {
     this.emit({ type: "available_commands", sessionId, commands: this.runtimeCommands });
   }
 
-  async loadSession(id: string): Promise<void> {
+  async loadSession(id: string, options?: { background?: boolean }): Promise<void> {
+    const existing = this.loadPromises.get(id);
+    if (existing) return existing;
+    const loading = this.performSessionLoad(id, options?.background === true);
+    this.loadPromises.set(id, loading);
+    try {
+      await loading;
+    } finally {
+      if (this.loadPromises.get(id) === loading) this.loadPromises.delete(id);
+    }
+  }
+
+  private async performSessionLoad(id: string, background: boolean): Promise<void> {
     // A provider restart cannot be allowed to interrupt an in-progress
     // session attachment; it would leave the visible conversation half bound
     // to the old child process.
     const loadingLock = `session/load:${id}:${++this.requestId}`;
     this.activePromptSessions.add(loadingLock);
     try {
-      await this.restoreSession(id);
+      await this.restoreSession(id, background);
     } finally {
       this.markPromptFinished(loadingLock);
     }
   }
 
-  private async restoreSession(id: string): Promise<void> {
+  private async restoreSession(id: string, background: boolean): Promise<void> {
     let meta = this.catalogue.get(id);
     if (!meta) {
       await this.listSessions();
       meta = this.catalogue.get(id);
     }
     if (!meta) throw new Error(`找不到会话：${id}`);
+
+    if (background) {
+      try {
+        const preview = await invoke<SessionDiskPreview | null>("preview_session_from_disk", { id });
+        if (preview?.messages.length) {
+          this.emit({
+            type: "session_ready",
+            session: sessionFromDiskPreview(meta, preview),
+            background: true,
+            preview: true,
+          });
+        }
+      } catch {
+        // A missing or unreadable local preview must not block canonical ACP restore.
+      }
+    }
 
     this.sessionWorkspaces.set(id, meta.cwd);
     this.cursors.set(id, { toolBlocks: new Map() });
@@ -2658,7 +2719,7 @@ export class AcpBridge implements GrokBridge {
       };
       this.replaying.delete(id);
       this.knownSessions.add(id);
-      this.emit({ type: "session_ready", session: finalized });
+      this.emit({ type: "session_ready", session: finalized, background });
       this.emit({ type: "available_commands", sessionId: id, commands: this.runtimeCommands });
       // Restored workflow actors emit a current snapshot, but older CLI
       // versions may have written the detailed updates only to JSONL. Read
@@ -2883,6 +2944,9 @@ export class AcpBridge implements GrokBridge {
     let terminalStatus: SessionStatus = "idle";
     try {
       await this.ready;
+      if (!this.knownSessions.has(sessionId)) {
+        await this.loadSession(sessionId, { background: true });
+      }
       // A new user prompt begins the new branch. It is the only event allowed
       // to lift the rewind isolation gate.
       this.forgetRewoundSession(sessionId);

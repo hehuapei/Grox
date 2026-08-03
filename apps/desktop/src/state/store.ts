@@ -725,14 +725,32 @@ export const useDesktop = create<DesktopState>((set, get) => {
         break;
       }
       case "session_ready": {
-        const readySession = {
+        const filteredSession = {
           ...e.session,
           blocks: e.session.blocks.filter((block) => !isHiddenWorkflowControlPrompt(block)),
+          preview: e.preview === true,
         };
-        const { blocks: _b, usage: _u, status: _st, ...meta } = readySession;
-        const launch = pendingLaunch;
-        pendingLaunch = undefined;
-        const optimistic = Object.values(sessions).find((item) => item.id.startsWith("pending-"));
+        const existing = sessions[filteredSession.id];
+        const localPreviewSuffix = e.background && !e.preview && existing?.preview
+          ? existing.blocks.filter((block) => !block.id.startsWith(`preview-${filteredSession.id}-`))
+          : [];
+        const readySession = e.preview && existing
+          ? existing
+          : localPreviewSuffix.length > 0
+            ? {
+                ...filteredSession,
+                blocks: [...filteredSession.blocks, ...localPreviewSuffix],
+                status: existing?.status ?? filteredSession.status,
+              }
+            : e.background && existing && existing.blocks.length > filteredSession.blocks.length
+              ? { ...filteredSession, blocks: existing.blocks }
+            : filteredSession;
+        const { blocks: _b, usage: _u, status: _st, preview: _preview, ...meta } = readySession;
+        const launch = e.background ? undefined : pendingLaunch;
+        if (!e.background) pendingLaunch = undefined;
+        const optimistic = e.background
+          ? undefined
+          : Object.values(sessions).find((item) => item.id.startsWith("pending-"));
         const nextSession = launch && optimistic
           ? {
               ...readySession,
@@ -748,14 +766,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
             }
           : readySession;
         const previousMeta = sessionIndex.find((item) => item.id === readySession.id);
-        const nextIndex = [
-          {
-            ...decorateSessions([meta])[0],
-            lastStatus: nextSession.status,
-            completionUnread: previousMeta?.completionUnread ?? false,
-          },
-          ...sessionIndex.filter((m) => m.id !== readySession.id),
-        ];
+        const indexedMeta = {
+          ...decorateSessions([meta])[0],
+          lastStatus: nextSession.status,
+          completionUnread: previousMeta?.completionUnread ?? false,
+        };
+        const nextIndex = e.background && previousMeta
+          ? sessionIndex.map((item) => item.id === readySession.id ? indexedMeta : item)
+          : [indexedMeta, ...sessionIndex.filter((item) => item.id !== readySession.id)];
         const projects = ensureProject(get().projects, readySession.cwd);
         persistSessionCatalog(nextIndex);
         const state = get();
@@ -772,10 +790,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
         };
         const sessionComposers = { ...state.sessionComposers, [readySession.id]: composer };
         persistSessionComposers(sessionComposers);
-        bridge.setPermissionMode(composer.permissionMode);
-        const nextSessions = Object.fromEntries(
-          Object.entries(sessions).filter(([id]) => !id.startsWith("pending-")),
-        );
+        const remainsActive = state.activeId === readySession.id && state.view === "session";
+        if (!e.background || remainsActive) bridge.setPermissionMode(composer.permissionMode);
+        const nextSessions = e.background
+          ? sessions
+          : Object.fromEntries(Object.entries(sessions).filter(([id]) => !id.startsWith("pending-")));
         const loadedSessions = pruneLoadedSessions(
           { ...nextSessions, [readySession.id]: nextSession },
           readySession.id,
@@ -785,15 +804,22 @@ export const useDesktop = create<DesktopState>((set, get) => {
           sessions: loadedSessions,
           sessionIndex: nextIndex,
           projects,
-          workspace: readySession.cwd,
-          activeProjectId: projectId(readySession.cwd),
-          activeId: readySession.id,
-          view: "session",
-          model: composer.model,
-          effort: composer.effort,
-          mode: composer.mode,
-          permissionMode: composer.permissionMode,
           sessionComposers,
+          ...(!e.background ? {
+            workspace: readySession.cwd,
+            activeProjectId: projectId(readySession.cwd),
+            activeId: readySession.id,
+            view: "session" as const,
+            model: composer.model,
+            effort: composer.effort,
+            mode: composer.mode,
+            permissionMode: composer.permissionMode,
+          } : remainsActive ? {
+            model: composer.model,
+            effort: composer.effort,
+            mode: composer.mode,
+            permissionMode: composer.permissionMode,
+          } : {}),
         });
         if (launch) {
           void bridge.prompt(readySession.id, launch.text, {
@@ -1100,7 +1126,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
       if (meta && !samePath(meta.cwd, get().workspace)) await get().setWorkspace(meta.cwd);
       const state = get();
-      const has = state.sessions[id];
+      const existing = state.sessions[id];
       const composer = state.sessionComposers[id];
       if (composer) bridge.setPermissionMode(composer.permissionMode);
       set({
@@ -1114,7 +1140,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
           permissionMode: composer.permissionMode,
         } : {}),
       });
-      if (!has) await bridge.loadSession(id);
+      if (!existing || existing.preview) {
+        void bridge.loadSession(id, { background: true }).catch((error) => {
+          set({ startupError: `会话后台同步失败：${error instanceof Error ? error.message : String(error)}` });
+        });
+      }
     },
 
     async newSession(launch) {

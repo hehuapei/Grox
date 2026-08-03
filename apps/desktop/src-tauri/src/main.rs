@@ -9,7 +9,7 @@
 mod computer_mcp;
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     io::Write as _,
     path::{Component, Path, PathBuf},
@@ -74,6 +74,7 @@ const PROVIDER_ENV_KEYS: [&str; 3] = [
 ];
 const MAX_PROMPT_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PROMPT_IMAGE_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_SESSION_PREVIEW_MESSAGES: usize = 200;
 
 struct AgentProcess {
     child: Child,
@@ -534,6 +535,126 @@ fn grok_home() -> Result<PathBuf, String> {
         return Ok(PathBuf::from(path));
     }
     Ok(user_home()?.join(".grok"))
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionPreviewMessage {
+    role: String,
+    text: String,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionDiskPreview {
+    messages: Vec<SessionPreviewMessage>,
+    truncated: bool,
+}
+
+fn session_history_text(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(text) => Some(text.clone()),
+        serde_json::Value::Array(parts) => {
+            let text = parts
+                .iter()
+                .filter_map(|part| {
+                    let part = part.as_object()?;
+                    (part.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                        .then(|| part.get("text").and_then(serde_json::Value::as_str))
+                        .flatten()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            (!text.trim().is_empty()).then_some(text)
+        }
+        _ => None,
+    }
+}
+
+fn parse_session_disk_preview(
+    reader: impl std::io::BufRead,
+    limit: usize,
+) -> Result<SessionDiskPreview, String> {
+    let mut messages = VecDeque::with_capacity(limit.min(MAX_SESSION_PREVIEW_MESSAGES));
+    let mut truncated = false;
+    for line in reader.lines() {
+        let line = line.map_err(|error| format!("无法读取会话预览：{error}"))?;
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(role @ ("user" | "assistant")) =
+            value.get("type").and_then(serde_json::Value::as_str)
+        else {
+            continue;
+        };
+        if role == "user"
+            && value
+                .get("synthetic_reason")
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        {
+            continue;
+        }
+        let Some(text) = value.get("content").and_then(session_history_text) else {
+            continue;
+        };
+        if text.trim().is_empty() || limit == 0 {
+            continue;
+        }
+        if messages.len() == limit {
+            messages.pop_front();
+            truncated = true;
+        }
+        messages.push_back(SessionPreviewMessage {
+            role: role.to_string(),
+            text,
+        });
+    }
+    Ok(SessionDiskPreview {
+        messages: messages.into(),
+        truncated,
+    })
+}
+
+fn session_history_path(grok: &Path, session_id: &str) -> Result<Option<PathBuf>, String> {
+    let mut components = Path::new(session_id).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err("无效会话 ID".into());
+    }
+    let sessions = grok.join("sessions");
+    if !sessions.is_dir() {
+        return Ok(None);
+    }
+    let sessions = sessions
+        .canonicalize()
+        .map_err(|error| format!("无法读取 Grok 会话目录：{error}"))?;
+    let direct = sessions.join(session_id).join("chat_history.jsonl");
+    let candidates = std::iter::once(direct).chain(
+        fs::read_dir(&sessions)
+            .map_err(|error| format!("无法扫描 Grok 会话目录：{error}"))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join(session_id).join("chat_history.jsonl")),
+    );
+    for candidate in candidates {
+        let Ok(candidate) = candidate.canonicalize() else {
+            continue;
+        };
+        if candidate.starts_with(&sessions) && candidate.is_file() {
+            return Ok(Some(candidate));
+        }
+    }
+    Ok(None)
+}
+
+#[tauri::command]
+fn preview_session_from_disk(id: String) -> Result<Option<SessionDiskPreview>, String> {
+    let Some(path) = session_history_path(&grok_home()?, &id)? else {
+        return Ok(None);
+    };
+    let file = fs::File::open(&path)
+        .map_err(|error| format!("无法打开会话预览 {}：{error}", path.display()))?;
+    parse_session_disk_preview(std::io::BufReader::new(file), MAX_SESSION_PREVIEW_MESSAGES)
+        .map(Some)
 }
 
 /// Resolve the actual user home independently of `GROK_HOME`. The latter may
@@ -2566,6 +2687,9 @@ $apps.Values | Sort-Object name | ConvertTo-Json -Compress
 
 #[cfg(windows)]
 fn list_windows_open_applications() -> Result<Vec<OpenApplicationOption>, String> {
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
     let output = std::process::Command::new("powershell.exe")
         .args([
             "-NoProfile",
@@ -2576,6 +2700,7 @@ fn list_windows_open_applications() -> Result<Vec<OpenApplicationOption>, String
             windows_application_discovery_script(),
         ])
         .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|error| format!("无法读取 Windows 应用注册表：{error}"))?;
     if !output.status.success() {
@@ -5063,6 +5188,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             desktop_environment,
+            preview_session_from_disk,
             validate_workspace,
             pick_workspace,
             list_workspace_files,
@@ -5134,6 +5260,61 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_disk_preview_keeps_recent_visible_conversation() {
+        let history = concat!(
+            "{\"type\":\"system\",\"content\":\"hidden\"}\n",
+            "{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"first\"}]}\n",
+            "{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"reminder\"}],\"synthetic_reason\":\"system_reminder\"}\n",
+            "{\"type\":\"tool_result\",\"content\":\"hidden tool output\"}\n",
+            "{\"type\":\"assistant\",\"content\":\"answer\"}\n",
+            "{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"latest\"}]}\n",
+        );
+        let preview = parse_session_disk_preview(std::io::Cursor::new(history), 2).unwrap();
+        assert_eq!(
+            preview,
+            SessionDiskPreview {
+                messages: vec![
+                    SessionPreviewMessage {
+                        role: "assistant".into(),
+                        text: "answer".into(),
+                    },
+                    SessionPreviewMessage {
+                        role: "user".into(),
+                        text: "latest".into(),
+                    },
+                ],
+                truncated: true,
+            }
+        );
+    }
+
+    #[test]
+    fn session_history_path_rejects_traversal() {
+        assert!(session_history_path(Path::new("unused"), "../session").is_err());
+        assert!(session_history_path(Path::new("unused"), "folder/session").is_err());
+    }
+
+    #[test]
+    fn session_history_path_finds_workspace_session_layout() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-session-preview-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let history = root
+            .join("sessions")
+            .join("encoded-workspace")
+            .join("session-id")
+            .join("chat_history.jsonl");
+        fs::create_dir_all(history.parent().unwrap()).unwrap();
+        fs::write(&history, "").unwrap();
+        assert_eq!(
+            session_history_path(&root, "session-id").unwrap(),
+            Some(history.canonicalize().unwrap())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn rejects_missing_workspace() {
