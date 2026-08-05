@@ -164,14 +164,17 @@ export class MockBridge implements GrokBridge {
   }
 
   async saveProviderProfile(config: SaveProviderProfile): Promise<ProviderProfileSummary> {
+    const existing = config.id
+      ? this.providerProfiles.find((item) => item.id === config.id)
+      : undefined;
     const profile: ProviderProfileSummary = {
       id: config.id ?? crypto.randomUUID(),
       name: config.name,
-      apiKey: config.apiKey ?? "",
-      hasApiKey: Boolean(config.apiKey),
+      apiKey: "",
+      hasApiKey: Boolean(config.apiKey?.trim()) || Boolean(existing?.hasApiKey),
       baseUrl: config.baseUrl,
       apiBackend: config.apiBackend,
-      availableModels: ["grok-4.5", "grok-code-fast"],
+      availableModels: existing?.availableModels ?? ["grok-4.5", "grok-code-fast"],
       residentModels: config.residentModels,
     };
     this.providerProfiles = [profile, ...this.providerProfiles.filter((item) => item.id !== profile.id)];
@@ -229,6 +232,28 @@ export class MockBridge implements GrokBridge {
 
   setPermissionMode(mode: PermissionMode): void {
     this.permissionMode = mode;
+  }
+
+  private computerUseEnabled = localStorage.getItem("grox.computerUseEnabled") !== "0";
+
+  setComputerUseEnabled(enabled: boolean): void {
+    this.computerUseEnabled = enabled;
+    localStorage.setItem("grox.computerUseEnabled", enabled ? "1" : "0");
+  }
+
+  getComputerUseEnabled(): boolean {
+    return this.computerUseEnabled;
+  }
+
+  private browserUseEnabled = localStorage.getItem("grox.browserUseEnabled") !== "0";
+
+  setBrowserUseEnabled(enabled: boolean): void {
+    this.browserUseEnabled = enabled;
+    localStorage.setItem("grox.browserUseEnabled", enabled ? "1" : "0");
+  }
+
+  getBrowserUseEnabled(): boolean {
+    return this.browserUseEnabled;
   }
 
   async setSessionMode(sessionId: string, mode: AgentMode): Promise<void> {
@@ -307,7 +332,7 @@ export class MockBridge implements GrokBridge {
     const changedFiles: Set<string>[] = [];
     let promptIndex = -1;
     for (const block of session?.blocks ?? []) {
-      if (block.type === "user") {
+      if (block.type === "user" && !block.interjected) {
         promptIndex += 1;
         changedFiles[promptIndex] = new Set();
         points.push({
@@ -339,7 +364,7 @@ export class MockBridge implements GrokBridge {
     const changedFiles = new Set<string>();
     let activePrompt = -1;
     for (const block of session.blocks) {
-      if (block.type === "user") activePrompt += 1;
+      if (block.type === "user" && !block.interjected) activePrompt += 1;
       if (activePrompt === targetPromptIndex && block.type === "tool") {
         for (const hunk of block.call.diff ?? []) changedFiles.add(hunk.path);
       }
@@ -358,7 +383,7 @@ export class MockBridge implements GrokBridge {
     if (mode !== "files_only") {
       let prompts = -1;
       session.blocks = session.blocks.filter((block) => {
-        if (block.type === "user") prompts += 1;
+        if (block.type === "user" && !block.interjected) prompts += 1;
         return prompts < targetPromptIndex;
       });
       this.emit({ type: "session_ready", session: structuredClone(session) });
@@ -414,6 +439,21 @@ export class MockBridge implements GrokBridge {
         this.turns.delete(sessionId);
         this.emit({ type: "status", sessionId, status: "idle" });
       });
+  }
+
+  async interject(sessionId: string, text: string, opts: PromptOptions): Promise<boolean> {
+    if (!this.turns.has(sessionId)) return false;
+    const block: SessionBlock = {
+      type: "user",
+      id: uid(),
+      text: text.trim(),
+      interjected: true,
+      attachments: opts.attachments?.map(({ id, kind, name, mime, size }) => ({ id, kind, name, mime, size })),
+      ts: Date.now(),
+    };
+    this.sessions.get(sessionId)?.blocks.push(block);
+    this.emit({ type: "block_add", sessionId, block });
+    return true;
   }
 
   /* ── turn engine ─────────────────────────────────────────────────────── */

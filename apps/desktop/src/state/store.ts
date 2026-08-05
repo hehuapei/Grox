@@ -6,7 +6,8 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 import { bridge } from "../bridge";
-import { isSessionTerminal, MODELS } from "../bridge/types";
+import { EFFORTS, isSessionTerminal, MODELS } from "../bridge/types";
+import { notifyDesktop } from "../lib/notify";
 import type {
   AgentMode,
   AccountInfo,
@@ -42,6 +43,9 @@ import type {
   WorkflowRun,
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
+import { loadSessionCache, removeSessionCache, scheduleSaveSessionCache } from "../lib/sessionCache";
+import { readStoredPermissionMode } from "../lib/permissionMode";
+import { shouldDrainLocalQueue } from "../lib/queueTurnPolicy";
 
 export type View = "home" | "session";
 export type InspectorTab = "files" | "tasks" | "preview" | "usage";
@@ -146,6 +150,17 @@ export interface SessionComposerState {
   permissionMode: PermissionMode;
 }
 
+export interface QueuedPrompt {
+  id: string;
+  text: string;
+  attachments: PromptAttachment[];
+  model: string;
+  effort: Effort;
+  mode: AgentMode;
+  permissionMode: PermissionMode;
+  createdAt: number;
+}
+
 interface DesktopState {
   ready: boolean;
   startupError: string | null;
@@ -190,7 +205,10 @@ interface DesktopState {
   effort: Effort;
   mode: AgentMode;
   permissionMode: PermissionMode;
+  computerUseEnabled: boolean;
+  browserUseEnabled: boolean;
   sessionComposers: Record<string, SessionComposerState>;
+  promptQueues: Record<string, QueuedPrompt[]>;
   /** Model choices made during a turn, applied only when that turn settles. */
   pendingSessionModels: Record<string, string>;
 
@@ -254,6 +272,9 @@ interface DesktopState {
    * during that read cannot redirect or erase the original draft.
    */
   sendPrompt(text: string, attachments?: PromptAttachment[], targetSessionId?: string, modeOverride?: AgentMode): boolean;
+  interjectPrompt(text: string, attachments?: PromptAttachment[], targetSessionId?: string): Promise<boolean>;
+  removeQueuedPrompt(sessionId: string, queueId: string): void;
+  clearPromptQueue(sessionId?: string): void;
   stop(): void;
   emergencyStopComputer(): void;
   compact(): void;
@@ -267,6 +288,8 @@ interface DesktopState {
   setEffort(effort: Effort): void;
   setMode(mode: AgentMode): void;
   setPermissionMode(mode: PermissionMode): void;
+  setComputerUseEnabled(enabled: boolean): void;
+  setBrowserUseEnabled(enabled: boolean): void;
   setDraft(text: string): void;
   setComposerAttachments(attachments: PromptAttachment[]): void;
   setInspectorTab(tab: InspectorTab): void;
@@ -279,6 +302,7 @@ interface DesktopState {
 }
 
 const uid = () => crypto.randomUUID();
+const suppressedQueueDrain = new Set<string>();
 const SESSION_COMPOSERS_KEY = "grox.sessionComposers.v1";
 const WORKFLOW_RUNS_KEY = "grox.workflowRuns.v1";
 let catalogPersistTimer: number | undefined;
@@ -304,7 +328,11 @@ function loadSessionComposers(): Record<string, SessionComposerState> {
     {},
   );
   return Object.fromEntries(
-    Object.entries(stored).map(([id, state]) => [id, { ...state, attachments: [] }]),
+    Object.entries(stored).map(([id, state]) => [id, {
+      ...state,
+      effort: EFFORTS.find((effort) => effort === state.effort) ?? "high",
+      attachments: [],
+    }]),
   );
 }
 
@@ -558,12 +586,51 @@ function blocksBeforePrompt(blocks: SessionBlock[], targetPromptIndex: number): 
   let promptIndex = -1;
   return blocks.filter((block) => {
     if (isHiddenWorkflowControlPrompt(block)) return false;
-    if (block.type === "user") promptIndex += 1;
+    if (block.type === "user" && !block.interjected) promptIndex += 1;
     return promptIndex < targetPromptIndex;
   });
 }
 
 export const useDesktop = create<DesktopState>((set, get) => {
+  const drainPromptQueue = (sessionId: string) => {
+    const state = get();
+    const session = state.sessions[sessionId];
+    const queue = state.promptQueues[sessionId] ?? [];
+    if (!session || !shouldDrainLocalQueue({
+      status: session.status,
+      providerSwitching: state.providerSwitching,
+      restoring: state.restoringSessionId === sessionId,
+      suppressed: suppressedQueueDrain.has(sessionId),
+      queueLength: queue.length,
+    })) return;
+
+    const [next, ...rest] = queue;
+    const currentComposer = state.sessionComposers[sessionId] ?? {
+      text: "", attachments: [], model: state.model, effort: state.effort,
+      mode: state.mode, permissionMode: state.permissionMode,
+    };
+    const sessionComposers = {
+      ...state.sessionComposers,
+      [sessionId]: {
+        ...currentComposer,
+        model: next.model,
+        effort: next.effort,
+        mode: next.mode,
+        permissionMode: next.permissionMode,
+      },
+    };
+    persistSessionComposers(sessionComposers);
+    set({
+      promptQueues: { ...state.promptQueues, [sessionId]: rest },
+      sessionComposers,
+    });
+    const accepted = get().sendPrompt(next.text, next.attachments, sessionId, next.mode);
+    if (!accepted) {
+      const current = get().promptQueues[sessionId] ?? [];
+      set({ promptQueues: { ...get().promptQueues, [sessionId]: [next, ...current] } });
+    }
+  };
+
   const applyQueuedModel = (sessionId: string) => {
     const state = get();
     const model = state.pendingSessionModels[sessionId];
@@ -605,6 +672,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const s = state.sessions[sessionId];
       if (!s) return;
       const next = { ...fn(s), updatedAt: Date.now() };
+      scheduleSaveSessionCache(next);
       if (!touchCatalogue) {
         set({ sessions: { ...state.sessions, [sessionId]: next } });
         if (isSessionTerminal(next.status)) applyQueuedModel(sessionId);
@@ -731,6 +799,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           preview: e.preview === true,
         };
         const existing = sessions[filteredSession.id];
+        scheduleSaveSessionCache(filteredSession);
         const localPreviewSuffix = e.background && !e.preview && existing?.preview
           ? existing.blocks.filter((block) => !block.id.startsWith(`preview-${filteredSession.id}-`))
           : [];
@@ -881,6 +950,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         if (e.req.purpose === "plan" && get().activeId === e.sessionId) {
           set({ planPreviewOpen: true, previewOpen: false });
         }
+        void notifyDesktop(
+          localStorage.getItem("grox.language") === "en-US" ? "Approval needed" : "需要批准",
+          e.req.description || (localStorage.getItem("grox.language") === "en-US" ? "Grok is waiting for permission" : "Grok 正在等待工具权限"),
+        );
         break;
       case "permission_resolved":
         withSession(e.sessionId, (s) => ({
@@ -902,6 +975,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
             { type: "question", id: e.blockId, req: e.req, ts: Date.now() },
           ],
         }));
+        void notifyDesktop(
+          localStorage.getItem("grox.language") === "en-US" ? "Question pending" : "需要回答",
+          localStorage.getItem("grox.language") === "en-US" ? "Grok is waiting for your answer" : "Grok 正在等待你的回答",
+        );
         break;
       case "question_resolved":
         withSession(e.sessionId, (s) => ({
@@ -921,6 +998,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           true,
           e.status === "idle" ? get().activeId !== e.sessionId : e.status === "running" ? false : undefined,
         );
+        if (e.status === "idle") window.setTimeout(() => drainPromptQueue(e.sessionId), 0);
         break;
       case "usage":
         withSession(e.sessionId, (s) => ({ ...s, usage: e.usage }), false);
@@ -943,6 +1021,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
     }
   };
 
+  const resumePromptQueues = () => {
+    window.setTimeout(() => {
+      for (const sessionId of Object.keys(get().promptQueues)) drainPromptQueue(sessionId);
+    }, 0);
+  };
+
   // Changing provider replaces the ACP child. Reattach the visible session
   // only after that replacement, and lock the composer during the short load
   // so the first request cannot target a dead child process.
@@ -950,13 +1034,17 @@ export const useDesktop = create<DesktopState>((set, get) => {
     const { activeId, sessions } = get();
     if (!activeId || activeId.startsWith("pending-") || !sessions[activeId]) {
       set({ restoringSessionId: null });
+      resumePromptQueues();
       return;
     }
     const generation = ++providerRestoreGeneration;
     set({ restoringSessionId: activeId });
     void bridge.loadSession(activeId).then(
       () => {
-        if (generation === providerRestoreGeneration) set({ restoringSessionId: null });
+        if (generation === providerRestoreGeneration) {
+          set({ restoringSessionId: null });
+          resumePromptQueues();
+        }
       },
       (error) => {
         if (generation !== providerRestoreGeneration) return;
@@ -964,6 +1052,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           restoringSessionId: null,
           startupError: `模型服务已切换，但当前会话同步失败：${error instanceof Error ? error.message : String(error)}`,
         });
+        resumePromptQueues();
       },
     );
   };
@@ -1007,15 +1096,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
     model: localStorage.getItem("grok.model") ?? "grok-build",
     models: MODELS,
     modelsUpdatedAt: 0,
-    effort: (localStorage.getItem("grok.effort") as Effort) ?? "high",
+    effort: EFFORTS.find((effort) => effort === localStorage.getItem("grok.effort")) ?? "high",
     mode: "agent",
-    permissionMode:
-      localStorage.getItem("grok.permissionMode") === "auto"
-        ? "auto"
-        : localStorage.getItem("grok.permissionMode") === "bypass"
-          ? "bypass"
-          : "default",
+    permissionMode: readStoredPermissionMode(localStorage.getItem("grok.permissionMode")),
+    computerUseEnabled: localStorage.getItem("grox.computerUseEnabled") !== "0",
+    browserUseEnabled: localStorage.getItem("grox.browserUseEnabled") !== "0",
     sessionComposers: loadSessionComposers(),
+    promptQueues: {},
     pendingSessionModels: {},
 
     inspectorOpen: false,
@@ -1140,6 +1227,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
           permissionMode: composer.permissionMode,
         } : {}),
       });
+      if (!existing) {
+        void loadSessionCache(id).then((cached) => {
+          if (!cached) return;
+          const latest = get();
+          if (latest.sessions[id]) return;
+          set({ sessions: { ...latest.sessions, [id]: cached } });
+        });
+      }
       if (!existing || existing.preview) {
         void bridge.loadSession(id, { background: true }).catch((error) => {
           set({ startupError: `会话后台同步失败：${error instanceof Error ? error.message : String(error)}` });
@@ -1609,6 +1704,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     async deleteSession(id) {
       await bridge.deleteSession(id);
+      removeSessionCache(id);
       const { sessionIndex, sessions, activeId, sessionComposers, workflows } = get();
       const rest = { ...sessions };
       delete rest[id];
@@ -1770,7 +1866,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const sessionId = targetSessionId ?? activeId;
       if (providerSwitching || restoringSessionId === sessionId) return false;
       const session = sessionId ? sessions[sessionId] : null;
-      if (!session || !isSessionTerminal(session.status)) return false;
+      if (!session) return false;
       const storedComposer = sessionComposers[session.id] ?? {
         text: "",
         attachments: [],
@@ -1783,6 +1879,32 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
       const trimmed = text.trim();
       if (!trimmed && attachments.length === 0) return false;
+      if (!isSessionTerminal(session.status)) {
+        const queue = get().promptQueues[session.id] ?? [];
+        const duplicate = queue.some((item) => item.text.trim() === trimmed && trimmed.length > 0);
+        if (duplicate) return false;
+        const nextComposers = {
+          ...sessionComposers,
+          [session.id]: { ...composer, text: "", attachments: [] },
+        };
+        const queued: QueuedPrompt = {
+          id: uid(),
+          text: trimmed,
+          attachments,
+          model: composer.model,
+          effort: composer.effort,
+          mode: composer.mode,
+          permissionMode: composer.permissionMode,
+          createdAt: Date.now(),
+        };
+        persistSessionComposers(nextComposers);
+        set({
+          sessionComposers: nextComposers,
+          promptQueues: { ...get().promptQueues, [session.id]: [...queue, queued] },
+        });
+        return true;
+      }
+      suppressedQueueDrain.delete(session.id);
       const internalWorkflowControl = /^\/workflow\s+(?:pause|resume|stop)\s+\S+(?:\s|$)/i.test(trimmed);
       const titleText = trimmed || attachments.map((attachment) => attachment.name).join(", ");
       const nextIndex = get().sessionIndex.map((m) =>
@@ -1840,9 +1962,75 @@ export const useDesktop = create<DesktopState>((set, get) => {
       return true;
     },
 
+    async interjectPrompt(text, attachments = [], targetSessionId) {
+      const state = get();
+      const sessionId = targetSessionId ?? state.activeId;
+      if (!sessionId) return false;
+      const session = state.sessions[sessionId];
+      if (!session || state.providerSwitching || state.restoringSessionId === sessionId) return false;
+      if (session.status !== "running") return get().sendPrompt(text, attachments, sessionId);
+      const composer = state.sessionComposers[sessionId] ?? {
+        text: "",
+        attachments: [],
+        model: state.model,
+        effort: state.effort,
+        mode: state.mode,
+        permissionMode: state.permissionMode,
+      };
+      try {
+        const accepted = await bridge.interject(sessionId, text, {
+          model: composer.model,
+          effort: composer.effort,
+          mode: composer.mode,
+          attachments,
+        });
+        if (accepted) {
+          const nextComposers = {
+            ...get().sessionComposers,
+            [sessionId]: { ...composer, text: "", attachments: [] },
+          };
+          persistSessionComposers(nextComposers);
+          set({ sessionComposers: nextComposers });
+          return true;
+        }
+        const queue = get().promptQueues[sessionId] ?? [];
+        const queued: QueuedPrompt = {
+          id: uid(), text: text.trim(), attachments,
+          model: composer.model, effort: composer.effort, mode: composer.mode,
+          permissionMode: composer.permissionMode, createdAt: Date.now(),
+        };
+        set({ promptQueues: { ...get().promptQueues, [sessionId]: [queued, ...queue] } });
+        const nextComposers = {
+          ...get().sessionComposers,
+          [sessionId]: { ...composer, text: "", attachments: [] },
+        };
+        persistSessionComposers(nextComposers);
+        set({ sessionComposers: nextComposers });
+        return true;
+      } catch (error) {
+        set({ startupError: `插话失败：${error instanceof Error ? error.message : String(error)}` });
+        return false;
+      }
+    },
+
+    removeQueuedPrompt(sessionId, queueId) {
+      const queue = get().promptQueues[sessionId] ?? [];
+      set({ promptQueues: { ...get().promptQueues, [sessionId]: queue.filter((item) => item.id !== queueId) } });
+    },
+
+    clearPromptQueue(sessionId) {
+      const id = sessionId ?? get().activeId;
+      if (!id) return;
+      suppressedQueueDrain.delete(id);
+      set({ promptQueues: { ...get().promptQueues, [id]: [] } });
+    },
+
     stop() {
       const { activeId } = get();
-      if (activeId) bridge.cancel(activeId);
+      if (activeId) {
+        suppressedQueueDrain.add(activeId);
+        bridge.cancel(activeId);
+      }
     },
 
     emergencyStopComputer() {
@@ -1972,7 +2160,20 @@ export const useDesktop = create<DesktopState>((set, get) => {
       });
     },
     setPermissionMode: (permissionMode) => {
-      const { activeId, sessionComposers, model, effort, mode } = get();
+      const { activeId, sessionComposers, model, effort, mode, computerUseEnabled } = get();
+      if (permissionMode === "bypass") {
+        const zh = document.documentElement.lang.startsWith("zh");
+        const confirmed = window.confirm(
+          zh
+            ? "Bypass/YOLO 会跳过工具审批，仅应在完全可信环境使用。确定启用？"
+            : "Bypass/YOLO skips tool approvals. Use only in fully trusted environments. Enable?",
+        );
+        if (!confirmed) return;
+        if (computerUseEnabled) {
+          bridge.setComputerUseEnabled(false);
+          set({ computerUseEnabled: false });
+        }
+      }
       localStorage.setItem("grok.permissionMode", permissionMode);
       bridge.setPermissionMode(permissionMode);
       if (!activeId) return set({ permissionMode });
@@ -1980,6 +2181,20 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const next = { ...sessionComposers, [activeId]: { ...current, permissionMode } };
       persistSessionComposers(next);
       set({ permissionMode, sessionComposers: next });
+    },
+    setComputerUseEnabled(enabled) {
+      const { permissionMode } = get();
+      if (enabled && permissionMode === "bypass") {
+        localStorage.setItem("grok.permissionMode", "default");
+        bridge.setPermissionMode("default");
+        set({ permissionMode: "default" });
+      }
+      bridge.setComputerUseEnabled(enabled);
+      set({ computerUseEnabled: enabled });
+    },
+    setBrowserUseEnabled(enabled) {
+      bridge.setBrowserUseEnabled(enabled);
+      set({ browserUseEnabled: enabled });
     },
     setDraft(text) {
       const { activeId, sessionComposers, model, effort, mode, permissionMode } = get();

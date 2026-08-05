@@ -77,6 +77,14 @@ export interface GrokBridge {
   /** Change permission policy for existing and future sessions. */
   setPermissionMode(mode: PermissionMode): void;
 
+  /** Arm or disarm Computer Use MCP injection for new/restored sessions. */
+  setComputerUseEnabled(enabled: boolean): void;
+  getComputerUseEnabled(): boolean;
+
+  /** Arm or disarm Browser Use MCP (open URL / headless screenshot). */
+  setBrowserUseEnabled(enabled: boolean): void;
+  getBrowserUseEnabled(): boolean;
+
   /** Change the real Grok Build harness mode for an existing session. */
   setSessionMode(sessionId: string, mode: AgentMode): Promise<void>;
 
@@ -88,6 +96,9 @@ export interface GrokBridge {
 
   /** ACP: session/prompt — streams events until the turn settles. */
   prompt(sessionId: string, text: string, opts: PromptOptions): Promise<void>;
+
+  /** 在当前运行回合中插话；返回 false 表示当前 CLI 不支持即时插话。 */
+  interject(sessionId: string, text: string, opts: PromptOptions): Promise<boolean>;
 
   /** ACP: session/cancel — abort the in-flight turn. */
   cancel(sessionId: string): void;

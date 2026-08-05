@@ -226,7 +226,7 @@ export type QuestionResponse =
   | { outcome: "cancelled" };
 
 export type SessionBlock =
-  | { type: "user"; id: string; text: string; attachments?: PromptAttachmentSummary[]; ts: number }
+  | { type: "user"; id: string; text: string; attachments?: PromptAttachmentSummary[]; ts: number; interjected?: boolean }
   | { type: "assistant"; id: string; text: string; ts: number; streaming?: boolean }
   | { type: "thinking"; id: string; text: string; ts: number; live?: boolean; elapsedMs?: number }
   | { type: "tool"; id: string; call: ToolCall; ts: number }
@@ -282,6 +282,8 @@ export interface ModelInfo {
   id: string;
   label: string;
   tagline: string;
+  /** 由 CLI 模型目录声明；缺省时保留全部客户端档位供兼容供应商使用。 */
+  efforts?: Effort[];
 }
 
 export interface ModelState {
@@ -343,6 +345,7 @@ export interface ProviderStatus {
 export interface ProviderProfileSummary {
   id: string;
   name: string;
+  /** Always empty from the native layer; use hasApiKey + blank-to-keep on save. */
   apiKey: string;
   hasApiKey: boolean;
   baseUrl: string;
@@ -461,7 +464,7 @@ export const MODELS: ModelInfo[] = [
   { id: "grok-4", label: "GROK-4", tagline: "Flagship reasoning" },
 ];
 
-export const EFFORTS = ["low", "medium", "high", "xhigh"] as const;
+export const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type Effort = (typeof EFFORTS)[number];
 export type PermissionMode = "default" | "auto" | "bypass";
 

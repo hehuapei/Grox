@@ -102,11 +102,11 @@ function DeepResearchToolCard({ run, query }: { run?: WorkflowRun; query?: strin
   );
 }
 
-function groupTurns(blocks: SessionBlock[]): Turn[] {
+export function groupTurns(blocks: SessionBlock[]): Turn[] {
   const turns: Turn[] = [];
   let promptIndex = -1;
   for (const block of blocks) {
-    if (block.type === "user") {
+    if (block.type === "user" && !block.interjected) {
       promptIndex += 1;
       turns.push({ id: block.id, blocks: [block], promptIndex });
     } else if (turns.length === 0) turns.push({ id: block.id, blocks: [block], promptIndex: -1 });
@@ -444,7 +444,7 @@ export function Timeline({ session }: { session: Session }) {
         }}
         className="h-full min-w-0 flex-1 overflow-y-auto"
       >
-        <div className="mx-auto max-w-[860px] px-8 py-8">
+        <div className="mx-auto max-w-[980px] px-10 py-9">
           {turns.map((turn, index) => {
             const user = turn.blocks.find((block): block is Extract<SessionBlock, { type: "user" }> => block.type === "user");
             return (
