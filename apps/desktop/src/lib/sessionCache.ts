@@ -29,12 +29,36 @@ function freezeBlock(block: SessionBlock): SessionBlock {
   return block;
 }
 
+/**
+ * Take the last N blocks but never start mid-turn.
+ * Evidence: raw slice(-160) can begin on a tool mid-stream and seam badly on reopen.
+ */
+export function sliceCacheBlocks(
+  blocks: readonly SessionBlock[],
+  max = MAX_CACHED_BLOCKS,
+): SessionBlock[] {
+  if (blocks.length <= max) return [...blocks];
+  let start = blocks.length - max;
+  for (let i = start; i >= 0; i -= 1) {
+    const b = blocks[i];
+    if (b.type === "user" && !("interjected" in b && b.interjected)) {
+      start = i;
+      break;
+    }
+    if (i === 0) start = 0;
+  }
+  if (blocks.length - start > max * 2) {
+    start = blocks.length - max;
+  }
+  return blocks.slice(start);
+}
+
 export function compactSession(session: Session): Session {
   return {
     ...session,
     status: "idle",
     preview: true,
-    blocks: session.blocks.slice(-MAX_CACHED_BLOCKS).map(freezeBlock),
+    blocks: sliceCacheBlocks(session.blocks, MAX_CACHED_BLOCKS).map(freezeBlock),
   };
 }
 

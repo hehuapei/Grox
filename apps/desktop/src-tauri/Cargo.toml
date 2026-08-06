@@ -1,6 +1,6 @@
 [package]
 name = "grox-desktop"
-version = "0.2.9"
+version = "0.2.10"
 description = "Grox desktop agent powered by Grok Build"
 edition = "2021"
 rust-version = "1.77"
@@ -34,6 +34,7 @@ windows = { version = "0.58", features = [
   "Win32_Foundation",
   "Win32_Graphics_Gdi",
   "Win32_Security",
+  "Win32_System_JobObjects",
   "Win32_System_Threading",
   "Win32_UI_HiDpi",
   "Win32_UI_Input_KeyboardAndMouse",

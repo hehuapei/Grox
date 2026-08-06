@@ -199,7 +199,7 @@ function General() {
         aria-label={zh ? "权限模式" : "Permission mode"}
       />
     </Row>
-    <Row label="Computer Use" hint={zh ? "默认开启。Windows 提供完整键鼠控制；macOS/Linux 以截图观察为主，点击/输入可能需要辅助功能或 cliclick。与 Bypass 互斥；变更后需新建或重新加载会话。" : "On by default. Windows has full input control; macOS/Linux are observation-first and may need Accessibility / cliclick. Mutually exclusive with Bypass; reload or create a session after changing."}><Toggle on={computerUse} onChange={setComputerUse} /></Row>
+    <Row label="Computer Use" hint={zh ? "写入本机 host_prefs（主机权威）。关闭后无法仅靠 localStorage 重开。与 Bypass 互斥；变更后需新建或重新加载会话。" : "Persists to host_prefs (host authority). localStorage alone cannot re-open after host off. Mutually exclusive with Bypass; reload session after change."}><Toggle on={computerUse} onChange={setComputerUse} /></Row>
     <Row label="Browser Use" hint={zh ? "默认开启。提供打开 URL 与本机 Chrome/Edge 无头截图 MCP；变更后需新建或重新加载会话。" : "On by default. Mounts URL open + headless Chrome/Edge screenshot MCP. Reload or create a session after changing."}><Toggle on={browserUse} onChange={setBrowserUse} /></Row>
     <Row label={zh ? "桌面通知" : "Desktop notifications"} hint={zh ? "窗口在后台时，权限批准与问答会弹出系统通知。" : "When Grox is in the background, permission and question prompts raise OS notifications."}><Toggle on={desktopNotify} onChange={(on) => { localStorage.setItem("grox.desktopNotify", on ? "1" : "0"); setDesktopNotify(on); if (on) void import("../../lib/notify").then((module) => module.ensureNotifyPermission()); }} /></Row>
     <div className="mt-8">

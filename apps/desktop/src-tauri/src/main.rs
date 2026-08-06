@@ -9,8 +9,11 @@
 mod browser_mcp;
 mod computer_mcp;
 mod git_confirm;
+mod host_prefs;
 mod mcp_leases;
 mod path_sandbox;
+#[cfg(windows)]
+mod process_job;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -104,6 +107,9 @@ struct AgentProcess {
     child: Child,
     stdin: ChildStdin,
     generation: u64,
+    /// Windows Job Object so cancel kills nested tool trees (cargo test, shells).
+    #[cfg(windows)]
+    job: Option<process_job::ProcessJob>,
 }
 
 #[derive(Default)]
@@ -140,6 +146,7 @@ struct AcpExitPayload {
 struct DesktopEnvironment {
     default_workspace: String,
     grok_command: String,
+    app_version: String,
 }
 
 #[derive(Clone, Serialize)]
@@ -2147,16 +2154,96 @@ async fn start_project_preview(
 
 async fn terminate_process(mut process: AgentProcess) {
     drop(process.stdin);
+    // Job Object first: kills grandchildren that child.kill() alone orphans on Windows.
+    #[cfg(windows)]
+    if let Some(job) = process.job.take() {
+        job.terminate_tree();
+        drop(job);
+    }
     let _ = process.child.kill().await;
     let _ = process.child.wait().await;
+}
+
+fn host_prefs_dir_for_app(app: &tauri::AppHandle) -> PathBuf {
+    app.path()
+        .app_data_dir()
+        .unwrap_or_else(|_| default_workspace().join(".grox-host-prefs-fallback"))
+}
+
+/// Product gate: env OR host_prefs only (ignore FE for actual attach).
+fn computer_use_gate_open() -> bool {
+    if let Ok(v) = std::env::var("GROX_COMPUTER_USE") {
+        let t = v.trim();
+        if t == "1" || t.eq_ignore_ascii_case("true") {
+            return true;
+        }
+        if t == "0" || t.eq_ignore_ascii_case("false") {
+            return false;
+        }
+    }
+    host_prefs::is_computer_use_enabled()
+}
+
+#[tauri::command]
+fn computer_use_env_enabled() -> bool {
+    std::env::var("GROX_COMPUTER_USE")
+        .ok()
+        .map(|v| {
+            let t = v.trim();
+            t == "1" || t.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
+}
+
+#[tauri::command]
+fn host_prefs_get(app: tauri::AppHandle) -> host_prefs::HostPrefs {
+    host_prefs::load_prefs(&host_prefs_dir_for_app(&app))
+}
+
+#[tauri::command]
+fn host_prefs_migrate_computer_use(
+    app: tauri::AppHandle,
+    fe_enabled: bool,
+) -> Result<host_prefs::HostPrefs, String> {
+    host_prefs::migrate_computer_use_from_fe(&host_prefs_dir_for_app(&app), fe_enabled)
+}
+
+#[tauri::command]
+fn host_prefs_set_computer_use(
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<host_prefs::HostPrefs, String> {
+    let dir = host_prefs_dir_for_app(&app);
+    let mut prefs = host_prefs::load_prefs(&dir);
+    prefs.computer_use_enabled = enabled;
+    prefs.computer_use_fe_migrated = true;
+    host_prefs::save_prefs(&dir, &prefs)?;
+    Ok(prefs)
+}
+
+#[tauri::command]
+fn host_prefs_set_permission_mode(
+    app: tauri::AppHandle,
+    mode: String,
+) -> Result<host_prefs::HostPrefs, String> {
+    let mode = host_prefs::normalize_permission_mode(&mode)
+        .ok_or_else(|| "无效的权限模式".to_string())?;
+    let dir = host_prefs_dir_for_app(&app);
+    let mut prefs = host_prefs::load_prefs(&dir);
+    prefs.permission_mode = mode.to_string();
+    host_prefs::save_prefs(&dir, &prefs)?;
+    Ok(prefs)
 }
 
 #[tauri::command]
 fn desktop_environment(app: tauri::AppHandle) -> DesktopEnvironment {
     let runtime = configured_grok_command(&app);
+    // Warm host prefs cache at first environment probe.
+    let _ = host_prefs::load_prefs(&host_prefs_dir_for_app(&app));
     DesktopEnvironment {
         default_workspace: path_for_webview(&default_workspace()),
         grok_command: path_for_webview(Path::new(&runtime.path)),
+        app_version: CLIENT_VERSION.to_string(),
     }
 }
 
@@ -5146,16 +5233,37 @@ fn configure_provider(request: ProviderConfig) -> Result<(), String> {
     Ok(())
 }
 
-#[tauri::command]
-fn open_external(url: String) -> Result<(), String> {
-    let parsed = url::Url::parse(&url).map_err(|error| format!("无效链接：{error}"))?;
+/// Parse + gate a user/markdown open URL (credentials, remote HTTP, IMDS/SSRF).
+fn parse_browser_url(url: &str) -> Result<url::Url, String> {
+    let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed.len() > 8_192 {
+        return Err("链接长度无效".into());
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err("链接包含非法控制字符".into());
+    }
+    let parsed = url::Url::parse(trimmed).map_err(|error| format!("无效链接：{error}"))?;
     if !matches!(parsed.scheme(), "http" | "https") {
         return Err("只允许打开 HTTP(S) 链接".into());
     }
     if !parsed.username().is_empty() || parsed.password().is_some() {
         return Err("链接不能包含用户名或密码".into());
     }
+    if parsed.host_str().is_none() {
+        return Err("链接缺少主机名".into());
+    }
+    // Cleartext HTTP only for loopback; remote must be HTTPS.
+    if parsed.scheme() == "http" && !is_loopback_host(parsed.host_str()) {
+        return Err("远程链接必须使用 HTTPS；仅本机回环地址允许 HTTP".into());
+    }
+    // Never open cloud metadata / link-local targets.
+    if is_blocked_service_host(parsed.host_str()) {
+        return Err("不允许打开链路本地或云元数据地址".into());
+    }
+    Ok(parsed)
+}
 
+fn spawn_system_browser(parsed: &url::Url) -> Result<(), String> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
@@ -5182,6 +5290,12 @@ fn open_external(url: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn open_external(url: String) -> Result<(), String> {
+    let parsed = parse_browser_url(&url)?;
+    spawn_system_browser(&parsed)
+}
+
 fn is_media_https_host_allowed(host: Option<&str>) -> bool {
     let Some(host) = host.map(|value| value.trim().trim_end_matches('.').to_ascii_lowercase()) else {
         return false;
@@ -5193,16 +5307,11 @@ fn is_media_https_host_allowed(host: Option<&str>) -> bool {
 
 #[tauri::command]
 fn open_media_external(url: String) -> Result<(), String> {
-    let parsed = url::Url::parse(&url).map_err(|error| format!("无效媒体链接：{error}"))?;
-    let allowed = match parsed.scheme() {
-        "https" => is_media_https_host_allowed(parsed.host_str()),
-        "http" => is_loopback_host(parsed.host_str()),
-        _ => false,
-    };
-    if !allowed || !parsed.username().is_empty() || parsed.password().is_some() {
-        return Err("媒体链接不在允许的安全域名或本机回环地址中".into());
+    let parsed = parse_browser_url(&url).map_err(|error| format!("无效媒体链接：{error}"))?;
+    if parsed.scheme() == "https" && !is_media_https_host_allowed(parsed.host_str()) {
+        return Err("媒体链接域名不在允许列表中".into());
     }
-    open_external(parsed.to_string())
+    spawn_system_browser(&parsed)
 }
 
 fn ensure_computer_plugin() -> Result<PathBuf, String> {
@@ -5234,6 +5343,14 @@ Use only the grox_desktop_computer MCP tools for an explicit `/computer` or `@Co
 fn computer_session_extensions(
     leases: tauri::State<'_, Arc<McpLeaseStore>>,
 ) -> Result<ComputerSessionExtensions, String> {
+    // Soft-fail when host gate closed: empty lists, no lease (FE must not cache control).
+    if !computer_use_gate_open() {
+        return Ok(ComputerSessionExtensions {
+            mcp_servers: Vec::new(),
+            plugin_dirs: Vec::new(),
+            lease_id: String::new(),
+        });
+    }
     let mut lease_bytes = [0_u8; 16];
     getrandom::fill(&mut lease_bytes)
         .map_err(|error| format!("无法创建 Computer Use 租约：{error}"))?;
@@ -5629,10 +5746,9 @@ async fn acp_spawn(
     }
 
     let runtime = configured_grok_command(&app);
-    // Only expose the Computer Use Skill when the desktop toggle is on; the
-    // MCP endpoint is gated separately, but SKILL.md stays visible via
-    // --plugin-dir unless we skip it here.
-    let computer_plugin = if computer_use_enabled.unwrap_or(false) {
+    // Host gate only (env | host_prefs). FE `computer_use_enabled` is not authority.
+    let _ = computer_use_enabled;
+    let computer_plugin = if computer_use_gate_open() {
         Some(
             ensure_computer_plugin()
                 .map_err(|error| format!("Computer Use Plugin 初始化失败：{error}"))?,
@@ -5695,10 +5811,30 @@ async fn acp_spawn(
         .stderr
         .take()
         .ok_or_else(|| "Grok CLI 未提供标准错误".to_string())?;
+    // Windows: put ACP child in a Job Object so cancel kills nested tool trees.
+    #[cfg(windows)]
+    let job = {
+        match process_job::ProcessJob::create_kill_on_close() {
+            Ok(job) => {
+                if let Some(pid) = child.id() {
+                    if let Err(error) = job.assign_pid(pid) {
+                        eprintln!("grox: AssignProcessToJobObject failed: {error}");
+                    }
+                }
+                Some(job)
+            }
+            Err(error) => {
+                eprintln!("grox: CreateJobObject failed (orphan risk on cancel): {error}");
+                None
+            }
+        }
+    };
     *state.process.lock().await = Some(AgentProcess {
         child,
         stdin,
         generation,
+        #[cfg(windows)]
+        job,
     });
 
     let stdout_app = app.clone();
@@ -5772,6 +5908,74 @@ async fn acp_spawn(
     Ok(generation)
 }
 
+/// Methods the desktop shell may write on the ACP stdin channel.
+/// Unknown methods from a compromised WebView are rejected.
+///
+/// Wire note: FE may prefix extension notifies as `_x.ai/...`.
+fn acp_method_allowed(method: &str) -> bool {
+    if method.is_empty()
+        || method.contains("..")
+        || method.contains('\\')
+        || method.bytes().any(|b| b < 0x20 || b == 0x7f)
+    {
+        return false;
+    }
+    if !method
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'_' | b'.' | b'-'))
+    {
+        return false;
+    }
+    // Only x.ai extension notifications use the optional wire-level `_` prefix.
+    // Do not let the prefix turn arbitrary standard namespaces into aliases.
+    let m = method.strip_prefix("_x.ai/").map(|suffix| format!("x.ai/{suffix}"));
+    let m = m.as_deref().unwrap_or(method);
+    matches!(
+        m,
+        "session/new"
+            | "session/load"
+            | "session/prompt"
+            | "session/cancel"
+            | "session/delete"
+            | "session/set_config_option"
+            | "session/set_model"
+            | "session/setMode"
+            | "session/set_mode"
+            | "session/info"
+            | "session/list"
+            | "session/resume"
+            | "session/fork"
+            | "session/update"
+            | "initialize"
+            | "authenticate"
+            | "terminal/create"
+            | "terminal/output"
+            | "terminal/release"
+            | "terminal/wait_for_exit"
+            | "terminal/kill"
+            | "fs/read_text_file"
+            | "fs/write_text_file"
+            | "x.ai/interject"
+            | "x.ai/session/list"
+            | "x.ai/session/delete"
+            | "x.ai/session/update"
+            | "x.ai/session/prompt_queue"
+            | "x.ai/session/prompt_queue/list"
+            | "x.ai/session/prompt_queue/cancel"
+            | "x.ai/set_permission_mode"
+            | "x.ai/permission/respond"
+            | "x.ai/question/respond"
+            | "x.ai/model/list"
+            | "x.ai/model/set"
+            | "x.ai/account"
+            | "x.ai/billing"
+            | "x.ai/config"
+            | "x.ai/mcp/status"
+            | "x.ai/yolo_mode_changed"
+            | "x.ai/queue/changed"
+    ) || m.starts_with("x.ai/")
+}
+
 #[tauri::command]
 async fn acp_send(
     state: tauri::State<'_, Arc<AcpState>>,
@@ -5781,6 +5985,23 @@ async fn acp_send(
 ) -> Result<(), String> {
     if line.contains('\n') || line.contains('\r') {
         return Err("ACP 消息必须是单行 JSON".into());
+    }
+    // Bound stdin payload size (multimodal base64 still fits under 8 MiB).
+    const MAX_ACP_LINE_BYTES: usize = 8 * 1024 * 1024;
+    if line.len() > MAX_ACP_LINE_BYTES {
+        return Err(format!(
+            "ACP 消息过大（{} bytes，上限 {}）",
+            line.len(),
+            MAX_ACP_LINE_BYTES
+        ));
+    }
+    // Method allowlist before lease inject / stdin write.
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+        if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
+            if !acp_method_allowed(method) {
+                return Err(format!("不允许的 ACP 方法：{method}"));
+            }
+        }
     }
     let line = mcp_leases::inject_mcp_servers(&line, leases.inner())?;
     if line.contains('\n') || line.contains('\r') {
@@ -6325,6 +6546,11 @@ fn main() {
             open_external,
             open_media_external,
             start_project_preview,
+            computer_use_env_enabled,
+            host_prefs_get,
+            host_prefs_migrate_computer_use,
+            host_prefs_set_computer_use,
+            host_prefs_set_permission_mode,
             computer_session_extensions,
             computer_shutdown_lease,
             computer_emergency_stop,
@@ -7131,5 +7357,34 @@ UNRELATED=value
         assert!(is_trusted_cli_install_host(Some("cdn.x.ai")));
         assert!(!is_trusted_cli_install_host(Some("evil.example")));
         assert!(!is_trusted_cli_install_host(Some("github.com")));
+    }
+
+    #[test]
+    fn acp_method_allows_wire_xai_notify_and_rejects_traversal() {
+        assert!(acp_method_allowed("_x.ai/yolo_mode_changed"));
+        assert!(acp_method_allowed("x.ai/yolo_mode_changed"));
+        assert!(acp_method_allowed("session/prompt"));
+        assert!(acp_method_allowed("session/set_model"));
+        assert!(!acp_method_allowed("shell/exec"));
+        assert!(!acp_method_allowed("eval"));
+        assert!(!acp_method_allowed("_evil/hack"));
+        assert!(!acp_method_allowed("_session/prompt"));
+        assert!(!acp_method_allowed("session/unknown"));
+        assert!(!acp_method_allowed("terminal/unknown"));
+        assert!(!acp_method_allowed("fs/unknown"));
+        assert!(acp_method_allowed("x.ai/future_extension"));
+        assert!(acp_method_allowed("_x.ai/future_extension"));
+        assert!(!acp_method_allowed("session/../../evil"));
+    }
+
+    #[test]
+    fn parse_browser_url_rejects_remote_http_credentials_and_imds() {
+        assert!(parse_browser_url("https://github.com/x").is_ok());
+        assert!(parse_browser_url("http://127.0.0.1:5173/").is_ok());
+        assert!(parse_browser_url("http://evil.example/phish").is_err());
+        assert!(parse_browser_url("https://user:pass@evil.com/").is_err());
+        assert!(parse_browser_url("https://169.254.169.254/latest/meta-data/").is_err());
+        assert!(parse_browser_url("https://metadata.google.internal/").is_err());
+        assert!(parse_browser_url("https://100.100.100.200/").is_err());
     }
 }
