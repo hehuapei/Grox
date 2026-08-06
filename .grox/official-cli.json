@@ -1,10 +1,10 @@
 {
   "repository": "https://github.com/xai-org/grok-build",
   "branch": "main",
-  "commit": "b41c75a578f98bddbd326ab02cd53618451d97ee",
-  "sourceRevision": "91d8cf309110a3b879c1b8198f7525aed545dfb4",
-  "version": "0.2.112",
-  "reviewedAt": "2026-07-27",
+  "commit": "a5589e958437d79e13db026eedcb1720bffd4063",
+  "sourceRevision": "4d6d11372ab8f73026a78c45a7b7e7b1310eb39f",
+  "version": "0.2.120",
+  "reviewedAt": "2026-08-06",
   "changelog": "https://x.ai/build/changelog",
   "install": {
     "windows": "https://x.ai/cli/install.ps1",

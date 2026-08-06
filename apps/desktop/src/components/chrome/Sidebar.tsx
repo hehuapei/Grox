@@ -13,6 +13,9 @@ import { normalizeSessionQuery, sessionMatchesLoadedContent } from "../../lib/se
 export function Sidebar() {
   const { t, language } = useI18n();
   const width = usePreferences((state) => state.sidebarWidth);
+  const theme = usePreferences((state) => state.theme);
+  const setLanguage = usePreferences((state) => state.setLanguage);
+  const setTheme = usePreferences((state) => state.setTheme);
   const sessionIndex = useDesktop((state) => state.sessionIndex);
   const sessions = useDesktop((state) => state.sessions);
   const activeId = useDesktop((state) => state.activeId);
@@ -227,9 +230,29 @@ export function Sidebar() {
           </p>
         </button>
         <button
+          type="button"
+          onClick={() => setLanguage(language === "zh-CN" ? "en-US" : "zh-CN")}
+          className="flex h-7 min-w-7 shrink-0 items-center justify-center rounded-[3px] px-1 font-mono text-[9px] text-dim transition-colors hover:bg-high hover:text-fg focus-visible:outline focus-visible:outline-1 focus-visible:outline-acc"
+          title={language === "zh-CN" ? "切换至 English" : "Switch to 简体中文"}
+          aria-label={language === "zh-CN" ? "切换至 English" : "Switch to 简体中文"}
+        >
+          {language === "zh-CN" ? "中" : "EN"}
+        </button>
+        <button
+          type="button"
+          onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[3px] text-dim transition-colors hover:bg-high hover:text-fg focus-visible:outline focus-visible:outline-1 focus-visible:outline-acc"
+          title={theme === "dark" ? (language === "zh-CN" ? "切换至明亮主题" : "Switch to light theme") : (language === "zh-CN" ? "切换至暗黑主题" : "Switch to dark theme")}
+          aria-label={theme === "dark" ? (language === "zh-CN" ? "切换至明亮主题" : "Switch to light theme") : (language === "zh-CN" ? "切换至暗黑主题" : "Switch to dark theme")}
+        >
+          <Icon name={theme === "dark" ? "moon" : "sun"} size={12} />
+        </button>
+        <button
+          type="button"
           onClick={() => setSettingsOpen(true)}
-          className="flex h-7 w-7 items-center justify-center text-dim hover:text-fg"
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[3px] text-dim transition-colors hover:bg-high hover:text-fg focus-visible:outline focus-visible:outline-1 focus-visible:outline-acc"
           title={t("settings")}
+          aria-label={t("settings")}
         >
           <Icon name="gear" size={13} />
         </button>
@@ -408,7 +431,12 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
       >
         <Icon name="plus" size={12} />
       </button>
-      <button onClick={() => setMenu((open) => !open)} className="flex h-5 w-5 shrink-0 items-center justify-center text-dim hover:text-fg opacity-0 group-hover:opacity-100">
+      <button
+        onClick={() => setMenu((open) => !open)}
+        className="flex h-5 w-5 shrink-0 items-center justify-center text-dim opacity-0 transition-opacity hover:text-fg group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100"
+        aria-label={language === "zh-CN" ? "项目操作" : "Project actions"}
+        aria-expanded={menu}
+      >
         <Icon name="more" size={12} />
       </button>
       {menu && (
@@ -463,7 +491,12 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
         ) : (
           <span className="min-w-0 flex-1 truncate text-[11px] text-fg2">{meta.title}</span>
         )}
-        <button onClick={(event) => { event.stopPropagation(); setMenu((open) => !open); }} className="flex h-5 w-5 shrink-0 items-center justify-center text-dim hover:text-fg opacity-0 group-hover:opacity-100">
+        <button
+          onClick={(event) => { event.stopPropagation(); setMenu((open) => !open); }}
+          className="flex h-5 w-5 shrink-0 items-center justify-center text-dim opacity-0 transition-opacity hover:text-fg group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100"
+          aria-label={language === "zh-CN" ? "会话操作" : "Session actions"}
+          aria-expanded={menu}
+        >
           <Icon name="more" size={12} />
         </button>
       </div>
