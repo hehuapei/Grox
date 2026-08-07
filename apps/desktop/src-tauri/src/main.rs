@@ -430,6 +430,8 @@ struct StoredProviderProfile {
     api_key: String,
     base_url: String,
     #[serde(default)]
+    allow_insecure_http: bool,
+    #[serde(default)]
     api_backend: ProviderApiBackend,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     models_url: Option<String>,
@@ -507,6 +509,7 @@ struct ProviderProfileSummary {
     api_key: String,
     has_api_key: bool,
     base_url: String,
+    allow_insecure_http: bool,
     api_backend: ProviderApiBackend,
     available_models: Vec<String>,
     resident_models: Vec<String>,
@@ -526,6 +529,8 @@ struct SaveProviderProfile {
     name: String,
     api_key: Option<String>,
     base_url: String,
+    #[serde(default)]
+    allow_insecure_http: bool,
     #[serde(default)]
     api_backend: ProviderApiBackend,
     #[serde(default)]
@@ -966,7 +971,8 @@ fn restrict_private_file(path: &Path) -> Result<(), String> {
     // in depth for shared or relocated config folders.
     let path_text = path.to_string_lossy();
     let user = std::env::var("USERNAME").unwrap_or_else(|_| String::from("%USERNAME%"));
-    let status = std::process::Command::new("icacls")
+    let mut command = std::process::Command::new("icacls");
+    command
         .args([
             path_text.as_ref(),
             "/inheritance:r",
@@ -975,8 +981,13 @@ fn restrict_private_file(path: &Path) -> Result<(), String> {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000);
+    }
+    let status = command.status();
     match status {
         Ok(code) if code.success() => Ok(()),
         Ok(code) => {
@@ -1323,7 +1334,11 @@ fn is_blocked_service_host(host: Option<&str>) -> bool {
     }
 }
 
-fn checked_service_url(value: &str, label: &str) -> Result<String, String> {
+fn checked_service_url_with_policy(
+    value: &str,
+    label: &str,
+    allow_insecure_http: bool,
+) -> Result<String, String> {
     let value = value.trim().trim_end_matches('/');
     let parsed = url::Url::parse(value).map_err(|error| format!("无效{label}：{error}"))?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
@@ -1333,14 +1348,21 @@ fn checked_service_url(value: &str, label: &str) -> Result<String, String> {
         return Err(format!("{label}不能指向云元数据或链路本地地址"));
     }
     let secure = parsed.scheme() == "https";
-    let local_http = parsed.scheme() == "http" && is_loopback_host(parsed.host_str());
-    if !secure && !local_http {
-        return Err(format!("{label}必须使用 HTTPS；仅本机回环地址允许 HTTP"));
+    let allowed_http = parsed.scheme() == "http"
+        && (is_loopback_host(parsed.host_str()) || allow_insecure_http);
+    if !secure && !allowed_http {
+        return Err(format!(
+            "{label}必须使用 HTTPS；远程 HTTP 需要显式启用不安全连接"
+        ));
     }
     // Use url's serialized representation instead of the original input.
     // URL parsers may tolerate ASCII whitespace that would otherwise become a
     // second line in the managed dotenv block.
     Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
+fn checked_service_url(value: &str, label: &str) -> Result<String, String> {
+    checked_service_url_with_policy(value, label, false)
 }
 
 fn checked_api_key(value: &str) -> Result<&str, String> {
@@ -1715,6 +1737,8 @@ fn acp_write_text_file(cwd: String, path: String, content: String) -> Result<(),
 struct FetchProviderModels {
     api_key: String,
     base_url: String,
+    #[serde(default)]
+    allow_insecure_http: bool,
 }
 
 #[tauri::command]
@@ -3952,10 +3976,17 @@ fn create_permanent_worktree(cwd: String) -> Result<String, String> {
         .unwrap_or_default()
         .as_millis();
     let branch = format!("grox/worktree-{timestamp}");
-    let output = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .current_dir(&root)
         .args(["worktree", "add", "-b", &branch])
-        .arg(&target)
+        .arg(&target);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command
         .output()
         .map_err(|error| format!("无法执行 git worktree：{error}"))?;
     if !output.status.success() {
@@ -4704,14 +4735,19 @@ fn provider_profile_summary(profile: &StoredProviderProfile) -> ProviderProfileS
         api_key: String::new(),
         has_api_key: !profile.api_key.is_empty(),
         base_url: profile.base_url.clone(),
+        allow_insecure_http: profile.allow_insecure_http,
         api_backend: profile.api_backend,
         available_models: profile.available_models.clone(),
         resident_models,
     }
 }
 
-fn compatible_models_url(base_url: &str) -> Result<String, String> {
-    let base = checked_service_url(base_url, "服务地址")?;
+fn compatible_models_url(base_url: &str, allow_insecure_http: bool) -> Result<String, String> {
+    let base = checked_service_url_with_policy(
+        base_url,
+        "服务地址",
+        allow_insecure_http,
+    )?;
     let mut parsed = url::Url::parse(&base).map_err(|error| format!("无效服务地址：{error}"))?;
     let path = parsed.path().trim_end_matches('/');
     if !path.ends_with("/models") {
@@ -4745,18 +4781,23 @@ fn checked_model_ids(models: Vec<String>) -> Result<Vec<String>, String> {
 fn compatible_provider_env(
     api_key: &str,
     base_url: &str,
+    allow_insecure_http: bool,
 ) -> Result<String, String> {
     let key = checked_api_key(api_key.trim())?;
     if key.is_empty() {
         return Err("API Key 不能为空".into());
     }
-    let base = checked_service_url(base_url.trim(), "服务地址")?;
+    let base = checked_service_url_with_policy(
+        base_url.trim(),
+        "服务地址",
+        allow_insecure_http,
+    )?;
     let lines = vec![
         format!("XAI_API_KEY={}", env_value(key)),
         format!("GROK_MODELS_BASE_URL={}", env_value(&base)),
         format!(
             "GROK_MODELS_LIST_URL={}",
-            env_value(&compatible_models_url(&base)?)
+            env_value(&compatible_models_url(&base, allow_insecure_http)?)
         ),
     ];
     Ok(lines.join("\n"))
@@ -4824,9 +4865,13 @@ fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfile
         .filter(|key| !key.is_empty())
         .or_else(|| existing.map(|profile| profile.api_key.as_str()))
         .ok_or("API Key 不能为空")?;
-    compatible_provider_env(key, &request.base_url)?;
+    compatible_provider_env(key, &request.base_url, request.allow_insecure_http)?;
     let mut resident_models = checked_model_ids(request.resident_models)?;
-    let base_url = checked_service_url(&request.base_url, "服务地址")?;
+    let base_url = checked_service_url_with_policy(
+        &request.base_url,
+        "服务地址",
+        request.allow_insecure_http,
+    )?;
     let available_models = existing
         .filter(|profile| profile.base_url == base_url && profile.api_key == key)
         .map(|profile| profile.available_models.clone())
@@ -4852,6 +4897,7 @@ fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfile
         name: name.to_owned(),
         api_key: checked_api_key(key)?.to_owned(),
         base_url: base_url.clone(),
+        allow_insecure_http: request.allow_insecure_http,
         api_backend: request.api_backend,
         models_url: None,
         model: resident_models.first().cloned(),
@@ -4867,23 +4913,30 @@ fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfile
     Ok(provider_profile_summary(&profile))
 }
 
-async fn fetch_compatible_models(api_key: &str, base_url: &str) -> Result<Vec<String>, String> {
+async fn fetch_compatible_models(
+    api_key: &str,
+    base_url: &str,
+    allow_insecure_http: bool,
+) -> Result<Vec<String>, String> {
     let key = checked_api_key(api_key.trim())?;
     if key.is_empty() {
         return Err("API Key 不能为空".into());
     }
-    let endpoint = compatible_models_url(base_url)?;
+    let endpoint = compatible_models_url(base_url, allow_insecure_http)?;
     let mut response = reqwest::Client::builder()
         .user_agent(format!("Grox/{CLIENT_VERSION}"))
         .timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= 3 {
                 return attempt.error("provider redirect limit exceeded");
             }
             let url = attempt.url();
             let allowed = match url.scheme() {
                 "https" => !is_blocked_service_host(url.host_str()),
-                "http" => is_loopback_host(url.host_str()),
+                "http" => {
+                    !is_blocked_service_host(url.host_str())
+                        && (is_loopback_host(url.host_str()) || allow_insecure_http)
+                }
                 _ => false,
             };
             if allowed {
@@ -4943,7 +4996,12 @@ async fn fetch_compatible_models(api_key: &str, base_url: &str) -> Result<Vec<St
 
 #[tauri::command]
 async fn fetch_provider_models(request: FetchProviderModels) -> Result<Vec<String>, String> {
-    fetch_compatible_models(&request.api_key, &request.base_url).await
+    fetch_compatible_models(
+        &request.api_key,
+        &request.base_url,
+        request.allow_insecure_http,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -4953,7 +5011,12 @@ async fn refresh_provider_models(id: String) -> Result<ProviderProfileSummary, S
         .into_iter()
         .find(|profile| profile.id == id)
         .ok_or("供应商档案不存在")?;
-    let models = fetch_compatible_models(&profile.api_key, &profile.base_url).await?;
+    let models = fetch_compatible_models(
+        &profile.api_key,
+        &profile.base_url,
+        profile.allow_insecure_http,
+    )
+    .await?;
 
     let mut value = read_provider_profiles_file()?;
     let stored = value
@@ -4994,7 +5057,11 @@ fn activate_provider_profile(id: String) -> Result<(), String> {
         .ok_or("供应商没有可用模型；请先获取模型目录并选择一个模型")?;
     let backend = profile.api_backend.config_value(&profile.name, &profile.base_url);
     apply_grox_provider_backend_overrides(&model_ids, &profile.base_url, primary_model, backend)?;
-    let replacement = compatible_provider_env(&profile.api_key, &profile.base_url)?;
+    let replacement = compatible_provider_env(
+        &profile.api_key,
+        &profile.base_url,
+        profile.allow_insecure_http,
+    )?;
     let path = grok_home()?.join(".env");
     let current = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
     atomic_write(&path, &replace_managed_env_block(&current, &replacement))?;
@@ -5079,7 +5146,7 @@ fn configure_provider(request: ProviderConfig) -> Result<(), String> {
         "compatible" => {
             let base_url = request.base_url.as_deref().unwrap_or_default();
             let key = requested_key.or(saved_key).ok_or("API Key 不能为空")?;
-            let replacement = compatible_provider_env(key, base_url)?;
+            let replacement = compatible_provider_env(key, base_url, false)?;
             restore_grox_provider_auth_overrides()?;
             restore_grox_provider_backend_overrides()?;
             replacement
@@ -6861,6 +6928,18 @@ OPENAI_API_KEY=******** # keep env comment
         assert!(checked_service_url("http://127.0.0.1:11434/v1", "服务地址").is_ok());
         assert!(checked_service_url("http://[::1]:11434/v1", "服务地址").is_ok());
         assert!(checked_service_url("http://api.example.com/v1", "服务地址").is_err());
+        assert!(checked_service_url_with_policy(
+            "http://api.example.com/v1",
+            "服务地址",
+            true,
+        )
+        .is_ok());
+        assert!(checked_service_url_with_policy(
+            "http://169.254.169.254/latest",
+            "服务地址",
+            true,
+        )
+        .is_err());
         assert!(checked_service_url("https://user:secret@example.com/v1", "服务地址").is_err());
         let normalized =
             checked_service_url("https://api.example.com/v1\n?model=grok", "服务地址").unwrap();
@@ -6870,7 +6949,12 @@ OPENAI_API_KEY=******** # keep env comment
 
     #[test]
     fn compatible_provider_environment_is_validated_and_complete() {
-        let env = compatible_provider_env("sk-test", "https://gateway.example.com/v1").unwrap();
+        let env = compatible_provider_env(
+            "sk-test",
+            "https://gateway.example.com/v1",
+            false,
+        )
+        .unwrap();
         assert!(env.contains("XAI_API_KEY=\"sk-test\""));
         assert!(env.contains("GROK_MODELS_BASE_URL=\"https://gateway.example.com/v1\""));
         assert!(env.contains("GROK_MODELS_LIST_URL=\"https://gateway.example.com/v1/models\""));
@@ -6878,13 +6962,22 @@ OPENAI_API_KEY=******** # keep env comment
         assert!(compatible_provider_env(
             "",
             "https://gateway.example.com/v1",
+            false,
         )
         .is_err());
         assert!(compatible_provider_env(
             "sk-test",
             "http://gateway.example.com/v1",
+            false,
         )
         .is_err());
+        let insecure = compatible_provider_env(
+            "sk-test",
+            "http://gateway.example.com/v1",
+            true,
+        )
+        .unwrap();
+        assert!(insecure.contains("GROK_MODELS_BASE_URL=\"http://gateway.example.com/v1\""));
     }
 
     #[test]
@@ -7030,6 +7123,7 @@ UNRELATED=value
         let compatible = compatible_provider_env(
             "gateway-key",
             "https://gateway.example/v1",
+            false,
         )
         .unwrap();
         fs::write(&path, replace_managed_env_block("", &compatible)).unwrap();

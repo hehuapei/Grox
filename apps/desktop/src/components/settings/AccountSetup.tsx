@@ -79,6 +79,7 @@ export function AccountSetup() {
           // Chat Completions. Responses-only routing belongs in a user-owned
           // custom model declaration, not an app-generated config override.
           apiBackend: "chat_completions",
+          allowInsecureHttp: false,
           residentModels: [],
         });
         localStorage.setItem("grox.accountSetupComplete", "1");

@@ -344,6 +344,7 @@ export interface ProviderProfileSummary {
   apiKey: string;
   hasApiKey: boolean;
   baseUrl: string;
+  allowInsecureHttp: boolean;
   apiBackend: ProviderApiBackend;
   availableModels: string[];
   residentModels: string[];
@@ -359,6 +360,7 @@ export interface SaveProviderProfile {
   name: string;
   apiKey?: string;
   baseUrl: string;
+  allowInsecureHttp: boolean;
   apiBackend: ProviderApiBackend;
   residentModels: string[];
 }
@@ -366,6 +368,7 @@ export interface SaveProviderProfile {
 export interface FetchProviderModels {
   apiKey: string;
   baseUrl: string;
+  allowInsecureHttp: boolean;
 }
 
 export interface GrokRuntimeInfo {

@@ -1,4 +1,5 @@
 import { memo, type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
+import { Virtuoso, type VirtuosoHandle } from "react-virtuoso";
 import { isSessionTerminal, type Session, type SessionBlock, type WorkflowRun } from "../../bridge/types";
 import { useI18n } from "../../lib/i18n";
 import { useDesktop } from "../../state/store";
@@ -394,8 +395,7 @@ const MemoTurnGroup = memo(TurnGroup, (previous, next) => {
 export function Timeline({ session }: { session: Session }) {
   const { language } = useI18n();
   const workflows = useDesktop((state) => state.workflows[session.id] ?? EMPTY_WORKFLOWS);
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const turnNodes = useRef(new Map<string, HTMLDivElement>());
+  const listRef = useRef<VirtuosoHandle>(null);
   const followRef = useRef(true);
   const turns = useMemo(() => groupTurns(session.blocks), [session.blocks]);
   const lastBlock = session.blocks.at(-1);
@@ -416,52 +416,49 @@ export function Timeline({ session }: { session: Session }) {
 
   useEffect(() => {
     const frame = requestAnimationFrame(() => {
-      const element = scrollRef.current;
-      if (element && followRef.current) element.scrollTop = element.scrollHeight;
+      if (followRef.current && turns.length > 0) {
+        listRef.current?.scrollToIndex({ index: turns.length - 1, align: "end" });
+      }
     });
     return () => cancelAnimationFrame(frame);
-  }, [signature]);
+  }, [signature, turns.length]);
 
   if (session.blocks.length === 0) return <div className="flex flex-1 flex-col items-center justify-center gap-4 pb-24"><BlackHole size={44} spin="slow" /><div className="text-center"><p className="text-[14px] text-mute">{language === "zh-CN" ? "任务通道已打开。" : "Mission channel open."}</p><p className="lbl mt-1.5 !text-[10px]">{language === "zh-CN" ? "输入你的第一个请求" : "TRANSMIT YOUR FIRST DIRECTIVE"}</p></div></div>;
 
   const jumpToTurn = (id: string) => {
-    const viewport = scrollRef.current;
-    const node = turnNodes.current.get(id);
-    if (!viewport || !node) return;
+    const index = turns.findIndex((turn) => turn.id === id);
+    if (index < 0) return;
     followRef.current = false;
-    const viewportRect = viewport.getBoundingClientRect();
-    const target = viewport.scrollTop + node.getBoundingClientRect().top - viewportRect.top - viewport.clientHeight * 0.14;
-    viewport.scrollTo({ top: Math.max(0, target), behavior: "smooth" });
+    listRef.current?.scrollToIndex({ index, align: "start", behavior: "smooth" });
   };
 
   return (
     <div className="relative flex min-h-0 flex-1">
-      <div
-        ref={scrollRef}
-        onScroll={() => {
-          const element = scrollRef.current;
-          if (element) followRef.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+      <Virtuoso
+        key={session.id}
+        ref={listRef}
+        data={turns}
+        computeItemKey={(_, turn) => turn.id}
+        initialTopMostItemIndex={turns.length - 1}
+        followOutput={(atBottom) => (atBottom ? "auto" : false)}
+        atBottomStateChange={(atBottom) => {
+          followRef.current = atBottom;
         }}
+        increaseViewportBy={{ top: 700, bottom: 1_000 }}
         className="h-full min-w-0 flex-1 overflow-y-auto"
-      >
-        <div className="mx-auto max-w-[980px] px-10 py-9">
-          {turns.map((turn, index) => {
-            const user = turn.blocks.find((block): block is Extract<SessionBlock, { type: "user" }> => block.type === "user");
-            return (
-              <div
-                key={turn.id}
-                ref={(node) => {
-                  if (node) turnNodes.current.set(turn.id, node);
-                  else turnNodes.current.delete(turn.id);
-                }}
-              >
-                <MemoTurnGroup turn={turn} sessionId={session.id} status={session.status} active={index === turns.length - 1} workflow={matchingResearchRun(workflows, user)} />
-              </div>
-            );
-          })}
-          <div className="h-2" />
-        </div>
-      </div>
+        components={{
+          Header: () => <div className="h-9" />,
+          Footer: () => <div className="h-11" />,
+        }}
+        itemContent={(index, turn) => {
+          const user = turn.blocks.find((block): block is Extract<SessionBlock, { type: "user" }> => block.type === "user");
+          return (
+            <div className="mx-auto max-w-[980px] px-10">
+              <MemoTurnGroup turn={turn} sessionId={session.id} status={session.status} active={index === turns.length - 1} workflow={matchingResearchRun(workflows, user)} />
+            </div>
+          );
+        }}
+      />
       <RequestRail markers={markers} language={language} onJump={jumpToTurn} />
     </div>
   );

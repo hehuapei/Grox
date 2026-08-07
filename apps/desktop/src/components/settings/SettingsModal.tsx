@@ -276,6 +276,7 @@ function ProviderAndModels() {
   const [apiKey, setApiKey] = useState("");
   const [apiKeyHidden, setApiKeyHidden] = useState(false);
   const [baseUrl, setBaseUrl] = useState(provider.kind === "compatible" ? "" : (provider.baseUrl ?? ""));
+  const [allowInsecureHttp, setAllowInsecureHttp] = useState(false);
   const [apiBackend, setApiBackend] = useState<ProviderApiBackend>("auto");
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [residentModels, setResidentModels] = useState<string[]>([]);
@@ -296,6 +297,7 @@ function ProviderAndModels() {
     setEditingProfileId(profile.id);
     setProfileName(profile.name);
     setBaseUrl(profile.baseUrl);
+    setAllowInsecureHttp(profile.allowInsecureHttp);
     setApiBackend(profile.apiBackend);
     setAvailableModels(profile.availableModels);
     setResidentModels(profile.residentModels);
@@ -312,6 +314,7 @@ function ProviderAndModels() {
     setApiKey("");
     setApiKeyHidden(false);
     setBaseUrl("");
+    setAllowInsecureHttp(false);
     setApiBackend("auto");
     setAvailableModels([]);
     setResidentModels([]);
@@ -330,6 +333,7 @@ function ProviderAndModels() {
     setApiKey("");
     setApiKeyHidden(false);
     setBaseUrl("");
+    setAllowInsecureHttp(false);
     setAvailableModels([]);
     setResidentModels([]);
     setError("");
@@ -350,6 +354,7 @@ function ProviderAndModels() {
           name: profileName,
           apiKey: apiKey.trim() || undefined,
           baseUrl,
+          allowInsecureHttp,
           apiBackend,
           residentModels,
         });
@@ -378,7 +383,7 @@ function ProviderAndModels() {
         const refreshed = await refreshStoredModels(editingProfileId);
         setAvailableModels(refreshed.availableModels);
       } else {
-        const discovered = await fetchProfileModels({ apiKey, baseUrl });
+        const discovered = await fetchProfileModels({ apiKey, baseUrl, allowInsecureHttp });
         setAvailableModels(discovered);
       }
     } catch (cause) {
@@ -423,6 +428,7 @@ function ProviderAndModels() {
         <label className="block"><span className="lbl !text-[9px]">API KEY</span><SecretInput value={apiKey} onChange={(value) => { setApiKey(value); if (kind === "compatible") setAvailableModels([]); }} hidden={apiKeyHidden} onToggle={() => setApiKeyHidden((value) => !value)} placeholder={editingProfileId && profiles.find((item) => item.id === editingProfileId)?.hasApiKey ? (zh ? "已保存 · 留空则保持原密钥" : "Saved · leave blank to keep") : "xai-…"} /></label>
         {kind === "official" ? <div><span className="lbl !text-[9px]">BASE URL</span><div className="h-8 rounded-[4px] border border-line bg-void px-2.5 font-mono text-[10px] leading-8 text-dim">https://api.x.ai/v1</div></div> : <label className="block"><span className="lbl !text-[9px]">BASE URL</span><Input value={baseUrl} onChange={(value) => { setBaseUrl(value); setAvailableModels([]); setResidentModels([]); }} placeholder="https://example.com/v1" /></label>}
         {kind === "compatible" && <label className="block"><span className="lbl !text-[9px]">API BACKEND</span><ChipSelect variant="field" menuPlacement="down" fullWidth activeId={apiBackend} label={apiBackend === "auto" ? (zh ? "自动识别" : "Auto detect") : apiBackend === "responses" ? "Responses API" : "Chat Completions"} items={[{ id: "auto", label: zh ? "自动识别" : "Auto detect", hint: zh ? "标准服务默认 Chat Completions，已知 Responses 网关自动匹配" : "Chat Completions by default; known Responses gateways are detected" }, { id: "chat_completions", label: "Chat Completions", hint: "/chat/completions" }, { id: "responses", label: "Responses API", hint: "/responses" }]} onSelect={(id) => setApiBackend(id as ProviderApiBackend)} aria-label={zh ? "API 请求协议" : "API backend"} /></label>}
+        {kind === "compatible" && <div className={`col-span-2 flex items-start gap-3 rounded-[5px] border px-3 py-2.5 ${allowInsecureHttp ? "border-gold/45 bg-gold/5" : "border-line bg-void/60"}`}><Toggle on={allowInsecureHttp} onChange={setAllowInsecureHttp} /><button type="button" className="min-w-0 flex-1 text-left" onClick={() => setAllowInsecureHttp((value) => !value)}><span className={`block font-mono text-[9.5px] ${allowInsecureHttp ? "text-gold" : "text-fg2"}`}>{zh ? "允许远程 HTTP（不安全）" : "ALLOW REMOTE HTTP (INSECURE)"}</span><span className="mt-1 block text-[9.5px] leading-relaxed text-dim">{zh ? "仅用于无法提供 HTTPS 的可信中转；API Key 与请求内容会以明文经过网络。云元数据和链路本地地址仍会被拒绝。" : "Only for trusted gateways that cannot provide HTTPS. API keys and prompts travel in plaintext; metadata and link-local targets remain blocked."}</span></button></div>}
         {kind === "compatible" && <p className="col-span-2 rounded-[4px] border border-line bg-void/60 px-2.5 py-2 text-[9.5px] leading-relaxed text-dim">{zh ? "Grox 只把真实 Key 注入当前 ACP 子进程，并为当前模型与标题别名写入可恢复的 env_key、base_url 和所选 API 协议；切走供应商时原样恢复用户配置。" : "Grox injects the literal key only into the active ACP child and applies reversible env_key, base_url, and API backend overrides for the selected models and title alias."}</p>}
       </div>
       {kind === "compatible" && <div className="mt-4 grid grid-cols-2 gap-3 border-t border-line pt-4">
