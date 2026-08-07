@@ -40,6 +40,7 @@ import type {
   RewindResult,
   SlashCommand,
   WorkflowRun,
+  RuntimeNotice,
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
 import { loadSessionCache, removeSessionCache, scheduleSaveSessionCache } from "../lib/sessionCache";
@@ -54,11 +55,13 @@ import {
 import {
   consumeShellUpgradeRescan,
   sanitizeSessionForOpen,
+  shouldCloseDetachedSession,
   shouldForceOfflineRescan,
 } from "../lib/sessionOpenPolicy";
 import {
   filterQueueGhostsByLiveText,
   nextLocalDrainIndex,
+  moveQueueEntry,
 } from "../lib/promptQueue";
 import { nextQueueDrainParked } from "../lib/queueParkPolicy";
 import {
@@ -157,6 +160,7 @@ export interface QueuedPrompt {
 interface DesktopState {
   ready: boolean;
   startupError: string | null;
+  runtimeNotices: RuntimeNotice[];
   auth: AuthState;
   bridgeKind: "mock" | "acp";
   workspace: string;
@@ -218,6 +222,7 @@ interface DesktopState {
   historySyncedAt: number;
 
   init(): Promise<void>;
+  dismissRuntimeNotice(id: string): void;
   goHome(): void;
   openSession(id: string): Promise<void>;
   newSession(launch?: { text: string; attachments?: PromptAttachment[] }): Promise<void>;
@@ -268,6 +273,9 @@ interface DesktopState {
   sendPrompt(text: string, attachments?: PromptAttachment[], targetSessionId?: string, modeOverride?: AgentMode): boolean;
   interjectPrompt(text: string, attachments?: PromptAttachment[], targetSessionId?: string): Promise<boolean>;
   removeQueuedPrompt(sessionId: string, queueId: string): void;
+  updateQueuedPrompt(sessionId: string, queueId: string, text: string): void;
+  moveQueuedPrompt(sessionId: string, queueId: string, direction: -1 | 1): void;
+  moveQueuedAttachment(sessionId: string, queueId: string, attachmentId: string, direction: -1 | 1): void;
   clearPromptQueue(sessionId?: string): void;
   stop(): void;
   emergencyStopComputer(): void;
@@ -1042,6 +1050,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
       case "usage":
         withSession(e.sessionId, (s) => ({ ...s, usage: e.usage }), false);
         break;
+      case "runtime_notice":
+        set((state) => ({
+          runtimeNotices: state.runtimeNotices.some((item) => item.id === e.notice.id)
+            ? state.runtimeNotices
+            : [...state.runtimeNotices, e.notice],
+        }));
+        void notifyDesktop(e.notice.title, e.notice.message);
+        break;
       case "error":
         withSession(
           e.sessionId,
@@ -1099,6 +1115,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
   return {
     ready: false,
     startupError: null,
+    runtimeNotices: [],
     auth: { required: false, inProgress: false },
     bridgeKind: bridge.kind,
     workspace: DEMO_CWD,
@@ -1241,10 +1258,27 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
     },
 
-    goHome: () => set({ view: "home", activeId: null }),
+    dismissRuntimeNotice: (id) => set((state) => ({
+      runtimeNotices: state.runtimeNotices.filter((item) => item.id !== id),
+    })),
+
+    goHome: () => {
+      const state = get();
+      const currentId = state.activeId;
+      const current = currentId ? state.sessions[currentId] : undefined;
+      if (shouldCloseDetachedSession({ currentId, nextId: null, status: current?.status })) {
+        void bridge.closeSession(currentId!).catch(() => {});
+      }
+      set({ view: "home", activeId: null });
+    },
 
     async openSession(id) {
       const beforeOpen = get();
+      const currentId = beforeOpen.activeId;
+      const current = currentId ? beforeOpen.sessions[currentId] : undefined;
+      if (shouldCloseDetachedSession({ currentId, nextId: id, status: current?.status })) {
+        void bridge.closeSession(currentId!).catch(() => {});
+      }
       const meta = beforeOpen.sessionIndex.find((entry) => entry.id === id);
       if (meta?.completionUnread) {
         const sessionIndex = beforeOpen.sessionIndex.map((entry) =>
@@ -1294,6 +1328,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async newSession(launch) {
+      const beforeNew = get();
+      const currentId = beforeNew.activeId;
+      const current = currentId ? beforeNew.sessions[currentId] : undefined;
+      if (shouldCloseDetachedSession({ currentId, nextId: null, status: current?.status })) {
+        void bridge.closeSession(currentId!).catch(() => {});
+      }
       pendingLaunch = launch
         ? { text: launch.text, attachments: launch.attachments ?? [] }
         : undefined;
@@ -2054,6 +2094,36 @@ export const useDesktop = create<DesktopState>((set, get) => {
     removeQueuedPrompt(sessionId, queueId) {
       const queue = get().promptQueues[sessionId] ?? [];
       set({ promptQueues: { ...get().promptQueues, [sessionId]: queue.filter((item) => item.id !== queueId) } });
+    },
+
+    updateQueuedPrompt(sessionId, queueId, text) {
+      const queue = get().promptQueues[sessionId] ?? [];
+      set({
+        promptQueues: {
+          ...get().promptQueues,
+          [sessionId]: queue.map((item) => item.id === queueId ? { ...item, text } : item),
+        },
+      });
+    },
+
+    moveQueuedPrompt(sessionId, queueId, direction) {
+      const queue = get().promptQueues[sessionId] ?? [];
+      const index = queue.findIndex((item) => item.id === queueId);
+      set({ promptQueues: { ...get().promptQueues, [sessionId]: moveQueueEntry(queue, index, direction) } });
+    },
+
+    moveQueuedAttachment(sessionId, queueId, attachmentId, direction) {
+      const queue = get().promptQueues[sessionId] ?? [];
+      set({
+        promptQueues: {
+          ...get().promptQueues,
+          [sessionId]: queue.map((item) => {
+            if (item.id !== queueId) return item;
+            const index = item.attachments.findIndex((attachment) => attachment.id === attachmentId);
+            return { ...item, attachments: moveQueueEntry(item.attachments, index, direction) };
+          }),
+        },
+      });
     },
 
     clearPromptQueue(sessionId) {

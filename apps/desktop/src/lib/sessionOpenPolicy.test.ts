@@ -3,6 +3,7 @@ import {
   SHELL_VERSION_STORAGE_KEY,
   consumeShellUpgradeRescan,
   sanitizeSessionForOpen,
+  shouldCloseDetachedSession,
   shouldForceOfflineRescan,
 } from "./sessionOpenPolicy";
 
@@ -94,5 +95,16 @@ describe("shouldForceOfflineRescan (0.2.30 per-session)", () => {
 describe("sanitizeSessionForOpen", () => {
   it("always paints idle", () => {
     expect(sanitizeSessionForOpen({ status: "running", blocks: [] }).status).toBe("idle");
+  });
+});
+
+describe("shouldCloseDetachedSession", () => {
+  it("closes an idle attachment when navigating away", () => {
+    expect(shouldCloseDetachedSession({ currentId: "sess-a", nextId: "sess-b", status: "idle" })).toBe(true);
+  });
+
+  it("keeps running and same-session attachments alive", () => {
+    expect(shouldCloseDetachedSession({ currentId: "sess-a", nextId: "sess-b", status: "running" })).toBe(false);
+    expect(shouldCloseDetachedSession({ currentId: "sess-a", nextId: "sess-a", status: "idle" })).toBe(false);
   });
 });

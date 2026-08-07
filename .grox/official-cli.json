@@ -1,10 +1,30 @@
 {
+  "schemaVersion": 2,
   "repository": "https://github.com/xai-org/grok-build",
   "branch": "main",
-  "commit": "393430ee4934bc791b0d538f304a21691c517433",
-  "sourceRevision": "796754a8bf947b7c6c579049f94c7cfd0ac0ec03",
-  "version": "0.2.121",
-  "reviewedAt": "2026-08-07",
+  "latestObserved": {
+    "commit": "afbc0fb710320c7add294c2106d447ecc3e3af2e",
+    "sourceRevision": "3e620a76a5f374ce644dc7c87f7e990c68348218",
+    "publicVersion": "1.0.0",
+    "packageVersion": "1.0.0",
+    "observedAt": "2026-08-08"
+  },
+  "verifiedIntegration": null,
+  "integrationTarget": {
+    "baseCommit": "a5589e958437d79e13db026eedcb1720bffd4063",
+    "commit": "afbc0fb710320c7add294c2106d447ecc3e3af2e",
+    "publicVersion": "1.0.0",
+    "packageVersion": "1.0.0",
+    "status": "in_progress",
+    "inventory": "docs/upstream/grok-build-v1.0.0.md",
+    "issue": 16
+  },
+  "invalidatedClaim": {
+    "commit": "393430ee4934bc791b0d538f304a21691c517433",
+    "claimedAt": "2026-08-07",
+    "invalidatedAt": "2026-08-08",
+    "reason": "此前仅完成静态兼容检查，未逐项完成桌面融合决策和真实 CLI 回归"
+  },
   "changelog": "https://x.ai/build/changelog",
   "install": {
     "windows": "https://x.ai/cli/install.ps1",

@@ -500,6 +500,9 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
           <Icon name="more" size={12} />
         </button>
       </div>
+      {meta.summary && meta.summary !== meta.title && (
+        <p className="mt-0.5 truncate pl-3.5 text-[9.5px] leading-tight text-mute" title={meta.summary}>{meta.summary}</p>
+      )}
       <div className="mt-0.5 flex items-center justify-between pl-3.5">
         <span className="font-mono text-[9.5px] text-faint">{fmtRelTime(meta.updatedAt)}</span>
         {tokens > 0 && <span className="tnum text-[9.5px] text-faint">{fmtTokens(tokens)} TOK</span>}
@@ -515,6 +518,7 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
           <MenuButton icon="folder" label={language === "zh-CN" ? "复制工作目录" : "Copy working directory"} onClick={() => void copySessionValue(meta.id, "cwd")} />
           <MenuButton icon="copy" label={language === "zh-CN" ? "复制会话 ID" : "Copy session ID"} onClick={() => void copySessionValue(meta.id, "id")} />
           <MenuButton icon="external" label={language === "zh-CN" ? "复制深度链接" : "Copy deep link"} onClick={() => void copySessionValue(meta.id, "link")} />
+          <MenuButton icon="summary" label={language === "zh-CN" ? "导出会话诊断" : "Export session trace"} onClick={() => void invoke<string>("export_session_trace", { sessionId: meta.id }).then((path) => navigator.clipboard.writeText(path))} />
           <MenuDivider />
           <MenuButton icon="arrowRight" label={language === "zh-CN" ? "在新聊天中继续" : "Continue in new chat"} onClick={() => void continueInNewChat(meta.id)} />
           <MenuButton icon="branch" label={language === "zh-CN" ? "在新工作树中继续" : "Continue in new worktree"} onClick={() => void continueInWorktree(meta.id)} />

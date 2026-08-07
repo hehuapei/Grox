@@ -277,6 +277,8 @@ export class MockBridge implements GrokBridge {
     });
   }
 
+  async closeSession(_id: string): Promise<void> {}
+
   async renameSession(id: string, title: string): Promise<void> {
     const s = this.sessions.get(id);
     if (s) s.title = title;

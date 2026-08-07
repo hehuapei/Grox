@@ -1746,6 +1746,39 @@ fn grok_runtime_info(app: tauri::AppHandle) -> GrokRuntimeInfo {
     configured_grok_command(&app)
 }
 
+#[tauri::command]
+async fn export_session_trace(app: tauri::AppHandle, session_id: String) -> Result<String, String> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() || session_id.len() > 128 || !session_id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-') {
+        return Err("会话 ID 格式无效".into());
+    }
+    let runtime = configured_grok_command(&app);
+    let mut command = Command::new(&runtime.path);
+    command.args(["trace", session_id, "--local", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command.output().await.map_err(|error| format!("无法启动会话诊断导出：{error}"))?;
+    if !output.status.success() {
+        return Err(format!("会话诊断导出失败：{}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|error| format!("无法解析会话诊断导出结果：{error}"))?;
+    let path = value.get("path")
+        .or_else(|| value.get("outputPath"))
+        .or_else(|| value.get("local_path"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "会话诊断已导出，但官方 CLI 未返回文件路径".to_string())?;
+    Ok(path.to_string())
+}
+
 fn is_trusted_cli_install_host(host: Option<&str>) -> bool {
     let Some(host) = host else {
         return false;
@@ -6474,6 +6507,7 @@ fn main() {
             activate_provider_profile,
             delete_provider_profile,
             grok_runtime_info,
+            export_session_trace,
             install_official_grok_cli,
             check_for_update,
             get_update_status,

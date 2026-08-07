@@ -4,7 +4,7 @@
    place and quiets down into the transcript.
    ───────────────────────────────────────────────────────────────────────── */
 
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import type { PermissionOption, SessionBlock } from "../../bridge/types";
 import { useDesktop } from "../../state/store";
 import { Icon } from "../fx/Icon";
@@ -17,6 +17,7 @@ export function PermissionCard({ block, sessionId }: { block: PermissionBlock; s
   const resolvePermission = useDesktop((s) => s.resolvePermission);
   const isActive = useDesktop((s) => s.activeId === sessionId && s.sessions[sessionId]?.status === "awaiting_permission");
   const resolved = block.resolved;
+  const [expanded, setExpanded] = useState(false);
   const order: PermissionOption[] = ["allow_once", "allow_always", "deny"];
   const options = order.filter((o) => block.req.options.includes(o));
   const optionLabels: Record<PermissionOption, string> = {
@@ -28,6 +29,16 @@ export function PermissionCard({ block, sessionId }: { block: PermissionBlock; s
   useEffect(() => {
     if (resolved || !isActive) return;
     const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f" && block.req.payload && block.req.payload.length > 240) {
+        e.preventDefault();
+        setExpanded(true);
+        return;
+      }
+      if (e.key === "Escape" && options.includes("deny")) {
+        e.preventDefault();
+        resolvePermission(block.id, "deny");
+        return;
+      }
       const idx = ["1", "2", "3"].indexOf(e.key);
       if (idx >= 0 && options[idx]) {
         e.preventDefault();
@@ -36,7 +47,7 @@ export function PermissionCard({ block, sessionId }: { block: PermissionBlock; s
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [resolved, isActive, options, block.id, resolvePermission]);
+  }, [resolved, isActive, options, block.id, block.req.payload, resolvePermission]);
 
   return (
     <div
@@ -62,7 +73,14 @@ export function PermissionCard({ block, sessionId }: { block: PermissionBlock; s
 
       {block.req.payload && (
         <div className="mt-2.5 rounded-[5px] border border-line2 bg-void px-3 py-2">
-          <code className="font-mono text-[11px] text-fg2 select-text">{block.req.payload}</code>
+          <pre className={`${expanded ? "max-h-[60vh]" : "max-h-36"} overflow-auto whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-fg2 select-text`}>{block.req.payload}</pre>
+          {block.req.payload.length > 240 && (
+            <button onClick={() => setExpanded((value) => !value)} className="mt-2 font-mono text-[9px] text-gold hover:text-fg">
+              {expanded
+                ? language === "zh-CN" ? "收起完整脚本" : "Collapse script"
+                : language === "zh-CN" ? "展开完整脚本" : "Expand full script"}
+            </button>
+          )}
         </div>
       )}
 

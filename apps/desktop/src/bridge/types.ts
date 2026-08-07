@@ -39,6 +39,8 @@ export type ToolKind =
   | "use_tool"
   | "monitor"
   | "goal_update"
+  | "voice"
+  | "finance"
   /** Legacy aliases emitted by older Grok builds and the demo bridge. */
   | "terminal"
   | "web"
@@ -77,6 +79,8 @@ export interface ToolCall {
   kind: ToolKind;
   /** Exact wire value. Kept so new Grok tools remain inspectable before the UI is upgraded. */
   rawKind?: string;
+  /** Official x.ai/tool metadata: true means the call cannot mutate user state. */
+  readOnly?: boolean;
   /** short human title, e.g. "read_file — src/middleware/api.rs" */
   title: string;
   detail?: string;
@@ -253,6 +257,8 @@ export const isSessionTerminal = (status: SessionStatus) => status === "idle" ||
 export interface SessionMeta {
   id: string;
   title: string;
+  /** Latest upstream answer/finding summary for the desktop mission row. */
+  summary?: string;
   cwd: string;
   createdAt: number;
   updatedAt: number;
@@ -488,7 +494,15 @@ export type BridgeEvent =
   | { type: "question_resolved"; sessionId: string; blockId: string; response: QuestionResponse }
   | { type: "status"; sessionId: string; status: SessionStatus }
   | { type: "usage"; sessionId: string; usage: Usage }
+  | { type: "runtime_notice"; notice: RuntimeNotice }
   | { type: "error"; sessionId: string; message: string };
+
+export interface RuntimeNotice {
+  id: string;
+  level: "warning" | "error";
+  title: string;
+  message: string;
+}
 
 export interface PromptOptions {
   model: string;

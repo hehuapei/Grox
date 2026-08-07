@@ -21,6 +21,7 @@ import { useI18n } from "./lib/i18n";
 import { WorkbenchPanel } from "./components/chrome/WorkbenchPanel";
 import { AccountSetup } from "./components/settings/AccountSetup";
 import { UpdateNotice } from "./components/update/UpdateNotice";
+import { RuntimeNotice } from "./components/update/RuntimeNotice";
 
 class AppErrorBoundary extends Component<{ children: ReactNode }, { error?: Error }> {
   state: { error?: Error } = {};
@@ -104,6 +105,7 @@ export default function App() {
     <AppErrorBoundary>
     <div className="flex h-screen flex-col bg-base">
       <TitleBar />
+      <RuntimeNotice />
       <div className="flex min-h-0 flex-1">
         <Sidebar />
         <ResizeHandle side="right" value={sidebarWidth} onChange={setSidebarWidth} />

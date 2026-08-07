@@ -48,11 +48,13 @@ import type {
   WorkflowRun,
 } from "./types";
 import { readStoredPermissionMode } from "../lib/permissionMode";
+import { cleanApiError, toolCanonicalKind, toolReadOnly, versionMismatchNotice } from "../lib/runtimeNotice";
 
 export const ACP_METHODS = {
   initialize: "initialize",
   sessionNew: "session/new",
   sessionLoad: "session/load",
+  sessionClose: "session/close",
   sessionPrompt: "session/prompt",
   sessionCancel: "session/cancel",
   sessionSetMode: "session/set_mode",
@@ -337,12 +339,7 @@ function array(value: unknown): unknown[] {
 }
 
 function errorText(value: unknown): string {
-  const object = record(value);
-  return (
-    string(object?.message) ??
-    string(object?.data) ??
-    (value instanceof Error ? value.message : String(value))
-  );
+  return cleanApiError(value);
 }
 
 function jsonText(value: unknown): string | undefined {
@@ -518,7 +515,7 @@ const TOOL_KINDS = new Set<ToolKind>([
   "kill_task_action", "list", "skill", "memory_search", "memory_get", "task", "enter_plan",
   "exit_plan", "ask_user", "image_gen", "video_gen", "image_to_video", "reference_to_video", "computer",
   "deploy_app", "search_tool", "use_tool", "monitor", "goal_update", "terminal", "web",
-  "think", "switch_mode", "other",
+  "think", "switch_mode", "voice", "finance", "other",
 ]);
 
 function mapToolKind(kindValue: unknown, titleValue: unknown): ToolKind {
@@ -526,6 +523,8 @@ function mapToolKind(kindValue: unknown, titleValue: unknown): ToolKind {
   if (TOOL_KINDS.has(exact as ToolKind)) return exact as ToolKind;
   if (exact === "fetch") return "web_fetch";
   const source = `${exact} ${string(titleValue) ?? ""}`.toLowerCase();
+  if (/\b(voice|speech|audio|transcri(?:be|ption))\b/.test(source)) return "voice";
+  if (/\b(finance|market|stock|quote|ticker)\b/.test(source)) return "finance";
   if (
     /\bcomputer_(screenshot|mouse|click|drag|scroll|key|type|wait)\b/.test(source) ||
     (
@@ -959,6 +958,7 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
     case "available_commands":
     case "workflow_update":
     case "workflow_trace_update":
+    case "runtime_notice":
       return session;
     case "session_meta":
       return { ...session, ...event.patch };
@@ -1587,6 +1587,11 @@ export class AcpBridge implements GrokBridge {
   }
 
   private onNotification(method: string, paramsValue: unknown) {
+    if (method === "x.ai/leader/version_mismatch") {
+      const notice = versionMismatchNotice(paramsValue);
+      if (notice) this.emit({ type: "runtime_notice", notice });
+      return;
+    }
     if (method === "session/update" || method === "x.ai/session/update") {
       const params = record(paramsValue);
       const sessionId = string(params?.sessionId);
@@ -1857,11 +1862,13 @@ export class AcpBridge implements GrokBridge {
     const blockId = cursor.toolBlocks.get(toolCallId) ?? uid();
     cursor.toolBlocks.set(toolCallId, blockId);
     const content = array(update.content);
-    const kind = mapToolKind(update.kind, update.title);
+    const canonicalKind = toolCanonicalKind(update);
+    const kind = mapToolKind(canonicalKind ?? update.kind, update.title);
     const call: ToolCall = {
       id: toolCallId,
       kind,
-      rawKind: string(update.kind),
+      rawKind: canonicalKind ?? string(update.kind),
+      readOnly: toolReadOnly(update),
       title: string(update.title) ?? "tool",
       detail: string(update.detail),
       status: mapToolStatus(update.status),
@@ -1902,14 +1909,17 @@ export class AcpBridge implements GrokBridge {
     }
     const status = mapToolStatus(update.status);
     const content = array(update.content);
+    const canonicalKind = toolCanonicalKind(update);
     const terminal = extractTerminal(
-      mapToolKind(update.kind, update.title),
+      mapToolKind(canonicalKind ?? update.kind, update.title),
       update.title,
       update.rawInput,
       update.rawOutput,
       content,
     );
-    const kind = mapToolKind(update.kind, update.title);
+    const kind = mapToolKind(canonicalKind ?? update.kind, update.title);
+    const hasSpecificKind = canonicalKind !== undefined
+      || (update.kind !== undefined && string(update.kind) !== "other");
     const computerToolKey = `${sessionId}:${toolCallId}`;
     const isComputerTool = kind === "computer" || this.activeComputerToolCalls.has(computerToolKey);
     if (isComputerTool) {
@@ -1930,8 +1940,8 @@ export class AcpBridge implements GrokBridge {
       sessionId,
       blockId,
       call: {
-        ...(update.kind !== undefined || update.title !== undefined ? { kind } : {}),
-        ...(update.kind !== undefined ? { rawKind: string(update.kind) } : {}),
+        ...(hasSpecificKind ? { kind, rawKind: canonicalKind ?? string(update.kind) } : {}),
+        ...(toolReadOnly(update) !== undefined ? { readOnly: toolReadOnly(update) } : {}),
         status,
         ...(status === "done" || status === "error" || status === "cancelled" ? { endedAt: Date.now() } : {}),
         ...(update.title !== undefined ? { title: string(update.title) } : {}),
@@ -2412,6 +2422,7 @@ export class AcpBridge implements GrokBridge {
     return {
       id,
       title,
+      summary: string(row.summary),
       cwd: string(row.cwd) ?? fallbackCwd,
       createdAt: parseTimestamp(row.createdAt),
       updatedAt: parseTimestamp(row.lastActiveAt ?? row.updatedAt),
@@ -3585,6 +3596,21 @@ export class AcpBridge implements GrokBridge {
     this.activeComputerSessions.delete(id);
     for (const key of this.activeComputerToolCalls) {
       if (key.startsWith(`${id}:`)) this.activeComputerToolCalls.delete(key);
+    }
+    this.knownSessions.delete(id);
+    this.sessionWorkspaces.delete(id);
+    this.cursors.delete(id);
+    this.usage.delete(id);
+  }
+
+  async closeSession(id: string): Promise<void> {
+    if (!this.knownSessions.has(id)) return;
+    try {
+      await this.request(ACP_METHODS.sessionClose, { sessionId: id });
+    } catch (error) {
+      // Grok Build v1 also retains the pre-ACP spelling for older clients.
+      if (!isMethodUnavailable(error)) throw error;
+      await this.request("x.ai/session/close", { sessionId: id });
     }
     this.knownSessions.delete(id);
     this.sessionWorkspaces.delete(id);

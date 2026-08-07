@@ -24,6 +24,7 @@ import {
 import { attachExplicitPromptImages } from "../../lib/pathAttachments";
 import { RewindMenu } from "./RewindMenu";
 import { useImeGuard } from "../../lib/ime";
+import { bridge } from "../../bridge";
 
 interface SlashCmd {
   id: string;
@@ -41,6 +42,10 @@ export function Composer() {
   const [slashIdx, setSlashIdx] = useState(0);
   const [attachmentError, setAttachmentError] = useState("");
   const [readingFiles, setReadingFiles] = useState(false);
+  const [feedbackOpen, setFeedbackOpen] = useState(false);
+  const [feedbackText, setFeedbackText] = useState("");
+  const [feedbackError, setFeedbackError] = useState("");
+  const [feedbackSending, setFeedbackSending] = useState(false);
   const taRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const slashMenuRef = useRef<HTMLDivElement>(null);
@@ -50,6 +55,9 @@ export function Composer() {
   const sendPrompt = useDesktop((s) => s.sendPrompt);
   const interjectPrompt = useDesktop((s) => s.interjectPrompt);
   const removeQueuedPrompt = useDesktop((s) => s.removeQueuedPrompt);
+  const updateQueuedPrompt = useDesktop((s) => s.updateQueuedPrompt);
+  const moveQueuedPrompt = useDesktop((s) => s.moveQueuedPrompt);
+  const moveQueuedAttachment = useDesktop((s) => s.moveQueuedAttachment);
   const clearPromptQueue = useDesktop((s) => s.clearPromptQueue);
   const activeId = useDesktop((s) => s.activeId);
   const workspace = useDesktop((s) => s.workspace);
@@ -117,9 +125,12 @@ export function Composer() {
     { id: "/tasks", hint: language === "zh-CN" ? "查看任务和工具活动" : "show tasks and tool activity", run: () => setInspectorTab("tasks") },
     { id: "/workflows", hint: language === "zh-CN" ? "打开后台工作流面板（深度研究进度）" : "open background workflow runs", run: () => setInspectorTab("tasks") },
     { id: "/context", hint: language === "zh-CN" ? "查看上下文和用量" : "show context and usage", run: () => setInspectorTab("usage") },
+    { id: "/usage", hint: language === "zh-CN" ? "查看用量" : "show usage", run: () => setInspectorTab("usage") },
+    { id: "/session-info", hint: language === "zh-CN" ? "查看当前任务信息" : "show current mission info", run: () => setInspectorTab("usage") },
     { id: "/skills", hint: language === "zh-CN" ? "管理 Skill" : "manage skills", run: () => openExtensionSettings("skills") },
     { id: "/mcps", hint: language === "zh-CN" ? "管理 MCP Server" : "manage MCP servers", run: () => openExtensionSettings("mcp") },
     { id: "/plugins", hint: language === "zh-CN" ? "管理 Plugin 与市场" : "manage plugins and marketplace", run: () => openExtensionSettings("plugins") },
+    { id: "/feedback", hint: language === "zh-CN" ? "向 Grok Build 提交反馈" : "send feedback to Grok Build", run: () => setFeedbackOpen(true) },
     {
       id: "/model",
       hint: "cycle model",
@@ -401,12 +412,28 @@ export function Composer() {
                 </button>
               </div>
               <div className="space-y-1">
-                {queue.map((item) => (
-                  <div key={item.id} className="flex items-center gap-2 rounded-lg bg-high/60 px-2 py-1.5">
-                    <span className="min-w-0 flex-1 truncate text-[10.5px] text-fg2">{item.text || item.attachments.map((a) => a.name).join(", ")}</span>
+                {queue.map((item, index) => (
+                  <div key={item.id} className="rounded-lg bg-high/60 px-2 py-1.5">
+                    <div className="flex items-center gap-1.5">
+                    <input
+                      value={item.text}
+                      onChange={(event) => activeId && updateQueuedPrompt(activeId, item.id, event.target.value)}
+                      placeholder={item.attachments.length > 0 ? (language === "zh-CN" ? "图片消息" : "Image prompt") : undefined}
+                      className="min-w-0 flex-1 bg-transparent text-[10.5px] text-fg2 outline-none placeholder:text-faint"
+                    />
+                    <button disabled={index === 0} onClick={() => activeId && moveQueuedPrompt(activeId, item.id, -1)} className="text-faint enabled:hover:text-fg disabled:opacity-25" title={language === "zh-CN" ? "上移" : "Move up"}><Icon name="arrowUp" size={9} /></button>
+                    <button disabled={index === queue.length - 1} onClick={() => activeId && moveQueuedPrompt(activeId, item.id, 1)} className="rotate-180 text-faint enabled:hover:text-fg disabled:opacity-25" title={language === "zh-CN" ? "下移" : "Move down"}><Icon name="arrowUp" size={9} /></button>
                     <button onClick={() => activeId && removeQueuedPrompt(activeId, item.id)} className="text-faint hover:text-red" title={language === "zh-CN" ? "移出队列" : "Remove from queue"}>
                       <Icon name="x" size={9} />
                     </button>
+                    </div>
+                    {item.attachments.length > 0 && <div className="mt-1 flex flex-wrap gap-1">{item.attachments.map((attachment, attachmentIndex) => (
+                      <span key={attachment.id} className="flex items-center gap-1 rounded-[3px] border border-line px-1.5 py-0.5 font-mono text-[8.5px] text-mute">
+                        <span className="max-w-28 truncate">{attachment.name}</span>
+                        <button disabled={attachmentIndex === 0} onClick={() => activeId && moveQueuedAttachment(activeId, item.id, attachment.id, -1)} className="disabled:opacity-20" aria-label="上移附件">↑</button>
+                        <button disabled={attachmentIndex === item.attachments.length - 1} onClick={() => activeId && moveQueuedAttachment(activeId, item.id, attachment.id, 1)} className="disabled:opacity-20" aria-label="下移附件">↓</button>
+                      </span>
+                    ))}</div>}
                   </div>
                 ))}
               </div>
@@ -516,6 +543,17 @@ export function Composer() {
               </button>
             )}
           </div>
+          {feedbackOpen && (
+            <div className="fixed inset-0 z-[80] flex items-center justify-center bg-black/65 p-6" onMouseDown={(event) => event.target === event.currentTarget && setFeedbackOpen(false)}>
+              <div className="w-full max-w-lg rounded-[7px] border border-line3 bg-raise p-4 shadow-2xl">
+                <div className="flex items-center justify-between"><span className="lbl !text-gold">{language === "zh-CN" ? "提交 GROK BUILD 反馈" : "GROK BUILD FEEDBACK"}</span><button onClick={() => setFeedbackOpen(false)} className="text-faint hover:text-fg"><Icon name="x" size={11} /></button></div>
+                <p className="mt-2 text-[10.5px] leading-relaxed text-dim">{language === "zh-CN" ? "反馈会通过官方 x.ai/feedback 通道提交，并关联当前任务上下文。" : "Feedback is submitted through the official x.ai/feedback channel with this mission context."}</p>
+                <textarea autoFocus value={feedbackText} onChange={(event) => setFeedbackText(event.target.value)} rows={6} className="mt-3 w-full resize-y rounded-[5px] border border-line2 bg-void p-3 text-[12px] text-fg outline-none focus:border-gold/60" placeholder={language === "zh-CN" ? "请描述问题或建议…" : "Describe the issue or suggestion…"} />
+                {feedbackError && <p className="mt-2 text-[10px] text-red">{feedbackError}</p>}
+                <div className="mt-3 flex justify-end gap-2"><button onClick={() => setFeedbackOpen(false)} className="rounded-[4px] border border-line2 px-3 py-2 text-[10.5px] text-mute hover:text-fg">{language === "zh-CN" ? "取消" : "Cancel"}</button><button disabled={!feedbackText.trim() || feedbackSending || !activeId} onClick={() => { if (!activeId) return; setFeedbackSending(true); setFeedbackError(""); void bridge.callExtension("x.ai/feedback", { session_id: activeId, feedback_text: feedbackText.trim() }).then(() => { setFeedbackText(""); setFeedbackOpen(false); }).catch((error) => setFeedbackError(error instanceof Error ? error.message : String(error))).finally(() => setFeedbackSending(false)); }} className="rounded-[4px] bg-gold px-3 py-2 text-[10.5px] font-medium text-base disabled:opacity-40">{feedbackSending ? (language === "zh-CN" ? "提交中…" : "Sending…") : (language === "zh-CN" ? "提交" : "Submit")}</button></div>
+              </div>
+            </div>
+          )}
           {attachmentError && <p className="border-t border-red/20 px-3 py-1.5 text-[9.5px] text-red">{attachmentError}</p>}
         </div>
         </div>
