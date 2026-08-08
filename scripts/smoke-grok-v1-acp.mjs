@@ -21,6 +21,7 @@ const lines = createInterface({ input: child.stdout });
 let requestId = 0;
 const pending = new Map();
 const notifications = [];
+let permissionRequests = 0;
 let stderr = "";
 child.stderr.on("data", (chunk) => { stderr = `${stderr}${chunk}`.slice(-16_000); });
 
@@ -35,6 +36,18 @@ lines.on("line", (line) => {
     return;
   }
   if (message.method && message.id !== undefined) {
+    if (message.method === "session/request_permission") {
+      permissionRequests += 1;
+      const options = Array.isArray(message.params?.options) ? message.params.options : [];
+      const allowed = options.find((option) => option?.kind === "allow_once")
+        ?? options.find((option) => /allow|approve/i.test(`${option?.optionId ?? ""} ${option?.name ?? ""}`));
+      if (!allowed?.optionId) {
+        child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32602, message: "No allow-once permission option" } })}\n`);
+      } else {
+        child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { outcome: { outcome: "selected", optionId: allowed.optionId } } })}\n`);
+      }
+      return;
+    }
     child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: `Smoke client does not implement ${message.method}` } })}\n`);
     return;
   }
@@ -151,6 +164,7 @@ try {
     sessionId,
     forkedSessionId,
     versionMismatchNotifications: notifications.filter((message) => message.method.includes("version_mismatch")).length,
+    permissionRequests,
   }, null, 2));
 } finally {
   lines.close();
