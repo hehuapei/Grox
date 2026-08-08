@@ -36,6 +36,8 @@ Grox 已完成官网 v1.0.0（上游提交 `afbc0fb710320c7add294c2106d447ecc3e3
 
 Windows 另使用本机已登录的官方稳定版完成真实在线 prompt，以上会话、模式、列表、fork/load/close 路径均通过；凭据未被读取、打印或复制。
 
+针对大目录与 Git 边界，Windows 还构造了一个无 origin、无 HEAD、在默认忽略的 `node_modules` 下含 8,000 个文件的临时仓库。官方 v1.0.0 在 7.4 秒内完成 initialize、new、info、模式切换、fork、load、close，未出现启动或 restore 挂起；夹具随后已清理。
+
 ## Grox 非终端融合
 
 - 队列、取消和忙碌态由 Grox 每会话 GUI 状态机承接，共 24 项队列测试；不会依赖 TUI 的按键或绘制状态。

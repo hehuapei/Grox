@@ -25,7 +25,7 @@
 | UP-005 | 远端父会话恢复后，子会话续接不再 404 | 继承运行时修复；以 Grox 后台 workflow 恢复场景验收。 | `workflow_trace_update`、`loadSession(background)`；会话重挂/分叉回归通过 |
 | UP-006 | 无重放重挂运行会话，并可显式关闭 | 保留后台 `session/load` 重挂；离开空闲/失败任务时调用标准 `session/close`，旧拼写回退，不删除历史。运行中任务继续后台执行。 | 三平台官方 `fork → load → close` 与 Grox 单测通过 |
 | UP-007 | 超大 Session fork 内存降低 | 继承 CLI；Grox 的“新聊天继续”使用官方 fork 扩展。 | `continueSessionInNewChat` / `x.ai/session/fork`；待大历史实机 |
-| UP-008 | 无 origin/HEAD 时正确识别默认分支 | 继承 CLI Git 探测；Grox 工作树流程不得另行猜测分支。 | Tauri `git_confirm` + 官方 session/fork；已验证 |
+| UP-008 | 无 origin/HEAD 时正确识别默认分支 | 继承 CLI Git 探测；Grox 工作树流程不得另行猜测分支。 | Windows 无 origin/HEAD、8,000 文件夹具完成官方 new/fork/load/close；已验证 |
 | UP-009 | 可重新启用的禁用 MCP 仍可见 | Grox MCP 设置不按 enabled 过滤，直接渲染官方列表并提供 Toggle。 | `SettingsModal.McpPanel` 与官方 `x.ai/mcp/list`；已验证 |
 | UP-010 | Home/非项目目录不再询问项目目录 | Grox Home 明确展示当前 workspace；只有“新建项目”才打开目录选择器。 | `Home`、`newProject`；桌面原生等价 |
 | UP-011 | 快速 send-now / 等待子 Agent 时不丢队列消息 | Grox 使用每会话本地队列、去重、故障 rehome 和按序 drain；不依赖 TUI 队列绘制。 | `promptQueue.test.ts` 24 项队列/并发回归通过 |
@@ -39,7 +39,7 @@
 | UP-019 | Pinned prompt header 可鼠标选择复制 | Grox transcript 文本保持 `select-text`/浏览器原生选择；没有覆盖文本的 TUI 鼠标层。 | WebView 原生选择路径；桌面等价验证通过 |
 | UP-020 | Tab/Esc 在 Question/Permission/Cancel 卡行为一致 | Tab 使用原生焦点顺序；Esc 会取消问题或拒绝权限，Stop 独立可见。 | `QuestionCard`、`PermissionCard`；已实现 |
 | UP-021 | `/new` 后从空 prompt 能回 Dashboard | Grox `/new` 显式创建项目任务；`/home`/侧栏导航始终可返回，不依赖空 prompt 状态。 | `Composer` 本地命令；桌面等价 |
-| UP-022 | 大型或浅克隆仓库 restore 不挂起 | 继承 CLI codebase restore；Grox 后台加载不阻塞主 UI，并保留离线快照。 | 官方 `session/load` + Grox 后台打开/离线合并回归通过 |
+| UP-022 | 大型或浅克隆仓库 restore 不挂起 | 继承 CLI codebase restore；Grox 后台加载不阻塞主 UI，并保留离线快照。 | Windows 8,000 文件仓库官方 `session/load` + Grox 后台打开/离线合并回归通过 |
 | UP-023 | SSH/tmux 自动主题 | Grox 主题由桌面偏好和系统窗口环境决定，不运行于 SSH/tmux TTY。 | 终端检测不适用；用户目标由桌面主题切换覆盖 |
 | UP-024 | Voice/Finance 工具卡图标及本地化 | 增加 voice/finance 工具分类、mic/summary 图标与中文标签。 | `mapToolKind`、`ToolCallCard.kindMeta`；构建/UI 验证通过 |
 | UP-025 | 远端恢复默认只恢复对话，显式参数才恢复代码 | 继承 CLI 安全默认值；Grox 普通打开只走 `session/load`，代码回退仅通过显式 Rewind UI。 | `openSession`、`RewindMenu`；待远端实机 |
@@ -71,7 +71,7 @@
 | UP-051 | Session recap 使用会话语言 | 继承 CLI 的 recap 语言判断；Grox 不翻译模型内容，确保中文 recap 原样进入时间线/摘要。 | 事件流原文透传与摘要合并测试通过 |
 | UP-052 | Session request metadata 支持 startupHints；修复 headless MCP connecting 提醒 | Grox 是可读取正文的交互式 ACP 桌面宿主，不声明“仅通过 deliveryTools 输出”；保留默认连接提醒，避免错误引导模型放弃正文。 | 三平台 MCP 初始化/连接/工具调用通过 |
 | UP-053 | Windows 最新下载名改为 `Grok Setup.exe` | 这是官方 CLI 自身分发文件名；Grox 使用受信 x.ai installer/update 接口，不按旧文件名定位。 | Windows runner 通过 x.ai 官方安装器安装固定 v1.0.0 |
-| UP-054 | 大量 deny-glob 的大目录中 sandboxed Grok 可启动 | 继承 CLI sandbox 修复；Grox 的 ACP child 由官方 CLI建立 sandbox，不自行复制匹配逻辑。 | 三平台官方 ACP 启动与 Grox `acp_spawn` Rust 回归通过 |
+| UP-054 | 大量 deny-glob 的大目录中 sandboxed Grok 可启动 | 继承 CLI sandbox 修复；Grox 的 ACP child 由官方 CLI建立 sandbox，不自行复制匹配逻辑。 | Windows `node_modules` 8,000 文件夹具启动通过；三平台 `acp_spawn` 回归通过 |
 
 ## 集成门禁
 
