@@ -9,13 +9,23 @@
     "packageVersion": "1.0.0",
     "observedAt": "2026-08-08"
   },
-  "verifiedIntegration": null,
+  "verifiedIntegration": {
+    "commit": "afbc0fb710320c7add294c2106d447ecc3e3af2e",
+    "sourceRevision": "3e620a76a5f374ce644dc7c87f7e990c68348218",
+    "publicVersion": "1.0.0",
+    "packageVersion": "1.0.0",
+    "verifiedAt": "2026-08-08",
+    "groxCommit": "ccce3106d6117557613a89f68281ef03e78861e1",
+    "evidence": "docs/upstream/evidence/grok-build-v1.0.0.md",
+    "workflowRun": "https://github.com/dandandujie/Grox/actions/runs/31246326257",
+    "platforms": ["windows-x64", "macos-arm64", "macos-x64"]
+  },
   "integrationTarget": {
     "baseCommit": "a5589e958437d79e13db026eedcb1720bffd4063",
     "commit": "afbc0fb710320c7add294c2106d447ecc3e3af2e",
     "publicVersion": "1.0.0",
     "packageVersion": "1.0.0",
-    "status": "in_progress",
+    "status": "complete",
     "inventory": "docs/upstream/grok-build-v1.0.0.md",
     "issue": 16
   },
