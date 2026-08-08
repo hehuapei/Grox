@@ -1,0 +1,65 @@
+name: Verify Grok Build v1 integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            runner: windows-latest
+          - name: macOS Apple Silicon
+            runner: macos-15
+          - name: macOS Intel
+            runner: macos-15-intel
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Install Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+
+      - name: Install official Grok Build v1.0.0
+        shell: bash
+        run: |
+          export GROK_BIN_DIR="$RUNNER_TEMP/grok-bin"
+          curl -fsSL https://x.ai/cli/install.sh | bash -s -- 1.0.0
+          echo "$GROK_BIN_DIR" >> "$GITHUB_PATH"
+
+      - name: Verify native architecture and official ACP integration
+        shell: bash
+        run: |
+          grok --version
+          node scripts/verify-grok-v1-hermetic.mjs
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6
+        with:
+          version: 10
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: pnpm install --frozen-lockfile
+
+      - name: Run frontend tests and build
+        working-directory: apps/desktop
+        run: pnpm test && pnpm build
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@387aeee55b189f024a4f6d94890c5b18d73339cc # 1.92.0
+
+      - name: Run native Rust tests
+        working-directory: apps/desktop/src-tauri
+        run: cargo test --locked

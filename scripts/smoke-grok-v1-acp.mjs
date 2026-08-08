@@ -1,10 +1,14 @@
 import { createInterface } from "node:readline";
 import { spawn, spawnSync } from "node:child_process";
+import { resolve } from "node:path";
 
 const command = process.env.GROK_COMMAND || "grok";
+const expectedVersion = process.env.GROK_EXPECTED_VERSION || "1.0.0";
 const versionRun = spawnSync(command, ["--version"], { encoding: "utf8", shell: process.platform === "win32" });
 const versionText = `${versionRun.stdout ?? ""}${versionRun.stderr ?? ""}`.trim();
-if (!/\bgrok 1\.0\.0\b/.test(versionText)) throw new Error(`需要官方 grok 1.0.0，实际为：${versionText || "无法执行"}`);
+if (!new RegExp(`\\bgrok ${expectedVersion.replaceAll(".", "\\.")}\\b`).test(versionText)) {
+  throw new Error(`需要官方 grok ${expectedVersion}，实际为：${versionText || "无法执行"}`);
+}
 
 const workspace = process.cwd();
 const child = spawn(command, ["agent", "stdio"], {
@@ -34,7 +38,7 @@ lines.on("line", (line) => {
     child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: `Smoke client does not implement ${message.method}` } })}\n`);
     return;
   }
-  if (message.method) notifications.push(message.method);
+  if (message.method) notifications.push(message);
 });
 
 function request(method, params, timeoutMs = 20_000) {
@@ -46,9 +50,10 @@ function request(method, params, timeoutMs = 20_000) {
     }, timeoutMs);
     pending.set(id, {
       resolve: (value) => { clearTimeout(timer); resolve(value); },
-      reject: (error) => { clearTimeout(timer); reject(error); },
+      reject: (error) => { clearTimeout(timer); reject(new Error(`${method}: ${error instanceof Error ? error.message : String(error)}`)); },
     });
-    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`);
+    const wireMethod = method.startsWith("x.ai/") ? `_${method}` : method;
+    child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method: wireMethod, params })}\n`);
   });
 }
 
@@ -62,16 +67,71 @@ try {
     clientCapabilities: { fs: { readTextFile: true, writeTextFile: true }, terminal: false },
     clientInfo: { name: "grok-shell", title: "Grox v1 smoke", version: "1.0.0" },
     _meta: { clientIdentifier: "grok-shell", clientType: "shell", clientVersion: "1.0.0" },
-  });
+  }, 45_000);
   if (!initialized || typeof initialized !== "object") throw new Error("initialize 未返回对象");
 
-  const listed = unwrapExtension(await request("_x.ai/session/list", { cwd: workspace, limit: 5 }));
+  const listed = unwrapExtension(await request("x.ai/session/list", { cwd: workspace, limit: 5 }));
   if (!listed || typeof listed !== "object" || !Array.isArray(listed.sessions)) throw new Error("x.ai/session/list 返回结构不正确");
 
-  const created = await request("session/new", { cwd: workspace, mcpServers: [], _meta: { reasoningEffort: "low" } }, 45_000);
+  const mcpServers = process.env.GROK_SMOKE_MCP_SCRIPT
+    ? [{ name: "grox-large-image", command: process.execPath, args: [resolve(process.env.GROK_SMOKE_MCP_SCRIPT)], env: [] }]
+    : [];
+  const created = await request("session/new", {
+    cwd: workspace,
+    mcpServers,
+    _meta: { reasoningEffort: "low", modelId: process.env.GROK_SMOKE_MODEL || "grok-build" },
+  }, 60_000);
   const sessionId = created?.sessionId;
   if (typeof sessionId !== "string" || !sessionId) throw new Error("session/new 未返回 sessionId");
 
+  const infoBefore = unwrapExtension(await request("x.ai/session/info", { sessionId }, 30_000));
+  if (infoBefore?.sessionId !== sessionId) throw new Error("x.ai/session/info 未返回当前会话");
+  await request("session/set_mode", { sessionId, modeId: "plan" });
+  await request("session/set_mode", { sessionId, modeId: "agent" });
+
+  let mcp = unwrapExtension(await request("x.ai/mcp/list", { sessionId, cache: true }, 45_000));
+  if (!mcp || !Array.isArray(mcp.servers)) throw new Error("x.ai/mcp/list 返回结构不正确");
+  if (mcpServers.length > 0) {
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline && !JSON.stringify(mcp).includes("large_image")) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 250));
+      mcp = unwrapExtension(await request("x.ai/mcp/list", { sessionId, cache: true }, 10_000));
+    }
+    if (!JSON.stringify(mcp).includes("large_image")) throw new Error(`MCP 工具未完成连接：${JSON.stringify(mcp)}`);
+  }
+  const skills = unwrapExtension(await request("x.ai/skills/list", { cwd: workspace }, 30_000));
+  if (!skills || !Array.isArray(skills.skills)) throw new Error("x.ai/skills/list 返回结构不正确");
+  const workflows = unwrapExtension(await request("x.ai/workflows/list", { sessionId }, 30_000));
+  if (!workflows || !Array.isArray(workflows.workflows)) throw new Error("x.ai/workflows/list 返回结构不正确");
+
+  let prompt = false;
+  let largeMcpImage = false;
+  if (process.env.GROK_SMOKE_PROMPT === "1") {
+    const result = await request("session/prompt", {
+      sessionId,
+      prompt: [{ type: "text", text: process.env.GROK_SMOKE_PROMPT_TEXT || "只回复 GROX_V1_SMOKE_OK，不要使用工具。" }],
+    }, 120_000);
+    const transcript = JSON.stringify([result, notifications]);
+    if (!transcript.includes("GROX_V1_SMOKE_OK")) throw new Error("在线 prompt 未返回约定文本");
+    prompt = true;
+    if (process.env.GROK_SMOKE_EXPECT_IMAGE === "1") {
+      if (!transcript.includes("GROX_LARGE_IMAGE_OK")) throw new Error("大型 MCP 图片工具未成功执行");
+      largeMcpImage = true;
+    }
+  }
+
+  const infoAfter = unwrapExtension(await request("x.ai/session/info", { sessionId }, 30_000));
+  if (prompt && !(Number(infoAfter?.turns) >= 1)) throw new Error("在线 prompt 后 session info 未推进 turns");
+
+  const forked = unwrapExtension(await request("x.ai/session/fork", {
+    sourceSessionId: sessionId,
+    sourceCwd: workspace,
+    newCwd: workspace,
+  }, 60_000));
+  const forkedSessionId = forked?.newSessionId;
+  if (typeof forkedSessionId !== "string" || !forkedSessionId) throw new Error("x.ai/session/fork 未返回新会话 ID");
+  await request("session/load", { sessionId: forkedSessionId, cwd: workspace, mcpServers: [] }, 60_000);
+  await request("session/close", { sessionId: forkedSessionId }, 45_000);
   await request("session/close", { sessionId }, 45_000);
   console.log(JSON.stringify({
     ok: true,
@@ -79,9 +139,18 @@ try {
     initialize: true,
     sessionList: true,
     sessionNew: true,
+    sessionInfo: true,
+    modePlanAgent: true,
+    mcpList: true,
+    skillsList: true,
+    workflowsList: true,
+    prompt,
+    largeMcpImage,
+    sessionForkLoadClose: true,
     sessionClose: true,
     sessionId,
-    versionMismatchNotifications: notifications.filter((method) => method.includes("version_mismatch")).length,
+    forkedSessionId,
+    versionMismatchNotifications: notifications.filter((message) => message.method.includes("version_mismatch")).length,
   }, null, 2));
 } finally {
   lines.close();
