@@ -16,7 +16,6 @@
     "packageVersion": "1.0.0",
     "verifiedAt": "2026-08-08",
     "groxCommit": "ccce3106d6117557613a89f68281ef03e78861e1",
-    "evidence": "docs/upstream/evidence/grok-build-v1.0.0.md",
     "workflowRun": "https://github.com/dandandujie/Grox/actions/runs/31246326257",
     "platforms": ["windows-x64", "macos-arm64", "macos-x64"]
   },
@@ -26,7 +25,6 @@
     "publicVersion": "1.0.0",
     "packageVersion": "1.0.0",
     "status": "complete",
-    "inventory": "docs/upstream/grok-build-v1.0.0.md",
     "issue": 16
   },
   "invalidatedClaim": {
