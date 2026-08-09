@@ -27,8 +27,14 @@
     "sourceRevision": "27b3c66635e2c0bf213429a36ab916f25d59df20",
     "publicVersion": null,
     "packageVersion": "1.0.0",
-    "status": "in_progress",
-    "issue": 23
+    "status": "source_adapted_waiting_release",
+    "issue": 23,
+    "groxCommit": "90dd185b46d442ab5c99823f043c2f97b0d592de",
+    "stableRegressionRun": "https://github.com/dandandujie/Grox/actions/runs/31308799109",
+    "blockers": [
+      "upstream snapshot is not published in the official changelog or installer",
+      "public source snapshot uses /dev/stdout and /dev/null in xai-proto-build, blocking an unmodified Windows Cargo verification"
+    ]
   },
   "invalidatedClaim": {
     "commit": "393430ee4934bc791b0d538f304a21691c517433",
