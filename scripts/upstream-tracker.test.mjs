@@ -8,6 +8,8 @@ import {
   normalizeSourceDiff,
   parsePackageVersion,
   parseSourceRevision,
+  shouldLoadChangelog,
+  versionLabel,
 } from "./upstream-tracker.mjs";
 
 test("parses only the package version", () => {
@@ -79,6 +81,16 @@ test("normalizes every structured changelog item without dropping categories", (
   ]);
 });
 
+test("does not reuse an old changelog for a new source snapshot with the same package version", () => {
+  const state = {
+    latestObserved: { commit: "old", packageVersion: "1.0.0" },
+    integrationTarget: { commit: "old" },
+  };
+  assert.equal(shouldLoadChangelog(state, "new", "1.0.0"), false);
+  assert.equal(shouldLoadChangelog(state, "new", "1.0.1"), true);
+  assert.equal(versionLabel(null, "1.0.0", "8a14c91d888"), "snapshot 8a14c91 (package 1.0.0)");
+});
+
 test("issue body makes observation and verified integration distinct", () => {
   const state = {
     latestObserved: { commit: "old" },
@@ -105,8 +117,15 @@ test("issue body makes observation and verified integration distinct", () => {
   assert.match(body, /源码审计输入（不能由 Changelog 替代）/);
   assert.match(body, /Source-only fix/);
   assert.match(body, /src\/fix\.rs/);
+  assert.match(body, /不得为此提交根目录 `docs\/`/);
+  assert.doesNotMatch(body, /适配矩阵已提交到仓库/);
   assert.equal(findTrackedIssue([{ number: 16, body, state: "CLOSED" }], latest.sha)?.number, 16);
-  assert.equal(findTrackedIssue([{ number: 16, body: "legacy", state: "CLOSED" }], latest.sha, 16)?.number, 16);
+  assert.equal(findTrackedIssue([{ number: 16, body: "legacy", state: "CLOSED" }], latest.sha), null);
+  assert.equal(findTrackedIssue([{
+    number: 16,
+    body: "<!-- grox-upstream-commit:old-verified-commit -->",
+    state: "CLOSED",
+  }], latest.sha), null);
 });
 
 test("extracts source revision from an upstream sync message", () => {

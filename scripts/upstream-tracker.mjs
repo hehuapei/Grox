@@ -14,6 +14,16 @@ export function parseSourceRevision(message) {
   return message.match(/^Source-Revision:\s*([0-9a-f]{40})\s*$/mi)?.[1] ?? null;
 }
 
+export function shouldLoadChangelog(state, latestCommit, packageVersion) {
+  return state.integrationTarget?.commit === latestCommit
+    || state.latestObserved?.commit === latestCommit
+    || state.latestObserved?.packageVersion !== packageVersion;
+}
+
+export function versionLabel(publicVersion, packageVersion, commit) {
+  return publicVersion ? `v${publicVersion}` : `snapshot ${commit.slice(0, 7)} (package ${packageVersion})`;
+}
+
 export function normalizeChanges(value) {
   if (!Array.isArray(value)) return [];
   return value.flatMap((item, index) => {
@@ -91,16 +101,13 @@ export function expandSourceDiffWithTrees(sourceDiff, baseTree, latestTree) {
 export function buildIssueBody({ state, latest, packageVersion, publicVersion, sourceRevision, changes, sourceDiff }) {
   const target = state.integrationTarget?.commit === latest.sha ? state.integrationTarget : null;
   const baseCommit = target?.baseCommit ?? state.latestObserved?.commit;
-  const publicLabel = publicVersion ? `v${publicVersion}` : "待核对官网版本";
+  const publicLabel = publicVersion ? `v${publicVersion}` : "未进入官网 Changelog";
   const verified = state.verifiedIntegration
     ? `${state.verifiedIntegration.commit}（${state.verifiedIntegration.publicVersion ?? state.verifiedIntegration.packageVersion}）`
     : "无；历史完整集成声明已失效，必须补齐证据";
   const compare = baseCommit && baseCommit !== latest.sha
     ? `https://github.com/xai-org/grok-build/compare/${baseCommit}...${latest.sha}`
     : `https://github.com/xai-org/grok-build/commit/${latest.sha}`;
-  const inventory = target?.inventory
-    ? `- 适配矩阵：[${target.inventory}](https://github.com/${process.env.GITHUB_REPOSITORY ?? "OWNER/REPO"}/blob/main/${target.inventory})`
-    : "- 适配矩阵：待创建并提交到仓库";
   const checklist = changes.length > 0
     ? changes.map((change) => [
         `- [ ] **${change.id} · ${change.category}${change.breakingChange ? " · BREAKING" : ""}** — ${change.description}`,
@@ -137,7 +144,7 @@ export function buildIssueBody({ state, latest, packageVersion, publicVersion, s
 - 当前验证集成基线：${verified}
 - 源码差异：${compare}
 - 变化项数量：${changes.length}
-${inventory}
+- 适配记录：直接维护在本 Issue，并链接具体代码和测试；不得为此提交根目录 \`docs/\`
 
 ## 上游变化逐项矩阵
 
@@ -168,15 +175,14 @@ ${sourceFiles}
 - [ ] Windows 完整回归通过
 - [ ] macOS Apple Silicon 与 Intel 的关键路径回归通过
 - [ ] ACP 初始化、会话重挂接/关闭、更新流、工具、权限、模式、模型、认证、队列均有证据
-- [ ] 适配矩阵已提交到仓库并链接具体代码/测试
+- [ ] 本 Issue 已逐项记录结论并链接具体代码/测试
 - [ ] 最后才允许推进 verifiedIntegration 并关闭本 issue
 `;
 }
 
-export function findTrackedIssue(issues, commit, issueNumber) {
+export function findTrackedIssue(issues, commit) {
   const marker = `${MARKER_PREFIX}${commit} -->`;
-  return issues.find((issue) => issue.number === issueNumber)
-    ?? issues.find((issue) => typeof issue.body === "string" && issue.body.includes(marker))
+  return issues.find((issue) => typeof issue.body === "string" && issue.body.includes(marker))
     ?? null;
 }
 
@@ -235,17 +241,21 @@ async function main() {
   );
   const packageVersion = parsePackageVersion(cargo);
   let changes = [];
-  try {
-    const changelog = await githubRaw(
-      upstreamOwner,
-      upstreamRepo,
-      `crates/codegen/xai-grok-shell/changelogs/${packageVersion}.json`,
-      latest.sha,
-      token,
-    );
-    changes = normalizeChanges(JSON.parse(changelog));
-  } catch (error) {
-    console.warn(`无法读取结构化 Changelog：${error instanceof Error ? error.message : String(error)}`);
+  if (shouldLoadChangelog(state, latest.sha, packageVersion)) {
+    try {
+      const changelog = await githubRaw(
+        upstreamOwner,
+        upstreamRepo,
+        `crates/codegen/xai-grok-shell/changelogs/${packageVersion}.json`,
+        latest.sha,
+        token,
+      );
+      changes = normalizeChanges(JSON.parse(changelog));
+    } catch (error) {
+      console.warn(`无法读取结构化 Changelog：${error instanceof Error ? error.message : String(error)}`);
+    }
+  } else {
+    console.log(`提交 ${latest.sha} 没有新的公开版本，跳过复用 package ${packageVersion} 的旧 Changelog。`);
   }
 
   const publicVersion = state.integrationTarget?.commit === latest.sha
@@ -279,10 +289,9 @@ async function main() {
   const issues = JSON.parse(gh([
     "issue", "list", "--repo", repository, "--state", "all", "--limit", "200", "--json", "number,title,body,state",
   ]) || "[]");
-  const existing = findTrackedIssue(issues, latest.sha, state.integrationTarget?.issue);
+  const existing = findTrackedIssue(issues, latest.sha);
   if (existing) {
-    const versionLabel = publicVersion ? `v${publicVersion}` : `package ${packageVersion}`;
-    const title = `[Upstream][待全面适配] Grok Build ${versionLabel}`;
+    const title = `[Upstream][待全面适配] Grok Build ${versionLabel(publicVersion, packageVersion, latest.sha)}`;
     if (existing.body !== body || existing.title !== title) {
       gh([
         "issue", "edit", String(existing.number), "--repo", repository,
@@ -299,8 +308,7 @@ async function main() {
     return;
   }
 
-  const versionLabel = publicVersion ? `v${publicVersion}` : `package ${packageVersion}`;
-  const title = `[Upstream][待全面适配] Grok Build ${versionLabel}`;
+  const title = `[Upstream][待全面适配] Grok Build ${versionLabel(publicVersion, packageVersion, latest.sha)}`;
   gh(["issue", "create", "--repo", repository, "--title", title, "--body-file", "-"], { input: body });
   console.log(`已为 ${latest.sha} 创建逐项全面适配 issue。`);
 }
