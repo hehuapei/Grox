@@ -69,6 +69,7 @@ export const ACP_METHODS = {
   gitStatus: "x.ai/git/status",
   gitDiffs: "x.ai/git/diffs",
   sessionFork: "x.ai/session/fork",
+  modelsList: "x.ai/models/list",
   compact: "x.ai/compact_conversation",
   promptHistory: "x.ai/prompt_history",
 } as const;
@@ -1270,6 +1271,16 @@ export class AcpBridge implements GrokBridge {
     this.captureModelState(response);
     this.captureRuntimeCommands(response);
     await this.configureAuthentication(response);
+    // v1 source snapshots make startup structurally non-blocking: initialize
+    // may expose a cached/bundled catalog before the authenticated fetch ends.
+    // Refresh in the background so desktop readiness never waits on network.
+    void this.requestRaw(ACP_METHODS.modelsList, {}, 30_000)
+      .then((catalog) => this.captureModelState(catalog))
+      .catch((error) => {
+        if (!isMethodUnavailable(error)) {
+          this.diagnostics.push(`模型目录后台刷新失败：${errorText(error)}`);
+        }
+      });
   }
 
   /** Best-effort version of the spawned `grok` CLI ("grok 0.2.106 (abc) [stable]" → "0.2.106"). */

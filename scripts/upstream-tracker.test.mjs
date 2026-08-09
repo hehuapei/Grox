@@ -7,7 +7,9 @@ import {
   normalizeChanges,
   normalizeSourceDiff,
   parsePackageVersion,
+  parseCommitChanges,
   parseSourceRevision,
+  parseSourceRevisionFile,
   shouldLoadChangelog,
   versionLabel,
 } from "./upstream-tracker.mjs";
@@ -88,7 +90,18 @@ test("does not reuse an old changelog for a new source snapshot with the same pa
   };
   assert.equal(shouldLoadChangelog(state, "new", "1.0.0"), false);
   assert.equal(shouldLoadChangelog(state, "new", "1.0.1"), true);
+  assert.equal(shouldLoadChangelog({
+    latestObserved: { commit: "new", packageVersion: "1.0.0", publicVersion: null },
+  }, "new", "1.0.0"), false);
   assert.equal(versionLabel(null, "1.0.0", "8a14c91d888"), "snapshot 8a14c91 (package 1.0.0)");
+});
+
+test("uses the source snapshot change list when no public changelog exists", () => {
+  assert.deepEqual(parseCommitChanges("Synced from monorepo\n\nChanges:\n- Fix queue loss\n- Bound startup"), [
+    { id: "SRC-001", category: "source snapshot", description: "Fix queue loss", breakingChange: false },
+    { id: "SRC-002", category: "source snapshot", description: "Bound startup", breakingChange: false },
+  ]);
+  assert.deepEqual(parseCommitChanges("No list"), []);
 });
 
 test("issue body makes observation and verified integration distinct", () => {
@@ -131,4 +144,6 @@ test("issue body makes observation and verified integration distinct", () => {
 test("extracts source revision from an upstream sync message", () => {
   assert.equal(parseSourceRevision(`Synced\n\nSource-Revision: ${"c".repeat(40)}`), "c".repeat(40));
   assert.equal(parseSourceRevision("no source revision"), null);
+  assert.equal(parseSourceRevisionFile(` ${"D".repeat(40)}\n`), "d".repeat(40));
+  assert.equal(parseSourceRevisionFile("not-a-revision"), null);
 });

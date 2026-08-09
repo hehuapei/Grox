@@ -3,11 +3,13 @@
   "repository": "https://github.com/xai-org/grok-build",
   "branch": "main",
   "latestObserved": {
-    "commit": "afbc0fb710320c7add294c2106d447ecc3e3af2e",
-    "sourceRevision": "3e620a76a5f374ce644dc7c87f7e990c68348218",
-    "publicVersion": "1.0.0",
+    "commit": "8a14c91d88875a831a38b3a066b1683116bcb31c",
+    "sourceRevision": "27b3c66635e2c0bf213429a36ab916f25d59df20",
+    "publicVersion": null,
     "packageVersion": "1.0.0",
-    "observedAt": "2026-08-08"
+    "observedAt": "2026-08-09",
+    "officialLatestPublicVersion": "1.0.0",
+    "releaseStatus": "unpublished_snapshot"
   },
   "verifiedIntegration": {
     "commit": "afbc0fb710320c7add294c2106d447ecc3e3af2e",
@@ -20,12 +22,13 @@
     "platforms": ["windows-x64", "macos-arm64", "macos-x64"]
   },
   "integrationTarget": {
-    "baseCommit": "a5589e958437d79e13db026eedcb1720bffd4063",
-    "commit": "afbc0fb710320c7add294c2106d447ecc3e3af2e",
-    "publicVersion": "1.0.0",
+    "baseCommit": "afbc0fb710320c7add294c2106d447ecc3e3af2e",
+    "commit": "8a14c91d88875a831a38b3a066b1683116bcb31c",
+    "sourceRevision": "27b3c66635e2c0bf213429a36ab916f25d59df20",
+    "publicVersion": null,
     "packageVersion": "1.0.0",
-    "status": "complete",
-    "issue": 16
+    "status": "in_progress",
+    "issue": 23
   },
   "invalidatedClaim": {
     "commit": "393430ee4934bc791b0d538f304a21691c517433",

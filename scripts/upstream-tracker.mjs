@@ -14,9 +14,27 @@ export function parseSourceRevision(message) {
   return message.match(/^Source-Revision:\s*([0-9a-f]{40})\s*$/mi)?.[1] ?? null;
 }
 
+export function parseSourceRevisionFile(value) {
+  const revision = value.trim();
+  return /^[0-9a-f]{40}$/i.test(revision) ? revision.toLowerCase() : null;
+}
+
+export function parseCommitChanges(message) {
+  const section = message.match(/(?:^|\n)Changes:\s*\r?\n((?:\s*-\s+[^\r\n]+\r?\n?)*)/i)?.[1] ?? "";
+  return section.split(/\r?\n/).flatMap((line, index) => {
+    const description = line.match(/^\s*-\s+(.+?)\s*$/)?.[1];
+    return description ? [{
+      id: `SRC-${String(index + 1).padStart(3, "0")}`,
+      category: "source snapshot",
+      description,
+      breakingChange: false,
+    }] : [];
+  });
+}
+
 export function shouldLoadChangelog(state, latestCommit, packageVersion) {
-  return state.integrationTarget?.commit === latestCommit
-    || state.latestObserved?.commit === latestCommit
+  return (state.integrationTarget?.commit === latestCommit && Boolean(state.integrationTarget.publicVersion))
+    || (state.latestObserved?.commit === latestCommit && Boolean(state.latestObserved.publicVersion))
     || state.latestObserved?.packageVersion !== packageVersion;
 }
 
@@ -256,6 +274,7 @@ async function main() {
     }
   } else {
     console.log(`提交 ${latest.sha} 没有新的公开版本，跳过复用 package ${packageVersion} 的旧 Changelog。`);
+    changes = parseCommitChanges(latest.commit.message);
   }
 
   const publicVersion = state.integrationTarget?.commit === latest.sha
@@ -263,7 +282,20 @@ async function main() {
     : state.latestObserved?.commit === latest.sha
       ? state.latestObserved.publicVersion
       : null;
-  const sourceRevision = parseSourceRevision(latest.commit.message);
+  let sourceRevision = parseSourceRevision(latest.commit.message);
+  if (!sourceRevision) {
+    try {
+      sourceRevision = parseSourceRevisionFile(await githubRaw(
+        upstreamOwner,
+        upstreamRepo,
+        "SOURCE_REV",
+        latest.sha,
+        token,
+      ));
+    } catch (error) {
+      console.warn(`无法读取 SOURCE_REV：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
   const target = state.integrationTarget?.commit === latest.sha ? state.integrationTarget : null;
   const baseCommit = target?.baseCommit ?? state.latestObserved?.commit;
   let sourceDiff = null;
