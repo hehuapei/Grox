@@ -10,6 +10,7 @@ const paths: Record<string, JSX.Element> = {
   plus: <path d="M12 5v14M5 12h14" />,
   minus: <path d="M5 12h14" />,
   arrowUp: <path d="M12 19V5M5 12l7-7 7 7" />,
+  arrowDown: <path d="M12 5v14M5 12l7 7 7-7" />,
   arrowRight: <path d="M5 12h14M13 5l7 7-7 7" />,
   stop: <rect x="6.5" y="6.5" width="11" height="11" />,
   x: <path d="M6 6l12 12M18 6L6 18" />,

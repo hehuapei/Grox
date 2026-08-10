@@ -22,6 +22,7 @@ interface ReleaseSummary {
   notes: string;
   releaseUrl: string;
   publishedAt?: string;
+  installable: boolean;
 }
 
 interface UpdateStatus {
@@ -29,6 +30,7 @@ interface UpdateStatus {
   updateAvailable: boolean;
   latest: UpdateInfo;
   history: ReleaseSummary[];
+  rollback?: ReleaseSummary | null;
 }
 
 const UPDATE_POLL_INTERVAL_MS = 2 * 60_000;
@@ -54,6 +56,7 @@ export function UpdateNotice() {
   const [status, setStatus] = useState<UpdateStatus | null>(null);
   const [checking, setChecking] = useState(false);
   const [installing, setInstalling] = useState(false);
+  const [rollingBack, setRollingBack] = useState(false);
   const [error, setError] = useState("");
   const lastAutomaticCheck = useRef(0);
   const inFlight = useRef(false);
@@ -107,6 +110,18 @@ export function UpdateNotice() {
       await invoke("install_update", { version: status.latest.latestVersion });
     } catch (cause) {
       setInstalling(false);
+      setError(cause instanceof Error ? cause.message : String(cause));
+    }
+  };
+
+  const rollback = async () => {
+    if (!status?.rollback?.installable) return;
+    setRollingBack(true);
+    setError("");
+    try {
+      await invoke("rollback_update", { version: status.rollback.version });
+    } catch (cause) {
+      setRollingBack(false);
       setError(cause instanceof Error ? cause.message : String(cause));
     }
   };
@@ -182,10 +197,11 @@ export function UpdateNotice() {
         </div>
 
         <div className="flex flex-wrap items-center justify-end gap-2 border-t border-line bg-void px-5 py-3">
-          <button disabled={checking || installing} onClick={() => void check(true)} className="flex h-8 items-center gap-2 rounded-[4px] border border-line2 px-3 text-[10.5px] text-mute hover:border-line3 hover:text-fg2 disabled:opacity-40"><Icon name="refresh" size={11} className={checking ? "animate-orbit" : ""} />{zh ? "手动检查更新" : "Check again"}</button>
+          <button disabled={checking || installing || rollingBack} onClick={() => void check(true)} className="flex h-8 items-center gap-2 rounded-[4px] border border-line2 px-3 text-[10.5px] text-mute hover:border-line3 hover:text-fg2 disabled:opacity-40"><Icon name="refresh" size={11} className={checking ? "animate-orbit" : ""} />{zh ? "手动检查更新" : "Check again"}</button>
+          {status?.rollback && <button disabled={!status.rollback.installable || installing || rollingBack} onClick={() => void rollback()} className="flex h-8 items-center gap-2 rounded-[4px] border border-gold/35 bg-gold/5 px-3 text-[10.5px] text-gold hover:bg-gold/10 disabled:cursor-not-allowed disabled:opacity-40" title={!status.rollback.installable ? (zh ? "上一版本缺少适用于当前系统的安装包" : "No installer for the previous version on this platform") : undefined}>{rollingBack ? (zh ? "正在回退…" : "Rolling back…") : (zh ? `一键回退到 v${status.rollback.version}` : `Roll back to v${status.rollback.version}`)}<Icon name={rollingBack ? "refresh" : "arrowDown"} size={11} className={rollingBack ? "animate-orbit" : ""} /></button>}
           {status?.updateAvailable && update && <>
-            <button disabled={installing} onClick={() => void invoke("open_external", { url: update.releaseUrl })} className="flex h-8 items-center gap-2 rounded-[4px] border border-line2 px-3 text-[10.5px] text-mute hover:border-line3 hover:text-fg2 disabled:opacity-40">{zh ? "手动下载" : "Manual download"}<Icon name="external" size={11} /></button>
-            <button disabled={!update.installable || installing} onClick={() => void install()} className="flex h-8 items-center gap-2 rounded-[4px] border border-acc-dim bg-acc-wash px-3 font-medium text-[10.5px] text-acc hover:bg-high disabled:cursor-not-allowed disabled:opacity-40" title={!update.installable ? (zh ? "此版本缺少适用于当前系统的安装包" : "No installer for this platform") : undefined}>{installing ? (zh ? "正在更新…" : "Updating…") : (zh ? "一键更新并重启" : "Update & restart")}<Icon name={installing ? "refresh" : "arrowUp"} size={11} className={installing ? "animate-orbit" : ""} /></button>
+            <button disabled={installing || rollingBack} onClick={() => void invoke("open_external", { url: update.releaseUrl })} className="flex h-8 items-center gap-2 rounded-[4px] border border-line2 px-3 text-[10.5px] text-mute hover:border-line3 hover:text-fg2 disabled:opacity-40">{zh ? "手动下载" : "Manual download"}<Icon name="external" size={11} /></button>
+            <button disabled={!update.installable || installing || rollingBack} onClick={() => void install()} className="flex h-8 items-center gap-2 rounded-[4px] border border-acc-dim bg-acc-wash px-3 font-medium text-[10.5px] text-acc hover:bg-high disabled:cursor-not-allowed disabled:opacity-40" title={!update.installable ? (zh ? "此版本缺少适用于当前系统的安装包" : "No installer for this platform") : undefined}>{installing ? (zh ? "正在更新…" : "Updating…") : (zh ? "一键更新并重启" : "Update & restart")}<Icon name={installing ? "refresh" : "arrowUp"} size={11} className={installing ? "animate-orbit" : ""} /></button>
           </>}
         </div>
       </section>

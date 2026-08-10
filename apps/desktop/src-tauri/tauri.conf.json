@@ -50,6 +50,7 @@
     "shortDescription": "基于 Grok Build 的桌面端 Agent",
     "longDescription": "Grox 是以 xai-org/grok-build 为核心打造的桌面端 Agent，支持真实 ACP 会话、工具授权与任务恢复。",
     "windows": {
+      "allowDowngrades": true,
       "nsis": {
         "installMode": "currentUser"
       }

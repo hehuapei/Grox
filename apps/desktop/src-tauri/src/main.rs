@@ -327,6 +327,7 @@ struct ReleaseSummary {
     notes: String,
     release_url: String,
     published_at: Option<String>,
+    installable: bool,
 }
 
 #[derive(Serialize)]
@@ -336,6 +337,7 @@ struct UpdateStatus {
     update_available: bool,
     latest: UpdateInfo,
     history: Vec<ReleaseSummary>,
+    rollback: Option<ReleaseSummary>,
 }
 
 #[derive(Clone, Serialize)]
@@ -6363,6 +6365,19 @@ fn update_available(current: &str, latest: &str) -> Result<bool, String> {
     Ok(release_version(latest)? > release_version(current)?)
 }
 
+fn previous_release<'a>(current: &str, releases: &'a [GitHubRelease]) -> Option<&'a GitHubRelease> {
+    let current = release_version(current).ok()?;
+    releases
+        .iter()
+        .filter(|release| !release.draft && !release.prerelease)
+        .filter_map(|release| {
+            let version = release_version(&release.tag_name).ok()?;
+            (version < current && version.pre.is_empty()).then_some((version, release))
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, release)| release)
+}
+
 fn update_asset_matches(name: &str, platform: &str, architecture: &str) -> bool {
     let name = name.to_ascii_lowercase();
     match platform {
@@ -6417,7 +6432,7 @@ async fn release_history() -> Result<Vec<GitHubRelease>, String> {
         .build()
         .map_err(|error| format!("无法创建更新客户端：{error}"))?
         .get(RELEASES_URL)
-        .query(&[("per_page", "8")])
+        .query(&[("per_page", "30")])
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
@@ -6430,7 +6445,6 @@ async fn release_history() -> Result<Vec<GitHubRelease>, String> {
     Ok(releases
         .into_iter()
         .filter(|release| !release.draft && !release.prerelease)
-        .take(8)
         .collect())
 }
 
@@ -6481,6 +6495,7 @@ fn release_summary(release: &GitHubRelease) -> ReleaseSummary {
             .collect(),
         release_url: release.html_url.clone(),
         published_at: release.published_at.clone(),
+        installable: update_asset(release).is_some(),
     }
 }
 
@@ -6500,9 +6515,11 @@ async fn get_update_status() -> Result<UpdateStatus, String> {
     // keep the two lightweight GitHub requests sequential instead of relying
     // on `tokio::try_join!` (which is not compiled into this build).
     let latest = latest_release().await?;
-    let history = release_history().await?;
-    let mut history = history
+    let releases = release_history().await?;
+    let rollback = previous_release(CLIENT_VERSION, &releases).map(release_summary);
+    let mut history = releases
         .iter()
+        .take(8)
         .map(release_summary)
         .collect::<Vec<_>>();
     if !history.iter().any(|release| release.version == latest.tag_name.trim().trim_start_matches(['v', 'V'])) {
@@ -6513,6 +6530,7 @@ async fn get_update_status() -> Result<UpdateStatus, String> {
         update_available: update_available(CLIENT_VERSION, &latest.tag_name)?,
         latest: update_info(&latest),
         history,
+        rollback,
     })
 }
 
@@ -6742,6 +6760,22 @@ fn launch_update_helper(
     Err("当前平台暂不支持一键更新".into())
 }
 
+async fn install_release(
+    app: &tauri::AppHandle,
+    version: &str,
+    release: &GitHubRelease,
+) -> Result<(), String> {
+    let asset =
+        update_asset(release).ok_or_else(|| "此版本没有适用于当前系统的安装包".to_string())?;
+    let work = update_temp_dir(version)?;
+    let installer = work.join(&asset.name);
+    if let Err(error) = download_update_asset(asset, &installer).await {
+        let _ = fs::remove_dir_all(&work);
+        return Err(error);
+    }
+    launch_update_helper(app, &installer, &work)
+}
+
 #[tauri::command]
 async fn install_update(app: tauri::AppHandle, version: String) -> Result<(), String> {
     let expected = release_version(&version)?;
@@ -6751,15 +6785,19 @@ async fn install_update(app: tauri::AppHandle, version: String) -> Result<(), St
     {
         return Err("更新版本已变化，请重新检查更新".into());
     }
-    let asset =
-        update_asset(&release).ok_or_else(|| "此版本没有适用于当前系统的安装包".to_string())?;
-    let work = update_temp_dir(&version)?;
-    let installer = work.join(&asset.name);
-    if let Err(error) = download_update_asset(asset, &installer).await {
-        let _ = fs::remove_dir_all(&work);
-        return Err(error);
+    install_release(&app, &version, &release).await
+}
+
+#[tauri::command]
+async fn rollback_update(app: tauri::AppHandle, version: String) -> Result<(), String> {
+    let expected = release_version(&version)?;
+    let releases = release_history().await?;
+    let release = previous_release(CLIENT_VERSION, &releases)
+        .ok_or_else(|| "没有可回退的正式版本".to_string())?;
+    if release_version(&release.tag_name)? != expected {
+        return Err("可回退版本已变化，请重新检查更新日志".into());
     }
-    launch_update_helper(&app, &installer, &work)
+    install_release(&app, &version, release).await
 }
 
 fn main() {
@@ -6865,6 +6903,7 @@ fn main() {
             check_for_update,
             get_update_status,
             install_update,
+            rollback_update,
             open_external,
             open_media_external,
             start_project_preview,
@@ -6907,6 +6946,19 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_release(tag_name: &str, draft: bool, prerelease: bool) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: tag_name.to_string(),
+            name: None,
+            body: None,
+            html_url: format!("https://github.com/dandandujie/Grox/releases/tag/{tag_name}"),
+            published_at: None,
+            draft,
+            prerelease,
+            assets: Vec::new(),
+        }
+    }
 
     #[test]
     fn git_summary_includes_untracked_text_in_diff_stats() {
@@ -7724,6 +7776,22 @@ UNRELATED=value
         assert!(!update_available("0.2.0", "V0.2.0").unwrap());
         assert!(!update_available("0.3.0", "v0.2.9").unwrap());
         assert!(update_available("0.2.0-beta.1", "v0.2.0").unwrap());
+    }
+
+    #[test]
+    fn selects_highest_stable_release_below_current_for_rollback() {
+        let releases = vec![
+            test_release("v0.2.9", false, false),
+            test_release("v0.2.12", false, false),
+            test_release("not-semver", false, false),
+            test_release("v0.2.10", false, false),
+            test_release("v0.2.10-beta.1", false, false),
+            test_release("v0.2.10-hotfix.1", true, false),
+        ];
+
+        let selected = previous_release("0.2.11", &releases).unwrap();
+        assert_eq!(selected.tag_name, "v0.2.10");
+        assert!(previous_release("0.2.9", &[test_release("v0.2.9", false, false)]).is_none());
     }
 
     #[test]
