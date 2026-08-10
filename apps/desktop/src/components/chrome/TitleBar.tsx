@@ -33,28 +33,38 @@ export function TitleBar() {
   const { language } = useI18n();
   const activeId = useDesktop((s) => s.activeId);
   const meta = useDesktop((s) => s.sessionIndex.find((m) => m.id === s.activeId));
+  const draftSession = useDesktop((s) => {
+    const id = s.activeId;
+    if (!id || !id.startsWith("draft-")) return null;
+    return s.sessions[id] ?? null;
+  });
   const toggleInspector = useDesktop((s) => s.toggleInspector);
   const inspectorOpen = useDesktop((s) => s.inspectorOpen);
   const toggleTerminal = useDesktop((s) => s.toggleTerminal);
   const terminalOpen = useDesktop((s) => s.terminalOpen);
   const setPaletteOpen = useDesktop((s) => s.setPaletteOpen);
+  const breadcrumbCwd = meta?.cwd ?? draftSession?.cwd;
+  const breadcrumbTitle = meta?.title
+    || (draftSession
+      ? (language === "zh-CN" ? "新会话" : "New session")
+      : null);
 
   return (
     <header
       data-tauri-drag-region
-      className="relative z-40 flex h-10 shrink-0 items-center border-b border-line bg-void pl-[78px] pr-2 select-none"
+      className="titlebar relative z-40 flex h-10 shrink-0 items-center border-b border-line bg-void pl-[78px] pr-2 select-none"
     >
-      {/* center — mission breadcrumb */}
+      {/* center — mission breadcrumb (drag only; not interactive) */}
       <div
         data-tauri-drag-region
         className="pointer-events-none flex min-w-0 flex-1 items-center justify-center px-3"
       >
         <div className="flex min-w-0 max-w-full items-center gap-2 overflow-hidden whitespace-nowrap text-[11px]">
-          {activeId && meta ? (
+          {activeId && breadcrumbCwd && breadcrumbTitle !== null ? (
             <>
-              <span className="lbl max-w-[35%] shrink-0 truncate">{baseName(meta.cwd)}</span>
+              <span className="lbl max-w-[35%] shrink-0 truncate">{baseName(breadcrumbCwd)}</span>
               <span className="shrink-0 text-faint">/</span>
-              <span className="min-w-0 truncate text-fg2">{meta.title}</span>
+              <span className="min-w-0 truncate text-fg2">{breadcrumbTitle}</span>
             </>
           ) : (
             <span className="lbl" style={{ letterSpacing: "0.3em" }}>
@@ -64,8 +74,8 @@ export function TitleBar() {
         </div>
       </div>
 
-      {/* right cluster */}
-      <div className="flex shrink-0 items-center gap-1">
+      {/* right cluster — must be no-drag or buttons eat drag and never click */}
+      <div data-tauri-drag-region="false" className="titlebar-actions flex shrink-0 items-center gap-1">
         <button
           className="chip mr-1"
           onClick={() => window.dispatchEvent(new Event("grox:open-update-center"))}
@@ -126,7 +136,6 @@ function DefaultOpenMenu({ language }: { language: "zh-CN" | "en-US" }) {
   const zh = language === "zh-CN";
 
   useEffect(() => {
-    let alive = true;
     const syncApplications = (event: Event) => {
       const value = (event as CustomEvent<OpenApplicationOption[]>).detail;
       if (Array.isArray(value)) setApplications(value);
@@ -143,13 +152,10 @@ function DefaultOpenMenu({ language }: { language: "zh-CN" | "en-US" }) {
     window.addEventListener("grox:default-open-application", sync);
     document.addEventListener("pointerdown", close, true);
     document.addEventListener("keydown", escape);
-    void refreshOpenApplications().then((next) => {
-      if (!alive) return;
-      setApplications(next);
-      setApplication(getDefaultOpenApplication());
-    });
+    // Do NOT call refreshOpenApplications() on mount. On Windows it runs a
+    // full PowerShell registry+icon scan that freezes the shell for 2–3s
+    // (UI visible, clicks dead). Discover apps only when the menu opens.
     return () => {
-      alive = false;
       window.removeEventListener("grox:open-applications", syncApplications);
       window.removeEventListener("grox:default-open-application", sync);
       document.removeEventListener("pointerdown", close, true);
@@ -223,6 +229,8 @@ function DefaultOpenMenu({ language }: { language: "zh-CN" | "en-US" }) {
 function WinBtn({ onClick, label, danger }: { onClick: () => void; label: string; danger?: boolean }) {
   return (
     <button
+      type="button"
+      data-tauri-drag-region="false"
       onClick={onClick}
       className={`flex h-8 w-11 items-center justify-center text-[10px] text-mute transition-colors ${
         danger ? "hover:bg-red hover:text-base" : "hover:bg-high hover:text-fg"

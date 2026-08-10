@@ -48,8 +48,14 @@ export function SettingsModal() {
   ];
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-void/75 p-5 backdrop-blur-[3px]" onMouseDown={() => setOpen(false)}>
-      <div className="flex h-[min(820px,92vh)] w-[min(1180px,96vw)] overflow-hidden rounded-[9px] border border-line3 bg-panel shadow-2xl animate-fade-up" onMouseDown={(event) => event.stopPropagation()}>
+    <div
+      className="settings-shell fixed inset-0 z-50 flex items-center justify-center bg-void/75 p-5 backdrop-blur-[3px]"
+      onMouseDown={() => setOpen(false)}
+    >
+      <div
+        className="flex h-[min(820px,92vh)] w-[min(1180px,96vw)] overflow-hidden rounded-[9px] border border-line3 bg-panel shadow-2xl animate-fade-up"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
         <nav className="flex w-[210px] shrink-0 flex-col border-r border-line bg-void py-3">
           <div className="px-4 pb-3"><Wordmark size={11} withMark={false} /></div>
           {sections.map((item) => (
@@ -478,17 +484,40 @@ function Appearance() {
   const setLanguage = usePreferences((state) => state.setLanguage);
   const theme = usePreferences((state) => state.theme);
   const setTheme = usePreferences((state) => state.setTheme);
-  const fontSize = usePreferences((state) => state.fontSize);
-  const setFontSize = usePreferences((state) => state.setFontSize);
+  const fontScale = usePreferences((state) => state.fontScale);
+  const setFontScale = usePreferences((state) => state.setFontScale);
   const fontWeight = usePreferences((state) => state.fontWeight);
   const setFontWeight = usePreferences((state) => state.setFontWeight);
+  const contentDensity = usePreferences((state) => state.contentDensity);
+  const setContentDensity = usePreferences((state) => state.setContentDensity);
   const [reduceMotion, setReduceMotion] = useState(localStorage.getItem("grok.pref.reduceMotion") === "1");
   const updateMotion = (value: boolean) => { localStorage.setItem("grok.pref.reduceMotion", value ? "1" : "0"); document.documentElement.dataset.reduceMotion = value ? "1" : "0"; window.dispatchEvent(new Event("grox-motion-change")); setReduceMotion(value); };
   return <div><Heading title={t("appearance")} description={uiLanguage === "zh-CN" ? "语言默认为中文，主题默认为 GrokNight 暗黑模式。" : "The default language is Chinese and the default theme is GrokNight dark."} />
     <Row label={t("language")}><div className="flex gap-1"><Choice active={language === "zh-CN"} onClick={() => setLanguage("zh-CN")}>{t("chinese")}</Choice><Choice active={language === "en-US"} onClick={() => setLanguage("en-US")}>{t("english")}</Choice></div></Row>
     <Row label={t("theme")}><div className="flex gap-1"><Choice active={theme === "dark"} onClick={() => setTheme("dark")}><Icon name="moon" size={10} /> {t("dark")}</Choice><Choice active={theme === "light"} onClick={() => setTheme("light")}><Icon name="sun" size={10} /> {t("light")}</Choice></div></Row>
-    <Row label={uiLanguage === "zh-CN" ? "字体大小" : "Font size"} hint={uiLanguage === "zh-CN" ? "统一调整正文、工具信息、侧栏标签和代码字号。" : "Adjust text, tool details, sidebar labels, and code together."}><RangeControl value={fontSize} min={0} max={6} step={0.25} display={`+${fontSize.toFixed(2).replace(/\.00$/, "").replace(/0$/, "")} px`} onChange={setFontSize} label={uiLanguage === "zh-CN" ? "字体大小" : "Font size"} /></Row>
-    <Row label={uiLanguage === "zh-CN" ? "字体粗细" : "Font weight"}><RangeControl value={fontWeight} min={400} max={700} step={25} display={String(fontWeight)} onChange={setFontWeight} label={uiLanguage === "zh-CN" ? "字体粗细" : "Font weight"} /></Row>
+    <Row
+      label={uiLanguage === "zh-CN" ? "阅读栏宽度" : "Reading width"}
+      hint={uiLanguage === "zh-CN" ? "仅改会话正文与输入框最大宽度（720 / 920 / 1120 / 铺满）；行距、内边距、侧栏与按钮不变。" : "Transcript + composer max-width only (720 / 920 / 1120 / fill). Spacing and chrome never change."}
+    >
+      <div className="flex flex-wrap gap-1">
+        <Choice active={contentDensity === "narrow"} onClick={() => setContentDensity("narrow")}>{uiLanguage === "zh-CN" ? "窄" : "Narrow"}</Choice>
+        <Choice active={contentDensity === "medium"} onClick={() => setContentDensity("medium")}>{uiLanguage === "zh-CN" ? "中" : "Medium"}</Choice>
+        <Choice active={contentDensity === "wide"} onClick={() => setContentDensity("wide")}>{uiLanguage === "zh-CN" ? "宽" : "Wide"}</Choice>
+        <Choice active={contentDensity === "fill"} onClick={() => setContentDensity("fill")}>{uiLanguage === "zh-CN" ? "铺满" : "Fill"}</Choice>
+      </div>
+    </Row>
+    <Row
+      label={uiLanguage === "zh-CN" ? "正文大小" : "Reading size"}
+      hint={uiLanguage === "zh-CN" ? "仅调整对话正文（整数像素）；侧栏、标题栏、按钮字号固定，避免布局错位与模糊。" : "Integer sizes for transcript only. Sidebar, title bar, and buttons stay fixed for sharp layout."}
+    >
+      <div className="flex flex-wrap gap-1">
+        <Choice active={fontScale === "sm"} onClick={() => setFontScale("sm")}>{uiLanguage === "zh-CN" ? "小" : "S"}</Choice>
+        <Choice active={fontScale === "md"} onClick={() => setFontScale("md")}>{uiLanguage === "zh-CN" ? "默认" : "M"}</Choice>
+        <Choice active={fontScale === "lg"} onClick={() => setFontScale("lg")}>{uiLanguage === "zh-CN" ? "大" : "L"}</Choice>
+        <Choice active={fontScale === "xl"} onClick={() => setFontScale("xl")}>{uiLanguage === "zh-CN" ? "更大" : "XL"}</Choice>
+      </div>
+    </Row>
+    <Row label={uiLanguage === "zh-CN" ? "字体粗细" : "Font weight"} hint={uiLanguage === "zh-CN" ? "建议 400 以获得更清晰的 WebView 渲染。" : "400 is usually sharpest in WebView2."}><RangeControl value={fontWeight} min={400} max={700} step={25} display={String(fontWeight)} onChange={setFontWeight} label={uiLanguage === "zh-CN" ? "字体粗细" : "Font weight"} /></Row>
     <Row label={uiLanguage === "zh-CN" ? "减少动态效果" : "Reduce motion"} hint={uiLanguage === "zh-CN" ? "停用轨道动画和进入过渡。" : "Disable orbital animations and entrance transitions."}><Toggle on={reduceMotion} onChange={updateMotion} /></Row>
   </div>;
 }

@@ -9,6 +9,7 @@ import { Icon } from "../fx/Icon";
 import type { Session, SessionMeta, SessionStatus } from "../../bridge/types";
 import { BlackHole } from "../fx/BlackHole";
 import { normalizeSessionQuery, sessionMatchesLoadedContent } from "../../lib/sessionSearch";
+import { projectId, samePath } from "../../lib/projectCatalog";
 
 export function Sidebar() {
   const { t, language } = useI18n();
@@ -75,12 +76,12 @@ export function Sidebar() {
         historyMatches.has(meta.id) || sessionMatchesLoadedContent(meta, sessions[meta.id], normalizedQuery)
       )
     : orderedSessions;
-  const matchedWorkspaceKeys = new Set(matchedSessions.map((session) => workspaceKey(session.cwd)));
+  const matchedWorkspaceKeys = new Set(matchedSessions.map((session) => projectId(session.cwd)));
   const activeProjects = orderedProjects.filter(
-    (project) => !project.archived && (!normalizedQuery || matchedWorkspaceKeys.has(workspaceKey(project.path))),
+    (project) => !project.archived && (!normalizedQuery || matchedWorkspaceKeys.has(projectId(project.path))),
   );
   const archivedProjects = orderedProjects.filter(
-    (project) => project.archived && (!normalizedQuery || matchedWorkspaceKeys.has(workspaceKey(project.path))),
+    (project) => project.archived && (!normalizedQuery || matchedWorkspaceKeys.has(projectId(project.path))),
   );
 
   useEffect(() => {
@@ -163,7 +164,7 @@ export function Sidebar() {
             project={project}
             active={project.id === activeProjectId}
             expanded={Boolean(normalizedQuery) || expandedProjectIds.has(project.id)}
-            sessions={matchedSessions.filter((session) => sameWorkspace(session.cwd, project.path))}
+            sessions={matchedSessions.filter((session) => samePath(session.cwd, project.path))}
             showArchived={Boolean(normalizedQuery)}
             activeId={activeId}
             loadedSessions={sessions}
@@ -184,7 +185,7 @@ export function Sidebar() {
                 project={project}
                 active={project.id === activeProjectId}
                 expanded={Boolean(normalizedQuery) || expandedProjectIds.has(project.id)}
-                sessions={matchedSessions.filter((session) => sameWorkspace(session.cwd, project.path))}
+                sessions={matchedSessions.filter((session) => samePath(session.cwd, project.path))}
                 showArchived={Boolean(normalizedQuery)}
                 activeId={activeId}
                 loadedSessions={sessions}
@@ -292,12 +293,6 @@ export function Sidebar() {
     </aside>
   );
 }
-
-const sameWorkspace = (left: string, right: string) =>
-  left.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase() ===
-  right.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
-
-const workspaceKey = (path: string) => path.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
 
 function ProjectGroup({
   project,
@@ -454,19 +449,30 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
   );
 }
 
+function missionTitle(meta: SessionMeta, language: string): string {
+  const title = meta.title?.trim();
+  if (title) return title;
+  const summary = meta.summary?.trim();
+  if (summary) return summary.slice(0, 48);
+  const shortId = meta.id.length > 12 ? `${meta.id.slice(0, 8)}…` : meta.id;
+  return language === "zh-CN" ? `无标题会话（${shortId}）` : `Untitled (${shortId})`;
+}
+
 function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: { meta: SessionMeta; status: SessionStatus; completionUnread: boolean; active: boolean; tokens: number; onOpen(): void }) {
   const { t, language } = useI18n();
   const renameSession = useDesktop((state) => state.renameSession);
   const pinSession = useDesktop((state) => state.pinSession);
   const archiveSession = useDesktop((state) => state.archiveSession);
   const markSessionUnread = useDesktop((state) => state.markSessionUnread);
+  const removeFromSidebar = useDesktop((state) => state.removeSessionFromSidebar);
   const continueInNewChat = useDesktop((state) => state.continueSessionInNewChat);
   const continueInWorktree = useDesktop((state) => state.continueSessionInNewWorktree);
   const openInNewWindow = useDesktop((state) => state.openSessionInNewWindow);
   const copySessionValue = useDesktop((state) => state.copySessionValue);
   const [editing, setEditing] = useState(false);
   const [menu, setMenu] = useState(false);
-  const [draft, setDraft] = useState(meta.title);
+  const displayTitle = missionTitle(meta, language);
+  const [draft, setDraft] = useState(displayTitle);
   const commit = () => {
     setEditing(false);
     const title = draft.trim();
@@ -489,7 +495,9 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
         {editing ? (
           <input autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={commit} onKeyDown={(event) => event.key === "Enter" && commit()} onClick={(event) => event.stopPropagation()} className="min-w-0 flex-1 border border-line3 bg-void px-1 text-[11px] text-fg outline-none" />
         ) : (
-          <span className="min-w-0 flex-1 truncate text-[11px] text-fg2">{meta.title}</span>
+          <span className={`min-w-0 flex-1 truncate text-[11px] ${meta.title?.trim() ? "text-fg2" : "text-faint italic"}`} title={meta.id}>
+            {displayTitle}
+          </span>
         )}
         <button
           onClick={(event) => { event.stopPropagation(); setMenu((open) => !open); }}
@@ -514,7 +522,7 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
           <MenuButton icon="archive" label={t("archive")} onClick={() => archiveSession(meta.id)} />
           <MenuButton icon="dot" label={language === "zh-CN" ? "标记为未读" : "Mark as unread"} onClick={() => markSessionUnread(meta.id)} />
           <MenuDivider />
-          <MenuButton icon="external" label={language === "zh-CN" ? "在 Finder 中显示" : "Show in Finder"} onClick={() => void useDesktop.getState().openProjectInExplorer(workspaceKey(meta.cwd))} />
+          <MenuButton icon="external" label={language === "zh-CN" ? "在 Finder 中显示" : "Show in Finder"} onClick={() => void useDesktop.getState().openProjectInExplorer(projectId(meta.cwd))} />
           <MenuButton icon="folder" label={language === "zh-CN" ? "复制工作目录" : "Copy working directory"} onClick={() => void copySessionValue(meta.id, "cwd")} />
           <MenuButton icon="copy" label={language === "zh-CN" ? "复制会话 ID" : "Copy session ID"} onClick={() => void copySessionValue(meta.id, "id")} />
           <MenuButton icon="external" label={language === "zh-CN" ? "复制深度链接" : "Copy deep link"} onClick={() => void copySessionValue(meta.id, "link")} />
@@ -524,6 +532,13 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
           <MenuButton icon="branch" label={language === "zh-CN" ? "在新工作树中继续" : "Continue in new worktree"} onClick={() => void continueInWorktree(meta.id)} />
           <MenuDivider />
           <MenuButton icon="external" label={language === "zh-CN" ? "在新窗口中打开" : "Open in new window"} onClick={() => void openInNewWindow(meta.id)} />
+          <MenuDivider />
+          <MenuButton
+            icon="x"
+            label={language === "zh-CN" ? "从侧栏移除" : "Remove from sidebar"}
+            tone="text-red"
+            onClick={() => void removeFromSidebar(meta.id)}
+          />
         </ContextMenu>
       )}
     </div>

@@ -656,6 +656,14 @@ fn parse_session_disk_preview(
     })
 }
 
+/// History file names used by current and older Grok CLI layouts.
+const SESSION_HISTORY_FILENAMES: &[&str] = &[
+    "chat_history.jsonl",
+    "history.jsonl",
+    "session.jsonl",
+    "transcript.jsonl",
+];
+
 fn session_history_path(grok: &Path, session_id: &str) -> Result<Option<PathBuf>, String> {
     let mut components = Path::new(session_id).components();
     if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
@@ -668,19 +676,106 @@ fn session_history_path(grok: &Path, session_id: &str) -> Result<Option<PathBuf>
     let sessions = sessions
         .canonicalize()
         .map_err(|error| format!("无法读取 Grok 会话目录：{error}"))?;
-    let direct = sessions.join(session_id).join("chat_history.jsonl");
-    let candidates = std::iter::once(direct).chain(
-        fs::read_dir(&sessions)
-            .map_err(|error| format!("无法扫描 Grok 会话目录：{error}"))?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path().join(session_id).join("chat_history.jsonl")),
-    );
-    for candidate in candidates {
-        let Ok(candidate) = candidate.canonicalize() else {
+    let wanted = session_id.to_ascii_lowercase();
+
+    // Fast path: known layouts.
+    for name in SESSION_HISTORY_FILENAMES {
+        let direct = sessions.join(session_id).join(name);
+        if let Ok(candidate) = direct.canonicalize() {
+            if candidate.starts_with(&sessions) && candidate.is_file() {
+                return Ok(Some(candidate));
+            }
+        }
+        let Ok(entries) = fs::read_dir(&sessions) else {
+            break;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let candidate = entry.path().join(session_id).join(name);
+            if let Ok(candidate) = candidate.canonicalize() {
+                if candidate.starts_with(&sessions) && candidate.is_file() {
+                    return Ok(Some(candidate));
+                }
+            }
+        }
+    }
+
+    // Slow path: case-insensitive id match + one extra nesting level
+    // (workspace / batch / session-id / history).
+    if let Some(path) = find_session_history_by_scan(&sessions, &wanted)? {
+        return Ok(Some(path));
+    }
+    Ok(None)
+}
+
+fn history_file_in_session_dir(dir: &Path) -> Option<PathBuf> {
+    for name in SESSION_HISTORY_FILENAMES {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn dir_name_eq_ci(path: &Path, wanted_lower: &str) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.to_ascii_lowercase() == wanted_lower)
+}
+
+/// Depth-limited scan under `~/.grok/sessions` for a folder matching session id.
+fn find_session_history_by_scan(sessions: &Path, wanted_lower: &str) -> Result<Option<PathBuf>, String> {
+    let Ok(level1) = fs::read_dir(sessions) else {
+        return Ok(None);
+    };
+    for entry in level1.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if dir_name_eq_ci(&path, wanted_lower) {
+            if let Some(file) = history_file_in_session_dir(&path) {
+                if let Ok(canonical) = file.canonicalize() {
+                    if canonical.starts_with(sessions) {
+                        return Ok(Some(canonical));
+                    }
+                }
+            }
+        }
+        // workspace-encoded / nested batch folders
+        let Ok(level2) = fs::read_dir(&path) else {
             continue;
         };
-        if candidate.starts_with(&sessions) && candidate.is_file() {
-            return Ok(Some(candidate));
+        for child in level2.filter_map(Result::ok) {
+            let child_path = child.path();
+            if !child_path.is_dir() {
+                continue;
+            }
+            if dir_name_eq_ci(&child_path, wanted_lower) {
+                if let Some(file) = history_file_in_session_dir(&child_path) {
+                    if let Ok(canonical) = file.canonicalize() {
+                        if canonical.starts_with(sessions) {
+                            return Ok(Some(canonical));
+                        }
+                    }
+                }
+            }
+            // rare: workspace / group / session-id
+            let Ok(level3) = fs::read_dir(&child_path) else {
+                continue;
+            };
+            for grand in level3.filter_map(Result::ok) {
+                let grand_path = grand.path();
+                if grand_path.is_dir() && dir_name_eq_ci(&grand_path, wanted_lower) {
+                    if let Some(file) = history_file_in_session_dir(&grand_path) {
+                        if let Ok(canonical) = file.canonicalize() {
+                            if canonical.starts_with(sessions) {
+                                return Ok(Some(canonical));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(None)
@@ -866,6 +961,82 @@ fn read_bounded_text(path: &Path, max_bytes: u64) -> Result<String, String> {
     fs::read_to_string(path).map_err(|error| format!("无法读取 {}：{error}", path.display()))
 }
 
+/// Platform-aware atomic replace of `to` with `from` (same volume).
+/// - Unix: `rename` replaces the destination atomically.
+/// - Windows: `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` avoids the
+///   final→bak then temp→final crash window of a two-step rename.
+fn replace_file_atomic(from: &Path, to: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+        // Wide, NUL-terminated paths kept alive for the duration of the call.
+        let from_wide: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to_wide: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: `from_wide` / `to_wide` are valid NUL-terminated UTF-16 for the
+        // whole call; `MoveFileExW` only reads those pointers and does not retain
+        // them. Same-directory replace keeps the operation on one volume so
+        // MOVEFILE_REPLACE_EXISTING is an in-place metadata replace, not a copy.
+        unsafe {
+            MoveFileExW(
+                PCWSTR(from_wide.as_ptr()),
+                PCWSTR(to_wide.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+            .map_err(|error| {
+                format!(
+                    "无法原子替换 {} → {}：{error}",
+                    from.display(),
+                    to.display()
+                )
+            })
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to).map_err(|error| {
+            format!(
+                "无法原子替换 {} → {}：{error}",
+                from.display(),
+                to.display()
+            )
+        })
+    }
+}
+
+/// Parse `.name.grox-pid-nonce.bak` / `.tmp` → original final file name.
+fn atomic_orphan_final_name(orphan_name: &str) -> Option<&str> {
+    if !orphan_name.starts_with('.') || !orphan_name.contains(".grox-") {
+        return None;
+    }
+    let stem = orphan_name
+        .strip_suffix(".bak")
+        .or_else(|| orphan_name.strip_suffix(".tmp"))?;
+    // stem = ".{file}.grox-{pid}-{nonce}"
+    let rest = stem.strip_prefix('.')?;
+    let marker = rest.rfind(".grox-")?;
+    let file_name = &rest[..marker];
+    if file_name.is_empty() {
+        return None;
+    }
+    Some(file_name)
+}
+
+/// Parse writer pid from `.name.grox-{pid}-{nonce}.tmp|.bak`.
+fn atomic_orphan_writer_pid(orphan_name: &str) -> Option<u32> {
+    let stem = orphan_name
+        .strip_suffix(".bak")
+        .or_else(|| orphan_name.strip_suffix(".tmp"))?;
+    let rest = stem.strip_prefix('.')?;
+    let marker = rest.rfind(".grox-")?;
+    let after = &rest[marker + ".grox-".len()..];
+    let pid = after.split('-').next()?;
+    pid.parse().ok()
+}
+
 fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
     if content.len() as u64 > MAX_CONFIG_BYTES {
         return Err("配置文档不能超过 4 MB".into());
@@ -875,13 +1046,16 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
         .ok_or_else(|| "配置路径缺少父目录".to_string())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("无法创建 {}：{error}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    let nonce = CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
     let temp = parent.join(format!(
         ".{}.grox-{}-{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("config"),
+        file_name,
         std::process::id(),
-        CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed),
+        nonce,
     ));
     {
         let mut file = fs::OpenOptions::new()
@@ -898,11 +1072,109 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
             return Err(format!("无法写入配置 {}：{error}", temp.display()));
         }
     }
-    if path.exists() {
-        fs::remove_file(path)
-            .map_err(|error| format!("无法替换配置 {}：{error}", path.display()))?;
+    // Single platform-native replace — never leave a window where `path` is
+    // missing while only a `.bak` remains (the previous two-step rename).
+    if let Err(error) = replace_file_atomic(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
     }
-    fs::rename(&temp, path).map_err(|error| format!("无法保存配置 {}：{error}", path.display()))
+    Ok(())
+}
+
+/// Drop orphan atomic-write temps; restore recovery copies when final is missing.
+///
+/// Rules:
+/// - Never touch `.tmp` still owned by **this** process (may be mid-write).
+/// - Final missing + `.bak`/aged foreign `.tmp` → promote to final (do not delete
+///   the only copy if promote fails).
+/// - Final present + aged leftover → delete.
+fn scrub_atomic_write_orphans(dir: &Path, max_age: std::time::Duration) -> u32 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let self_pid = std::process::id();
+    let mut removed = 0u32;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let is_orphan = name.starts_with('.')
+            && (name.ends_with(".tmp") || name.ends_with(".bak"))
+            && name.contains(".grox-");
+        if !is_orphan {
+            continue;
+        }
+        // Live writer temps use our pid in the name — age-0 scrub must not
+        // steal them between sync_all and replace.
+        if name.ends_with(".tmp") {
+            if let Some(pid) = atomic_orphan_writer_pid(name) {
+                if pid == self_pid {
+                    continue;
+                }
+            }
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let aged = meta
+            .modified()
+            .ok()
+            .map(|modified| now.duration_since(modified).unwrap_or_default() >= max_age)
+            .unwrap_or(true);
+
+        if name.ends_with(".bak") {
+            if let Some(final_name) = atomic_orphan_final_name(name) {
+                let final_path = dir.join(final_name);
+                if !final_path.exists() {
+                    // Crash mid-replace left only the recovery copy — restore it.
+                    if fs::rename(&path, &final_path).is_ok() {
+                        removed += 1;
+                    }
+                    // Rename failed: leave bak (only copy). Never delete.
+                    continue;
+                }
+            }
+            // Final exists: only drop aged bak leftovers.
+            if aged && fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+            continue;
+        }
+
+        // .tmp from a dead writer.
+        if let Some(final_name) = atomic_orphan_final_name(name) {
+            let final_path = dir.join(final_name);
+            if !final_path.exists() {
+                // First-write crash: promote complete temp instead of deleting
+                // the only snapshot.
+                if aged && fs::rename(&path, &final_path).is_ok() {
+                    removed += 1;
+                }
+                continue;
+            }
+        }
+        if aged && fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn scrub_session_cache_dir(app: &tauri::AppHandle) {
+    let Ok(dir) = app.path().app_config_dir().map(|d| d.join("session-cache")) else {
+        return;
+    };
+    if !dir.is_dir() {
+        return;
+    }
+    // Temps older than 30s are safe leftovers; immediate cleanup of all .tmp
+    // is fine because live writers hold exclusive create_new names.
+    let removed = scrub_atomic_write_orphans(&dir, std::time::Duration::from_secs(30));
+    if removed > 0 {
+        eprintln!("grox: scrubbed {removed} orphan session-cache temp/bak files");
+    }
 }
 
 const SESSION_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -955,6 +1227,22 @@ fn delete_session_cache(app: tauri::AppHandle, id: String) -> Result<(), String>
         fs::remove_file(&path).map_err(|error| format!("无法删除会话缓存：{error}"))?;
     }
     Ok(())
+}
+
+#[tauri::command]
+fn scrub_session_cache_orphans(app: tauri::AppHandle) -> Result<u32, String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map(|directory| directory.join("session-cache"))
+        .map_err(|error| format!("无法定位会话缓存目录：{error}"))?;
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+    Ok(scrub_atomic_write_orphans(
+        &dir,
+        std::time::Duration::from_secs(0),
+    ))
 }
 
 #[cfg(unix)]
@@ -3839,7 +4127,7 @@ fn desktop_command_for_file(path: &Path, file: &Path) -> Result<(String, Vec<Str
 
 /// Enumerate installed editor and terminal applications on the host.
 #[tauri::command]
-fn list_open_applications() -> Result<Vec<OpenApplicationOption>, String> {
+fn list_open_applications_sync() -> Result<Vec<OpenApplicationOption>, String> {
     #[cfg(target_os = "macos")]
     {
         let mut applications = discovered_application_paths()
@@ -3863,6 +4151,16 @@ fn list_open_applications() -> Result<Vec<OpenApplicationOption>, String> {
     {
         Ok(Vec::new())
     }
+}
+
+/// Enumerate installable "Open with" targets. Must be async: on Windows this
+/// shells out to PowerShell and extracts icons — a sync command freezes the
+/// WebView for 2–3s on cold open (UI painted, clicks dead).
+#[tauri::command]
+async fn list_open_applications() -> Result<Vec<OpenApplicationOption>, String> {
+    tauri::async_runtime::spawn_blocking(list_open_applications_sync)
+        .await
+        .map_err(|error| format!("应用发现任务失败：{error}"))?
 }
 
 #[cfg(target_os = "macos")]
@@ -6455,9 +6753,17 @@ fn main() {
                 window.set_icon(icon)?;
             }
             register_computer_emergency_shortcut(app.handle().clone());
-            if let Err(error) = provision_grox_deep_research_workflow() {
-                eprintln!("grox: 无法安装完整 deep-research 工作流：{error}");
-            }
+            // Never block setup (window interactivity) on disk / provisioning.
+            // These can take seconds with large session-cache dirs and freeze
+            // the first 2–3s of operator input.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                if let Err(error) = provision_grox_deep_research_workflow() {
+                    eprintln!("grox: 无法安装完整 deep-research 工作流：{error}");
+                }
+                // Crash / BSOD leftovers: orphan .tmp/.bak under session-cache.
+                scrub_session_cache_dir(&handle);
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -6467,6 +6773,7 @@ fn main() {
             read_session_cache,
             write_session_cache,
             delete_session_cache,
+            scrub_session_cache_orphans,
             validate_workspace,
             pick_workspace,
             list_workspace_files,
@@ -6585,6 +6892,146 @@ mod tests {
     }
 
     #[test]
+    fn atomic_write_replaces_without_delete_first_gap() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-atomic-write-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("payload.json");
+        atomic_write(&path, "{\"v\":1}").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"v\":1}");
+        atomic_write(&path, "{\"v\":2}").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"v\":2}");
+        // No lingering temps/baks for a clean replace.
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".grox-"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scrub_atomic_write_orphans_removes_tmp_and_aged_bak_when_final_exists() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-scrub-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        // Foreign pid so age-0 scrub is allowed to touch the temp.
+        let tmp = root.join(".x.json.grox-1-2.tmp");
+        let bak = root.join(".x.json.grox-1-3.bak");
+        let keep = root.join("x.json");
+        fs::write(&tmp, b"tmp").unwrap();
+        fs::write(&bak, b"bak").unwrap();
+        fs::write(&keep, b"keep").unwrap();
+        let removed = scrub_atomic_write_orphans(&root, std::time::Duration::from_secs(0));
+        assert!(removed >= 2);
+        assert!(!tmp.exists());
+        assert!(!bak.exists());
+        assert!(keep.exists());
+        assert_eq!(fs::read_to_string(&keep).unwrap(), "keep");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scrub_restores_bak_when_final_missing_crash_mid_replace() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-scrub-restore-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let final_path = root.join("session.json");
+        let bak = root.join(".session.json.grox-9-9.bak");
+        // Simulate crash after final → bak, before temp → final.
+        fs::write(&bak, b"{\"recovered\":true}").unwrap();
+        assert!(!final_path.exists());
+        let touched = scrub_atomic_write_orphans(&root, std::time::Duration::from_secs(0));
+        assert!(touched >= 1);
+        assert!(final_path.exists(), "final must be restored from bak");
+        assert!(!bak.exists(), "bak consumed by restore");
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "{\"recovered\":true}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scrub_promotes_foreign_tmp_when_final_missing_first_write_crash() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-scrub-promote-tmp-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let final_path = root.join("session.json");
+        // Dead writer pid (not this process).
+        let tmp = root.join(".session.json.grox-4242-7.tmp");
+        fs::write(&tmp, b"{\"first\":true}").unwrap();
+        assert!(!final_path.exists());
+        let touched = scrub_atomic_write_orphans(&root, std::time::Duration::from_secs(0));
+        assert!(touched >= 1);
+        assert!(final_path.exists());
+        assert!(!tmp.exists());
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "{\"first\":true}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scrub_skips_live_process_tmp_even_with_max_age_zero() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-scrub-live-tmp-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let pid = std::process::id();
+        let tmp = root.join(format!(".session.json.grox-{pid}-99.tmp"));
+        fs::write(&tmp, b"in-flight").unwrap();
+        let removed = scrub_atomic_write_orphans(&root, std::time::Duration::from_secs(0));
+        assert_eq!(removed, 0);
+        assert!(tmp.exists(), "live writer temp must survive concurrent scrub");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scrub_keeps_fresh_bak_when_final_present_until_aged() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-scrub-keep-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let final_path = root.join("payload.json");
+        fs::write(&final_path, b"live").unwrap();
+        let bak2 = root.join(".payload.json.grox-1-2.bak");
+        fs::write(&bak2, b"stale-but-fresh").unwrap();
+        let removed = scrub_atomic_write_orphans(&root, std::time::Duration::from_secs(3600));
+        assert_eq!(removed, 0, "fresh bak with final present must not be scrubbed");
+        assert!(bak2.exists());
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "live");
+        // Concurrent-style second scrub with age=0 should drop aged bak only.
+        let removed2 = scrub_atomic_write_orphans(&root, std::time::Duration::from_secs(0));
+        assert!(removed2 >= 1);
+        assert!(!bak2.exists());
+        assert!(final_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_orphan_final_name_parses_bak_and_tmp() {
+        assert_eq!(
+            atomic_orphan_final_name(".payload.json.grox-12-3.bak"),
+            Some("payload.json")
+        );
+        assert_eq!(
+            atomic_orphan_final_name(".x.json.grox-1-2.tmp"),
+            Some("x.json")
+        );
+        assert_eq!(atomic_orphan_final_name("payload.json"), None);
+        assert_eq!(atomic_orphan_final_name(".nope.bak"), None);
+        assert_eq!(atomic_orphan_writer_pid(".x.json.grox-42-9.tmp"), Some(42));
+    }
+
+    #[test]
     fn session_history_path_rejects_traversal() {
         assert!(session_history_path(Path::new("unused"), "../session").is_err());
         assert!(session_history_path(Path::new("unused"), "folder/session").is_err());
@@ -6605,6 +7052,27 @@ mod tests {
         fs::write(&history, "").unwrap();
         assert_eq!(
             session_history_path(&root, "session-id").unwrap(),
+            Some(history.canonicalize().unwrap())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_history_path_finds_nested_and_alternate_filenames() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-session-scan-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let history = root
+            .join("sessions")
+            .join("ws-a")
+            .join("batch")
+            .join("019fdc55-nested-id")
+            .join("history.jsonl");
+        fs::create_dir_all(history.parent().unwrap()).unwrap();
+        fs::write(&history, "{\"type\":\"user\",\"content\":\"hello\"}\n").unwrap();
+        assert_eq!(
+            session_history_path(&root, "019fdc55-nested-id").unwrap(),
             Some(history.canonicalize().unwrap())
         );
         fs::remove_dir_all(root).unwrap();
@@ -6648,7 +7116,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn discovers_installed_open_applications_from_host() {
-        let applications = list_open_applications().unwrap();
+        let applications = list_open_applications_sync().unwrap();
         assert!(applications.iter().any(|item| item.id == "com.apple.finder"));
         assert!(applications.iter().all(|item| {
             !item.id.trim().is_empty()

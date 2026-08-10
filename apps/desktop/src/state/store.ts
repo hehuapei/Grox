@@ -43,7 +43,16 @@ import type {
   RuntimeNotice,
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
-import { loadSessionCache, removeSessionCache, scheduleSaveSessionCache } from "../lib/sessionCache";
+import {
+  clearDraftBuffer,
+  flushAllPendingSessionCaches,
+  flushSessionCache,
+  loadDraftBuffer,
+  removeSessionCache,
+  saveDraftBuffer,
+  scheduleSaveSessionCache,
+  scrubSessionCacheOrphans,
+} from "../lib/sessionCache";
 import { readStoredPermissionMode } from "../lib/permissionMode";
 import { shouldDrainLocalQueue } from "../lib/queueTurnPolicy";
 import { mergeProjectSessionsPure } from "../lib/sessionCatalogMerge";
@@ -54,7 +63,6 @@ import {
 } from "../lib/sessionGate";
 import {
   consumeShellUpgradeRescan,
-  sanitizeSessionForOpen,
   shouldCloseDetachedSession,
   shouldForceOfflineRescan,
 } from "../lib/sessionOpenPolicy";
@@ -70,6 +78,24 @@ import {
   setComputerUseHostPrefsEnabled,
   setComputerUseOperatorEnabled,
 } from "../lib/computerUse";
+import {
+  dedupeProjects,
+  dismissProjectId,
+  ensureProject as ensureProjectPure,
+  isDraftSessionId,
+  isEphemeralSessionId,
+  maySurfaceProject,
+  mergeDiscoveredProjects as mergeDiscoveredProjectsPure,
+  projectId,
+  samePath,
+  undismissProjectId,
+} from "../lib/projectCatalog";
+import {
+  buildDraftRestoreAfterSessionNewFailure,
+  shouldRetainDraftBufferUntilSessionReady,
+} from "../lib/draftLaunchRecovery";
+import { sessionShellFromMeta } from "../lib/sessionShell";
+import { hydrateSessionOffline, preferRicherSession } from "../lib/offlineSessionHydrate";
 
 export type View = "home" | "session";
 export type InspectorTab = "files" | "tasks" | "preview" | "usage";
@@ -234,7 +260,10 @@ interface DesktopState {
   removeProject(id: string): void;
   openProjectInExplorer(id?: string): Promise<void>;
   createProjectWorktree(id: string): Promise<void>;
+  /** Remove from sidebar/catalog; ACP delete is best-effort (stale ids may fail). */
   deleteSession(id: string): Promise<void>;
+  /** Alias of deleteSession for dead/stale sidebar rows. */
+  removeSessionFromSidebar(id: string): Promise<void>;
   renameSession(id: string, title: string): void;
   pinSession(id: string): void;
   archiveSession(id: string): void;
@@ -243,7 +272,8 @@ interface DesktopState {
   continueSessionInNewChat(id: string): Promise<void>;
   continueSessionInNewWorktree(id: string): Promise<void>;
   openSessionInNewWindow(id: string): Promise<void>;
-  setWorkspace(cwd: string): Promise<void>;
+  /** `restoreProject`: explicit add (folder picker) may undismiss a removed project. */
+  setWorkspace(cwd: string, options?: { restoreProject?: boolean }): Promise<void>;
   authenticate(): Promise<void>;
   logout(): Promise<void>;
   refreshAccount(): Promise<void>;
@@ -293,6 +323,8 @@ interface DesktopState {
   setComputerUseEnabled(enabled: boolean): void;
   setBrowserUseEnabled(enabled: boolean): void;
   setDraft(text: string): void;
+  /** Flush UI session cache + catalog for crash durability (visibility/pagehide). */
+  flushDurableState(): void;
   setComposerAttachments(attachments: PromptAttachment[]): void;
   setInspectorTab(tab: InspectorTab): void;
   setPlanPreviewOpen(open: boolean): void;
@@ -390,30 +422,42 @@ function persistWorkflowRuns(runs: Record<string, WorkflowRun[]>) {
   }, 300);
 }
 
-const projectId = (path: string) => path.replace(/[\\/]+$/, "").toLocaleLowerCase();
-const projectName = (path: string) => path.replace(/[\\/]+$/, "").split(/[\\/]/).at(-1) || path;
-const samePath = (left: string, right: string) => projectId(left) === projectId(right);
+const DISMISSED_PROJECTS_KEY = "grox.dismissedProjects";
 
-function ensureProject(projects: ProjectMeta[], path: string): ProjectMeta[] {
+function loadDismissedProjects(): Set<string> {
+  const raw = loadJson<string[]>(DISMISSED_PROJECTS_KEY, []);
+  return new Set(raw.map((entry) => projectId(entry)).filter(Boolean));
+}
+
+function persistDismissedProjects(dismissed: Iterable<string>) {
+  localStorage.setItem(
+    DISMISSED_PROJECTS_KEY,
+    JSON.stringify([...new Set([...dismissed].map((entry) => projectId(entry)).filter(Boolean))].sort()),
+  );
+}
+
+function loadProjects(): ProjectMeta[] {
+  const loaded = dedupeProjects(loadJson<ProjectMeta[]>("grox.projects", []));
+  localStorage.setItem("grox.projects", JSON.stringify(loaded));
+  return loaded;
+}
+
+function ensureProject(
+  projects: ProjectMeta[],
+  path: string,
+  options?: { restore?: boolean },
+): ProjectMeta[] {
+  const dismissed = loadDismissedProjects();
   const id = projectId(path);
-  const now = Date.now();
-  const current = projects.find((project) => project.id === id);
-  const next = current
-    ? projects.map((project) =>
-        project.id === id ? { ...project, path, lastOpenedAt: now } : project,
-      )
-    : [
-        ...projects,
-        {
-          id,
-          path,
-          name: projectName(path),
-          pinned: false,
-          archived: false,
-          createdAt: now,
-          lastOpenedAt: now,
-        },
-      ];
+  // Passive open / session_ready / CLI import must NOT resurrect removed projects.
+  // Only explicit restore (new project folder picker) clears dismissal.
+  if (!maySurfaceProject({ path, dismissed, restore: options?.restore })) {
+    return dedupeProjects(projects) as ProjectMeta[];
+  }
+  if (options?.restore && id && dismissed.has(id)) {
+    persistDismissedProjects(undismissProjectId(dismissed, id));
+  }
+  const next = ensureProjectPure(projects, path) as ProjectMeta[];
   localStorage.setItem("grox.projects", JSON.stringify(next));
   return next;
 }
@@ -458,24 +502,24 @@ function mergeSessions(
 }
 
 function mergeDiscoveredProjects(projects: ProjectMeta[], sessions: SessionMeta[]): ProjectMeta[] {
-  const next = [...projects];
-  const known = new Set(next.map((project) => project.id));
-  for (const session of sessions) {
-    const id = projectId(session.cwd);
-    if (!session.cwd.trim() || known.has(id)) continue;
-    known.add(id);
-    next.push({
-      id,
-      path: session.cwd,
-      name: projectName(session.cwd),
-      pinned: false,
-      archived: false,
-      createdAt: session.createdAt,
-      lastOpenedAt: session.updatedAt,
-    });
+  const next = mergeDiscoveredProjectsPure(
+    projects,
+    sessions,
+    loadDismissedProjects(),
+  ) as ProjectMeta[];
+  if (JSON.stringify(next) !== JSON.stringify(projects)) {
+    localStorage.setItem("grox.projects", JSON.stringify(next));
   }
-  if (next.length !== projects.length) localStorage.setItem("grox.projects", JSON.stringify(next));
   return next;
+}
+
+function dropEphemeralSessions(
+  sessions: Record<string, Session>,
+  keepId?: string | null,
+): Record<string, Session> {
+  return Object.fromEntries(
+    Object.entries(sessions).filter(([id]) => id === keepId || !isEphemeralSessionId(id)),
+  );
 }
 
 function patchLines(path: string, patch: string, additions = 0, deletions = 0): DiffHunk {
@@ -560,7 +604,7 @@ function scheduleSessionCatalog(metas: SessionMeta[]) {
     if (pendingCatalog) persistSessionCatalog(pendingCatalog);
     pendingCatalog = undefined;
     catalogPersistTimer = undefined;
-  }, 750);
+  }, 300);
 }
 
 if (import.meta.hot) {
@@ -701,7 +745,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const s = state.sessions[sessionId];
       if (!s) return;
       const next = { ...fn(s), updatedAt: Date.now() };
-      scheduleSaveSessionCache(next);
+      // Terminal turns flush cache immediately (BSOD window); live turns debounce.
+      if (isSessionTerminal(next.status)) flushSessionCache(next);
+      else scheduleSaveSessionCache(next);
       if (!touchCatalogue) {
         set({ sessions: { ...state.sessions, [sessionId]: next } });
         if (isSessionTerminal(next.status)) applyQueuedModel(sessionId);
@@ -717,7 +763,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
             }
           : m,
       );
-      scheduleSessionCatalog(nextIndex);
+      if (isSessionTerminal(next.status)) {
+        // Catalogue row status should survive hard crash too.
+        persistSessionCatalog(nextIndex);
+      } else {
+        scheduleSessionCatalog(nextIndex);
+      }
       set({
         sessions: { ...state.sessions, [sessionId]: next },
         sessionIndex: nextIndex,
@@ -886,6 +937,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         const nextIndex = e.background && previousMeta
           ? sessionIndex.map((item) => item.id === readySession.id ? indexedMeta : item)
           : [indexedMeta, ...sessionIndex.filter((item) => item.id !== readySession.id)];
+        // Passive session bind must not resurrect a removed project row.
         const projects = ensureProject(get().projects, readySession.cwd);
         persistSessionCatalog(nextIndex);
         const state = get();
@@ -900,13 +952,20 @@ export const useDesktop = create<DesktopState>((set, get) => {
           mode: state.mode,
           permissionMode: state.permissionMode,
         };
-        const sessionComposers = { ...state.sessionComposers, [readySession.id]: composer };
+        // Drop ephemeral draft/pending composer shells once a real session binds.
+        const sessionComposers = Object.fromEntries(
+          Object.entries({ ...state.sessionComposers, [readySession.id]: composer })
+            .filter(([id]) => !isEphemeralSessionId(id)),
+        );
         persistSessionComposers(sessionComposers);
         const remainsActive = state.activeId === readySession.id && state.view === "session";
         if (!e.background || remainsActive) bridge.setPermissionMode(composer.permissionMode);
         const nextSessions = e.background
           ? sessions
-          : Object.fromEntries(Object.entries(sessions).filter(([id]) => !id.startsWith("pending-")));
+          : Object.fromEntries(Object.entries(sessions).filter(([id]) => !isEphemeralSessionId(id)));
+        const readyProjectId = projects.some((project) => samePath(project.path, readySession.cwd))
+          ? projectId(readySession.cwd)
+          : null;
         set({
           sessions: { ...nextSessions, [readySession.id]: nextSession },
           sessionIndex: nextIndex,
@@ -914,7 +973,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           sessionComposers,
           ...(!e.background ? {
             workspace: readySession.cwd,
-            activeProjectId: projectId(readySession.cwd),
+            activeProjectId: readyProjectId,
             activeId: readySession.id,
             view: "session" as const,
             model: composer.model,
@@ -929,6 +988,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
           } : {}),
         });
         if (launch) {
+          // Create path succeeded — crash buffer is no longer needed.
+          clearDraftBuffer(readySession.cwd);
           void bridge.prompt(readySession.id, launch.text, {
             model: composer.model,
             effort: composer.effort,
@@ -1120,7 +1181,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     bridgeKind: bridge.kind,
     workspace: DEMO_CWD,
     view: "home",
-    projects: loadJson<ProjectMeta[]>("grox.projects", []),
+    projects: loadProjects(),
     activeProjectId: null,
     sessionIndex: [],
     sessions: {},
@@ -1176,85 +1237,154 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (bridgeSubscribed) return;
       bridgeSubscribed = true;
       bridge.subscribe(applyEvent);
-      try {
-        const runtime = bridge.kind === "acp"
-          ? await invoke<GrokRuntimeInfo>("grok_runtime_info")
-          : null;
-        // Host-attested CU: migrate FE once, then host_prefs is authority.
-        const feCu = localStorage.getItem("grox.computerUseEnabled") !== "0";
-        await invoke("host_prefs_migrate_computer_use", { feEnabled: feCu }).catch(() => {});
-        const hostPrefs = await invoke<{ computerUseEnabled?: boolean }>("host_prefs_get").catch(() => null);
-        if (hostPrefs && typeof hostPrefs.computerUseEnabled === "boolean") {
-          setComputerUseHostPrefsEnabled(hostPrefs.computerUseEnabled);
+
+      // ── Phase 0: paint the shell from local cache only ─────────────────
+      // Critical: do NOT await CLI spawn / initialize in this turn. An
+      // await here keeps the microtask queue busy for 2–3s and starves
+      // React paint + pointer events even after ready:true is set.
+      const sessionIndex = decorateSessions(loadJson<SessionMeta[]>("grox.sessionCatalog", []));
+      const cachedWorkspace = (() => {
+        try {
+          return localStorage.getItem("grok.workspace")?.trim() || "";
+        } catch {
+          return "";
         }
-        const envOn = await invoke<boolean>("computer_use_env_enabled").catch(() => false);
-        setComputerUseHostEnvEnabled(Boolean(envOn));
-        const env = await invoke<{ appVersion?: string }>("desktop_environment").catch(() => null);
-        if (env?.appVersion && consumeShellUpgradeRescan(env.appVersion)) {
-          upgradeForceOfflineRescan = true;
-          upgradeForceRescanned.clear();
-        }
+      })();
+      if (cachedWorkspace) {
+        const projects = ensureProject(get().projects, cachedWorkspace);
         set({
-          runtime,
-          computerUseEnabled: isComputerUseOperatorEnabled(),
-          accountSetupOpen: get().accountSetupOpen || Boolean(runtime?.selectionRequired),
-        });
-        const workspace = await bridge.getWorkspace();
-        const projects = ensureProject(get().projects, workspace);
-        const [auth, modelState, provider] = await Promise.all([
-          bridge.getAuthState(),
-          bridge.getModelState(),
-          bridge.getProviderStatus(),
-        ]);
-        const sessionIndex = decorateSessions(loadJson<SessionMeta[]>("grox.sessionCatalog", []));
-        set({
-          workspace,
+          workspace: cachedWorkspace,
           projects,
-          activeProjectId: projectId(workspace),
+          activeProjectId: projectId(cachedWorkspace),
           sessionIndex,
-          auth,
-          ...resolveModelState(modelState),
-          provider,
           ready: true,
-          startupError: null,
         });
-        window.setTimeout(() => {
-          if (get().auth.inProgress) return;
-          void get().refreshWorkspaceFiles();
-          void get().refreshProjectPreview(false);
-          if (get().view === "session") void get().refreshWorkspaceDiffs();
-        }, 750);
-        if (!auth.required) void get().refreshAccount();
-        void get().refreshProviderProfiles();
-        window.setTimeout(() => {
-          if (!get().auth.inProgress && get().historySyncedAt === 0) void get().refreshHistory();
-        }, 500);
-        if (workspaceWatchTimer === undefined) {
-          workspaceWatchTimer = window.setInterval(() => {
-            if (document.visibilityState !== "visible" || get().auth.inProgress || get().view !== "session") return;
-            workspaceWatchTick += 1;
-            void get().refreshWorkspaceDiffs();
-            if (workspaceWatchTick % 3 === 0) void get().refreshWorkspaceFiles();
-            if (get().projectPreview.status === "starting") void get().refreshProjectPreview();
-          }, 2_000);
-        }
-      } catch (error) {
-        set({
-          ready: true,
-          startupError: error instanceof Error ? error.message : String(error),
-        });
-        return;
+      } else {
+        set({ sessionIndex, ready: true });
       }
 
-      // Dev deep links: ?open=<sessionId> opens a mission,
-      // ?prompt=<text> launches a fresh one. Runs once (guard above).
+      // Deep links / agent boot are scheduled after a real interaction window.
       const params = new URLSearchParams(window.location.search);
       const open = params.get("open");
       const prompt = params.get("prompt");
-      if (open) void get().openSession(open);
-      else if (prompt) {
-        await get().newSession();
-        get().sendPrompt(prompt);
+      const needsImmediateAgent = Boolean(open || prompt);
+
+      // ── Phase 1 (macrotask): host-only prefs. Never spawn CLI here. ───
+      // Case B freeze: UI painted but unclickable for 2–3s because ensureReady
+      // + getWorkspace/getAuth pile IPC/JSON on the main thread right after paint.
+      window.setTimeout(() => {
+        void (async () => {
+          try {
+            const feCu = localStorage.getItem("grox.computerUseEnabled") !== "0";
+            void invoke("host_prefs_migrate_computer_use", { feEnabled: feCu }).catch(() => {});
+
+            const [hostPrefs, envOn, env] = await Promise.all([
+              invoke<{ computerUseEnabled?: boolean }>("host_prefs_get").catch(() => null),
+              invoke<boolean>("computer_use_env_enabled").catch(() => false),
+              invoke<{ appVersion?: string }>("desktop_environment").catch(() => null),
+            ]);
+            if (hostPrefs && typeof hostPrefs.computerUseEnabled === "boolean") {
+              setComputerUseHostPrefsEnabled(hostPrefs.computerUseEnabled);
+            }
+            setComputerUseHostEnvEnabled(Boolean(envOn));
+            if (env?.appVersion && consumeShellUpgradeRescan(env.appVersion)) {
+              upgradeForceOfflineRescan = true;
+              upgradeForceRescanned.clear();
+            }
+            set({ computerUseEnabled: isComputerUseOperatorEnabled() });
+          } catch {
+            // Host prefs are non-fatal.
+          }
+        })();
+      }, 0);
+
+      // ── Phase 2: agent boot only after idle (or immediately for deep links).
+      // Keep the shell fully interactive for ~2s before any acp_spawn work.
+      const bootAgent = () => {
+        void (async () => {
+          try {
+            // Intentionally start connect here (not at import, not at ready:true).
+            void bridge.ensureReady?.();
+
+            const runtimeP = bridge.kind === "acp"
+              ? invoke<GrokRuntimeInfo>("grok_runtime_info").catch(() => null)
+              : Promise.resolve(null);
+            const workspaceP = bridge.getWorkspace().catch(() => get().workspace);
+            const authP = bridge.getAuthState().catch(() => get().auth);
+            const modelP = bridge.getModelState().catch(() => ({
+              models: get().models,
+              currentId: get().model,
+            }));
+            const providerP = bridge.getProviderStatus().catch(() => get().provider);
+
+            const [runtime, workspace, auth, modelState, provider] = await Promise.all([
+              runtimeP,
+              workspaceP,
+              authP,
+              modelP,
+              providerP,
+            ]);
+
+            const projects = ensureProject(get().projects, workspace);
+            set({
+              runtime: runtime ?? null,
+              computerUseEnabled: isComputerUseOperatorEnabled(),
+              // Never force-open setup mid-session unless runtime truly missing.
+              accountSetupOpen: get().accountSetupOpen || Boolean(runtime?.selectionRequired),
+              workspace,
+              projects,
+              activeProjectId: projectId(workspace),
+              auth,
+              ...resolveModelState(modelState),
+              provider,
+              startupError: null,
+            });
+
+            if (!auth.required) void get().refreshAccount();
+            void get().refreshProviderProfiles();
+
+            window.setTimeout(() => {
+              if (get().auth.inProgress) return;
+              void get().refreshWorkspaceFiles();
+              void get().refreshProjectPreview(false);
+              if (get().view === "session") void get().refreshWorkspaceDiffs();
+            }, 1_500);
+
+            window.setTimeout(() => {
+              void scrubSessionCacheOrphans();
+            }, 4_000);
+            window.setTimeout(() => {
+              if (!get().auth.inProgress && get().historySyncedAt === 0) void get().refreshHistory();
+            }, 3_500);
+
+            if (workspaceWatchTimer === undefined) {
+              workspaceWatchTimer = window.setInterval(() => {
+                if (document.visibilityState !== "visible" || get().auth.inProgress || get().view !== "session") return;
+                workspaceWatchTick += 1;
+                void get().refreshWorkspaceDiffs();
+                if (workspaceWatchTick % 3 === 0) void get().refreshWorkspaceFiles();
+                if (get().projectPreview.status === "starting") void get().refreshProjectPreview();
+              }, 2_000);
+            }
+
+            if (open) void get().openSession(open);
+            else if (prompt) void get().newSession({ text: prompt });
+          } catch (error) {
+            set({
+              ready: true,
+              startupError: error instanceof Error ? error.message : String(error),
+            });
+          }
+        })();
+      };
+
+      if (needsImmediateAgent) {
+        // Deep-link must talk to the agent; still yield one frame for paint.
+        window.setTimeout(bootAgent, 50);
+      } else if (typeof window.requestIdleCallback === "function") {
+        window.requestIdleCallback(() => bootAgent(), { timeout: 2_800 });
+      } else {
+        window.setTimeout(bootAgent, 1_800);
       }
     },
 
@@ -1269,7 +1399,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (shouldCloseDetachedSession({ currentId, nextId: null, status: current?.status })) {
         void bridge.closeSession(currentId!).catch(() => {});
       }
-      set({ view: "home", activeId: null });
+      set({
+        view: "home",
+        activeId: null,
+        sessions: dropEphemeralSessions(state.sessions),
+      });
     },
 
     async openSession(id) {
@@ -1289,40 +1423,124 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
       if (meta && !samePath(meta.cwd, get().workspace)) await get().setWorkspace(meta.cwd);
       const state = get();
-      const existing = state.sessions[id];
+      let existing = state.sessions[id];
       const composer = state.sessionComposers[id];
       if (composer) bridge.setPermissionMode(composer.permissionMode);
-      set({
-        activeId: id,
-        view: "session",
-        ...(composer ? {
-          model: composer.model,
-          effort: composer.effort,
-          mode: composer.mode,
-          permissionMode: composer.permissionMode,
-        } : {}),
-      });
+
+      // Never leave activeId set with sessions[id] missing — that paints the
+      // infinite black "RESTORING MISSION" spinner when cache/ACP is slow.
+      if (!existing && meta) {
+        existing = sessionShellFromMeta(meta, meta.lastStatus === "failed" ? "failed" : "idle");
+        set({
+          activeId: id,
+          view: "session",
+          sessions: { ...state.sessions, [id]: existing },
+          ...(composer ? {
+            model: composer.model,
+            effort: composer.effort,
+            mode: composer.mode,
+            permissionMode: composer.permissionMode,
+          } : {}),
+        });
+      } else {
+        set({
+          activeId: id,
+          view: "session",
+          ...(composer ? {
+            model: composer.model,
+            effort: composer.effort,
+            mode: composer.mode,
+            permissionMode: composer.permissionMode,
+          } : {}),
+        });
+      }
+
       const forceRescan = shouldForceOfflineRescan({
         upgradeRescanActive: upgradeForceOfflineRescan,
         sessionAlreadyForceRescanned: upgradeForceRescanned.has(id),
       });
-      if (!existing) {
-        void loadSessionCache(id).then((cached) => {
-          if (!cached) return;
+      const needsHydrate = !existing || existing.preview || existing.blocks.length === 0 || forceRescan;
+      const openMeta: SessionMeta | null = (meta ?? existing)
+        ? {
+            id,
+            title: meta?.title ?? existing?.title ?? "Untitled mission",
+            cwd: meta?.cwd ?? existing?.cwd ?? get().workspace,
+            createdAt: meta?.createdAt ?? existing?.createdAt ?? Date.now(),
+            updatedAt: meta?.updatedAt ?? existing?.updatedAt ?? Date.now(),
+            model: meta?.model ?? existing?.model ?? get().model,
+            lastStatus: meta?.lastStatus ?? existing?.lastStatus,
+            summary: meta?.summary ?? existing?.summary,
+            completionUnread: meta?.completionUnread,
+            parentId: meta?.parentId ?? existing?.parentId,
+            demo: meta?.demo ?? existing?.demo,
+            pinned: meta?.pinned ?? existing?.pinned,
+            archived: meta?.archived ?? existing?.archived,
+          }
+        : null;
+
+      // Local cache + disk jsonl first (fast paint). ACP may fail with "找不到会话"
+      // when the CLI catalogue no longer lists a sidebar id.
+      if (openMeta && (!existing || existing.blocks.length === 0 || existing.preview)) {
+        void hydrateSessionOffline(id, openMeta).then((offline) => {
+          if (!offline) return;
           const latest = get();
-          if (latest.sessions[id]) return;
-          const painted = {
-            ...cached,
-            ...sanitizeSessionForOpen(cached),
-          };
-          set({ sessions: { ...latest.sessions, [id]: painted } });
+          if (latest.activeId !== id) return;
+          const currentSession = latest.sessions[id];
+          const next = preferRicherSession(currentSession, offline);
+          if (next === currentSession) return;
+          set({ sessions: { ...latest.sessions, [id]: next } });
         });
       }
-      // Upgrade generation: always re-bind full history once per session.
-      if (!existing || existing.preview || forceRescan) {
+
+      // ACP bind / full history when needed.
+      if (needsHydrate) {
         if (forceRescan) upgradeForceRescanned.add(id);
         void bridge.loadSession(id, { background: true }).catch((error) => {
-          set({ startupError: `会话后台同步失败：${error instanceof Error ? error.message : String(error)}` });
+          const message = error instanceof Error ? error.message : String(error);
+          void (async () => {
+            const offline = openMeta ? await hydrateSessionOffline(id, openMeta) : null;
+            set((latest) => {
+              if (latest.activeId !== id) return latest;
+              const shell = latest.sessions[id];
+              if (offline && offline.blocks.length > 0) {
+                const next = preferRicherSession(shell, offline);
+                return {
+                  // Soft notice — offline history is still usable.
+                  startupError: `会话未能绑定到 CLI（已显示本地历史）：${message}`,
+                  sessions: { ...latest.sessions, [id]: { ...next, preview: true } },
+                };
+              }
+              const unavailable = /找不到会话|session not found|unknown session|no such session/i.test(message);
+              const friendly = unavailable
+                ? (message.includes("找不到") || message.includes("会话")
+                  ? `找不到会话：${id}`
+                  : `Session not found: ${id}`)
+                : message;
+              return {
+                startupError: unavailable
+                  ? null
+                  : `会话后台同步失败：${message}`,
+                sessions: shell
+                  ? {
+                      ...latest.sessions,
+                      [id]: {
+                        ...shell,
+                        blocks: shell.blocks.length > 0
+                          ? shell.blocks
+                          : [{
+                              type: "system" as const,
+                              id: `open-fail-${id}`,
+                              text: friendly,
+                              ts: Date.now(),
+                              kind: "error" as const,
+                            }],
+                        preview: false,
+                      },
+                    }
+                  : latest.sessions,
+              };
+            });
+          })();
         });
       }
     },
@@ -1334,16 +1552,88 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (shouldCloseDetachedSession({ currentId, nextId: null, status: current?.status })) {
         void bridge.closeSession(currentId!).catch(() => {});
       }
-      pendingLaunch = launch
-        ? { text: launch.text, attachments: launch.attachments ?? [] }
-        : undefined;
+      const launchAttachments = launch?.attachments ?? [];
+      const hasLaunch = Boolean(launch && (launch.text.trim() || launchAttachments.length > 0));
+
+      // Empty "+" / new mission: open a local draft composer only. Do not call
+      // session/new or insert an "Untitled mission" into the sidebar until the
+      // operator actually sends the first message.
+      if (!hasLaunch) {
+        pendingLaunch = undefined;
+        const draftId = `draft-${uid()}`;
+        const now = Date.now();
+        const workspace = get().workspace;
+        const recovered = loadDraftBuffer(workspace);
+        const recoveredText = recovered?.text ?? "";
+        const recoveredAttachments = (recovered?.attachments ?? []).map((item) => ({
+          id: item.id,
+          kind: item.kind,
+          name: item.name,
+          mime: item.mime,
+          size: item.size,
+          text: item.text,
+          data: item.data,
+        }));
+        const hasRecovered = Boolean(recoveredText.trim() || recoveredAttachments.length > 0);
+        set((state) => {
+          const baseComposers = state.sessionComposers;
+          const sessionComposers = hasRecovered
+            ? {
+                ...baseComposers,
+                [draftId]: {
+                  text: recoveredText,
+                  attachments: recoveredAttachments,
+                  model: state.model,
+                  effort: state.effort,
+                  mode: state.mode,
+                  permissionMode: state.permissionMode,
+                },
+              }
+            : baseComposers;
+          if (hasRecovered) persistSessionComposers(sessionComposers);
+          return {
+            view: "session" as const,
+            activeId: draftId,
+            sessionComposers,
+            sessions: {
+              ...dropEphemeralSessions(state.sessions),
+              [draftId]: {
+                id: draftId,
+                title: "",
+                cwd: workspace,
+                createdAt: now,
+                updatedAt: now,
+                model: state.model,
+                blocks: [],
+                usage: {
+                  inputTokens: 0,
+                  outputTokens: 0,
+                  cacheReadTokens: 0,
+                  costUSD: 0,
+                  contextUsed: 0,
+                  contextMax: 0,
+                  turns: 0,
+                },
+                status: "idle" as const,
+              },
+            },
+            startupError: null,
+          };
+        });
+        return;
+      }
+
+      pendingLaunch = {
+        text: launch!.text,
+        attachments: launchAttachments,
+      };
       const pendingId = `pending-${uid()}`;
       const now = Date.now();
       set((state) => ({
         view: "session",
         activeId: pendingId,
         sessions: {
-          ...state.sessions,
+          ...dropEphemeralSessions(state.sessions),
           [pendingId]: {
             id: pendingId,
             title: "正在创建任务",
@@ -1351,15 +1641,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
             createdAt: now,
             updatedAt: now,
             model: state.model,
-            blocks: launch
-              ? [{
-                  type: "user" as const,
-                  id: uid(),
-                  text: launch.text,
-                  attachments: (launch.attachments ?? []).map(({ id, kind, name, mime, size }) => ({ id, kind, name, mime, size })),
-                  ts: now,
-                }]
-              : [],
+            blocks: [{
+              type: "user" as const,
+              id: uid(),
+              text: launch!.text,
+              attachments: launchAttachments.map(({ id, kind, name, mime, size }) => ({ id, kind, name, mime, size })),
+              ts: now,
+            }],
             usage: {
               inputTokens: 0,
               outputTokens: 0,
@@ -1379,16 +1667,37 @@ export const useDesktop = create<DesktopState>((set, get) => {
         await bridge.newSession(get().workspace);
         set({ startupError: null });
       } catch (error) {
+        // Keep the just-sent draft recoverable: session/new (CLI boot, auth,
+        // or ACP) can fail after we already left the draft shell.
+        const failedLaunch = pendingLaunch;
         pendingLaunch = undefined;
-        set((state) => {
-          const sessions = { ...state.sessions };
-          delete sessions[pendingId];
-          return {
-            sessions,
-            activeId: null,
-            view: "home",
-            startupError: error instanceof Error ? error.message : String(error),
-          };
+        const draftId = `draft-${uid()}`;
+        const workspace = get().workspace;
+        const restored = buildDraftRestoreAfterSessionNewFailure({
+          pendingId,
+          draftId,
+          workspace,
+          launch: failedLaunch,
+          sessions: get().sessions,
+          sessionComposers: get().sessionComposers,
+          controls: {
+            model: get().model,
+            effort: get().effort,
+            mode: get().mode,
+            permissionMode: get().permissionMode,
+          },
+          now: Date.now(),
+        });
+        if (restored.draftText.trim() || restored.draftAttachments.length > 0) {
+          saveDraftBuffer(workspace, restored.draftText, restored.draftAttachments);
+        }
+        persistSessionComposers(restored.sessionComposers);
+        set({
+          sessions: restored.sessions,
+          sessionComposers: restored.sessionComposers,
+          activeId: restored.activeId,
+          view: restored.view,
+          startupError: error instanceof Error ? error.message : String(error),
         });
       }
     },
@@ -1397,7 +1706,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
       try {
         const cwd = await invoke<string | null>("pick_workspace");
         if (!cwd) return;
-        await get().setWorkspace(cwd);
+        // Explicit folder pick is the only restore path for dismissed projects.
+        await get().setWorkspace(cwd, { restoreProject: true });
         await get().newSession();
       } catch (error) {
         set({ startupError: error instanceof Error ? error.message : String(error) });
@@ -1405,7 +1715,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async openProject(id) {
-      const project = get().projects.find((entry) => entry.id === id);
+      const project = get().projects.find(
+        (entry) => entry.id === id || samePath(entry.path, id) || entry.id === projectId(id),
+      );
       if (project) await get().setWorkspace(project.path);
     },
 
@@ -1436,9 +1748,40 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     removeProject(id) {
-      const projects = get().projects.filter((project) => project.id !== id);
+      const target = get().projects.find((project) => project.id === id || samePath(project.path, id));
+      const path = target?.path ?? id;
+      const dismissId = target ? projectId(target.path) : projectId(id);
+      if (dismissId) {
+        persistDismissedProjects(dismissProjectId(loadDismissedProjects(), dismissId));
+      }
+      const projects = get().projects.filter(
+        (project) => project.id !== id && project.id !== dismissId && !samePath(project.path, id),
+      );
       localStorage.setItem("grox.projects", JSON.stringify(projects));
-      set({ projects, ...(get().activeProjectId === id ? { activeProjectId: null } : {}) });
+
+      // Keep sessions durable on disk, but move them out of the live sidebar into
+      // the archive manager so "remove" does not create invisible orphans.
+      const flags = loadJson<Record<string, SessionFlags>>("grox.sessionFlags", {});
+      const sessionIndex = get().sessionIndex.map((meta) => {
+        if (!samePath(meta.cwd, path)) return meta;
+        flags[meta.id] = { ...flags[meta.id], archived: true };
+        return { ...meta, archived: true };
+      });
+      localStorage.setItem("grox.sessionFlags", JSON.stringify(flags));
+      persistSessionCatalog(sessionIndex);
+
+      const activeId = get().activeId;
+      const activeSession = activeId ? get().sessions[activeId] : undefined;
+      const leaveActive = Boolean(activeSession && samePath(activeSession.cwd, path));
+
+      set({
+        projects,
+        sessionIndex,
+        ...(get().activeProjectId === id || get().activeProjectId === dismissId
+          ? { activeProjectId: null }
+          : {}),
+        ...(leaveActive ? { activeId: null, view: "home" as View } : {}),
+      });
     },
 
     async openProjectInExplorer(id) {
@@ -1461,16 +1804,21 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
     },
 
-    async setWorkspace(cwd) {
+    async setWorkspace(cwd, options) {
       await bridge.setWorkspace(cwd);
       const workspace = await bridge.getWorkspace();
       const fetchedSessions = await bridge.listSessions(workspace);
       const sessionIndex = mergeSessions(get().sessionIndex, fetchedSessions, workspace);
-      const projects = ensureProject(get().projects, workspace);
+      const projects = ensureProject(get().projects, workspace, {
+        restore: Boolean(options?.restoreProject),
+      });
+      const activeProjectId = projects.some((project) => samePath(project.path, workspace))
+        ? projectId(workspace)
+        : null;
       set({
         workspace,
         projects,
-        activeProjectId: projectId(workspace),
+        activeProjectId,
         sessionIndex: decorateSessions(sessionIndex),
         startupError: null,
         activeId: null,
@@ -1776,7 +2124,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
     closePreview: () => set({ previewOpen: false, previewFile: null, previewError: null }),
 
     async deleteSession(id) {
-      await bridge.deleteSession(id);
+      // Stale sidebar rows often are unknown to the current CLI — never block
+      // local catalog cleanup on ACP session/delete.
+      try {
+        await bridge.deleteSession(id);
+      } catch {
+        // ignore missing CLI session
+      }
       removeSessionCache(id);
       const { sessionIndex, sessions, activeId, sessionComposers, workflows } = get();
       const rest = { ...sessions };
@@ -1797,8 +2151,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
         sessionComposers: nextComposers,
         workflows: nextWorkflows,
         pendingSessionModels,
+        startupError: null,
         ...(activeId === id ? { activeId: null, view: "home" as View } : {}),
       });
+    },
+
+    async removeSessionFromSidebar(id) {
+      await get().deleteSession(id);
     },
 
     renameSession(id, title) {
@@ -1952,6 +2311,29 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
       const trimmed = text.trim();
       if (!trimmed && attachments.length === 0) return false;
+      const cwd = session.cwd || get().workspace;
+      // Real sessions: text is durable via CLI. Draft first-send must keep the
+      // crash buffer (text + attachments) until session_ready.
+      if (!shouldRetainDraftBufferUntilSessionReady(session.id)) {
+        clearDraftBuffer(cwd);
+      } else {
+        saveDraftBuffer(cwd, trimmed, attachments);
+      }
+
+      // Promote a local draft into a real ACP session on first send only.
+      // Keep global controls in sync, then hand off to newSession which replaces
+      // the draft with a pending shell — no activeId=null flash in between.
+      // Do NOT wipe composer/buffer yet: session/new may reject (CLI/auth/ACP).
+      if (isDraftSessionId(session.id)) {
+        set({
+          model: composer.model,
+          effort: composer.effort,
+          mode: modeOverride ?? composer.mode,
+          permissionMode: composer.permissionMode,
+        });
+        void get().newSession({ text: trimmed, attachments });
+        return true;
+      }
       if (!isSessionTerminal(session.status)) {
         const queue = get().promptQueues[session.id] ?? [];
         const duplicate = queue.some((item) => item.text.trim() === trimmed && trimmed.length > 0);
@@ -2310,18 +2692,64 @@ export const useDesktop = create<DesktopState>((set, get) => {
       set({ browserUseEnabled: enabled });
     },
     setDraft(text) {
-      const { activeId, sessionComposers, model, effort, mode, permissionMode } = get();
+      const { activeId, sessionComposers, model, effort, mode, permissionMode, sessions, workspace } = get();
       if (!activeId) return;
       const current = sessionComposers[activeId] ?? { text: "", attachments: [], model, effort, mode, permissionMode };
       const next = { ...sessionComposers, [activeId]: { ...current, text } };
       persistSessionComposers(next);
       set({ sessionComposers: next });
+      // Crash buffer for unsent prompts (draft or idle session composer).
+      const session = sessions[activeId];
+      const cwd = session?.cwd || workspace;
+      if (isDraftSessionId(activeId) || !session || isSessionTerminal(session.status)) {
+        saveDraftBuffer(cwd, text, current.attachments);
+      }
     },
     setComposerAttachments(attachments) {
-      const { activeId, sessionComposers, model, effort, mode, permissionMode } = get();
+      const { activeId, sessionComposers, model, effort, mode, permissionMode, sessions, workspace } = get();
       if (!activeId) return;
       const current = sessionComposers[activeId] ?? { text: "", attachments: [], model, effort, mode, permissionMode };
-      set({ sessionComposers: { ...sessionComposers, [activeId]: { ...current, attachments } } });
+      const next = { ...sessionComposers, [activeId]: { ...current, attachments } };
+      set({ sessionComposers: next });
+      const session = sessions[activeId];
+      const cwd = session?.cwd || workspace;
+      if (isDraftSessionId(activeId) || !session || isSessionTerminal(session.status)) {
+        saveDraftBuffer(cwd, current.text, attachments);
+      }
+    },
+    flushDurableState() {
+      const state = get();
+      flushAllPendingSessionCaches(state.sessions);
+      if (catalogPersistTimer !== undefined) {
+        window.clearTimeout(catalogPersistTimer);
+        catalogPersistTimer = undefined;
+      }
+      if (pendingCatalog) {
+        persistSessionCatalog(pendingCatalog);
+        pendingCatalog = undefined;
+      }
+      if (composerPersistTimer !== undefined) {
+        window.clearTimeout(composerPersistTimer);
+        composerPersistTimer = undefined;
+      }
+      if (pendingComposerStates) {
+        const serializable = Object.fromEntries(
+          Object.entries(pendingComposerStates).map(([id, { attachments: _attachments, ...rest }]) => [id, rest]),
+        );
+        localStorage.setItem(SESSION_COMPOSERS_KEY, JSON.stringify(serializable));
+        pendingComposerStates = undefined;
+      }
+      // Active composer crash buffer (text + attachments when budget allows).
+      const activeId = state.activeId;
+      if (activeId) {
+        const composer = state.sessionComposers[activeId];
+        const text = composer?.text ?? "";
+        const attachments = composer?.attachments ?? [];
+        const cwd = state.sessions[activeId]?.cwd || state.workspace;
+        if (isDraftSessionId(activeId) || isSessionTerminal(state.sessions[activeId]?.status ?? "idle")) {
+          saveDraftBuffer(cwd, text, attachments);
+        }
+      }
     },
     setInspectorTab: (inspectorTab) => set({ inspectorTab, inspectorOpen: true }),
     setPlanPreviewOpen: (planPreviewOpen) => set({ planPreviewOpen, ...(planPreviewOpen ? { previewOpen: false } : {}) }),

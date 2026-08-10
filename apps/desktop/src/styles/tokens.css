@@ -71,40 +71,153 @@
   --ease-snap: cubic-bezier(0.34, 1.4, 0.64, 1);
 }
 
-/* Typography controls. Most of the shell intentionally uses exact pixel
-   sizes, so a root em change would leave the smallest labels untouched. A
-   shared offset keeps their hierarchy while making every existing tier
-   respond to the appearance setting. */
+/*
+ * Typography
+ * ----------
+ * Chrome (sidebar, titlebar, chips, fixed-height rows) uses exact integer
+ * Tailwind pixel sizes and is NEVER scaled — scaling those caused overflow
+ * and sub-pixel blur.
+ *
+ * Only the mission transcript / composer read surface uses discrete integer
+ * tiers via html[data-font=sm|md|lg|xl].
+ */
+/* Frameless window: interactive chrome inside drag regions must opt out. */
+.titlebar-actions,
+.titlebar-actions *,
+[data-tauri-drag-region="false"] {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
 html {
-  --grox-font-increase: 3.5px;
-  --grox-font-weight: 500;
-  --grox-component-font-size: 11.5px;
+  --grox-font-weight: 400;
+  --grox-component-font-size: 11px;
+  /*
+   * Transcript-only integer tiers (default = md).
+   * Compact type + tight leading for long Chinese replies; chrome untouched.
+   */
+  --grox-prose-size: 13px;
+  --grox-prose-leading: 1.45;
+  --grox-user-size: 12px;
+  --grox-process-size: 11px;
+  --grox-code-size: 11px;
+  /*
+   * Reading column (narrow / medium / wide)
+   * ---------------------------------------
+   * ONLY --grox-content-max / --grox-composer-max change with density.
+   * Padding, turn gap, and nested prose max-widths stay FIXED so density
+   * cannot reflow chrome, collapse tables, or leave a hollow column.
+   * Composer max always equals content max (aligned gutters).
+   */
+  --grox-content-max: 920px;
+  --grox-composer-max: 920px;
+  --grox-content-px: 1.5rem; /* fixed — never density-coupled */
+  --grox-turn-gap: 1.15rem; /* fixed — never density-coupled */
+}
+
+html[data-font="sm"] {
+  --grox-prose-size: 12px;
+  --grox-prose-leading: 1.4;
+  --grox-user-size: 11px;
+  --grox-process-size: 10px;
+  --grox-code-size: 10px;
+}
+html[data-font="md"] {
+  --grox-prose-size: 13px;
+  --grox-prose-leading: 1.45;
+  --grox-user-size: 12px;
+  --grox-process-size: 11px;
+  --grox-code-size: 11px;
+}
+html[data-font="lg"] {
+  --grox-prose-size: 14px;
+  --grox-prose-leading: 1.5;
+  --grox-user-size: 13px;
+  --grox-process-size: 12px;
+  --grox-code-size: 12px;
+}
+html[data-font="xl"] {
+  --grox-prose-size: 15px;
+  --grox-prose-leading: 1.55;
+  --grox-user-size: 14px;
+  --grox-process-size: 13px;
+  --grox-code-size: 13px;
+}
+
+/* Density: column width only (padding/gap fixed). */
+html[data-density="narrow"] {
+  --grox-content-max: 720px;
+  --grox-composer-max: 720px;
+}
+
+html[data-density="medium"] {
+  --grox-content-max: 920px;
+  --grox-composer-max: 920px;
+}
+
+html[data-density="wide"] {
+  --grox-content-max: 1120px;
+  --grox-composer-max: 1120px;
+}
+
+/* Fill: span the entire main pane (still keeps fixed horizontal pad). */
+html[data-density="fill"] {
+  --grox-content-max: 100%;
+  --grox-composer-max: 100%;
 }
 
 body {
-  font-size: calc(15px + var(--grox-font-increase));
-  font-weight: var(--grox-font-weight);
+  font-size: 15px;
+  font-weight: var(--grox-font-weight, 400);
+  /* Crisp rasterization in WebView2 — avoid synthetic bold + subpixel mush. */
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: geometricPrecision;
 }
 .font-mono {
-  font-weight: var(--grox-font-weight);
+  font-weight: var(--grox-font-weight, 400);
 }
-.text-\[8\.5px\] { font-size: calc(8.5px + var(--grox-font-increase)); }
-.text-\[9px\] { font-size: calc(9px + var(--grox-font-increase)); }
-.text-\[9\.5px\] { font-size: calc(9.5px + var(--grox-font-increase)); }
-.text-\[10px\] { font-size: calc(10px + var(--grox-font-increase)); }
-.text-\[10\.5px\] { font-size: calc(10.5px + var(--grox-font-increase)); }
-.text-\[11px\] { font-size: calc(11px + var(--grox-font-increase)); }
-.text-\[11\.5px\] { font-size: calc(11.5px + var(--grox-font-increase)); }
-.text-\[12px\] { font-size: calc(12px + var(--grox-font-increase)); }
-.text-\[12\.5px\] { font-size: calc(12.5px + var(--grox-font-increase)); }
-.text-\[13px\] { font-size: calc(13px + var(--grox-font-increase)); }
-.text-\[14px\] { font-size: calc(14px + var(--grox-font-increase)); }
-.text-\[15px\] { font-size: calc(15px + var(--grox-font-increase)); }
-.text-\[16px\] { font-size: calc(16px + var(--grox-font-increase)); }
-.text-\[17px\] { font-size: calc(17px + var(--grox-font-increase)); }
+
+/* Settings: fixed chrome scale — independent of transcript font tier. */
+.settings-shell {
+  --grox-font-weight: 400;
+  font-size: 15px;
+  font-weight: 400;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: geometricPrecision;
+}
+.settings-shell .font-mono {
+  font-weight: 400;
+}
+
+/* Chrome utilities stay exact integers (Tailwind defaults). Do NOT inject
+   calc offsets here — that broke fixed-height rows and blurred glyphs. */
 .lbl,
 .chip {
-  font-size: calc(var(--grox-component-font-size, 11.5px) + var(--grox-font-increase));
+  font-size: var(--grox-component-font-size, 11px);
+}
+
+/* Transcript-only scaling surfaces */
+.timeline-content .assistant-prose,
+.timeline-content .assistant-prose.md,
+.timeline-content .process-prose {
+  font-size: var(--grox-prose-size) !important;
+  line-height: var(--grox-prose-leading) !important;
+}
+.timeline-content .process-prose {
+  font-size: var(--grox-process-size) !important;
+}
+.timeline-content .user-msg-text {
+  font-size: var(--grox-user-size) !important;
+  line-height: var(--grox-prose-leading) !important;
+}
+.timeline-content .md-code pre code {
+  font-size: var(--grox-code-size) !important;
+}
+.composer-shell textarea,
+.composer-shell .composer-input {
+  font-size: var(--grox-user-size);
+  line-height: var(--grox-prose-leading);
 }
 
 .summary-row {
@@ -115,7 +228,7 @@ body {
   border-radius: 5px;
   padding: 0 10px;
   color: var(--color-fg2);
-  font-size: calc(12px + var(--grox-font-increase));
+  font-size: 12px;
   transition: background-color 120ms ease, color 120ms ease;
 }
 button.summary-row:hover {
@@ -128,7 +241,7 @@ button.summary-row:hover {
   border-radius: 4px;
   padding: 0 9px;
   color: var(--color-fg2);
-  font-size: calc(9.5px + var(--grox-font-increase));
+  font-size: 10px;
 }
 .summary-action:hover:not(:disabled) {
   border-color: var(--color-line3);
@@ -211,12 +324,59 @@ html:not([data-theme="light"]) {
   box-shadow: 0 0 0 1px var(--color-line3);
 }
 
-/* Long restored transcripts stay mounted and searchable, while Chromium can
-   skip layout and paint work for turns far outside the scroll viewport. */
+/*
+ * Turn spacing only. Do NOT use content-visibility / contain-intrinsic-size:
+ * expanded process trails are thousands of px; fake intrinsic height breaks
+ * scrollHeight (missing scrollbar) and yanks the viewport on reflow.
+ * Timeline uses a native scroller + hard turn window (not Virtuoso) so expand
+ * and free scroll stay stable. Expanded process trails are also height-capped.
+ */
+.timeline-scroller {
+  overflow-anchor: none;
+  overscroll-behavior: contain;
+  /* Room for the right-edge message rail so ticks don't cover prose. */
+  padding-right: 28px;
+}
+
+/* Bound expanded process height so a single open trail cannot dominate scroll. */
+.process-sequence--bounded {
+  max-height: min(48vh, 560px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
 .timeline-turn {
-  content-visibility: auto;
-  contain-intrinsic-block-size: auto 180px;
-  contain: layout paint style;
+  margin-bottom: var(--grox-turn-gap, 1.75rem);
+  /* Prefer keeping the focused answer stable when process expands above it. */
+  overflow-anchor: auto;
+}
+
+.timeline-content {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--grox-content-max, 920px);
+  padding-left: var(--grox-content-px, 2rem);
+  padding-right: var(--grox-content-px, 2rem);
+}
+
+/*
+ * Composer dock shares the SAME outer max + horizontal pad as .timeline-content
+ * so density changes never desync the input card from the transcript column.
+ */
+.composer-dock {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: var(--grox-content-max, 920px);
+  margin-left: auto;
+  margin-right: auto;
+  padding-left: var(--grox-content-px, 2rem);
+  padding-right: var(--grox-content-px, 2rem);
+}
+
+.composer-shell {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: none;
 }
 
 .animate-orbit,
@@ -300,38 +460,27 @@ html[data-reduce-motion="1"] * {
 }
 
 /* Hyperspace deck enter — session / restore */
+/* No blur filters — blur on large subtrees freezes main-thread hit testing
+   for hundreds of ms on cold open (case B: UI visible, clicks dead). */
 @keyframes stageDeck {
   0% {
     opacity: 0;
-    filter: blur(10px);
-    transform: translate3d(0, 18px, 0) scale(0.985);
-  }
-  55% {
-    opacity: 1;
-    filter: blur(0);
+    transform: translate3d(0, 10px, 0);
   }
   100% {
     opacity: 1;
-    filter: blur(0);
-    transform: translate3d(0, 0, 0) scale(1);
+    transform: translate3d(0, 0, 0);
   }
 }
 
-/* Home enter — slight warp from deeper field */
 @keyframes stageHome {
   0% {
     opacity: 0;
-    filter: blur(14px);
-    transform: translate3d(0, 28px, 0) scale(1.03);
-  }
-  60% {
-    opacity: 1;
-    filter: blur(0);
+    transform: translate3d(0, 12px, 0);
   }
   100% {
     opacity: 1;
-    filter: blur(0);
-    transform: translate3d(0, 0, 0) scale(1);
+    transform: translate3d(0, 0, 0);
   }
 }
 
@@ -349,13 +498,11 @@ html[data-reduce-motion="1"] * {
 @keyframes missionIn {
   0% {
     opacity: 0;
-    transform: translate3d(0, 22px, 0) scale(0.96);
-    filter: blur(6px);
+    transform: translate3d(0, 12px, 0);
   }
   100% {
     opacity: 1;
-    transform: translate3d(0, 0, 0) scale(1);
-    filter: blur(0);
+    transform: translate3d(0, 0, 0);
   }
 }
 
@@ -395,19 +542,19 @@ html[data-reduce-motion="1"] * {
 }
 
 .animate-stage-deck {
-  animation: stageDeck 0.62s var(--ease-mission) both;
-  will-change: transform, opacity, filter;
+  animation: stageDeck 0.28s var(--ease-mission) both;
+  will-change: transform, opacity;
 }
 .animate-stage-home {
-  animation: stageHome 0.78s var(--ease-warp) both;
-  will-change: transform, opacity, filter;
+  animation: stageHome 0.32s var(--ease-mission) both;
+  will-change: transform, opacity;
 }
 .animate-stage-panel {
   animation: stagePanel 0.48s var(--ease-mission) both;
 }
 .animate-mission-in {
-  animation: missionIn 0.7s var(--ease-mission) both;
-  will-change: transform, opacity, filter;
+  animation: missionIn 0.3s var(--ease-mission) both;
+  will-change: transform, opacity;
 }
 .animate-mission-card {
   animation: missionCard 0.55s var(--ease-mission) both;
@@ -746,8 +893,9 @@ html[data-reduce-motion="1"] .plan-spinner {
     margin-bottom: 0;
   }
   .md p {
-    max-width: 72ch;
-    margin: 0 0 0.85em;
+    /* Fill the reading column — no nested ch clamp (caused hollow wide layouts). */
+    max-width: 100%;
+    margin: 0 0 0.42em;
   }
   .md h1,
   .md h2,
@@ -758,19 +906,19 @@ html[data-reduce-motion="1"] .plan-spinner {
     color: var(--color-fg);
     font-weight: 640;
     letter-spacing: -0.012em;
-    line-height: 1.4;
-    margin: 1.5em 0 0.55em;
+    line-height: 1.3;
+    margin: 1.05em 0 0.35em;
   }
   .md h1 {
-    font-size: 1.32em;
-    padding-bottom: 0.3em;
+    font-size: 1.22em;
+    padding-bottom: 0.22em;
     border-bottom: 1px solid var(--color-line);
   }
   .md h2 {
-    font-size: 1.16em;
+    font-size: 1.1em;
   }
   .md h3 {
-    font-size: 1.05em;
+    font-size: 1.02em;
   }
   .md h4 {
     font-size: 1em;
@@ -865,7 +1013,7 @@ html[data-reduce-motion="1"] .plan-spinner {
     border-radius: 0;
     background: transparent;
     color: var(--color-fg2);
-    font-size: calc(11.5px + var(--grox-font-increase));
+    font-size: 12px;
     line-height: 1.7;
   }
 
@@ -929,9 +1077,9 @@ html[data-reduce-motion="1"] .plan-spinner {
 
   .md ul,
   .md ol {
-    max-width: 72ch;
-    margin: 0.35em 0 0.9em;
-    padding-left: 1.5em;
+    max-width: 100%;
+    margin: 0.2em 0 0.5em;
+    padding-left: 1.35em;
     list-style: outside disc;
   }
   .md ol {
@@ -941,18 +1089,18 @@ html[data-reduce-motion="1"] .plan-spinner {
     list-style-type: circle;
   }
   .md li {
-    margin: 0.28em 0;
-    padding-left: 0.25em;
+    margin: 0.12em 0;
+    padding-left: 0.2em;
   }
   .md li::marker {
     color: var(--color-acc-dim);
   }
   .md li > ul,
   .md li > ol {
-    margin: 0.28em 0 0.1em;
+    margin: 0.12em 0 0.05em;
   }
   .md li > p {
-    margin-bottom: 0.4em;
+    margin-bottom: 0.2em;
   }
   .md li:has(> input[type="checkbox"]) {
     margin-left: -1.5em;
@@ -980,9 +1128,9 @@ html[data-reduce-motion="1"] .plan-spinner {
   }
 
   .md blockquote {
-    max-width: 72ch;
-    margin: 0.9em 0;
-    padding: 0.1em 0 0.1em 1em;
+    max-width: 100%;
+    margin: 0.55em 0;
+    padding: 0.05em 0 0.05em 0.85em;
     border-left: 2px solid var(--color-line3);
     color: var(--color-mute);
   }
@@ -1063,10 +1211,12 @@ html[data-reduce-motion="1"] .plan-spinner {
   }
 
   .assistant-message__content {
-    max-width: min(100%, 740px);
+    /* Span the full reading column so actions stay under the text, not in a void. */
+    max-width: 100%;
   }
   .assistant-prose {
     letter-spacing: -0.008em;
+    max-width: 100%;
   }
   .md-streaming {
     color: var(--color-fg2);
@@ -1108,19 +1258,19 @@ html[data-reduce-motion="1"] .plan-spinner {
   .process-text {
     display: flex;
     align-items: flex-start;
-    gap: 12px;
+    gap: 10px;
   }
   .process-text .process-node {
-    margin-top: 8px;
+    margin-top: 6px;
   }
   .process-tool-toggle {
     display: flex;
     width: 100%;
     min-width: 0;
-    min-height: 29px;
+    min-height: 26px;
     align-items: center;
-    gap: 7px;
-    padding: 2px 4px 2px 0;
+    gap: 6px;
+    padding: 1px 4px 1px 0;
     border-radius: 5px;
     text-align: left;
   }
@@ -1131,12 +1281,12 @@ html[data-reduce-motion="1"] .plan-spinner {
     display: flex;
     width: 100%;
     min-width: 0;
-    min-height: 34px;
+    min-height: 28px;
     align-items: center;
-    gap: 8px;
-    padding: 4px 10px;
+    gap: 7px;
+    padding: 2px 8px;
     border: 1px solid var(--color-line);
-    border-radius: 7px;
+    border-radius: 6px;
     background: color-mix(in srgb, var(--color-panel) 55%, transparent);
     text-align: left;
   }
@@ -1147,11 +1297,11 @@ html[data-reduce-motion="1"] .plan-spinner {
   .turn-elapsed {
     display: flex;
     align-items: center;
-    gap: 14px;
-    margin-top: 12px;
+    gap: 10px;
+    margin-top: 8px;
     color: var(--color-faint);
     font-family: var(--font-mono);
-    font-size: calc(9px + var(--grox-font-increase));
+    font-size: 9px;
     letter-spacing: 0.05em;
   }
   .turn-elapsed i {
@@ -1160,146 +1310,186 @@ html[data-reduce-motion="1"] .plan-spinner {
     background: linear-gradient(90deg, var(--color-line2), transparent);
   }
   .process-sequence .assistant-message {
-    margin-bottom: 12px;
+    margin-bottom: 8px;
   }
   .process-sequence .assistant-prose {
     color: var(--color-mute);
   }
 
-  /* Request rail — a compact, evenly spaced table of contents for turns. */
-  .request-rail {
+  /*
+   * Message / request node rail — grok-app style (right edge).
+   * Tick list + prev/next steppers; jump without relying on scroll wheel alone.
+   */
+  .msg-rail {
     position: absolute;
-    z-index: 20;
-    top: 18px;
-    bottom: 18px;
-    left: 0;
-    width: 54px;
-    touch-action: none;
-  }
-  .request-rail__spine {
-    position: absolute;
-    top: 0;
-    bottom: 0;
-    left: 20px;
-    width: 1px;
-    background: linear-gradient(to bottom, transparent, var(--color-line3) 8%, var(--color-line3) 92%, transparent);
-    opacity: 0.9;
-  }
-  .request-rail__marker {
-    position: absolute;
-    left: 10px;
-    z-index: 1;
-    display: block;
-    width: calc(11px + var(--request-rail-wave, 0) * 13px + var(--request-rail-hovered, 0) * 9px);
-    height: 17px;
-    padding: 0;
-    transform: translateY(-50%);
-    cursor: pointer;
-    outline: none;
-    will-change: width;
-    transition: width 90ms linear;
-  }
-  .request-rail__marker::before {
-    position: absolute;
-    inset: 0 -7px;
-    content: "";
-  }
-  .request-rail__marker:focus-visible .request-rail__bar {
-    outline: 1px solid var(--color-acc);
-    outline-offset: 3px;
-  }
-  .request-rail__bar {
-    position: absolute;
+    z-index: 30;
     top: 50%;
-    right: 0;
-    left: 0;
-    height: 2.5px;
-    border-radius: 999px;
-    background: color-mix(in srgb, var(--color-mute) 84%, var(--color-fg));
-    box-shadow: 0 0 0 1px color-mix(in srgb, var(--color-void) 42%, transparent);
-    opacity: calc(0.84 + var(--request-rail-wave, 0) * 0.16);
+    right: 8px;
     transform: translateY(-50%);
-    transition: height 90ms linear, background-color 120ms ease, box-shadow 120ms ease, opacity 90ms linear;
-  }
-  .request-rail__marker.is-hovered {
-    z-index: 3;
-  }
-  .request-rail__marker.is-hovered .request-rail__bar {
-    height: 3px;
-    background: var(--color-acc);
-    box-shadow: 0 0 13px var(--color-glow);
-    opacity: 1;
-  }
-  .request-rail__tooltip {
-    position: absolute;
-    top: 50%;
-    left: 43px;
-    display: grid;
-    width: min(350px, calc(100vw - 150px));
+    display: flex;
+    flex-direction: column;
+    align-items: center;
     gap: 4px;
-    padding: 12px 14px;
-    border: 1px solid color-mix(in srgb, var(--color-line3) 82%, var(--color-acc));
-    border-radius: 8px;
-    background: color-mix(in srgb, var(--color-raise) 94%, transparent);
-    box-shadow: 0 15px 40px rgba(0, 0, 0, 0.34), 0 0 0 1px color-mix(in srgb, var(--color-void) 30%, transparent);
-    color: var(--color-fg2);
+    max-height: min(70vh, 520px);
+    padding: 4px 2px;
     pointer-events: none;
-    text-align: left;
-    transform: translateY(-50%);
-    animation: requestRailTooltip 140ms cubic-bezier(0.22, 1, 0.36, 1) both;
   }
-  .request-rail__tooltip-label {
+  .msg-rail__step,
+  .msg-rail__tick,
+  .msg-rail__list {
+    pointer-events: auto;
+  }
+  .msg-rail__step {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--color-dim);
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+  .msg-rail__step:hover:not(:disabled) {
+    color: var(--color-fg);
+    background: color-mix(in srgb, var(--color-fg) 8%, transparent);
+  }
+  .msg-rail__step:disabled {
+    opacity: 0.28;
+    cursor: default;
+  }
+  .msg-rail__list {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 5px;
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: min(56vh, 420px);
+    overflow-x: hidden;
+    overflow-y: auto;
+    padding: 4px 0;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  .msg-rail__list::-webkit-scrollbar {
+    width: 0;
+    height: 0;
+  }
+  .msg-rail__item {
+    display: flex;
+    flex: 0 0 auto;
+    justify-content: center;
+    align-items: center;
+  }
+  .msg-rail__tick {
+    position: relative;
+    flex: 0 0 auto;
+    width: 14px;
+    height: 10px;
+    padding: 0;
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    cursor: pointer;
+  }
+  .msg-rail__tick::before {
+    content: "";
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    width: 10px;
+    height: 2px;
+    border-radius: 1px;
+    transform: translate(-50%, -50%);
+    background: color-mix(in srgb, var(--color-dim) 55%, transparent);
+    transition: width 120ms ease, background 120ms ease, opacity 120ms ease;
+  }
+  .msg-rail__tick.is-hover::before,
+  .msg-rail__tick:hover::before {
+    width: 14px;
+    background: color-mix(in srgb, var(--color-mute) 90%, transparent);
+  }
+  .msg-rail__tick.is-active::before {
+    width: 14px;
+    height: 2.5px;
+    background: var(--color-fg);
+  }
+  .msg-rail__tick:focus-visible {
+    outline: 1px solid var(--color-acc);
+    outline-offset: 2px;
+    border-radius: 2px;
+  }
+  .msg-rail__tip {
+    position: fixed;
+    z-index: 80;
+    box-sizing: border-box;
+    width: max-content;
+    max-width: min(300px, 42vw);
+    padding: 10px 12px;
+    border-radius: 12px;
+    border: 1px solid color-mix(in srgb, var(--color-line3) 82%, var(--color-acc));
+    background: color-mix(in srgb, var(--color-raise) 96%, #000);
+    box-shadow: 0 8px 28px rgba(0, 0, 0, 0.38);
+    color: var(--color-fg);
+    pointer-events: none;
+    text-align: start;
+    transform: translateY(-50%);
+    animation: msgRailTip 140ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  }
+  .msg-rail__tip-role {
+    margin-bottom: 4px;
     color: var(--color-acc-dim);
     font-family: var(--font-mono);
-    font-size: calc(8.5px + var(--grox-font-increase));
-    letter-spacing: 0.12em;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    line-height: 1.3;
   }
-  .request-rail__tooltip-prompt,
-  .request-rail__tooltip-response {
+  .msg-rail__tip-body,
+  .msg-rail__tip-response {
     overflow: hidden;
     display: -webkit-box;
     -webkit-box-orient: vertical;
-    color: var(--color-fg);
-    font-size: calc(11px + var(--grox-font-increase));
+    color: var(--color-fg2);
+    font-size: 12px;
     line-height: 1.45;
-    -webkit-line-clamp: 2;
-  }
-  .request-rail__tooltip-prompt::before {
-    content: "› ";
-    color: var(--color-acc);
-  }
-  .request-rail__tooltip-response {
-    margin-top: 2px;
-    color: var(--color-dim);
-    font-size: calc(10px + var(--grox-font-increase));
     -webkit-line-clamp: 3;
   }
-  .request-rail__tooltip-response::before {
-    content: "GROK · ";
+  .msg-rail__tip-response {
+    margin-top: 4px;
+    color: var(--color-dim);
+    font-size: 11px;
+    -webkit-line-clamp: 3;
+  }
+  .msg-rail__tip-count {
+    margin-top: 8px;
     color: var(--color-faint);
     font-family: var(--font-mono);
-    font-size: 0.9em;
-    letter-spacing: 0.07em;
+    font-size: 10px;
+    letter-spacing: 0.04em;
   }
   @media (max-width: 760px) {
-    .request-rail {
+    .msg-rail {
       display: none;
     }
   }
   @media (prefers-reduced-motion: reduce) {
-    .request-rail__marker,
-    .request-rail__bar,
-    .request-rail__tooltip {
+    .msg-rail__tick::before,
+    .msg-rail__tip {
       transition-duration: 0.01ms;
       animation: none;
     }
   }
 }
 
-@keyframes requestRailTooltip {
+@keyframes msgRailTip {
   from {
     opacity: 0;
-    transform: translate(-5px, -50%);
+    transform: translate(6px, -50%);
   }
   to {
     opacity: 1;
