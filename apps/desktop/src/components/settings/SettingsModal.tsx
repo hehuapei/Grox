@@ -10,6 +10,7 @@ import { fmtBillingDate, fmtBillingValue } from "../../lib/format";
 import { Icon } from "../fx/Icon";
 import { Wordmark } from "../fx/Wordmark";
 import { ChipSelect } from "../common/ChipSelect";
+import { ConfirmDialog } from "../common/ConfirmDialog";
 
 type Section = "general" | "account" | "archives" | "appearance" | "mcp" | "skills" | "plugins" | "hooks";
 type Json = Record<string, unknown>;
@@ -189,6 +190,7 @@ function ArchiveManager() {
   const restore = useDesktop((state) => state.archiveSession);
   const remove = useDesktop((state) => state.deleteSession);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [confirmingSession, setConfirmingSession] = useState<string | null>(null);
   const [error, setError] = useState("");
 
   const destroy = async (id: string) => {
@@ -198,6 +200,7 @@ function ArchiveManager() {
       await remove(id);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
+      throw cause;
     } finally {
       setDeletingId(null);
     }
@@ -224,12 +227,7 @@ function ArchiveManager() {
             <ActionButton
               tone="danger"
               disabled={deletingId === session.id}
-              onClick={() => {
-                const message = zh
-                  ? `将永久删除“${session.title || "无标题会话"}”及其本地历史，是否继续？`
-                  : `Permanently delete “${session.title || "Untitled conversation"}” and its local history?`;
-                if (window.confirm(message)) void destroy(session.id);
-              }}
+              onClick={() => setConfirmingSession(session.id)}
             >
               {deletingId === session.id ? (zh ? "删除中" : "Deleting") : (zh ? "删除" : "Delete")}
             </ActionButton>
@@ -237,6 +235,26 @@ function ArchiveManager() {
         ))}
       </div>
     )}
+    {confirmingSession && (() => {
+      const session = sessions.find((entry) => entry.id === confirmingSession);
+      if (!session) return null;
+      return (
+        <ConfirmDialog
+          title={zh ? "永久删除会话？" : "Delete conversation permanently?"}
+          description={zh
+            ? `“${session.title || "无标题会话"}”及其本地历史将被永久删除。`
+            : `“${session.title || "Untitled conversation"}” and its local history will be permanently deleted.`}
+          confirmLabel={zh ? "永久删除" : "Delete permanently"}
+          cancelLabel={zh ? "取消" : "Cancel"}
+          workingLabel={zh ? "删除中" : "Deleting"}
+          onCancel={() => setConfirmingSession(null)}
+          onConfirm={async () => {
+            await destroy(session.id);
+            setConfirmingSession(null);
+          }}
+        />
+      );
+    })()}
   </div>;
 }
 

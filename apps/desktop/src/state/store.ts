@@ -96,6 +96,7 @@ import {
 } from "../lib/draftLaunchRecovery";
 import { sessionShellFromMeta } from "../lib/sessionShell";
 import { hydrateSessionOffline, preferRicherSession } from "../lib/offlineSessionHydrate";
+import { isUnavailableSessionError } from "../lib/sessionUnavailable";
 
 export type View = "home" | "session";
 export type InspectorTab = "files" | "tasks" | "preview" | "usage";
@@ -1582,7 +1583,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
                   sessions: { ...latest.sessions, [id]: { ...next, preview: true } },
                 };
               }
-              const unavailable = /找不到会话|session not found|unknown session|no such session/i.test(message);
+              const unavailable = isUnavailableSessionError(message);
               const friendly = unavailable
                 ? (message.includes("找不到") || message.includes("会话")
                   ? `找不到会话：${id}`
@@ -1851,18 +1852,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const path = target?.path ?? id;
       const dismissId = target ? projectId(target.path) : projectId(id);
       const errors: string[] = [];
-      const localSessionIds = get().sessionIndex
+      const sessionIds = get().sessionIndex
         .filter((meta) => samePath(meta.cwd, path))
         .map((meta) => meta.id);
-      let discoveredSessionIds: string[] = [];
-      try {
-        discoveredSessionIds = (await bridge.listSessions(path))
-          .filter((meta) => samePath(meta.cwd, path))
-          .map((meta) => meta.id);
-      } catch (error) {
-        errors.push(`无法完整枚举项目会话：${error instanceof Error ? error.message : String(error)}`);
-      }
-      const sessionIds = [...new Set([...localSessionIds, ...discoveredSessionIds])];
       if (dismissId) {
         persistDismissedProjects(dismissProjectId(loadDismissedProjects(), dismissId));
       }
@@ -1875,9 +1867,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const sessionIndex = get().sessionIndex.filter((meta) => !sessionIds.includes(meta.id));
       persistSessionCatalog(sessionIndex);
       const activeId = get().activeId;
-      const activeSession = activeId ? get().sessions[activeId] : undefined;
-      const leaveActive = Boolean(activeSession && samePath(activeSession.cwd, path));
+      const leaveActive = Boolean(activeId && sessionIds.includes(activeId));
 
+      // 删除意图必须先同步反映在目录和侧栏，不能被 CLI 启动或分页枚举阻塞。
       set({
         projects,
         sessionIndex,
@@ -1886,12 +1878,28 @@ export const useDesktop = create<DesktopState>((set, get) => {
           : {}),
         ...(leaveActive ? { activeId: null, view: "home" as View } : {}),
       });
+
       for (const sessionId of sessionIds) {
         try {
           await get().deleteSession(sessionId);
         } catch (error) {
           errors.push(error instanceof Error ? error.message : String(error));
         }
+      }
+      try {
+        if ("__TAURI_INTERNALS__" in window) {
+          const diskSessionIds = await invoke<string[]>("delete_project_session_data", { cwd: path });
+          markSessionsDeleted(diskSessionIds);
+          clearSessionFlags(diskSessionIds);
+          for (const sessionId of diskSessionIds) {
+            if (sessionIds.includes(sessionId)) continue;
+            void bridge.deleteSession(sessionId).catch((error) => {
+              console.info("CLI project session/delete skipped for stale session", sessionId, error);
+            });
+          }
+        }
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error));
       }
       if (errors.length > 0) {
         set({ startupError: `项目已从侧栏删除，但部分磁盘会话清理失败：${errors.join("；")}` });
@@ -2266,19 +2274,22 @@ export const useDesktop = create<DesktopState>((set, get) => {
         ...(activeId === id ? { activeId: null, view: "home" as View } : {}),
       });
 
-      try {
-        await bridge.deleteSession(id);
-      } catch (error) {
-        // CLI 不认识陈旧会话是常见情况；磁盘清理和防复活标记仍保证删除语义。
-        console.info("CLI session/delete skipped for stale session", id, error);
-      }
+      // 先通知运行中的回合停止写入，降低 Windows 上历史文件仍被占用的概率。
+      bridge.cancel(id);
+      let diskError: Error | null = null;
       try {
         if ("__TAURI_INTERNALS__" in window) await invoke("delete_session_data", { id });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         set({ startupError: `会话已从侧栏删除，但本地历史清理失败：${message}` });
-        throw new Error(message);
+        diskError = new Error(message);
       }
+      // 本机磁盘是删除语义的权威来源。上游 CLI 同步可能因未启动、旧会话或
+      // 不支持 delete 方法而卡住，不能反过来阻塞本地删除。
+      void bridge.deleteSession(id).catch((error) => {
+        console.info("CLI session/delete skipped for stale session", id, error);
+      });
+      if (diskError) throw diskError;
     },
 
     async removeSessionFromSidebar(id) {

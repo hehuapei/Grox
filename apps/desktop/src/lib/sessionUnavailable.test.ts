@@ -31,6 +31,8 @@ describe("sessionUnavailable", () => {
   it("detects Chinese and English missing-session errors", () => {
     expect(isUnavailableSessionError("找不到会话：abc-123")).toBe(true);
     expect(isUnavailableSessionError("Session not found: abc")).toBe(true);
+    expect(isUnavailableSessionError("Path not found. · session/load")).toBe(true);
+    expect(isUnavailableSessionError("Path not found: /missing/workspace")).toBe(false);
     expect(isUnavailableSessionError("network timeout")).toBe(false);
   });
 

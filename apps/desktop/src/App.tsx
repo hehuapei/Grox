@@ -3,8 +3,8 @@
 import { Component, useEffect, type ErrorInfo, type ReactNode } from "react";
 import { useDesktop } from "./state/store";
 import { TitleBar } from "./components/chrome/TitleBar";
-import { Sidebar } from "./components/chrome/Sidebar";
 import { StatusBar } from "./components/chrome/StatusBar";
+import { SidebarDock } from "./components/chrome/SidebarDock";
 import { Home } from "./components/home/Home";
 import { Timeline } from "./components/session/Timeline";
 import { Composer } from "./components/session/Composer";
@@ -15,7 +15,6 @@ import { BlackHole } from "./components/fx/BlackHole";
 import { StageTransition } from "./components/fx/StageTransition";
 import { PreviewPane } from "./components/preview/PreviewPane";
 import { PlanPreviewPane } from "./components/preview/PlanPreviewPane";
-import { ResizeHandle } from "./components/common/ResizeHandle";
 import { usePreferences } from "./state/preferences";
 import { useI18n } from "./lib/i18n";
 import { WorkbenchPanel } from "./components/chrome/WorkbenchPanel";
@@ -134,13 +133,8 @@ export default function App() {
     <div className="flex h-screen flex-col bg-base">
       <TitleBar />
       <RuntimeNotice />
-      <div className="flex min-h-0 flex-1">
-        {sidebarVisible && (
-          <>
-            <Sidebar />
-            <ResizeHandle side="right" value={sidebarWidth} onChange={setSidebarWidth} />
-          </>
-        )}
+      <div className="relative flex min-h-0 flex-1">
+        <SidebarDock visible={sidebarVisible} width={sidebarWidth} onResize={setSidebarWidth} />
         <div className="flex min-w-0 flex-1 flex-col bg-base">
           <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             <StageTransition

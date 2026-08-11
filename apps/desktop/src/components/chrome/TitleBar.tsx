@@ -51,22 +51,28 @@ export function TitleBar() {
     || (draftSession
       ? (language === "zh-CN" ? "新会话" : "New session")
       : null);
+  const windows = isWindows();
 
   return (
     <header
       data-tauri-drag-region
-      className="titlebar relative z-40 flex h-10 shrink-0 items-center border-b border-line bg-void pl-[78px] pr-2 select-none"
+      className={`titlebar relative z-40 flex h-10 shrink-0 items-center border-b border-line bg-void pr-2 select-none ${windows ? "pl-2" : "pl-[78px]"}`}
     >
-      <div data-tauri-drag-region="false" className="absolute left-[78px] flex items-center">
-        <button
-          className={`chip ${sidebarVisible ? "!text-fg2 !border-line3" : ""}`}
-          onClick={toggleSidebar}
-          title={language === "zh-CN" ? "显示/隐藏侧栏（Ctrl/⌘B）" : "Toggle sidebar (Ctrl/⌘B)"}
-          aria-pressed={sidebarVisible}
+      {!sidebarVisible && (
+        <div
+          data-tauri-drag-region="false"
+          className={`absolute flex items-center ${windows ? "left-2" : "left-[78px]"}`}
         >
-          <Icon name="panelLeft" size={12} />
-        </button>
-      </div>
+          <button
+            className="chip"
+            onClick={toggleSidebar}
+            title={language === "zh-CN" ? "显示侧栏（Ctrl/⌘B）" : "Show sidebar (Ctrl/⌘B)"}
+            aria-label={language === "zh-CN" ? "显示侧栏" : "Show sidebar"}
+          >
+            <Icon name="panelLeft" size={12} />
+          </button>
+        </div>
+      )}
 
       {/* center — mission breadcrumb (drag only; not interactive) */}
       <div
@@ -130,7 +136,7 @@ export function TitleBar() {
           <Icon name="panelRight" size={12} />
         </button>
 
-        {isWindows() && (
+        {windows && (
           <div className="ml-1 flex items-center">
             <WinBtn onClick={() => winCtl("min")} label="—" />
             <WinBtn onClick={() => winCtl("max")} label="▢" />

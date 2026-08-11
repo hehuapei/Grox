@@ -1,6 +1,6 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { useDesktop } from "../../state/store";
 import { Sidebar } from "./Sidebar";
 
@@ -41,6 +41,50 @@ describe("Sidebar", () => {
 
     expect(container.textContent).toContain("已有项目");
     expect(container.textContent).toContain("已有会话");
+    await act(async () => root.unmount());
+  });
+
+  it("永久删除会话使用应用内确认框并触发删除动作", async () => {
+    const removeSessionFromSidebar = vi.fn(async () => {});
+    useDesktop.setState({
+      activeProjectId: "c:/workspace/existing",
+      projects: [{
+        id: "c:/workspace/existing",
+        path: "C:/workspace/existing",
+        name: "已有项目",
+        pinned: false,
+        archived: false,
+        createdAt: 1,
+        lastOpenedAt: 2,
+      }],
+      sessionIndex: [{
+        id: "session-existing",
+        title: "已有会话",
+        cwd: "C:/workspace/existing",
+        createdAt: 1,
+        updatedAt: 2,
+        model: "grok-build",
+      }],
+      removeSessionFromSidebar,
+    });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    await act(async () => root.render(<Sidebar />));
+    const actions = container.querySelector<HTMLButtonElement>('button[aria-label="会话操作"]');
+    expect(actions).not.toBeNull();
+    await act(async () => actions?.click());
+    const deleteMenuItem = [...container.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.includes("永久删除会话"));
+    expect(deleteMenuItem).not.toBeUndefined();
+    await act(async () => deleteMenuItem?.click());
+    expect(document.body.textContent).toContain("永久删除会话？");
+    const confirm = [...document.body.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent === "永久删除");
+    await act(async () => confirm?.click());
+
+    expect(removeSessionFromSidebar).toHaveBeenCalledWith("session-existing");
     await act(async () => root.unmount());
   });
 });

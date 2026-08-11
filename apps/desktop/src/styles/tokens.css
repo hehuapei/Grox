@@ -379,6 +379,19 @@ html:not([data-theme="light"]) {
   max-width: none;
 }
 
+.sidebar-peek-panel {
+  transform: translate3d(-100%, 0, 0);
+  backface-visibility: hidden;
+  contain: layout paint;
+  will-change: transform;
+  transition: transform 140ms cubic-bezier(0.4, 0, 0.8, 0.2);
+}
+
+.sidebar-peek-panel[data-state="open"] {
+  transform: translate3d(0, 0, 0);
+  transition: transform 170ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
 .animate-orbit,
 .animate-orbit-slow,
 .animate-orbit-rev {
@@ -404,6 +417,12 @@ html[data-reduce-motion="1"] * {
   transition-duration: 0.01ms !important;
 }
 
+/* The hover sidebar is positional feedback, not decorative motion. Keep a
+   short transition so it does not flash even when other motion is reduced. */
+html[data-reduce-motion="1"] .sidebar-peek-panel {
+  transition-duration: 120ms !important;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .animate-orbit,
   .animate-orbit-slow,
@@ -421,6 +440,10 @@ html[data-reduce-motion="1"] * {
   * {
     scroll-behavior: auto !important;
     transition-duration: 0.01ms !important;
+  }
+
+  .sidebar-peek-panel {
+    transition-duration: 120ms !important;
   }
 }
 
@@ -582,15 +605,8 @@ html[data-theme="light"] .mission-card:hover {
   box-shadow: 0 10px 24px rgba(40, 40, 30, 0.12);
 }
 
-/* Aurora rim — dark: quiet hairline; light theme only: spectral flow */
-@property --aurora-angle {
-  syntax: "<angle>";
-  inherits: false;
-  initial-value: 0deg;
-}
-
+/* Composer rim — a quiet hairline in both themes. */
 .aurora-rim {
-  --aurora-angle: 0deg;
   position: relative;
   border-radius: 26px;
   padding: 0;
@@ -619,72 +635,14 @@ html[data-theme="light"] .mission-card:hover {
 }
 
 html[data-theme="light"] .aurora-rim {
-  border-radius: 28px;
-  padding: 1.5px;
-}
-html[data-theme="light"] .aurora-rim::before {
-  content: "";
-  display: block;
-  position: absolute;
-  inset: -1px;
-  border-radius: inherit;
-  background: conic-gradient(
-    from var(--aurora-angle),
-    #5eead4,
-    #38bdf8,
-    #818cf8,
-    #e879f9,
-    #fb7185,
-    #fbbf24,
-    #4ade80,
-    #5eead4
-  );
-  z-index: 0;
-  opacity: 0.72;
-  filter: saturate(1.1);
-  animation: auroraSpin 5.5s linear infinite;
-  transition: opacity 0.45s var(--ease-mission), filter 0.45s ease;
-}
-html[data-theme="light"] .aurora-rim::after {
-  content: "";
-  display: block;
-  position: absolute;
-  inset: -8px;
-  border-radius: 32px;
-  background: conic-gradient(
-    from var(--aurora-angle),
-    #5eead466,
-    #38bdf855,
-    #818cf855,
-    #e879f955,
-    #fb718555,
-    #fbbf2455,
-    #4ade8055,
-    #5eead466
-  );
-  z-index: -1;
-  opacity: 0.32;
-  filter: blur(12px) saturate(1.1);
-  animation: auroraSpin 5.5s linear infinite;
-  transition: opacity 0.45s var(--ease-mission);
-  pointer-events: none;
+  border-radius: 26px;
 }
 html[data-theme="light"] .aurora-rim__core {
-  border: none;
-  border-radius: 26px;
   background: color-mix(in srgb, var(--color-raise) 96%, white);
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.45);
 }
-html[data-theme="light"] .aurora-rim:hover::before,
-html[data-theme="light"] .aurora-rim:focus-within::before {
-  opacity: 0.98;
-  filter: saturate(1.25) brightness(1.05);
-  animation-duration: 2.4s;
-}
-html[data-theme="light"] .aurora-rim:hover::after,
-html[data-theme="light"] .aurora-rim:focus-within::after {
-  opacity: 0.5;
-  animation-duration: 2.4s;
+html[data-theme="light"] .aurora-rim:hover .aurora-rim__core {
+  border-color: var(--color-line3);
 }
 html[data-theme="light"] .aurora-rim:focus-within {
   transform: translateY(-2px);
@@ -693,25 +651,6 @@ html[data-theme="light"] .aurora-rim:focus-within .aurora-rim__core {
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.5),
     0 14px 32px rgba(40, 40, 30, 0.12);
-}
-
-@keyframes auroraSpin {
-  to {
-    --aurora-angle: 360deg;
-  }
-}
-
-html[data-reduce-motion="1"][data-theme="light"] .aurora-rim::before,
-html[data-reduce-motion="1"][data-theme="light"] .aurora-rim::after {
-  animation: none !important;
-  --aurora-angle: 210deg;
-}
-@media (prefers-reduced-motion: reduce) {
-  html[data-theme="light"] .aurora-rim::before,
-  html[data-theme="light"] .aurora-rim::after {
-    animation: none !important;
-    --aurora-angle: 210deg;
-  }
 }
 
 .home-nebula {

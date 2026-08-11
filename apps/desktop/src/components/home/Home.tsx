@@ -147,8 +147,6 @@ export function Home() {
       {/* engineering crosshairs */}
       <Crosshair className="left-3 top-3 animate-mission-in" style={{ animationDelay: "0.05s" }} />
       <Crosshair className="right-3 top-3 animate-mission-in" style={{ animationDelay: "0.08s" }} />
-      <Crosshair className="bottom-3 left-3 animate-mission-in" style={{ animationDelay: "0.1s" }} />
-      <Crosshair className="bottom-3 right-3 animate-mission-in" style={{ animationDelay: "0.12s" }} />
 
       <div className="relative z-[1] flex h-full flex-col items-center justify-center px-10 pb-16">
         <div className="animate-mission-in" style={{ animationDelay: "0.04s" }}>
@@ -279,11 +277,6 @@ export function Home() {
         )}
       </div>
 
-      {/* ground strip */}
-      <div className="absolute inset-x-0 bottom-0 z-[1] flex h-9 animate-mission-in items-center justify-between px-5" style={{ animationDelay: "0.55s" }}>
-        <span className="tnum max-w-[60%] truncate text-[10.5px] text-mute">{workspace}</span>
-        <span className="lbl !text-[10px]">⌘K {language === "zh-CN" ? "命令" : "PALETTE"} · ⌘N {t("newProject")}</span>
-      </div>
     </div>
   );
 }

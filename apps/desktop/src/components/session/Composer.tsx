@@ -558,20 +558,6 @@ export function Composer() {
         </div>
         </div>
 
-        <div className="mt-1.5 flex items-center justify-between px-1">
-          <span className="lbl !text-[9.5px]">
-            {creating
-              ? (language === "zh-CN" ? "正在创建会话…" : "CREATING CONVERSATION…")
-              : restoring
-              ? (language === "zh-CN" ? "正在同步当前会话…" : "SYNCHRONIZING CURRENT SESSION…")
-              : (language === "zh-CN" ? "⏎ 发送/排队 · ⌘/Ctrl+⏎ 插话 · ⇧⏎ 换行 · 输入法确认不发送" : "⏎ SEND/QUEUE · CMD/CTRL+⏎ INTERJECT · ⇧⏎ NEWLINE · IME SAFE")}
-          </span>
-          <span className="lbl !text-[9.5px]">
-            {language === "zh-CN"
-              ? mode === "plan" ? "计划模式 · 批准前只读" : mode === "ask" ? "问答模式 · 不使用工具" : "AGENT 模式 · 完整工具权限"
-              : mode === "plan" ? "PLAN MODE · READ-ONLY UNTIL APPROVED" : mode === "ask" ? "ASK MODE · NO TOOLS" : "AGENT MODE · FULL TOOL ACCESS"}
-          </span>
-        </div>
       </div>
     </div>
   );

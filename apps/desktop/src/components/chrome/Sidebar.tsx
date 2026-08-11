@@ -10,8 +10,9 @@ import type { Session, SessionMeta, SessionStatus } from "../../bridge/types";
 import { BlackHole } from "../fx/BlackHole";
 import { normalizeSessionQuery, sessionMatchesLoadedContent } from "../../lib/sessionSearch";
 import { projectId, samePath } from "../../lib/projectCatalog";
+import { ConfirmDialog } from "../common/ConfirmDialog";
 
-export function Sidebar() {
+export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) {
   const { t, language } = useI18n();
   const width = usePreferences((state) => state.sidebarWidth);
   const theme = usePreferences((state) => state.theme);
@@ -117,7 +118,7 @@ export function Sidebar() {
         </button>
         <button
           type="button"
-          onClick={toggleSidebar}
+          onClick={onRequestHide ?? toggleSidebar}
           className="ml-auto flex h-7 w-7 items-center justify-center rounded-[3px] text-dim hover:bg-high hover:text-fg"
           title={language === "zh-CN" ? "隐藏侧栏（Ctrl/⌘B）" : "Hide sidebar (Ctrl/⌘B)"}
           aria-label={language === "zh-CN" ? "隐藏侧栏" : "Hide sidebar"}
@@ -356,6 +357,7 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
   const allArchived = projectSessions.length > 0 && projectSessions.every((session) => session.archived);
   const [menu, setMenu] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const [draft, setDraft] = useState(project.name);
   const commit = () => {
     setEditing(false);
@@ -424,14 +426,25 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
             icon="trash"
             label={language === "zh-CN" ? "删除项目及会话" : "Delete project and sessions"}
             tone="text-red"
-            onClick={() => {
-              const message = language === "zh-CN"
-                ? `将永久删除“${project.name}”的全部会话（侧栏当前显示 ${projectSessions.length} 个，并会检查磁盘历史）；项目源码文件不会被删除。是否继续？`
-                : `Permanently delete all conversations from “${project.name}” (${projectSessions.length} currently shown; disk history will also be checked)? Workspace files will be kept.`;
-              if (window.confirm(message)) void removeProject(project.id);
-            }}
+            onClick={() => setConfirmDelete(true)}
           />
         </ContextMenu>
+      )}
+      {confirmDelete && (
+        <ConfirmDialog
+          title={language === "zh-CN" ? "永久删除项目会话？" : "Delete project conversations permanently?"}
+          description={language === "zh-CN"
+            ? `将删除“${project.name}”的全部会话和本地历史；项目源码文件不会被删除。`
+            : `All conversations and local history for “${project.name}” will be deleted. Workspace files will be kept.`}
+          confirmLabel={language === "zh-CN" ? "永久删除" : "Delete permanently"}
+          cancelLabel={language === "zh-CN" ? "取消" : "Cancel"}
+          workingLabel={language === "zh-CN" ? "删除中" : "Deleting"}
+          onCancel={() => setConfirmDelete(false)}
+          onConfirm={async () => {
+            await removeProject(project.id);
+            setConfirmDelete(false);
+          }}
+        />
       )}
     </div>
   );
@@ -459,6 +472,7 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
   const copySessionValue = useDesktop((state) => state.copySessionValue);
   const [editing, setEditing] = useState(false);
   const [menu, setMenu] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const displayTitle = missionTitle(meta, language);
   const [draft, setDraft] = useState(displayTitle);
   const commit = () => {
@@ -525,12 +539,25 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
             icon="trash"
             label={language === "zh-CN" ? "永久删除会话" : "Delete conversation permanently"}
             tone="text-red"
-            onClick={() => {
-              const message = language === "zh-CN" ? "将永久删除此会话及其本地历史，是否继续？" : "Permanently delete this conversation and its local history?";
-              if (window.confirm(message)) void removeFromSidebar(meta.id);
-            }}
+            onClick={() => setConfirmDelete(true)}
           />
         </ContextMenu>
+      )}
+      {confirmDelete && (
+        <ConfirmDialog
+          title={language === "zh-CN" ? "永久删除会话？" : "Delete conversation permanently?"}
+          description={language === "zh-CN"
+            ? `“${displayTitle}”及其本地历史将被永久删除。`
+            : `“${displayTitle}” and its local history will be permanently deleted.`}
+          confirmLabel={language === "zh-CN" ? "永久删除" : "Delete permanently"}
+          cancelLabel={language === "zh-CN" ? "取消" : "Cancel"}
+          workingLabel={language === "zh-CN" ? "删除中" : "Deleting"}
+          onCancel={() => setConfirmDelete(false)}
+          onConfirm={async () => {
+            await removeFromSidebar(meta.id);
+            setConfirmDelete(false);
+          }}
+        />
       )}
     </div>
   );

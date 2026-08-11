@@ -8,6 +8,7 @@ export function isUnavailableSessionError(text: string): boolean {
     || /session not found/i.test(t)
     || /unknown session/i.test(t)
     || /no such session/i.test(t)
+    || /path not found[\s\S]*session\/load/i.test(t)
   );
 }
 
