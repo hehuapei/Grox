@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useDesktop, type ProjectMeta } from "../../state/store";
 import { usePreferences } from "../../state/preferences";
@@ -346,7 +346,13 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
   const removeProject = useDesktop((state) => state.removeProject);
   const openExplorer = useDesktop((state) => state.openProjectInExplorer);
   const createWorktree = useDesktop((state) => state.createProjectWorktree);
-  const projectSessions = useDesktop((state) => state.sessionIndex.filter((session) => samePath(session.cwd, project.path)));
+  // Zustand selector 必须返回稳定快照；在 selector 内 filter 会让 React 19
+  // 持续看到新数组并触发 Maximum update depth exceeded（#29）。
+  const sessionIndex = useDesktop((state) => state.sessionIndex);
+  const projectSessions = useMemo(
+    () => sessionIndex.filter((session) => samePath(session.cwd, project.path)),
+    [project.path, sessionIndex],
+  );
   const allArchived = projectSessions.length > 0 && projectSessions.every((session) => session.archived);
   const [menu, setMenu] = useState(false);
   const [editing, setEditing] = useState(false);
