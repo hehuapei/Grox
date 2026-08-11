@@ -221,7 +221,18 @@ function ArchiveManager() {
               <p className="mt-0.5 truncate font-mono text-[9px] text-faint">{session.cwd} · {new Date(session.updatedAt).toLocaleString(language === "zh-CN" ? "zh-CN" : "en-US")}</p>
             </div>
             <ActionButton onClick={() => restore(session.id)}>{zh ? "恢复" : "Restore"}</ActionButton>
-            <ActionButton tone="danger" disabled={deletingId === session.id} onClick={() => void destroy(session.id)}>{deletingId === session.id ? (zh ? "删除中" : "Deleting") : (zh ? "删除" : "Delete")}</ActionButton>
+            <ActionButton
+              tone="danger"
+              disabled={deletingId === session.id}
+              onClick={() => {
+                const message = zh
+                  ? `将永久删除“${session.title || "无标题会话"}”及其本地历史，是否继续？`
+                  : `Permanently delete “${session.title || "Untitled conversation"}” and its local history?`;
+                if (window.confirm(message)) void destroy(session.id);
+              }}
+            >
+              {deletingId === session.id ? (zh ? "删除中" : "Deleting") : (zh ? "删除" : "Delete")}
+            </ActionButton>
           </div>
         ))}
       </div>

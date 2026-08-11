@@ -709,6 +709,58 @@ fn session_history_path(grok: &Path, session_id: &str) -> Result<Option<PathBuf>
     Ok(None)
 }
 
+fn session_directory_path(grok: &Path, session_id: &str) -> Result<Option<PathBuf>, String> {
+    if !valid_session_id(session_id) {
+        return Err("无效会话 ID".into());
+    }
+    let sessions = grok.join("sessions");
+    if !sessions.is_dir() {
+        return Ok(None);
+    }
+    let root = sessions
+        .canonicalize()
+        .map_err(|error| format!("无法读取 Grok 会话目录：{error}"))?;
+    let wanted = session_id.to_ascii_lowercase();
+    let mut pending = vec![(root.clone(), 0usize)];
+    while let Some((directory, depth)) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Ok(canonical) = path.canonicalize() else {
+                continue;
+            };
+            if !canonical.starts_with(&root) {
+                continue;
+            }
+            // 工作区目录名也可能碰巧等于会话 ID。必须看到已知历史文件才把
+            // 它视为会话目录，宁可留下无数据的空目录，也不能误删父级容器。
+            let is_session_directory = history_file_in_session_dir(&canonical).is_some();
+            if dir_name_eq_ci(&canonical, &wanted) && is_session_directory {
+                return Ok(Some(canonical));
+            }
+            // 当前和旧版布局最多为 workspace / batch / session-id。
+            if depth < 2 {
+                pending.push((canonical, depth + 1));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn delete_session_history_data(grok: &Path, session_id: &str) -> Result<bool, String> {
+    let Some(directory) = session_directory_path(grok, session_id)? else {
+        return Ok(false);
+    };
+    fs::remove_dir_all(&directory)
+        .map_err(|error| format!("无法删除会话历史 {}：{error}", directory.display()))?;
+    Ok(true)
+}
+
 fn history_file_in_session_dir(dir: &Path) -> Option<PathBuf> {
     for name in SESSION_HISTORY_FILENAMES {
         let candidate = dir.join(name);
@@ -1229,6 +1281,22 @@ fn delete_session_cache(app: tauri::AppHandle, id: String) -> Result<(), String>
         fs::remove_file(&path).map_err(|error| format!("无法删除会话缓存：{error}"))?;
     }
     Ok(())
+}
+
+#[tauri::command]
+fn delete_session_data(app: tauri::AppHandle, id: String) -> Result<bool, String> {
+    if !valid_session_id(&id) {
+        return Err("无效会话 ID".into());
+    }
+    let history = grok_home().and_then(|home| delete_session_history_data(&home, &id));
+    let cache = delete_session_cache(app, id);
+    match (history, cache) {
+        (Ok(removed), Ok(())) => Ok(removed),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(history_error), Err(cache_error)) => {
+            Err(format!("{history_error}；同时无法删除会话缓存：{cache_error}"))
+        }
+    }
 }
 
 #[tauri::command]
@@ -6857,6 +6925,7 @@ fn main() {
             read_session_cache,
             write_session_cache,
             delete_session_cache,
+            delete_session_data,
             scrub_session_cache_orphans,
             validate_workspace,
             pick_workspace,
@@ -7200,6 +7269,44 @@ mod tests {
             session_history_path(&root, "019fdc55-nested-id").unwrap(),
             Some(history.canonicalize().unwrap())
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_session_history_data_removes_only_the_requested_session_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-session-delete-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let target = root.join("sessions").join("workspace").join("session-a");
+        let sibling = root.join("sessions").join("workspace").join("session-b");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(target.join("chat_history.jsonl"), "").unwrap();
+        fs::write(sibling.join("chat_history.jsonl"), "").unwrap();
+
+        assert!(delete_session_history_data(&root, "session-a").unwrap());
+        assert!(!target.exists());
+        assert!(sibling.exists());
+        assert!(!delete_session_history_data(&root, "session-a").unwrap());
+        assert!(delete_session_history_data(&root, "../workspace").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_session_history_data_never_treats_workspace_container_as_session() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-session-delete-container-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let workspace = root.join("sessions").join("session-a");
+        let nested_session = workspace.join("actual-session");
+        fs::create_dir_all(&nested_session).unwrap();
+        fs::write(nested_session.join("chat_history.jsonl"), "").unwrap();
+
+        assert!(!delete_session_history_data(&root, "session-a").unwrap());
+        assert!(workspace.exists());
+        assert!(nested_session.exists());
         fs::remove_dir_all(root).unwrap();
     }
 

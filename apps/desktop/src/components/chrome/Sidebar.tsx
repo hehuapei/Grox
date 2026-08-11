@@ -17,6 +17,7 @@ export function Sidebar() {
   const theme = usePreferences((state) => state.theme);
   const setLanguage = usePreferences((state) => state.setLanguage);
   const setTheme = usePreferences((state) => state.setTheme);
+  const toggleSidebar = usePreferences((state) => state.toggleSidebar);
   const sessionIndex = useDesktop((state) => state.sessionIndex);
   const sessions = useDesktop((state) => state.sessions);
   const activeId = useDesktop((state) => state.activeId);
@@ -71,17 +72,15 @@ export function Sidebar() {
   );
   const sessionSearchIdsKey = sessionIndex.map((session) => session.id).join("\n");
   const normalizedQuery = normalizeSessionQuery(sessionQuery);
+  const sidebarSessions = orderedSessions.filter((session) => !session.archived);
   const matchedSessions = normalizedQuery
-    ? orderedSessions.filter((meta) =>
+    ? sidebarSessions.filter((meta) =>
         historyMatches.has(meta.id) || sessionMatchesLoadedContent(meta, sessions[meta.id], normalizedQuery)
       )
-    : orderedSessions;
+    : sidebarSessions;
   const matchedWorkspaceKeys = new Set(matchedSessions.map((session) => projectId(session.cwd)));
   const activeProjects = orderedProjects.filter(
-    (project) => !project.archived && (!normalizedQuery || matchedWorkspaceKeys.has(projectId(project.path))),
-  );
-  const archivedProjects = orderedProjects.filter(
-    (project) => project.archived && (!normalizedQuery || matchedWorkspaceKeys.has(projectId(project.path))),
+    (project) => !normalizedQuery || matchedWorkspaceKeys.has(projectId(project.path)),
   );
 
   useEffect(() => {
@@ -115,6 +114,15 @@ export function Sidebar() {
       <div className="flex h-14 items-center border-b border-line px-4">
         <button onClick={goHome} className="transition-opacity hover:opacity-70" title="Home">
           <Wordmark size={14} markSpin={view === "home" ? "slow" : false} />
+        </button>
+        <button
+          type="button"
+          onClick={toggleSidebar}
+          className="ml-auto flex h-7 w-7 items-center justify-center rounded-[3px] text-dim hover:bg-high hover:text-fg"
+          title={language === "zh-CN" ? "隐藏侧栏（Ctrl/⌘B）" : "Hide sidebar (Ctrl/⌘B)"}
+          aria-label={language === "zh-CN" ? "隐藏侧栏" : "Hide sidebar"}
+        >
+          <Icon name="panelLeft" size={12} />
         </button>
       </div>
 
@@ -165,7 +173,6 @@ export function Sidebar() {
             active={project.id === activeProjectId}
             expanded={Boolean(normalizedQuery) || expandedProjectIds.has(project.id)}
             sessions={matchedSessions.filter((session) => samePath(session.cwd, project.path))}
-            showArchived={Boolean(normalizedQuery)}
             activeId={activeId}
             loadedSessions={sessions}
             onOpenSession={(id) => void openSession(id)}
@@ -177,29 +184,6 @@ export function Sidebar() {
             })}
           />
         ))}
-        {archivedProjects.length > 0 && (
-          <ArchiveGroup label={t("archived")} forceOpen={Boolean(normalizedQuery)}>
-            {archivedProjects.map((project) => (
-              <ProjectGroup
-                key={project.id}
-                project={project}
-                active={project.id === activeProjectId}
-                expanded={Boolean(normalizedQuery) || expandedProjectIds.has(project.id)}
-                sessions={matchedSessions.filter((session) => samePath(session.cwd, project.path))}
-                showArchived={Boolean(normalizedQuery)}
-                activeId={activeId}
-                loadedSessions={sessions}
-                onOpenSession={(id) => void openSession(id)}
-                onToggle={() => setExpandedProjectIds((current) => {
-                  const next = new Set(current);
-                  if (next.has(project.id)) next.delete(project.id);
-                  else next.add(project.id);
-                  return next;
-                })}
-              />
-            ))}
-          </ArchiveGroup>
-        )}
         {normalizedQuery && !historySearching && matchedSessions.length === 0 && (
           <p className="px-2 py-6 text-center font-mono text-[9.5px] text-faint">
             {language === "zh-CN" ? "没有匹配的历史会话" : "NO MATCHING SESSIONS"}
@@ -301,7 +285,6 @@ function ProjectGroup({
   sessions,
   activeId,
   loadedSessions,
-  showArchived,
   onOpenSession,
   onToggle,
 }: {
@@ -311,11 +294,10 @@ function ProjectGroup({
   sessions: SessionMeta[];
   activeId: string | null;
   loadedSessions: Record<string, Session>;
-  showArchived?: boolean;
   onOpenSession(id: string): void;
   onToggle(): void;
 }) {
-  const visible = showArchived ? sessions : sessions.filter((session) => !session.archived);
+  const visible = sessions.filter((session) => !session.archived);
   return (
     <div className="mb-1">
       <ProjectRow
@@ -353,18 +335,6 @@ function SectionTitle({ label, count }: { label: string; count: number }) {
   );
 }
 
-function ArchiveGroup({ label, children, forceOpen = false }: { label: string; children: React.ReactNode; forceOpen?: boolean }) {
-  return (
-    <details className="group/archive mt-1" open={forceOpen || undefined}>
-      <summary className="flex cursor-pointer items-center gap-1.5 px-2 py-1 font-mono text-[9.5px] text-faint hover:text-mute">
-        <Icon name="chevronRight" size={8} className="transition-transform group-open/archive:rotate-90" />
-        {label}
-      </summary>
-      {children}
-    </details>
-  );
-}
-
 function ProjectRow({ project, active, expanded, count, onToggle }: { project: ProjectMeta; active: boolean; expanded: boolean; count: number; onToggle(): void }) {
   const { t, language } = useI18n();
   const openProject = useDesktop((state) => state.openProject);
@@ -376,6 +346,8 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
   const removeProject = useDesktop((state) => state.removeProject);
   const openExplorer = useDesktop((state) => state.openProjectInExplorer);
   const createWorktree = useDesktop((state) => state.createProjectWorktree);
+  const projectSessions = useDesktop((state) => state.sessionIndex.filter((session) => samePath(session.cwd, project.path)));
+  const allArchived = projectSessions.length > 0 && projectSessions.every((session) => session.archived);
   const [menu, setMenu] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(project.name);
@@ -441,8 +413,18 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
           <MenuButton icon="branch" label={language === "zh-CN" ? "创建永久工作树" : "Create permanent worktree"} onClick={() => void createWorktree(project.id)} />
           <MenuButton icon="gear" label={language === "zh-CN" ? "编辑项目" : "Edit project"} onClick={() => setEditing(true)} />
           <MenuDivider />
-          <MenuButton icon="archive" label={project.archived ? t("unarchive") : (language === "zh-CN" ? "归档项目" : "Archive project")} onClick={() => archiveProject(project.id)} />
-          <MenuButton icon="x" label={t("remove")} tone="text-red" onClick={() => removeProject(project.id)} />
+          <MenuButton icon="archive" label={allArchived ? (language === "zh-CN" ? "恢复项目会话" : "Restore project sessions") : (language === "zh-CN" ? "归档项目内全部会话" : "Archive all project sessions")} onClick={() => void archiveProject(project.id)} />
+          <MenuButton
+            icon="trash"
+            label={language === "zh-CN" ? "删除项目及会话" : "Delete project and sessions"}
+            tone="text-red"
+            onClick={() => {
+              const message = language === "zh-CN"
+                ? `将永久删除“${project.name}”的全部会话（侧栏当前显示 ${projectSessions.length} 个，并会检查磁盘历史）；项目源码文件不会被删除。是否继续？`
+                : `Permanently delete all conversations from “${project.name}” (${projectSessions.length} currently shown; disk history will also be checked)? Workspace files will be kept.`;
+              if (window.confirm(message)) void removeProject(project.id);
+            }}
+          />
         </ContextMenu>
       )}
     </div>
@@ -534,10 +516,13 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
           <MenuButton icon="external" label={language === "zh-CN" ? "在新窗口中打开" : "Open in new window"} onClick={() => void openInNewWindow(meta.id)} />
           <MenuDivider />
           <MenuButton
-            icon="x"
-            label={language === "zh-CN" ? "从侧栏移除" : "Remove from sidebar"}
+            icon="trash"
+            label={language === "zh-CN" ? "永久删除会话" : "Delete conversation permanently"}
             tone="text-red"
-            onClick={() => void removeFromSidebar(meta.id)}
+            onClick={() => {
+              const message = language === "zh-CN" ? "将永久删除此会话及其本地历史，是否继续？" : "Permanently delete this conversation and its local history?";
+              if (window.confirm(message)) void removeFromSidebar(meta.id);
+            }}
           />
         </ContextMenu>
       )}

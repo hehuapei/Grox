@@ -91,6 +91,12 @@ const paths: Record<string, JSX.Element> = {
       <path d="M14.8 4.5v15" />
     </>
   ),
+  panelLeft: (
+    <>
+      <rect x="3" y="4.5" width="18" height="15" />
+      <path d="M9.2 4.5v15" />
+    </>
+  ),
   command: (
     <path d="M9 9h6v6H9zM9 9H7.2A2.2 2.2 0 1 1 9 6.8V9zM15 9h1.8A2.2 2.2 0 1 0 15 6.8V9zM9 15H7.2A2.2 2.2 0 1 0 9 17.2V15zM15 15h1.8a2.2 2.2 0 1 1-2.2 2.2V15z" />
   ),

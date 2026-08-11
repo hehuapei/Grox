@@ -164,11 +164,15 @@ export function flushAllPendingSessionCaches(
   }
 }
 
-export function removeSessionCache(id: string): void {
+export function cancelPendingSessionCache(id: string): void {
   const timer = timers.get(id);
   if (timer !== undefined) window.clearTimeout(timer);
   timers.delete(id);
   pendingPayloads.delete(id);
+}
+
+export function removeSessionCache(id: string): void {
+  cancelPendingSessionCache(id);
   void invoke("delete_session_cache", { id }).catch(() => {});
 }
 

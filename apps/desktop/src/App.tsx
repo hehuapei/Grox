@@ -58,8 +58,10 @@ export default function App() {
   const terminalOpen = useDesktop((s) => s.terminalOpen);
   const previewOpen = useDesktop((s) => s.previewOpen);
   const planPreviewOpen = useDesktop((s) => s.planPreviewOpen);
+  const sidebarVisible = usePreferences((s) => s.sidebarVisible);
   const sidebarWidth = usePreferences((s) => s.sidebarWidth);
   const setSidebarWidth = usePreferences((s) => s.setSidebarWidth);
+  const toggleSidebar = usePreferences((s) => s.toggleSidebar);
 
   useEffect(() => {
     void init();
@@ -104,6 +106,9 @@ export default function App() {
       } else if (mod && e.key.toLowerCase() === "j") {
         e.preventDefault();
         s.toggleInspector();
+      } else if (mod && e.key.toLowerCase() === "b") {
+        e.preventDefault();
+        toggleSidebar();
       } else if (e.key === "Escape") {
         if (s.paletteOpen) s.setPaletteOpen(false);
         else if (s.settingsOpen) s.setSettingsOpen(false);
@@ -111,7 +116,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, []);
+  }, [toggleSidebar]);
 
   if (!ready) {
     return (
@@ -130,8 +135,12 @@ export default function App() {
       <TitleBar />
       <RuntimeNotice />
       <div className="flex min-h-0 flex-1">
-        <Sidebar />
-        <ResizeHandle side="right" value={sidebarWidth} onChange={setSidebarWidth} />
+        {sidebarVisible && (
+          <>
+            <Sidebar />
+            <ResizeHandle side="right" value={sidebarWidth} onChange={setSidebarWidth} />
+          </>
+        )}
         <div className="flex min-w-0 flex-1 flex-col bg-base">
           <main className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
             <StageTransition

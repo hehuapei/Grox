@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { fontScaleToRank, parseFontScale } from "./preferences";
+import { fontScaleToRank, parseFontScale, usePreferences } from "./preferences";
 
 describe("parseFontScale", () => {
   it("accepts discrete labels", () => {
@@ -31,5 +31,17 @@ describe("fontScaleToRank", () => {
     expect(fontScaleToRank("md")).toBe(1);
     expect(fontScaleToRank("lg")).toBe(2);
     expect(fontScaleToRank("xl")).toBe(3);
+  });
+});
+
+describe("sidebar visibility", () => {
+  it("persists every toggle", () => {
+    const initial = usePreferences.getState().sidebarVisible;
+    usePreferences.getState().toggleSidebar();
+    expect(usePreferences.getState().sidebarVisible).toBe(!initial);
+    expect(localStorage.getItem("grox.sidebarVisible")).toBe(initial ? "0" : "1");
+
+    usePreferences.getState().toggleSidebar();
+    expect(usePreferences.getState().sidebarVisible).toBe(initial);
   });
 });

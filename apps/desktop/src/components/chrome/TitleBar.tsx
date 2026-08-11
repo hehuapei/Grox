@@ -9,6 +9,7 @@ import { baseName } from "../../lib/format";
 import { Icon } from "../fx/Icon";
 import { useI18n } from "../../lib/i18n";
 import { EnvironmentSummary } from "./EnvironmentSummary";
+import { usePreferences } from "../../state/preferences";
 import {
   getAvailableOpenApplications,
   getDefaultOpenApplication,
@@ -43,6 +44,8 @@ export function TitleBar() {
   const toggleTerminal = useDesktop((s) => s.toggleTerminal);
   const terminalOpen = useDesktop((s) => s.terminalOpen);
   const setPaletteOpen = useDesktop((s) => s.setPaletteOpen);
+  const sidebarVisible = usePreferences((s) => s.sidebarVisible);
+  const toggleSidebar = usePreferences((s) => s.toggleSidebar);
   const breadcrumbCwd = meta?.cwd ?? draftSession?.cwd;
   const breadcrumbTitle = meta?.title
     || (draftSession
@@ -54,6 +57,17 @@ export function TitleBar() {
       data-tauri-drag-region
       className="titlebar relative z-40 flex h-10 shrink-0 items-center border-b border-line bg-void pl-[78px] pr-2 select-none"
     >
+      <div data-tauri-drag-region="false" className="absolute left-[78px] flex items-center">
+        <button
+          className={`chip ${sidebarVisible ? "!text-fg2 !border-line3" : ""}`}
+          onClick={toggleSidebar}
+          title={language === "zh-CN" ? "显示/隐藏侧栏（Ctrl/⌘B）" : "Toggle sidebar (Ctrl/⌘B)"}
+          aria-pressed={sidebarVisible}
+        >
+          <Icon name="panelLeft" size={12} />
+        </button>
+      </div>
+
       {/* center — mission breadcrumb (drag only; not interactive) */}
       <div
         data-tauri-drag-region

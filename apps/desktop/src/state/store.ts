@@ -45,10 +45,10 @@ import type {
 import { DEMO_CWD } from "../demo/data";
 import {
   clearDraftBuffer,
+  cancelPendingSessionCache,
   flushAllPendingSessionCaches,
   flushSessionCache,
   loadDraftBuffer,
-  removeSessionCache,
   saveDraftBuffer,
   scheduleSaveSessionCache,
   scrubSessionCacheOrphans,
@@ -256,13 +256,13 @@ interface DesktopState {
   openProject(id: string): Promise<void>;
   renameProject(id: string, name: string): void;
   pinProject(id: string): void;
-  archiveProject(id: string): void;
-  removeProject(id: string): void;
+  archiveProject(id: string): Promise<void>;
+  removeProject(id: string): Promise<void>;
   openProjectInExplorer(id?: string): Promise<void>;
   createProjectWorktree(id: string): Promise<void>;
-  /** Remove from sidebar/catalog; ACP delete is best-effort (stale ids may fail). */
+  /** Permanently remove CLI/disk/cache data and tombstone the id against re-import. */
   deleteSession(id: string): Promise<void>;
-  /** Alias of deleteSession for dead/stale sidebar rows. */
+  /** Alias of deleteSession for sidebar rows. */
   removeSessionFromSidebar(id: string): Promise<void>;
   renameSession(id: string, title: string): void;
   pinSession(id: string): void;
@@ -423,6 +423,8 @@ function persistWorkflowRuns(runs: Record<string, WorkflowRun[]>) {
 }
 
 const DISMISSED_PROJECTS_KEY = "grox.dismissedProjects";
+const DELETED_SESSIONS_KEY = "grox.deletedSessions";
+const LEGACY_ARCHIVED_PROJECT_PATHS_KEY = "grox.legacyArchivedProjectPaths";
 
 function loadDismissedProjects(): Set<string> {
   const raw = loadJson<string[]>(DISMISSED_PROJECTS_KEY, []);
@@ -436,10 +438,66 @@ function persistDismissedProjects(dismissed: Iterable<string>) {
   );
 }
 
+function loadDeletedSessions(): Set<string> {
+  return new Set(loadJson<string[]>(DELETED_SESSIONS_KEY, []).filter(Boolean));
+}
+
+function persistDeletedSessions(ids: Iterable<string>) {
+  localStorage.setItem(DELETED_SESSIONS_KEY, JSON.stringify([...new Set(ids)].sort()));
+}
+
+function markSessionsDeleted(ids: Iterable<string>) {
+  const deleted = loadDeletedSessions();
+  for (const id of ids) deleted.add(id);
+  persistDeletedSessions(deleted);
+}
+
+function clearSessionFlags(ids: Iterable<string>) {
+  const flags = loadJson<Record<string, SessionFlags>>("grox.sessionFlags", {});
+  let changed = false;
+  for (const id of ids) {
+    if (!(id in flags)) continue;
+    delete flags[id];
+    changed = true;
+  }
+  if (changed) localStorage.setItem("grox.sessionFlags", JSON.stringify(flags));
+}
+
 function loadProjects(): ProjectMeta[] {
   const loaded = dedupeProjects(loadJson<ProjectMeta[]>("grox.projects", []));
   localStorage.setItem("grox.projects", JSON.stringify(loaded));
   return loaded;
+}
+
+function migrateLegacyProjectArchives(projects: ProjectMeta[], sessions: SessionMeta[]) {
+  const archivedPaths = [
+    ...loadJson<string[]>(LEGACY_ARCHIVED_PROJECT_PATHS_KEY, []),
+    ...projects.filter((project) => project.archived).map((project) => project.path),
+  ].filter((path, index, all) => all.findIndex((candidate) => samePath(candidate, path)) === index);
+  if (archivedPaths.length === 0) return { projects, sessions };
+  localStorage.setItem(LEGACY_ARCHIVED_PROJECT_PATHS_KEY, JSON.stringify(archivedPaths));
+  const flags = loadJson<Record<string, SessionFlags>>("grox.sessionFlags", {});
+  const nextSessions = sessions.map((session) => {
+    if (!archivedPaths.some((path) => samePath(path, session.cwd))) return session;
+    flags[session.id] = { ...flags[session.id], archived: true };
+    return { ...session, archived: true };
+  });
+  const nextProjects = projects.map((project) => ({ ...project, archived: false }));
+  localStorage.setItem("grox.projects", JSON.stringify(nextProjects));
+  localStorage.setItem("grox.sessionFlags", JSON.stringify(flags));
+  return { projects: nextProjects, sessions: nextSessions };
+}
+
+function finishLegacyProjectArchiveMigration(sessions: SessionMeta[]) {
+  const archivedPaths = loadJson<string[]>(LEGACY_ARCHIVED_PROJECT_PATHS_KEY, []);
+  if (archivedPaths.length === 0) return;
+  const flags = loadJson<Record<string, SessionFlags>>("grox.sessionFlags", {});
+  for (const session of sessions) {
+    if (!archivedPaths.some((path) => samePath(path, session.cwd))) continue;
+    flags[session.id] = { ...flags[session.id], archived: true };
+  }
+  localStorage.setItem("grox.sessionFlags", JSON.stringify(flags));
+  localStorage.removeItem(LEGACY_ARCHIVED_PROJECT_PATHS_KEY);
 }
 
 function ensureProject(
@@ -464,7 +522,12 @@ function ensureProject(
 
 function decorateSessions(metas: SessionMeta[]) {
   const flags = loadJson<Record<string, SessionFlags>>("grox.sessionFlags", {});
-  return metas.map((meta) => ({ ...meta, ...flags[meta.id] }));
+  const legacyArchivedPaths = loadJson<string[]>(LEGACY_ARCHIVED_PROJECT_PATHS_KEY, []);
+  return metas.map((meta) => ({
+    ...meta,
+    ...flags[meta.id],
+    ...(legacyArchivedPaths.some((path) => samePath(path, meta.cwd)) ? { archived: true } : {}),
+  }));
 }
 
 function persistSessionCatalog(metas: SessionMeta[]) {
@@ -480,21 +543,24 @@ function mergeSessions(
   incoming: SessionMeta[],
   cwd?: string,
 ): SessionMeta[] {
+  const deleted = loadDeletedSessions();
+  const visibleExisting = existing.filter((meta) => !deleted.has(meta.id));
+  const visibleIncoming = incoming.filter((meta) => !deleted.has(meta.id));
   // When scoped to a cwd (project open / setWorkspace), keep same-cwd offline
   // catalog rows the CLI did not return — otherwise "project +" hides history.
   const merged = cwd
     ? (mergeProjectSessionsPure(
-        existing,
+        visibleExisting,
         samePath,
         cwd,
-        decorateSessions(incoming),
-        new Set(),
+        decorateSessions(visibleIncoming),
+        deleted,
       ) as SessionMeta[])
     : (() => {
-        const incomingIds = new Set(incoming.map((meta) => meta.id));
+        const incomingIds = new Set(visibleIncoming.map((meta) => meta.id));
         return [
-          ...decorateSessions(incoming),
-          ...existing.filter((meta) => !incomingIds.has(meta.id)),
+          ...decorateSessions(visibleIncoming),
+          ...visibleExisting.filter((meta) => !incomingIds.has(meta.id)),
         ].sort((a, b) => b.updatedAt - a.updatedAt);
       })();
   persistSessionCatalog(merged);
@@ -873,6 +939,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         break;
       }
       case "session_ready": {
+        if (loadDeletedSessions().has(e.session.id)) break;
         const filteredSession = {
           ...e.session,
           blocks: e.session.blocks.filter((block) => !isHiddenWorkflowControlPrompt(block)),
@@ -1242,7 +1309,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
       // Critical: do NOT await CLI spawn / initialize in this turn. An
       // await here keeps the microtask queue busy for 2–3s and starves
       // React paint + pointer events even after ready:true is set.
-      const sessionIndex = decorateSessions(loadJson<SessionMeta[]>("grox.sessionCatalog", []));
+      const migration = migrateLegacyProjectArchives(
+        get().projects,
+        decorateSessions(loadJson<SessionMeta[]>("grox.sessionCatalog", [])),
+      );
+      const deletedSessions = loadDeletedSessions();
+      const visibleSessionIndex = migration.sessions.filter((session) => !deletedSessions.has(session.id));
       const cachedWorkspace = (() => {
         try {
           return localStorage.getItem("grok.workspace")?.trim() || "";
@@ -1251,16 +1323,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
         }
       })();
       if (cachedWorkspace) {
-        const projects = ensureProject(get().projects, cachedWorkspace);
+        const projects = ensureProject(migration.projects, cachedWorkspace);
         set({
           workspace: cachedWorkspace,
           projects,
           activeProjectId: projectId(cachedWorkspace),
-          sessionIndex,
+          sessionIndex: visibleSessionIndex,
           ready: true,
         });
       } else {
-        set({ sessionIndex, ready: true });
+        set({ projects: migration.projects, sessionIndex: visibleSessionIndex, ready: true });
       }
 
       // Deep links / agent boot are scheduled after a real interaction window.
@@ -1739,18 +1811,58 @@ export const useDesktop = create<DesktopState>((set, get) => {
       set({ projects });
     },
 
-    archiveProject(id) {
+    async archiveProject(id) {
+      const target = get().projects.find((project) => project.id === id);
+      if (!target) return;
+      let baseSessionIndex = get().sessionIndex;
+      try {
+        const discovered = await bridge.listSessions(target.path);
+        baseSessionIndex = mergeSessions(baseSessionIndex, discovered, target.path);
+      } catch (error) {
+        set({
+          startupError: `无法完整枚举项目会话，将只处理当前已加载会话：${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
+      const projectSessions = baseSessionIndex.filter((session) => samePath(session.cwd, target.path));
+      if (projectSessions.length === 0) return;
+      const archived = !projectSessions.every((session) => session.archived);
+      const flags = loadJson<Record<string, SessionFlags>>("grox.sessionFlags", {});
+      const sessionIndex = baseSessionIndex.map((session) => {
+        if (!samePath(session.cwd, target.path)) return session;
+        flags[session.id] = { ...flags[session.id], archived };
+        return { ...session, archived };
+      });
       const projects = get().projects.map((project) =>
-        project.id === id ? { ...project, archived: !project.archived } : project,
+        project.id === id ? { ...project, archived: false } : project,
       );
       localStorage.setItem("grox.projects", JSON.stringify(projects));
-      set({ projects });
+      localStorage.setItem("grox.sessionFlags", JSON.stringify(flags));
+      set({
+        projects,
+        sessionIndex,
+        ...(archived && projectSessions.some((session) => session.id === get().activeId)
+          ? { activeId: null, view: "home" as View }
+          : {}),
+      });
     },
 
-    removeProject(id) {
+    async removeProject(id) {
       const target = get().projects.find((project) => project.id === id || samePath(project.path, id));
       const path = target?.path ?? id;
       const dismissId = target ? projectId(target.path) : projectId(id);
+      const errors: string[] = [];
+      const localSessionIds = get().sessionIndex
+        .filter((meta) => samePath(meta.cwd, path))
+        .map((meta) => meta.id);
+      let discoveredSessionIds: string[] = [];
+      try {
+        discoveredSessionIds = (await bridge.listSessions(path))
+          .filter((meta) => samePath(meta.cwd, path))
+          .map((meta) => meta.id);
+      } catch (error) {
+        errors.push(`无法完整枚举项目会话：${error instanceof Error ? error.message : String(error)}`);
+      }
+      const sessionIds = [...new Set([...localSessionIds, ...discoveredSessionIds])];
       if (dismissId) {
         persistDismissedProjects(dismissProjectId(loadDismissedProjects(), dismissId));
       }
@@ -1758,18 +1870,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         (project) => project.id !== id && project.id !== dismissId && !samePath(project.path, id),
       );
       localStorage.setItem("grox.projects", JSON.stringify(projects));
-
-      // Keep sessions durable on disk, but move them out of the live sidebar into
-      // the archive manager so "remove" does not create invisible orphans.
-      const flags = loadJson<Record<string, SessionFlags>>("grox.sessionFlags", {});
-      const sessionIndex = get().sessionIndex.map((meta) => {
-        if (!samePath(meta.cwd, path)) return meta;
-        flags[meta.id] = { ...flags[meta.id], archived: true };
-        return { ...meta, archived: true };
-      });
-      localStorage.setItem("grox.sessionFlags", JSON.stringify(flags));
+      markSessionsDeleted(sessionIds);
+      clearSessionFlags(sessionIds);
+      const sessionIndex = get().sessionIndex.filter((meta) => !sessionIds.includes(meta.id));
       persistSessionCatalog(sessionIndex);
-
       const activeId = get().activeId;
       const activeSession = activeId ? get().sessions[activeId] : undefined;
       const leaveActive = Boolean(activeSession && samePath(activeSession.cwd, path));
@@ -1782,6 +1886,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
           : {}),
         ...(leaveActive ? { activeId: null, view: "home" as View } : {}),
       });
+      for (const sessionId of sessionIds) {
+        try {
+          await get().deleteSession(sessionId);
+        } catch (error) {
+          errors.push(error instanceof Error ? error.message : String(error));
+        }
+      }
+      if (errors.length > 0) {
+        set({ startupError: `项目已从侧栏删除，但部分磁盘会话清理失败：${errors.join("；")}` });
+      }
     },
 
     async openProjectInExplorer(id) {
@@ -2124,14 +2238,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
     closePreview: () => set({ previewOpen: false, previewFile: null, previewError: null }),
 
     async deleteSession(id) {
-      // Stale sidebar rows often are unknown to the current CLI — never block
-      // local catalog cleanup on ACP session/delete.
-      try {
-        await bridge.deleteSession(id);
-      } catch {
-        // ignore missing CLI session
-      }
-      removeSessionCache(id);
+      // 先写防复活标记并清理本地索引，避免 CLI 列表刷新与删除请求竞态。
+      markSessionsDeleted([id]);
+      clearSessionFlags([id]);
+      // 取消尚未落盘的 debounce；否则删除完成后旧缓存可能被定时器重新写回。
+      cancelPendingSessionCache(id);
       const { sessionIndex, sessions, activeId, sessionComposers, workflows } = get();
       const rest = { ...sessions };
       delete rest[id];
@@ -2154,6 +2265,20 @@ export const useDesktop = create<DesktopState>((set, get) => {
         startupError: null,
         ...(activeId === id ? { activeId: null, view: "home" as View } : {}),
       });
+
+      try {
+        await bridge.deleteSession(id);
+      } catch (error) {
+        // CLI 不认识陈旧会话是常见情况；磁盘清理和防复活标记仍保证删除语义。
+        console.info("CLI session/delete skipped for stale session", id, error);
+      }
+      try {
+        if ("__TAURI_INTERNALS__" in window) await invoke("delete_session_data", { id });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        set({ startupError: `会话已从侧栏删除，但本地历史清理失败：${message}` });
+        throw new Error(message);
+      }
     },
 
     async removeSessionFromSidebar(id) {
@@ -2764,6 +2889,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         try {
           const imported = await bridge.listSessions();
           const sessionIndex = mergeSessions(get().sessionIndex, imported);
+          finishLegacyProjectArchiveMigration(sessionIndex);
           const projects = mergeDiscoveredProjects(get().projects, imported);
           set({
             sessionIndex,

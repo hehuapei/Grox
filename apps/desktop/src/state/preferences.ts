@@ -19,6 +19,7 @@ interface PreferencesState {
   fontScale: FontScale;
   fontWeight: number;
   contentDensity: ContentDensity;
+  sidebarVisible: boolean;
   sidebarWidth: number;
   inspectorWidth: number;
   previewWidth: number;
@@ -29,6 +30,7 @@ interface PreferencesState {
   setFontSize(fontSize: number): void;
   setFontWeight(fontWeight: number): void;
   setContentDensity(density: ContentDensity): void;
+  toggleSidebar(): void;
   setSidebarWidth(width: number): void;
   setInspectorWidth(width: number): void;
   setPreviewWidth(width: number): void;
@@ -130,6 +132,7 @@ export const usePreferences = create<PreferencesState>((set) => ({
   fontScale: initialFontScale,
   fontWeight: initialFontWeight,
   contentDensity: initialContentDensity,
+  sidebarVisible: localStorage.getItem("grox.sidebarVisible") !== "0",
   sidebarWidth: Math.min(380, Math.max(210, numberPreference("grox.sidebarWidth", 252))),
   inspectorWidth: Math.min(540, Math.max(260, numberPreference("grox.inspectorWidth", 312))),
   previewWidth: Math.min(760, Math.max(340, numberPreference("grox.previewWidth", 460))),
@@ -169,6 +172,13 @@ export const usePreferences = create<PreferencesState>((set) => ({
     localStorage.setItem("grox.contentDensity", value);
     document.documentElement.dataset.density = value;
     set({ contentDensity: value });
+  },
+  toggleSidebar() {
+    set((state) => {
+      const sidebarVisible = !state.sidebarVisible;
+      localStorage.setItem("grox.sidebarVisible", sidebarVisible ? "1" : "0");
+      return { sidebarVisible };
+    });
   },
   setSidebarWidth(sidebarWidth) {
     const width = Math.min(380, Math.max(210, sidebarWidth));
