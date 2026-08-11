@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
-const MARKER_PREFIX = "<!-- grox-upstream-commit:";
+const MARKER_PREFIX = "<!-- grox-upstream-version:";
 
 export function parsePackageVersion(cargo) {
   const match = cargo.match(/^\[package\][\s\S]*?^version\s*=\s*"([^"]+)"/m);
@@ -32,14 +32,16 @@ export function parseCommitChanges(message) {
   });
 }
 
-export function shouldLoadChangelog(state, latestCommit, packageVersion) {
-  return (state.integrationTarget?.commit === latestCommit && Boolean(state.integrationTarget.publicVersion))
-    || (state.latestObserved?.commit === latestCommit && Boolean(state.latestObserved.publicVersion))
-    || state.latestObserved?.packageVersion !== packageVersion;
+export function parsePublicVersion(value) {
+  const version = value.trim().replace(/^v/i, "");
+  if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(version)) {
+    throw new Error(`官方 stable 返回了无效版本：${JSON.stringify(value)}`);
+  }
+  return version;
 }
 
-export function versionLabel(publicVersion, packageVersion, commit) {
-  return publicVersion ? `v${publicVersion}` : `snapshot ${commit.slice(0, 7)} (package ${packageVersion})`;
+export function shouldTrackRelease(state, publicVersion) {
+  return state.verifiedIntegration?.publicVersion !== publicVersion;
 }
 
 export function normalizeChanges(value) {
@@ -118,8 +120,8 @@ export function expandSourceDiffWithTrees(sourceDiff, baseTree, latestTree) {
 
 export function buildIssueBody({ state, latest, packageVersion, publicVersion, sourceRevision, changes, sourceDiff }) {
   const target = state.integrationTarget?.commit === latest.sha ? state.integrationTarget : null;
-  const baseCommit = target?.baseCommit ?? state.latestObserved?.commit;
-  const publicLabel = publicVersion ? `v${publicVersion}` : "未进入官网 Changelog";
+  const baseCommit = target?.baseCommit ?? state.verifiedIntegration?.commit;
+  const publicLabel = `v${publicVersion}`;
   const verified = state.verifiedIntegration
     ? `${state.verifiedIntegration.commit}（${state.verifiedIntegration.publicVersion ?? state.verifiedIntegration.packageVersion}）`
     : "无；历史完整集成声明已失效，必须补齐证据";
@@ -148,7 +150,7 @@ export function buildIssueBody({ state, latest, packageVersion, publicVersion, s
     ? "> **警告：GitHub Compare API 返回可能被截断。必须继续分页/本地 diff，不能以本清单作为完整性证据。**"
     : "> 此清单是源码审计输入，不代表每个文件都需要修改 Grox；每项仍须记录影响或不适用理由。";
 
-  return `${MARKER_PREFIX}${latest.sha} -->
+  return `${MARKER_PREFIX}${publicVersion} -->
 # Grok Build ${publicLabel} 全面适配
 
 > **状态：未完成。** 本 issue 不是更新提醒的收件箱，而是上游变化逐项融入 Grox 桌面产品的验收清单。仅确认 ACP 不崩溃不能关闭本 issue。
@@ -157,7 +159,7 @@ export function buildIssueBody({ state, latest, packageVersion, publicVersion, s
 
 - 官网产品版本：${publicLabel}
 - 源码包版本：${packageVersion}
-- 官方提交：${latest.sha}
+- 源码观测提交（待与正式产物核对）：${latest.sha}
 - Source-Revision：${sourceRevision ?? "上游提交未提供"}
 - 当前验证集成基线：${verified}
 - 源码差异：${compare}
@@ -198,8 +200,8 @@ ${sourceFiles}
 `;
 }
 
-export function findTrackedIssue(issues, commit) {
-  const marker = `${MARKER_PREFIX}${commit} -->`;
+export function findTrackedIssue(issues, publicVersion) {
+  const marker = `${MARKER_PREFIX}${publicVersion} -->`;
   return issues.find((issue) => typeof issue.body === "string" && issue.body.includes(marker))
     ?? null;
 }
@@ -230,6 +232,14 @@ async function githubRaw(owner, repo, path, ref, token) {
   return response.text();
 }
 
+async function fetchPublicVersion(url) {
+  const response = await fetch(url, {
+    headers: { "User-Agent": "Grox-upstream-tracker" },
+  });
+  if (!response.ok) throw new Error(`官方 stable ${response.status}: ${await response.text()}`);
+  return parsePublicVersion(await response.text());
+}
+
 function gh(args, options = {}) {
   return execFileSync("gh", args, { encoding: "utf8", ...options }).trim();
 }
@@ -243,10 +253,28 @@ async function main() {
   const [owner, repo] = repository.split("/");
   const upstream = new URL(state.repository);
   const [upstreamOwner, upstreamRepo] = upstream.pathname.replace(/^\//, "").replace(/\.git$/, "").split("/");
-  const latest = await githubJson(`/repos/${upstreamOwner}/${upstreamRepo}/commits/${state.branch}`, token);
+  if (!state.stable) throw new Error(".grox/official-cli.json 缺少 stable 版本端点");
+  const [latest, publicVersion] = await Promise.all([
+    githubJson(`/repos/${upstreamOwner}/${upstreamRepo}/commits/${state.branch}`, token),
+    fetchPublicVersion(state.stable),
+  ]);
 
-  if (state.verifiedIntegration?.commit === latest.sha) {
-    console.log(`最新官方提交 ${latest.sha} 已达到验证集成状态。`);
+  if (!shouldTrackRelease(state, publicVersion)) {
+    console.log(`官方 stable 仍为 v${publicVersion}（已验证）；仅观测源码提交 ${latest.sha}，不创建适配 issue。`);
+    return;
+  }
+
+  const issues = JSON.parse(gh([
+    "issue", "list", "--repo", repository, "--state", "all", "--limit", "200", "--json", "number,title,body,state",
+  ]) || "[]");
+  const existing = findTrackedIssue(issues, publicVersion);
+  if (existing) {
+    if (existing.state === "CLOSED") {
+      gh(["issue", "reopen", String(existing.number), "--repo", repository]);
+      console.log(`已重新打开未完成的 Grok Build v${publicVersion} 适配 issue #${existing.number}。`);
+    } else {
+      console.log(`Grok Build v${publicVersion} 的全面适配 issue #${existing.number} 仍处于打开状态。`);
+    }
     return;
   }
 
@@ -259,29 +287,20 @@ async function main() {
   );
   const packageVersion = parsePackageVersion(cargo);
   let changes = [];
-  if (shouldLoadChangelog(state, latest.sha, packageVersion)) {
-    try {
-      const changelog = await githubRaw(
-        upstreamOwner,
-        upstreamRepo,
-        `crates/codegen/xai-grok-shell/changelogs/${packageVersion}.json`,
-        latest.sha,
-        token,
-      );
-      changes = normalizeChanges(JSON.parse(changelog));
-    } catch (error) {
-      console.warn(`无法读取结构化 Changelog：${error instanceof Error ? error.message : String(error)}`);
-    }
-  } else {
-    console.log(`提交 ${latest.sha} 没有新的公开版本，跳过复用 package ${packageVersion} 的旧 Changelog。`);
+  try {
+    const changelog = await githubRaw(
+      upstreamOwner,
+      upstreamRepo,
+      `crates/codegen/xai-grok-shell/changelogs/${publicVersion}.json`,
+      latest.sha,
+      token,
+    );
+    changes = normalizeChanges(JSON.parse(changelog));
+  } catch (error) {
+    console.warn(`无法读取 v${publicVersion} 结构化 Changelog：${error instanceof Error ? error.message : String(error)}`);
     changes = parseCommitChanges(latest.commit.message);
   }
 
-  const publicVersion = state.integrationTarget?.commit === latest.sha
-    ? state.integrationTarget.publicVersion
-    : state.latestObserved?.commit === latest.sha
-      ? state.latestObserved.publicVersion
-      : null;
   let sourceRevision = parseSourceRevision(latest.commit.message);
   if (!sourceRevision) {
     try {
@@ -297,7 +316,7 @@ async function main() {
     }
   }
   const target = state.integrationTarget?.commit === latest.sha ? state.integrationTarget : null;
-  const baseCommit = target?.baseCommit ?? state.latestObserved?.commit;
+  const baseCommit = target?.baseCommit ?? state.verifiedIntegration?.commit;
   let sourceDiff = null;
   if (baseCommit && baseCommit !== latest.sha) {
     try {
@@ -318,31 +337,9 @@ async function main() {
     }
   }
   const body = buildIssueBody({ state, latest, packageVersion, publicVersion, sourceRevision, changes, sourceDiff });
-  const issues = JSON.parse(gh([
-    "issue", "list", "--repo", repository, "--state", "all", "--limit", "200", "--json", "number,title,body,state",
-  ]) || "[]");
-  const existing = findTrackedIssue(issues, latest.sha);
-  if (existing) {
-    const title = `[Upstream][待全面适配] Grok Build ${versionLabel(publicVersion, packageVersion, latest.sha)}`;
-    if (existing.body !== body || existing.title !== title) {
-      gh([
-        "issue", "edit", String(existing.number), "--repo", repository,
-        "--title", title,
-        "--body-file", "-",
-      ], { input: body });
-    }
-    if (existing.state === "CLOSED") {
-      gh(["issue", "reopen", String(existing.number), "--repo", repository]);
-      console.log(`已重新打开未完成的上游适配 issue #${existing.number}。`);
-    } else {
-      console.log(`上游提交 ${latest.sha} 的全面适配 issue #${existing.number} 仍处于打开状态。`);
-    }
-    return;
-  }
-
-  const title = `[Upstream][待全面适配] Grok Build ${versionLabel(publicVersion, packageVersion, latest.sha)}`;
+  const title = `[Upstream][待全面适配] Grok Build v${publicVersion}`;
   gh(["issue", "create", "--repo", repository, "--title", title, "--body-file", "-"], { input: body });
-  console.log(`已为 ${latest.sha} 创建逐项全面适配 issue。`);
+  console.log(`已为正式发布的 Grok Build v${publicVersion} 创建逐项全面适配 issue。`);
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {

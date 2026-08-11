@@ -8,10 +8,10 @@ import {
   normalizeSourceDiff,
   parsePackageVersion,
   parseCommitChanges,
+  parsePublicVersion,
   parseSourceRevision,
   parseSourceRevisionFile,
-  shouldLoadChangelog,
-  versionLabel,
+  shouldTrackRelease,
 } from "./upstream-tracker.mjs";
 
 test("parses only the package version", () => {
@@ -83,17 +83,16 @@ test("normalizes every structured changelog item without dropping categories", (
   ]);
 });
 
-test("does not reuse an old changelog for a new source snapshot with the same package version", () => {
+test("tracks public releases, not source commits or repeated package versions", () => {
   const state = {
-    latestObserved: { commit: "old", packageVersion: "1.0.0" },
-    integrationTarget: { commit: "old" },
+    verifiedIntegration: { commit: "release-commit", publicVersion: "1.0.0" },
+    latestObserved: { commit: "new-source-commit", packageVersion: "1.0.0" },
   };
-  assert.equal(shouldLoadChangelog(state, "new", "1.0.0"), false);
-  assert.equal(shouldLoadChangelog(state, "new", "1.0.1"), true);
-  assert.equal(shouldLoadChangelog({
-    latestObserved: { commit: "new", packageVersion: "1.0.0", publicVersion: null },
-  }, "new", "1.0.0"), false);
-  assert.equal(versionLabel(null, "1.0.0", "8a14c91d888"), "snapshot 8a14c91 (package 1.0.0)");
+  assert.equal(parsePublicVersion("1.0.0\n"), "1.0.0");
+  assert.equal(parsePublicVersion("v1.1.0"), "1.1.0");
+  assert.throws(() => parsePublicVersion("main"), /无效版本/);
+  assert.equal(shouldTrackRelease(state, "1.0.0"), false);
+  assert.equal(shouldTrackRelease(state, "1.1.0"), true);
 });
 
 test("uses the source snapshot change list when no public changelog exists", () => {
@@ -132,13 +131,13 @@ test("issue body makes observation and verified integration distinct", () => {
   assert.match(body, /src\/fix\.rs/);
   assert.match(body, /不得为此提交根目录 `docs\/`/);
   assert.doesNotMatch(body, /适配矩阵已提交到仓库/);
-  assert.equal(findTrackedIssue([{ number: 16, body, state: "CLOSED" }], latest.sha)?.number, 16);
-  assert.equal(findTrackedIssue([{ number: 16, body: "legacy", state: "CLOSED" }], latest.sha), null);
+  assert.equal(findTrackedIssue([{ number: 16, body, state: "CLOSED" }], "1.0.0")?.number, 16);
+  assert.equal(findTrackedIssue([{ number: 16, body: "legacy", state: "CLOSED" }], "1.0.0"), null);
   assert.equal(findTrackedIssue([{
     number: 16,
     body: "<!-- grox-upstream-commit:old-verified-commit -->",
     state: "CLOSED",
-  }], latest.sha), null);
+  }], "1.0.0"), null);
 });
 
 test("extracts source revision from an upstream sync message", () => {
