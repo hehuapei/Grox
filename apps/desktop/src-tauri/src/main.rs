@@ -6893,7 +6893,15 @@ fn main() {
     if let Err(error) = synchronize_active_provider_backend() {
         eprintln!("grox: 无法同步当前供应商的协议覆盖：{error}");
     }
+    let window_state_flags = tauri_plugin_window_state::StateFlags::POSITION
+        | tauri_plugin_window_state::StateFlags::SIZE
+        | tauri_plugin_window_state::StateFlags::MAXIMIZED;
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(window_state_flags)
+                .build(),
+        )
         .manage(Arc::new(AcpState::default()))
         .manage(Arc::new(PreviewState::default()))
         .manage(Arc::new(FilePreviewState::default()))
