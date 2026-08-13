@@ -87,4 +87,41 @@ describe("Sidebar", () => {
     expect(removeSessionFromSidebar).toHaveBeenCalledWith("session-existing");
     await act(async () => root.unmount());
   });
+
+  it("本地支持包在读取完整对话 trace 前明确说明隐私边界", async () => {
+    useDesktop.setState({
+      activeProjectId: "c:/workspace/existing",
+      projects: [{
+        id: "c:/workspace/existing",
+        path: "C:/workspace/existing",
+        name: "已有项目",
+        pinned: false,
+        archived: false,
+        createdAt: 1,
+        lastOpenedAt: 2,
+      }],
+      sessionIndex: [{
+        id: "session-existing",
+        title: "已有会话",
+        cwd: "C:/workspace/existing",
+        createdAt: 1,
+        updatedAt: 2,
+        model: "grok-build",
+      }],
+    });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    await act(async () => root.render(<Sidebar />));
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="会话操作"]')?.click());
+    const exportItem = [...container.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.includes("导出本地支持包"));
+    await act(async () => exportItem?.click());
+
+    expect(document.body.textContent).toContain("导出本地会话支持包？");
+    expect(document.body.textContent).toContain("完整对话和工具记录");
+    expect(document.body.textContent).toContain("Grox 不会上传");
+    await act(async () => root.unmount());
+  });
 });

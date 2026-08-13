@@ -473,6 +473,7 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
   const [editing, setEditing] = useState(false);
   const [menu, setMenu] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmExport, setConfirmExport] = useState(false);
   const displayTitle = missionTitle(meta, language);
   const [draft, setDraft] = useState(displayTitle);
   const commit = () => {
@@ -528,7 +529,7 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
           <MenuButton icon="folder" label={language === "zh-CN" ? "复制工作目录" : "Copy working directory"} onClick={() => void copySessionValue(meta.id, "cwd")} />
           <MenuButton icon="copy" label={language === "zh-CN" ? "复制会话 ID" : "Copy session ID"} onClick={() => void copySessionValue(meta.id, "id")} />
           <MenuButton icon="external" label={language === "zh-CN" ? "复制深度链接" : "Copy deep link"} onClick={() => void copySessionValue(meta.id, "link")} />
-          <MenuButton icon="summary" label={language === "zh-CN" ? "导出会话诊断" : "Export session trace"} onClick={() => void invoke<string>("export_session_trace", { sessionId: meta.id }).then((path) => navigator.clipboard.writeText(path))} />
+          <MenuButton icon="summary" label={language === "zh-CN" ? "导出本地支持包" : "Export local support package"} onClick={() => setConfirmExport(true)} />
           <MenuDivider />
           <MenuButton icon="arrowRight" label={language === "zh-CN" ? "在新聊天中继续" : "Continue in new chat"} onClick={() => void continueInNewChat(meta.id)} />
           <MenuButton icon="branch" label={language === "zh-CN" ? "在新工作树中继续" : "Continue in new worktree"} onClick={() => void continueInWorktree(meta.id)} />
@@ -556,6 +557,52 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
           onConfirm={async () => {
             await removeFromSidebar(meta.id);
             setConfirmDelete(false);
+          }}
+        />
+      )}
+      {confirmExport && (
+        <ConfirmDialog
+          title={language === "zh-CN" ? "导出本地会话支持包？" : "Export local session support package?"}
+          description={language === "zh-CN"
+            ? "支持包包含应用/CLI 版本、运行时拓扑、journal 健康、队列与错误状态；若官方 trace 可用，还会包含完整对话和工具记录。文件仅写入本机临时目录，Grox 不会上传。分享前请自行检查。"
+            : "The package contains app/CLI versions, runtime topology, journal health, queue and error state. When available, the official trace also contains the full conversation and tool records. Grox writes it only to your local temp folder and never uploads it. Review before sharing."}
+          confirmLabel={language === "zh-CN" ? "导出到本机" : "Export locally"}
+          cancelLabel={language === "zh-CN" ? "取消" : "Cancel"}
+          workingLabel={language === "zh-CN" ? "正在收集" : "Collecting"}
+          tone="primary"
+          onCancel={() => setConfirmExport(false)}
+          onConfirm={async () => {
+            const state = useDesktop.getState();
+            const session = state.sessions[meta.id];
+            const blockCounts = (session?.blocks ?? []).reduce<Record<string, number>>((counts, block) => {
+              counts[block.type] = (counts[block.type] ?? 0) + 1;
+              return counts;
+            }, {});
+            const clientSnapshot = JSON.stringify({
+              generatedAt: Date.now(),
+              runtimeConnection: state.runtimeConnection,
+              providerSwitching: state.providerSwitching,
+              restoring: state.restoringSessionId === meta.id,
+              session: {
+                id: meta.id,
+                status: session?.status ?? status,
+                updatedAt: session?.updatedAt ?? meta.updatedAt,
+                preview: Boolean(session?.preview),
+                blockCounts,
+              },
+              queue: {
+                length: state.promptQueues[meta.id]?.length ?? 0,
+                parked: Boolean(state.queueDrainParked[meta.id]),
+              },
+              recentNotices: state.runtimeNotices.slice(-20),
+            });
+            const result = await invoke<{ path: string; officialTraceIncluded: boolean; officialTraceError?: string }>(
+              "export_session_support_bundle",
+              { sessionId: meta.id, clientSnapshot },
+            );
+            await navigator.clipboard.writeText(result.path).catch(() => {});
+            await invoke("reveal_support_bundle", { path: result.path });
+            setConfirmExport(false);
           }}
         />
       )}

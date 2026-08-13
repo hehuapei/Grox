@@ -14,6 +14,7 @@ mod mcp_leases;
 mod path_sandbox;
 #[cfg(windows)]
 mod process_job;
+mod support_bundle;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -2437,11 +2438,18 @@ fn grok_runtime_info(app: tauri::AppHandle) -> GrokRuntimeInfo {
 
 #[tauri::command]
 async fn export_session_trace(app: tauri::AppHandle, session_id: String) -> Result<String, String> {
+    export_official_session_trace(&app, &session_id)
+        .await
+        .map(|path| path_for_webview(&path))
+}
+
+async fn export_official_session_trace(
+    app: &tauri::AppHandle,
+    session_id: &str,
+) -> Result<PathBuf, String> {
     let session_id = session_id.trim();
-    if session_id.is_empty() || session_id.len() > 128 || !session_id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-') {
-        return Err("会话 ID 格式无效".into());
-    }
-    let runtime = configured_grok_command(&app);
+    safe_session_storage_id(session_id)?;
+    let runtime = configured_grok_command(app);
     let mut command = Command::new(&runtime.path);
     command.args(["trace", session_id, "--local", "--json"])
         .stdin(Stdio::null())
@@ -2453,7 +2461,10 @@ async fn export_session_trace(app: tauri::AppHandle, session_id: String) -> Resu
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let output = command.output().await.map_err(|error| format!("无法启动会话诊断导出：{error}"))?;
+    let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+        .await
+        .map_err(|_| "官方会话 trace 导出超过 30 秒".to_string())?
+        .map_err(|error| format!("无法启动会话诊断导出：{error}"))?;
     if !output.status.success() {
         return Err(format!("会话诊断导出失败：{}", String::from_utf8_lossy(&output.stderr).trim()));
     }
@@ -2465,7 +2476,167 @@ async fn export_session_trace(app: tauri::AppHandle, session_id: String) -> Resu
         .or_else(|| value.get("local_path"))
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "会话诊断已导出，但官方 CLI 未返回文件路径".to_string())?;
-    Ok(path.to_string())
+    let path = PathBuf::from(path);
+    if !path.is_file() {
+        return Err(format!("官方 CLI 返回的会话诊断不存在：{}", path.display()));
+    }
+    Ok(path)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionSupportExport {
+    path: String,
+    official_trace_included: bool,
+    official_trace_error: Option<String>,
+}
+
+fn support_path(value: &str) -> String {
+    let path = Path::new(value);
+    if let Ok(home) = user_home() {
+        if let Ok(relative) = path.strip_prefix(home) {
+            return format!("$HOME/{}", relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    value.replace('\\', "/")
+}
+
+fn selected_session_journal_diagnostic(app: &tauri::AppHandle, id: &str) -> serde_json::Value {
+    match read_session_journal(app.clone(), id.to_string()) {
+        Ok(Some(raw)) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => {
+                let session = value.get("session").unwrap_or(&value);
+                serde_json::json!({
+                    "readable": true,
+                    "version": value.get("version").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                    "appSessionId": value.get("appSessionId").and_then(serde_json::Value::as_str).unwrap_or(id),
+                    "agentSessionId": value.get("agentSessionId").and_then(serde_json::Value::as_str).unwrap_or(id),
+                    "savedAt": value.get("savedAt").or_else(|| value.get("updatedAt")),
+                    "turnState": value.get("turnState").and_then(serde_json::Value::as_str).unwrap_or("legacy-settled"),
+                    "sessionStatus": session.get("status"),
+                    "blockCount": session.get("blocks").and_then(serde_json::Value::as_array).map(Vec::len),
+                })
+            }
+            Err(error) => serde_json::json!({ "readable": false, "error": error.to_string() }),
+        },
+        Ok(None) => serde_json::json!({ "readable": true, "missing": true }),
+        Err(error) => serde_json::json!({ "readable": false, "error": error }),
+    }
+}
+
+#[tauri::command]
+async fn export_session_support_bundle(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AcpState>>,
+    session_id: String,
+    client_snapshot: String,
+) -> Result<SessionSupportExport, String> {
+    let session_id = session_id.trim().to_string();
+    safe_session_storage_id(&session_id)?;
+    if client_snapshot.len() > 256 * 1024 {
+        return Err("客户端诊断快照不能超过 256 KB".into());
+    }
+    let client = serde_json::from_str::<serde_json::Value>(&client_snapshot)
+        .map_err(|error| format!("客户端诊断快照必须是 JSON：{error}"))?;
+    if !client.is_object() {
+        return Err("客户端诊断快照必须是 JSON 对象".into());
+    }
+
+    let runtime_info = configured_grok_command(&app);
+    let process = {
+        let guard = state.process.lock().await;
+        guard.as_ref().map(|process| {
+            serde_json::json!({
+                "running": true,
+                "generation": process.generation,
+                "pid": process.child.id(),
+            })
+        })
+    };
+    let runtime = serde_json::json!({
+        "topology": "shared_process",
+        "processCapacity": 1,
+        "sessionCapacity": "shared_unbounded",
+        "process": process.unwrap_or_else(|| serde_json::json!({ "running": false })),
+        "nextGeneration": state.next_generation.load(Ordering::Relaxed),
+        "cli": {
+            "path": support_path(&runtime_info.path),
+            "source": runtime_info.source,
+            "version": runtime_info.version,
+            "selectionRequired": runtime_info.selection_required,
+        },
+    });
+    let journal = serde_json::json!({
+        "selected": selected_session_journal_diagnostic(&app, &session_id),
+        "summary": session_journal_status(app.clone())?,
+    });
+
+    let trace = export_official_session_trace(&app, &session_id).await;
+    let (trace_path, trace_error) = match trace {
+        Ok(path) => (Some(path), None),
+        Err(error) => (None, Some(error)),
+    };
+    let meta = serde_json::json!({
+        "kind": "grox_session_support_bundle",
+        "appVersion": CLIENT_VERSION,
+        "generatedAtUnixMs": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "sessionId": session_id,
+        "officialTraceIncluded": trace_path.is_some(),
+        "officialTraceError": trace_error,
+    });
+    let path = support_bundle::write_session_support_bundle(
+        support_bundle::SessionSupportBundle {
+            session_id: &session_id,
+            meta,
+            runtime,
+            journal,
+            client,
+            official_trace: trace_path.as_deref(),
+        },
+    )?;
+    Ok(SessionSupportExport {
+        path: path_for_webview(&path),
+        official_trace_included: trace_path.is_some(),
+        official_trace_error: trace_error,
+    })
+}
+
+#[tauri::command]
+fn reveal_support_bundle(path: String) -> Result<(), String> {
+    let file = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|error| format!("无法定位支持包：{error}"))?;
+    let temp = std::env::temp_dir()
+        .canonicalize()
+        .map_err(|error| format!("无法定位临时目录：{error}"))?;
+    let name = file.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+    if !file.starts_with(&temp)
+        || !file.is_file()
+        || !name.starts_with("Grox-session-support-")
+        || file.extension().and_then(|value| value.to_str()) != Some("zip")
+    {
+        return Err("拒绝显示非 Grox 会话支持包".into());
+    }
+    #[cfg(windows)]
+    std::process::Command::new("explorer.exe")
+        .arg("/select,")
+        .arg(&file)
+        .spawn()
+        .map_err(|error| format!("无法打开资源管理器：{error}"))?;
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open")
+        .arg("-R")
+        .arg(&file)
+        .spawn()
+        .map_err(|error| format!("无法在 Finder 中显示支持包：{error}"))?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    std::process::Command::new("xdg-open")
+        .arg(file.parent().unwrap_or(&file))
+        .spawn()
+        .map_err(|error| format!("无法打开文件管理器：{error}"))?;
+    Ok(())
 }
 
 fn is_trusted_cli_install_host(host: Option<&str>) -> bool {
@@ -7451,6 +7622,8 @@ fn main() {
             delete_provider_profile,
             grok_runtime_info,
             export_session_trace,
+            export_session_support_bundle,
+            reveal_support_bundle,
             install_official_grok_cli,
             check_for_update,
             get_update_status,
