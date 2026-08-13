@@ -128,7 +128,11 @@ try {
     if (!transcript.includes("GROX_V1_SMOKE_OK")) throw new Error("在线 prompt 未返回约定文本");
     prompt = true;
     if (process.env.GROK_SMOKE_EXPECT_IMAGE === "1") {
-      if (!transcript.includes("GROX_LARGE_IMAGE_OK")) throw new Error("大型 MCP 图片工具未成功执行");
+      // 1.0.3 会把 ACP 回放中的图片内容替换为占位符；外层隔离验证仍会
+      // 从实际模型请求确认 data:image 与原始文本均已被转发。
+      const imageResultVisible = transcript.includes("GROX_LARGE_IMAGE_OK")
+        || transcript.includes("[image content will be provided separately]");
+      if (!imageResultVisible) throw new Error("大型 MCP 图片工具未成功执行");
       largeMcpImage = true;
     }
   }
