@@ -130,20 +130,20 @@ export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) 
       <div className="p-2.5">
         <button
           onClick={() => void newProject()}
-          className="flex h-8 w-full items-center gap-2 rounded-[4px] border border-line2 bg-raise px-2.5 text-[11px] text-fg2 hover:border-line3 hover:text-fg"
+          className="flex h-9 w-full items-center gap-2 rounded-[5px] border border-line2 bg-raise px-2.5 text-[12px] text-fg2 hover:border-line3 hover:text-fg"
         >
           <Icon name="plus" size={12} className="text-acc" />
           {t("newProject")}
-          <span className="ml-auto font-mono text-[9.5px] text-faint">Ctrl N</span>
+          <span className="ml-auto font-mono text-[10px] text-faint">Ctrl N</span>
         </button>
-        <div className="mt-1.5 flex h-8 items-center gap-2 rounded-[4px] border border-line2 bg-void px-2.5 focus-within:border-line3">
+        <div className="mt-1.5 flex h-9 items-center gap-2 rounded-[5px] border border-line2 bg-void px-2.5 focus-within:border-line3">
           <Icon name="search" size={11} className={historySearching ? "animate-pulse text-acc" : "text-dim"} />
           <input
             value={sessionQuery}
             onChange={(event) => setSessionQuery(event.target.value)}
             placeholder={language === "zh-CN" ? "搜索会话标题与内容" : "Search titles and content"}
             aria-label={language === "zh-CN" ? "搜索会话标题与内容" : "Search session titles and content"}
-            className="min-w-0 flex-1 bg-transparent text-[10.5px] text-fg outline-none placeholder:text-faint"
+            className="min-w-0 flex-1 bg-transparent text-[12px] text-fg outline-none placeholder:text-faint"
           />
           {sessionQuery && (
             <button type="button" onClick={() => setSessionQuery("")} className="text-faint hover:text-fg" aria-label={language === "zh-CN" ? "清除搜索" : "Clear search"}>
@@ -155,7 +155,7 @@ export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) 
           onClick={() => void refreshHistory()}
           disabled={historySyncing}
           title={historyError ?? (language === "zh-CN" ? "重新扫描 ~/.grok/sessions" : "Rescan ~/.grok/sessions")}
-          className="mt-1.5 flex h-7 w-full items-center gap-2 rounded-[4px] px-2.5 font-mono text-[9.5px] text-dim hover:bg-high hover:text-fg2 disabled:cursor-wait disabled:opacity-60"
+          className="mt-1.5 flex h-8 w-full items-center gap-2 rounded-[4px] px-2.5 text-[11px] text-dim hover:bg-high hover:text-fg2 disabled:cursor-wait disabled:opacity-60"
         >
           <Icon name="refresh" size={10} className={historySyncing ? "animate-orbit" : ""} />
           {historySyncing
@@ -210,7 +210,7 @@ export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) 
           onClick={() => setAccountOpen((open) => !open)}
           className="min-w-0 flex-1 text-left"
         >
-          <p className="truncate text-[10.5px] text-fg2">{account?.email ?? t("account")}</p>
+          <p className="truncate text-[12px] text-fg2">{account?.email ?? t("account")}</p>
           <p className="lbl truncate !text-[9.5px]">
             {billing?.subscriptionTier ?? account?.subscriptionTier ?? (account?.authenticated ? "GROK" : t("login"))}
           </p>
@@ -330,8 +330,8 @@ function ProjectGroup({
 function SectionTitle({ label, count }: { label: string; count: number }) {
   return (
     <div className="flex h-7 items-center justify-between px-2">
-      <span className="lbl !text-[9.5px]">{label}</span>
-      <span className="tnum text-[9.5px] text-faint">{String(count).padStart(2, "0")}</span>
+      <span className="text-[11px] font-medium text-dim">{label}</span>
+      <span className="tnum text-[10px] text-faint">{String(count).padStart(2, "0")}</span>
     </div>
   );
 }
@@ -388,7 +388,7 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
             className="min-w-0 flex-1 border border-line3 bg-void px-1 text-[10.5px] outline-none"
           />
         ) : (
-          <span className="truncate text-[10.5px]">{project.name}</span>
+          <span className="truncate text-[12px]">{project.name}</span>
         )}
       </button>
       {count > 0 && <span className="tnum text-[9px] text-faint">{count}</span>}
@@ -497,7 +497,7 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
         {editing ? (
           <input autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={commit} onKeyDown={(event) => event.key === "Enter" && commit()} onClick={(event) => event.stopPropagation()} className="min-w-0 flex-1 border border-line3 bg-void px-1 text-[11px] text-fg outline-none" />
         ) : (
-          <span className={`min-w-0 flex-1 truncate text-[11px] ${meta.title?.trim() ? "text-fg2" : "text-faint italic"}`} title={meta.id}>
+          <span className={`min-w-0 flex-1 truncate text-[12px] ${meta.title?.trim() ? "text-fg2" : "text-faint italic"}`} title={meta.id}>
             {displayTitle}
           </span>
         )}
@@ -511,11 +511,11 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
         </button>
       </div>
       {meta.summary && meta.summary !== meta.title && (
-        <p className="mt-0.5 truncate pl-3.5 text-[9.5px] leading-tight text-mute" title={meta.summary}>{meta.summary}</p>
+        <p className="mt-0.5 truncate pl-3.5 text-[10.5px] leading-tight text-mute" title={meta.summary}>{meta.summary}</p>
       )}
       <div className="mt-0.5 flex items-center justify-between pl-3.5">
-        <span className="font-mono text-[9.5px] text-faint">{fmtRelTime(meta.updatedAt)}</span>
-        {tokens > 0 && <span className="tnum text-[9.5px] text-faint">{fmtTokens(tokens)} TOK</span>}
+        <span className="text-[10.5px] text-faint">{fmtRelTime(meta.updatedAt)}</span>
+        {tokens > 0 && <span className="tnum text-[10px] text-faint">{fmtTokens(tokens)} tokens</span>}
       </div>
       {menu && (
         <ContextMenu close={() => setMenu(false)}>

@@ -45,7 +45,7 @@ export function StatusBar() {
   }, [workspace, activeId, status]);
 
   return (
-    <footer className="flex h-7 shrink-0 items-center justify-between border-t border-line bg-panel px-3 font-mono text-[10.5px] tracking-[0.06em] text-dim select-none">
+    <footer className="flex h-8 shrink-0 items-center justify-between border-t border-line bg-panel px-3 text-[11px] text-dim select-none">
       <div className="flex items-center gap-2">
         <BlackHole size={13} spin={status === "running"} />
         <span
@@ -61,18 +61,12 @@ export function StatusBar() {
         >
           {language === "zh-CN"
             ? status === "running" ? "处理中" : status === "failed" ? "失败" : status === "awaiting_permission" ? "等待批准" : status === "awaiting_input" ? "等待输入" : "已完成"
-            : status === "running" ? "WORKING" : status === "failed" ? "FAILED" : status === "awaiting_permission" ? "AWAITING APPROVAL" : status === "awaiting_input" ? "AWAITING INPUT" : "COMPLETED"}
+            : status === "running" ? "Working" : status === "failed" ? "Failed" : status === "awaiting_permission" ? "Awaiting approval" : status === "awaiting_input" ? "Awaiting input" : "Completed"}
         </span>
         {branch && (
           <>
             <Sep />
             <span className="tnum text-fg2">{branch}</span>
-          </>
-        )}
-        {activeId && (
-          <>
-            <Sep />
-            <span className="tnum text-faint">SID {activeId.slice(0, 8)}</span>
           </>
         )}
       </div>
@@ -81,7 +75,7 @@ export function StatusBar() {
         {usage && usage.contextUsed > 0 && (
           <>
             <span className="flex items-center gap-1.5">
-              <span>CTX</span>
+              <span>{language === "zh-CN" ? "上下文" : "Context"}</span>
               <span className="relative h-[3px] w-14 overflow-hidden rounded-full bg-high">
                 <span
                   className={`absolute inset-y-0 left-0 ${ctxPct > 80 ? "bg-gold" : "bg-acc"}`}
@@ -98,13 +92,13 @@ export function StatusBar() {
             <Sep />
             <span className="tnum text-fg2">{fmtCost(usage.costUSD)}</span>
             <Sep />
-            <span className="tnum">{usage.turns} TRN</span>
+            <span className="tnum">{usage.turns} {language === "zh-CN" ? "轮" : "turns"}</span>
             <Sep />
           </>
         )}
         <span className="text-fg2">{model.toUpperCase().replace(/-/g, "‑")}</span>
         <Sep />
-        <span>{language === "zh-CN" ? "强度" : "EFFORT"} {effort.toUpperCase()}</span>
+        <span>{language === "zh-CN" ? "强度" : "Effort"} {effort.toUpperCase()}</span>
       </div>
     </footer>
   );

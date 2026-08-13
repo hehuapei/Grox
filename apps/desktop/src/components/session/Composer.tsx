@@ -11,7 +11,7 @@ import {
   type PromptAttachment,
   type SlashCommand,
 } from "../../bridge/types";
-import { sessionLooksBusy } from "../../lib/sessionBusy";
+import { deriveSessionSnapshot } from "../../lib/sessionRuntime";
 import { ChipSelect } from "../common/ChipSelect";
 import { PromptOptionsMenu, ProviderSwitcher } from "../common/PromptControls";
 import { Icon } from "../fx/Icon";
@@ -104,7 +104,7 @@ export function Composer() {
     window.dispatchEvent(new CustomEvent("grox:settings-section", { detail: section }));
   };
 
-  const running = sessionLooksBusy({ status });
+  const running = deriveSessionSnapshot({ status }).busy;
   const deepResearchAvailable = runtimeCommands.some((command) => command.name === "deep-research");
 
   const slashCommands: SlashCmd[] = [

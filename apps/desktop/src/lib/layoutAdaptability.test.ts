@@ -71,13 +71,13 @@ describe("layout adaptability — density isolation", () => {
     expect(dock).toMatch(/padding-left:\s*var\(--grox-content-px/);
   });
 
-  it("default transcript type is compact (md ≤ 13px prose, tight leading)", () => {
-    expect(tokens).toMatch(/html\s*\{[\s\S]*?--grox-prose-size\s*:\s*13px/);
+  it("default transcript type is comfortable without changing chrome geometry", () => {
+    expect(tokens).toMatch(/html\s*\{[\s\S]*?--grox-prose-size\s*:\s*14px/);
     const md = blockFor(`html[data-font="md"]`);
-    expect(md).toMatch(/--grox-prose-size\s*:\s*13px/);
-    expect(md).toMatch(/--grox-prose-leading\s*:\s*1\.45/);
+    expect(md).toMatch(/--grox-prose-size\s*:\s*14px/);
+    expect(md).toMatch(/--grox-prose-leading\s*:\s*1\.5/);
     const sm = blockFor(`html[data-font="sm"]`);
-    expect(sm).toMatch(/--grox-prose-size\s*:\s*12px/);
+    expect(sm).toMatch(/--grox-prose-size\s*:\s*13px/);
     expect(tokens).toMatch(/\.md p\s*\{[\s\S]*?margin:\s*0 0 0\.42em/);
   });
 

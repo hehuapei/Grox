@@ -91,16 +91,16 @@
 
 html {
   --grox-font-weight: 400;
-  --grox-component-font-size: 11px;
+  --grox-component-font-size: 12px;
   /*
    * Transcript-only integer tiers (default = md).
    * Compact type + tight leading for long Chinese replies; chrome untouched.
    */
-  --grox-prose-size: 13px;
-  --grox-prose-leading: 1.45;
-  --grox-user-size: 12px;
-  --grox-process-size: 11px;
-  --grox-code-size: 11px;
+  --grox-prose-size: 14px;
+  --grox-prose-leading: 1.5;
+  --grox-user-size: 13px;
+  --grox-process-size: 12px;
+  --grox-code-size: 12px;
   /*
    * Reading column (narrow / medium / wide)
    * ---------------------------------------
@@ -116,32 +116,32 @@ html {
 }
 
 html[data-font="sm"] {
-  --grox-prose-size: 12px;
-  --grox-prose-leading: 1.4;
-  --grox-user-size: 11px;
-  --grox-process-size: 10px;
-  --grox-code-size: 10px;
-}
-html[data-font="md"] {
   --grox-prose-size: 13px;
   --grox-prose-leading: 1.45;
   --grox-user-size: 12px;
   --grox-process-size: 11px;
   --grox-code-size: 11px;
 }
-html[data-font="lg"] {
+html[data-font="md"] {
   --grox-prose-size: 14px;
   --grox-prose-leading: 1.5;
   --grox-user-size: 13px;
   --grox-process-size: 12px;
   --grox-code-size: 12px;
 }
-html[data-font="xl"] {
+html[data-font="lg"] {
   --grox-prose-size: 15px;
   --grox-prose-leading: 1.55;
   --grox-user-size: 14px;
   --grox-process-size: 13px;
   --grox-code-size: 13px;
+}
+html[data-font="xl"] {
+  --grox-prose-size: 16px;
+  --grox-prose-leading: 1.6;
+  --grox-user-size: 15px;
+  --grox-process-size: 14px;
+  --grox-code-size: 14px;
 }
 
 /* Density: column width only (padding/gap fixed). */
@@ -194,7 +194,7 @@ body {
    calc offsets here — that broke fixed-height rows and blurred glyphs. */
 .lbl,
 .chip {
-  font-size: var(--grox-component-font-size, 11px);
+  font-size: var(--grox-component-font-size, 12px);
 }
 
 /* Transcript-only scaling surfaces */
@@ -241,7 +241,7 @@ button.summary-row:hover {
   border-radius: 4px;
   padding: 0 9px;
   color: var(--color-fg2);
-  font-size: 10px;
+  font-size: 11px;
 }
 .summary-action:hover:not(:disabled) {
   border-color: var(--color-line3);

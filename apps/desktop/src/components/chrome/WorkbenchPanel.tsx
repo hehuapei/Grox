@@ -1,10 +1,12 @@
-/* Bottom workbench: terminal output + side-agent launcher for parallel missions. */
+/* Right workbench: one deterministic home for terminal and parallel tasks. */
 
 import { useState } from "react";
 import { useDesktop } from "../../state/store";
 import { useI18n } from "../../lib/i18n";
 import { Icon } from "../fx/Icon";
 import { TerminalPanel } from "../terminal/TerminalPanel";
+import { ResizeHandle } from "../common/ResizeHandle";
+import { usePreferences } from "../../state/preferences";
 
 type Tab = "terminal" | "side";
 
@@ -18,6 +20,8 @@ export function WorkbenchPanel() {
   const session = useDesktop((state) => (state.activeId ? state.sessions[state.activeId] : null));
   const newSession = useDesktop((state) => state.newSession);
   const running = Object.values(useDesktop((state) => state.sessions)).filter((item) => item.status === "running").length;
+  const width = usePreferences((state) => state.inspectorWidth);
+  const setWidth = usePreferences((state) => state.setInspectorWidth);
 
   const launchSide = () => {
     const text = draft.trim();
@@ -32,26 +36,26 @@ export function WorkbenchPanel() {
   };
 
   return (
-    <section className="flex h-[min(300px,44vh)] shrink-0 flex-col overflow-hidden border-t border-line2 bg-void animate-fade-up">
-      <div className="flex h-9 shrink-0 items-center gap-1 border-b border-line bg-panel px-2">
+    <>
+    <ResizeHandle side="left" value={width} onChange={setWidth} />
+    <aside className="flex min-h-0 shrink-0 flex-col overflow-hidden border-l border-line2 bg-void animate-fade-up" style={{ width }}>
+      <div className="flex h-11 shrink-0 items-center gap-1 border-b border-line bg-panel px-2">
         <button
           onClick={() => setTab("terminal")}
-          className={`flex h-7 items-center gap-1.5 rounded-full px-3 font-mono text-[9.5px] ${tab === "terminal" ? "bg-high text-fg" : "text-dim hover:text-fg2"}`}
+          className={`flex h-8 items-center gap-1.5 rounded-full px-3 text-[12px] ${tab === "terminal" ? "bg-high text-fg" : "text-dim hover:text-fg2"}`}
         >
           <Icon name="terminal" size={11} />
-          {zh ? "终端" : "TERMINAL"}
+          {zh ? "终端" : "Terminal"}
         </button>
         <button
           onClick={() => setTab("side")}
-          className={`flex h-7 items-center gap-1.5 rounded-full px-3 font-mono text-[9.5px] ${tab === "side" ? "bg-high text-fg" : "text-dim hover:text-fg2"}`}
+          className={`flex h-8 items-center gap-1.5 rounded-full px-3 text-[12px] ${tab === "side" ? "bg-high text-fg" : "text-dim hover:text-fg2"}`}
         >
           <Icon name="layers" size={11} />
-          {zh ? "侧任务" : "SIDE AGENT"}
+          {zh ? "并行任务" : "Parallel task"}
           {running > 1 && <span className="tnum text-acc">{running}</span>}
         </button>
-        <span className="ml-auto font-mono text-[9px] text-faint">
-          {zh ? "并行会话共用同一 ACP 进程" : "Parallel sessions share one ACP process"}
-        </span>
+        <span className="ml-auto" />
         <button
           onClick={toggleTerminal}
           className="flex h-6 w-6 items-center justify-center text-dim hover:bg-high hover:text-fg"
@@ -66,8 +70,8 @@ export function WorkbenchPanel() {
           <TerminalPanel embedded />
         </div>
       ) : (
-        <div className="flex min-h-0 flex-1 flex-col gap-3 p-3">
-          <p className="text-[11px] leading-relaxed text-dim">
+        <div className="flex min-h-0 flex-1 flex-col gap-3 p-4">
+          <p className="text-[12px] leading-relaxed text-dim">
             {zh
               ? "侧任务会新建独立会话并立即发送，主会话可继续运行。适合并行调研、测试或修小问题。"
               : "Side agents open a fresh session and send immediately while the main mission keeps running — useful for research, tests, or small fixes."}
@@ -77,23 +81,24 @@ export function WorkbenchPanel() {
             onChange={(event) => setDraft(event.target.value)}
             rows={4}
             placeholder={zh ? "描述侧任务…" : "Describe the side task…"}
-            className="min-h-0 flex-1 resize-none rounded-[14px] border border-line2 bg-raise px-3 py-2 text-[13px] text-fg outline-none placeholder:text-faint focus:border-line3"
+            className="min-h-[160px] flex-1 resize-none rounded-[12px] border border-line2 bg-raise px-3 py-3 text-[13px] leading-relaxed text-fg outline-none placeholder:text-faint focus:border-line3"
           />
           <div className="flex items-center justify-between">
-            <span className="font-mono text-[9.5px] text-faint">
-              {activeId ? `MAIN · ${activeId.slice(0, 8)}` : (zh ? "无主会话" : "NO MAIN SESSION")}
+            <span className="text-[11px] text-faint">
+              {activeId ? (zh ? "基于当前任务" : "From current task") : (zh ? "独立任务" : "Independent task")}
             </span>
             <button
               disabled={!draft.trim()}
               onClick={launchSide}
-              className="flex h-8 items-center gap-1.5 rounded-full bg-acc px-3.5 font-mono text-[10px] text-base disabled:opacity-35"
+              className="flex h-9 items-center gap-1.5 rounded-full bg-acc px-4 text-[12px] font-medium text-base disabled:opacity-35"
             >
               <Icon name="play" size={11} />
-              {zh ? "启动侧任务" : "LAUNCH SIDE"}
+              {zh ? "开始并行任务" : "Start task"}
             </button>
           </div>
         </div>
       )}
-    </section>
+    </aside>
+    </>
   );
 }

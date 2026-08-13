@@ -11,8 +11,15 @@ import { Icon } from "../fx/Icon";
 import { Wordmark } from "../fx/Wordmark";
 import { ChipSelect } from "../common/ChipSelect";
 import { ConfirmDialog } from "../common/ConfirmDialog";
+import {
+  getSettingsCatalog,
+  isSettingsSection,
+  searchSettings,
+  settingsHash,
+  settingsSectionFromHash,
+  type SettingsSection,
+} from "../../lib/settingsCatalog";
 
-type Section = "general" | "account" | "archives" | "appearance" | "mcp" | "skills" | "plugins" | "hooks";
 type Json = Record<string, unknown>;
 
 const object = (value: unknown): Json =>
@@ -25,28 +32,59 @@ export function SettingsModal() {
   const { t, language } = useI18n();
   const open = useDesktop((state) => state.settingsOpen);
   const setOpen = useDesktop((state) => state.setSettingsOpen);
-  const [section, setSection] = useState<Section>("general");
+  const [section, setSection] = useState<SettingsSection>(() => settingsSectionFromHash(window.location.hash) ?? "general");
+  const [query, setQuery] = useState("");
+  const zh = language === "zh-CN";
+  const catalog = useMemo(() => getSettingsCatalog(zh), [zh]);
+  const results = useMemo(() => searchSettings(catalog, query), [catalog, query]);
 
   useEffect(() => {
     const openSection = (event: Event) => {
-      const next = (event as CustomEvent<Section>).detail;
-      if (["general", "account", "archives", "appearance", "mcp", "skills", "plugins", "hooks"].includes(next)) setSection(next);
+      const next = (event as CustomEvent<SettingsSection>).detail;
+      if (isSettingsSection(next)) {
+        setSection(next);
+        setOpen(true);
+      }
     };
     window.addEventListener("grox:settings-section", openSection);
     return () => window.removeEventListener("grox:settings-section", openSection);
-  }, []);
+  }, [setOpen]);
+
+  useEffect(() => {
+    const syncHash = () => {
+      const next = settingsSectionFromHash(window.location.hash);
+      if (next) {
+        setSection(next);
+        setOpen(true);
+      }
+    };
+    syncHash();
+    window.addEventListener("hashchange", syncHash);
+    return () => window.removeEventListener("hashchange", syncHash);
+  }, [setOpen]);
+
+  useEffect(() => {
+    if (!open) return;
+    window.history.replaceState(null, "", settingsHash(section));
+  }, [open, section]);
+
   if (!open) return null;
 
-  const sections: { id: Section; label: string; icon: React.ComponentProps<typeof Icon>["name"] }[] = [
-    { id: "general", label: t("settings"), icon: "gear" },
-    { id: "account", label: language === "zh-CN" ? "账户与配置" : "Account & config", icon: "user" },
-    { id: "archives", label: language === "zh-CN" ? "归档管理" : "Archive manager", icon: "archive" },
-    { id: "appearance", label: t("appearance"), icon: "sun" },
-    { id: "mcp", label: t("mcp"), icon: "globe" },
-    { id: "skills", label: t("skills"), icon: "bolt" },
-    { id: "plugins", label: `${t("plugins")} / ${t("marketplace")}`, icon: "layers" },
-    { id: "hooks", label: language === "zh-CN" ? "Hooks" : "Hooks", icon: "bolt" },
+  const sections: { id: SettingsSection; label: string; icon: React.ComponentProps<typeof Icon>["name"]; group: "personal" | "extensions" }[] = [
+    { id: "general", label: zh ? "通用" : "General", icon: "gear", group: "personal" },
+    { id: "account", label: zh ? "账户与服务" : "Account & providers", icon: "user", group: "personal" },
+    { id: "appearance", label: t("appearance"), icon: "sun", group: "personal" },
+    { id: "archives", label: zh ? "归档管理" : "Archive manager", icon: "archive", group: "personal" },
+    { id: "mcp", label: t("mcp"), icon: "globe", group: "extensions" },
+    { id: "skills", label: t("skills"), icon: "bolt", group: "extensions" },
+    { id: "plugins", label: `${t("plugins")} / ${t("marketplace")}`, icon: "layers", group: "extensions" },
+    { id: "hooks", label: "Hooks", icon: "bolt", group: "extensions" },
   ];
+
+  const selectSection = (next: SettingsSection) => {
+    setSection(next);
+    setQuery("");
+  };
 
   return (
     <div
@@ -57,26 +95,50 @@ export function SettingsModal() {
         className="flex h-[min(820px,92vh)] w-[min(1180px,96vw)] overflow-hidden rounded-[9px] border border-line3 bg-panel shadow-2xl animate-fade-up"
         onMouseDown={(event) => event.stopPropagation()}
       >
-        <nav className="flex w-[210px] shrink-0 flex-col border-r border-line bg-void py-3">
-          <div className="px-4 pb-3"><Wordmark size={11} withMark={false} /></div>
-          {sections.map((item) => (
-            <button key={item.id} onClick={() => setSection(item.id)} className={`flex items-center gap-2 px-4 py-2 text-left font-mono text-[10px] transition-colors ${section === item.id ? "bg-high text-acc" : "text-dim hover:text-fg2"}`}>
-              <Icon name={item.icon} size={11} />
-              <span className="truncate">{item.label}</span>
-            </button>
+        <nav className="flex w-[246px] shrink-0 flex-col border-r border-line bg-void py-3">
+          <div className="px-4 pb-3"><Wordmark size={12} withMark={false} /></div>
+          <label className="mx-3 mb-4 flex h-9 items-center gap-2 rounded-[8px] border border-line2 bg-panel px-3 focus-within:border-line3">
+            <Icon name="search" size={12} className="text-dim" />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={zh ? "搜索设置" : "Search settings"} autoFocus className="min-w-0 flex-1 bg-transparent text-[12px] text-fg outline-none placeholder:text-faint" />
+            {query && <button onClick={() => setQuery("")} aria-label={zh ? "清除搜索" : "Clear search"} className="text-faint hover:text-fg"><Icon name="x" size={10} /></button>}
+          </label>
+          {(["personal", "extensions"] as const).map((group) => (
+            <div key={group} className="mb-3">
+              <p className="px-4 pb-1 text-[10px] font-medium tracking-[0.08em] text-faint">{group === "personal" ? (zh ? "个人" : "PERSONAL") : (zh ? "扩展" : "EXTENSIONS")}</p>
+              {sections.filter((item) => item.group === group).map((item) => (
+                <button key={item.id} onClick={() => selectSection(item.id)} className={`flex w-full items-center gap-2.5 px-4 py-2 text-left text-[12px] transition-colors ${section === item.id && !query ? "bg-high text-acc" : "text-dim hover:text-fg2"}`}>
+                  <Icon name={item.icon} size={12} />
+                  <span className="truncate">{item.label}</span>
+                </button>
+              ))}
+            </div>
           ))}
           <div className="flex-1" />
           <button onClick={() => setOpen(false)} className="mx-3 flex h-8 items-center justify-center rounded-[4px] border border-line2 text-[10px] text-mute hover:border-line3 hover:text-fg">{language === "zh-CN" ? "关闭" : "Close"}</button>
         </nav>
         <div className="min-w-0 flex-1 overflow-y-auto p-8">
-          {section === "general" && <General />}
-          {section === "account" && <Account />}
-          {section === "archives" && <ArchiveManager />}
-          {section === "appearance" && <Appearance />}
-          {section === "mcp" && <McpPanel />}
-          {section === "skills" && <SkillsPanel />}
-          {section === "plugins" && <PluginsPanel />}
-          {section === "hooks" && <HooksPanel />}
+          {query ? (
+            <div>
+              <Heading title={zh ? "搜索设置" : "Search settings"} description={zh ? `“${query}”的匹配结果` : `Matches for “${query}”`} />
+              {results.length > 0 ? <div className="space-y-2">{results.map((result) => (
+                <button key={result.id} onClick={() => selectSection(result.section)} className="flex w-full items-center gap-4 rounded-[10px] border border-line2 bg-raise px-4 py-3 text-left hover:border-line3 hover:bg-high">
+                  <div className="min-w-0 flex-1"><p className="text-[13px] text-fg2">{result.label}</p><p className="mt-1 text-[11.5px] text-dim">{result.description}</p></div>
+                  <span className="text-[11px] text-faint">{sections.find((item) => item.id === result.section)?.label} →</span>
+                </button>
+              ))}</div> : <div className="rounded-[10px] border border-dashed border-line2 px-4 py-12 text-center text-[12px] text-dim">{zh ? "没有匹配设置，试试更短的关键词" : "No matching settings. Try a shorter keyword."}</div>}
+            </div>
+          ) : (
+            <>
+              {section === "general" && <General />}
+              {section === "account" && <Account />}
+              {section === "archives" && <ArchiveManager />}
+              {section === "appearance" && <Appearance />}
+              {section === "mcp" && <McpPanel />}
+              {section === "skills" && <SkillsPanel />}
+              {section === "plugins" && <PluginsPanel />}
+              {section === "hooks" && <HooksPanel />}
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -84,11 +146,11 @@ export function SettingsModal() {
 }
 
 function Heading({ title, description }: { title: string; description?: string }) {
-  return <div className="mb-5"><h2 className="text-[15px] font-medium text-fg">{title}</h2>{description && <p className="mt-1 text-[10.5px] leading-relaxed text-dim">{description}</p>}</div>;
+  return <div className="mb-5"><h2 className="text-[18px] font-medium text-fg">{title}</h2>{description && <p className="mt-1 text-[12px] leading-relaxed text-dim">{description}</p>}</div>;
 }
 
 function Row({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
-  return <div className="flex items-center justify-between border-b border-line py-3"><div className="min-w-0 pr-4"><p className="text-[11.5px] text-fg2">{label}</p>{hint && <p className="mt-0.5 text-[10px] text-dim">{hint}</p>}</div><div className="shrink-0">{children}</div></div>;
+  return <div className="flex items-center justify-between border-b border-line py-3.5"><div className="min-w-0 pr-4"><p className="text-[13px] text-fg2">{label}</p>{hint && <p className="mt-0.5 text-[11.5px] leading-relaxed text-dim">{hint}</p>}</div><div className="shrink-0">{children}</div></div>;
 }
 
 function Toggle({ on, onChange, disabled = false }: { on: boolean; onChange(value: boolean): void; disabled?: boolean }) {

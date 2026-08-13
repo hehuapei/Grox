@@ -54,22 +54,21 @@ import {
   scrubSessionCacheOrphans,
 } from "../lib/sessionCache";
 import { readStoredPermissionMode } from "../lib/permissionMode";
-import { shouldDrainLocalQueue } from "../lib/queueTurnPolicy";
 import { turnHasLiveText } from "../lib/processFold";
 import {
   POST_PROMPT_SETTLE_MS,
+  nextQueueDrainParked,
+  reconcileIncomingStatus,
   sessionAcceptsNewPrimaryPrompt,
   settleLiveProcessBlocks,
   settleLiveTextBlocks,
+  shouldDrainLocalQueue,
   shouldArmPostPromptSettle,
   shouldPromotePostPrompt,
-} from "../lib/sessionBusy";
+  statusAfterGateResolve,
+} from "../lib/sessionRuntime";
 import { mergeProjectSessionsPure } from "../lib/sessionCatalogMerge";
 import { isLiveBusyStatus, mergeOfflineWithLive } from "../lib/offlineMerge";
-import {
-  reconcileIncomingStatus,
-  statusAfterGateResolve,
-} from "../lib/sessionGate";
 import {
   consumeShellUpgradeRescan,
   shouldCloseDetachedSession,
@@ -80,7 +79,6 @@ import {
   nextLocalDrainIndex,
   moveQueueEntry,
 } from "../lib/promptQueue";
-import { nextQueueDrainParked } from "../lib/queueParkPolicy";
 import {
   isComputerUseOperatorEnabled,
   setComputerUseHostEnvEnabled,
@@ -980,7 +978,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({
           workflows: { ...state.workflows, [e.sessionId]: next },
           ...(state.activeId === e.sessionId && workflow.status !== "cleared"
-            ? { inspectorOpen: true, inspectorTab: "tasks" as InspectorTab }
+            ? { inspectorOpen: true, inspectorTab: "tasks" as InspectorTab, terminalOpen: false, previewOpen: false, planPreviewOpen: false }
             : {}),
         });
         persistWorkflowRuns({ ...state.workflows, [e.sessionId]: next });
@@ -1152,7 +1150,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           applyPostPromptContinuation(e.sessionId);
         }
         if (e.block.type === "plan" && get().activeId === e.sessionId) {
-          set({ planPreviewOpen: true, previewOpen: false });
+          set({ planPreviewOpen: true, previewOpen: false, inspectorOpen: false, terminalOpen: false });
         }
         break;
       case "block_patch":
@@ -1198,7 +1196,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           ],
         }));
         if (e.req.purpose === "plan" && get().activeId === e.sessionId) {
-          set({ planPreviewOpen: true, previewOpen: false });
+          set({ planPreviewOpen: true, previewOpen: false, inspectorOpen: false, terminalOpen: false });
         }
         void notifyDesktop(
           localStorage.getItem("grox.language") === "en-US" ? "Approval needed" : "需要批准",
@@ -1568,6 +1566,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
         view: "home",
         activeId: null,
         sessions: dropEphemeralSessions(state.sessions),
+        inspectorOpen: false,
+        terminalOpen: false,
+        previewOpen: false,
+        previewFile: null,
+        planPreviewOpen: false,
       });
     },
 
@@ -2295,7 +2298,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         const shouldOpen = start && (projectPreview.status === "starting" || projectPreview.status === "ready");
         set({
           projectPreview,
-          ...(shouldOpen ? { inspectorOpen: true, inspectorTab: "preview" as InspectorTab } : {}),
+          ...(shouldOpen ? { inspectorOpen: true, inspectorTab: "preview" as InspectorTab, terminalOpen: false, previewOpen: false, planPreviewOpen: false } : {}),
         });
       } catch (error) {
         set({
@@ -2312,7 +2315,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async openPreview(path) {
-      set({ previewOpen: true, planPreviewOpen: false, previewLoading: true, previewError: null });
+      set({ previewOpen: true, planPreviewOpen: false, inspectorOpen: false, terminalOpen: false, previewLoading: true, previewError: null });
       try {
         let previewFile = await invoke<PreviewFile>("read_preview_file", {
           cwd: get().workspace,
@@ -2996,10 +2999,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
         }
       }
     },
-    setInspectorTab: (inspectorTab) => set({ inspectorTab, inspectorOpen: true }),
-    setPlanPreviewOpen: (planPreviewOpen) => set({ planPreviewOpen, ...(planPreviewOpen ? { previewOpen: false } : {}) }),
-    toggleInspector: () => set((s) => ({ inspectorOpen: !s.inspectorOpen })),
-    toggleTerminal: () => set((s) => ({ terminalOpen: !s.terminalOpen })),
+    setInspectorTab: (inspectorTab) => set({ inspectorTab, inspectorOpen: true, terminalOpen: false, previewOpen: false, planPreviewOpen: false }),
+    setPlanPreviewOpen: (planPreviewOpen) => set({ planPreviewOpen, ...(planPreviewOpen ? { previewOpen: false, inspectorOpen: false, terminalOpen: false } : {}) }),
+    toggleInspector: () => set((state) => state.inspectorOpen
+      ? { inspectorOpen: false }
+      : { inspectorOpen: true, terminalOpen: false, previewOpen: false, planPreviewOpen: false }),
+    toggleTerminal: () => set((state) => state.terminalOpen
+      ? { terminalOpen: false }
+      : { terminalOpen: true, inspectorOpen: false, previewOpen: false, planPreviewOpen: false }),
     setPaletteOpen: (paletteOpen) => set({ paletteOpen }),
     setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
     async refreshHistory() {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyTurnStatus, shouldDrainLocalQueue } from "./queueTurnPolicy";
+import { classifyTurnStatus, shouldDrainLocalQueue } from "./sessionRuntime";
 
 describe("queue turn policy", () => {
   it("权限与提问阶段保持门控，不会提前排空队列", () => {

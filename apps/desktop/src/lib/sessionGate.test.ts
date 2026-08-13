@@ -4,7 +4,7 @@ import {
   statusAfterGateResolve,
   topPendingPermissionId,
   topPendingQuestionId,
-} from "./sessionGate";
+} from "./sessionRuntime";
 import type { Session, SessionBlock } from "../bridge/types";
 
 const perm = (id: string, resolved?: "allow_once"): SessionBlock => ({

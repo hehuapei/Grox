@@ -8,7 +8,7 @@ import {
   rememberProcessOpen,
   resolveInitialProcessOpen,
 } from "../../lib/processFold";
-import { sessionLooksBusy } from "../../lib/sessionBusy";
+import { deriveSessionSnapshot } from "../../lib/sessionRuntime";
 import {
   TIMELINE_TURN_WINDOW_INITIAL,
   TIMELINE_TURN_WINDOW_STEP,
@@ -579,7 +579,7 @@ export function Timeline({ session }: { session: Session }) {
   const settleTimerRef = useRef<number | undefined>(undefined);
   const turns = useMemo(() => groupTurns(session.blocks), [session.blocks]);
   const [visibleCount, setVisibleCount] = useState(TIMELINE_TURN_WINDOW_INITIAL);
-  const sessionRunning = sessionLooksBusy({ status: session.status, blocks: session.blocks });
+  const sessionRunning = deriveSessionSnapshot({ status: session.status, blocks: session.blocks }).busy;
   const wasRunningRef = useRef(sessionRunning);
   const lastBlock = session.blocks.at(-1);
   const liveSignature = sessionRunning

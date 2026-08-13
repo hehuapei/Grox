@@ -79,7 +79,7 @@ export function TitleBar() {
         data-tauri-drag-region
         className="pointer-events-none flex min-w-0 flex-1 items-center justify-center px-3"
       >
-        <div className="flex min-w-0 max-w-full items-center gap-2 overflow-hidden whitespace-nowrap text-[11px]">
+        <div className="flex min-w-0 max-w-full items-center gap-2 overflow-hidden whitespace-nowrap text-[12px]">
           {activeId && breadcrumbCwd && breadcrumbTitle !== null ? (
             <>
               <span className="lbl max-w-[35%] shrink-0 truncate">{baseName(breadcrumbCwd)}</span>
@@ -87,9 +87,7 @@ export function TitleBar() {
               <span className="min-w-0 truncate text-fg2">{breadcrumbTitle}</span>
             </>
           ) : (
-            <span className="lbl" style={{ letterSpacing: "0.3em" }}>
-              GROX DESKTOP
-            </span>
+            <span className="font-medium tracking-[0.18em] text-mute">GROX</span>
           )}
         </div>
       </div>
@@ -102,7 +100,7 @@ export function TitleBar() {
           title={language === "zh-CN" ? "检查更新并查看更新日志" : "Check for updates and view the changelog"}
         >
           <Icon name="refresh" size={11} />
-          <span>{language === "zh-CN" ? "更新日志" : "CHANGELOG"}</span>
+          <span>{language === "zh-CN" ? "更新日志" : "Changelog"}</span>
         </button>
 
         <DefaultOpenMenu language={language} />
@@ -128,9 +126,10 @@ export function TitleBar() {
         </button>
 
         <button
-          className={`chip ${inspectorOpen ? "!text-fg2 !border-line3" : ""}`}
+          disabled={!activeId}
+          className={`chip disabled:cursor-default disabled:opacity-35 ${inspectorOpen ? "!text-fg2 !border-line3" : ""}`}
           onClick={toggleInspector}
-          title={language === "zh-CN" ? "显示/隐藏检查器" : "Toggle inspector"}
+          title={!activeId ? (language === "zh-CN" ? "进入任务后可用" : "Available inside a task") : (language === "zh-CN" ? "显示/隐藏检查器" : "Toggle inspector")}
           aria-pressed={inspectorOpen}
         >
           <Icon name="panelRight" size={12} />

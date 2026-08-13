@@ -1,13 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { SessionBlock } from "../bridge/types";
 import {
+  deriveSessionSnapshot,
   sessionAcceptsNewPrimaryPrompt,
   sessionLooksBusy,
   settleLiveProcessBlocks,
   settleLiveTextBlocks,
   shouldArmPostPromptSettle,
   shouldPromotePostPrompt,
-} from "./sessionBusy";
+} from "./sessionRuntime";
 
 const liveThought: SessionBlock = {
   type: "thinking",
@@ -33,6 +34,22 @@ describe("sessionLooksBusy", () => {
   it("does not lock a finished conversation that left thinking.live set", () => {
     expect(sessionLooksBusy({ status: "idle", blocks: [liveThought] })).toBe(false);
     expect(sessionLooksBusy({ status: null, blocks: [liveThought] })).toBe(false);
+  });
+});
+
+describe("deriveSessionSnapshot", () => {
+  it("provides one coherent projection for rendering and send admission", () => {
+    expect(deriveSessionSnapshot({ status: "awaiting_permission", blocks: [] })).toMatchObject({
+      status: "awaiting_permission",
+      phase: "waiting_permission",
+      busy: true,
+      sendable: false,
+    });
+    expect(deriveSessionSnapshot({ status: "idle", blocks: [] })).toMatchObject({
+      phase: "idle",
+      busy: false,
+      sendable: true,
+    });
   });
 });
 
