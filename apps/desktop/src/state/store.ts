@@ -98,6 +98,18 @@ import {
 } from "../lib/automations";
 import type { Automation } from "../lib/automations";
 import {
+  failLatestAutomationSessionRun,
+  loadAutomationRunHistory,
+  newAutomationRunId,
+  patchAutomationRun,
+  persistAutomationRunHistory,
+  prependAutomationRun,
+  redactAutomationDetail,
+} from "../lib/automationRunHistory";
+import type { AutomationRunRecord } from "../lib/automationRunHistory";
+import { nextViewNavigation, shouldCommitViewNavigation } from "../lib/viewNavigation";
+import type { ViewNavigationIntent } from "../lib/viewNavigation";
+import {
   isComputerUseOperatorEnabled,
   setComputerUseHostEnvEnabled,
   setComputerUseHostPrefsEnabled,
@@ -226,6 +238,8 @@ interface DesktopState {
   accountSetupOpen: boolean;
   automations: Automation[];
   automationRunningId: string | null;
+  automationRunHistory: AutomationRunRecord[];
+  automationLastTickAt: number | null;
 
   workspaceFiles: WorkspaceEntry[];
   workspaceDiffs: DiffHunk[];
@@ -290,7 +304,7 @@ interface DesktopState {
   continueSessionInNewWorktree(id: string): Promise<void>;
   openSessionInNewWindow(id: string): Promise<void>;
   /** `restoreProject`: explicit add (folder picker) may undismiss a removed project. */
-  setWorkspace(cwd: string, options?: { restoreProject?: boolean }): Promise<void>;
+  setWorkspace(cwd: string, options?: { restoreProject?: boolean; navigation?: ViewNavigationIntent }): Promise<void>;
   authenticate(): Promise<void>;
   logout(): Promise<void>;
   refreshAccount(): Promise<void>;
@@ -308,6 +322,7 @@ interface DesktopState {
   deleteAutomation(id: string): void;
   setAutomationEnabled(id: string, enabled: boolean): void;
   runAutomation(id: string): Promise<void>;
+  clearAutomationRunHistory(): void;
   setAccountSetupOpen(open: boolean): void;
   refreshWorkspaceFiles(): Promise<void>;
   refreshWorkspaceDiffs(): Promise<void>;
@@ -327,6 +342,7 @@ interface DesktopState {
   updateQueuedPrompt(sessionId: string, queueId: string, text: string): void;
   moveQueuedPrompt(sessionId: string, queueId: string, direction: -1 | 1): void;
   moveQueuedAttachment(sessionId: string, queueId: string, attachmentId: string, direction: -1 | 1): void;
+  resumePromptQueue(sessionId?: string): void;
   clearPromptQueue(sessionId?: string): void;
   stop(): void;
   emergencyStopComputer(): void;
@@ -373,6 +389,8 @@ let pendingComposerStates: Record<string, SessionComposerState> | undefined;
 let workflowPersistTimer: number | undefined;
 let pendingWorkflowRuns: Record<string, WorkflowRun[]> | undefined;
 let historySyncPromise: Promise<void> | undefined;
+let viewNavigation: ViewNavigationIntent = { generation: 0, sessionId: null };
+let pendingForegroundNavigation: ViewNavigationIntent | null = null;
 
 function loadJson<T>(key: string, fallback: T): T {
   try {
@@ -758,6 +776,21 @@ export const useDesktop = create<DesktopState>((set, get) => {
     });
   };
 
+  const saveAutomationHistory = (history: AutomationRunRecord[]) => {
+    set({ automationRunHistory: history });
+    try {
+      persistAutomationRunHistory(history);
+    } catch (cause) {
+      publishRuntimeError(cause, {
+        domain: "environment",
+        code: "AUTOMATION_HISTORY_WRITE_FAILED",
+        message: "自动化运行记录未能写入本地存储",
+        recoverable: true,
+        action: "任务状态仍保留在当前窗口；请检查应用数据目录的可用空间和写入权限",
+      });
+    }
+  };
+
   const drainPromptQueue = (sessionId: string) => {
     const state = get();
     const session = state.sessions[sessionId];
@@ -777,7 +810,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       status: session.status,
       providerSwitching: state.providerSwitching,
       restoring: state.restoringSessionId === sessionId,
-      suppressed: suppressedQueueDrain.has(sessionId),
+      suppressed: suppressedQueueDrain.has(sessionId) || Boolean(state.queueDrainParked[sessionId]),
       queueLength: queue.length,
       hasLiveProcess: turnHasLiveText(session.blocks),
     })) return;
@@ -854,13 +887,23 @@ export const useDesktop = create<DesktopState>((set, get) => {
     if (automationRunnerBusy) return;
     const state = get();
     const automation = state.automations.find((item) => item.id === id);
-    if (!automation || !automation.enabled) return;
+    if (!automation || (!automation.enabled && !manual)) return;
     const runtimeBusy = Object.values(state.sessions).some((session) => (
       !isSessionTerminal(session.status)
     ));
     // 自动化不能抢占正在流式、门禁、恢复或停止中的会话。
     if (runtimeBusy || state.providerSwitching || state.runtimeConnection !== "ready") {
       if (manual) {
+        const detail = "已有会话、门禁、恢复或运行时连接正在占用执行通道。";
+        saveAutomationHistory(prependAutomationRun(get().automationRunHistory, {
+          id: newAutomationRunId(),
+          automationId: automation.id,
+          title: automation.title,
+          at: Date.now(),
+          outcome: "skipped",
+          source: "run_now",
+          detail,
+        }));
         const error = toGroxError("已有会话或运行时正在忙碌", {
           domain: "operation",
           code: "AUTOMATION_RUNTIME_BUSY",
@@ -874,15 +917,29 @@ export const useDesktop = create<DesktopState>((set, get) => {
       return;
     }
 
+    const runId = newAutomationRunId();
+    saveAutomationHistory(prependAutomationRun(get().automationRunHistory, {
+      id: runId,
+      automationId: automation.id,
+      title: automation.title,
+      at: Date.now(),
+      outcome: "starting",
+      source: manual ? "run_now" : "scheduled",
+    }));
     automationRunnerBusy = true;
     set({ automationRunningId: id });
-    const claimed = advanceAutomation(automation);
+    // “立即运行”是独立尝试，不消费一次性任务、也不改写下一次排程；
+    // 只有定时触发需要先推进排程来获得崩溃后的至多一次语义。
+    const claimed = manual
+      ? { ...automation, lastRunAt: Date.now() }
+      : advanceAutomation(automation);
     let automations = state.automations.map((item) => item.id === id ? claimed : item);
     set({ automations });
     try {
       // 先原子认领再创建会话；认领落盘失败时绝不能继续执行，否则崩溃后会重复触发。
       await persistAutomations(automations);
       const sessionId = await bridge.newBackgroundSession(automation.cwd);
+      saveAutomationHistory(patchAutomationRun(get().automationRunHistory, runId, { sessionId }));
       const created = get().sessions[sessionId];
       if (created) {
         const updated: Session = {
@@ -933,15 +990,28 @@ export const useDesktop = create<DesktopState>((set, get) => {
       } : item);
       set({ automations });
       await persistAutomations(automations);
+      saveAutomationHistory(patchAutomationRun(get().automationRunHistory, runId, {
+        outcome: "started",
+        detail: "提示已交给当前应用进程中的 Agent 运行时。",
+      }));
       void bridge.prompt(sessionId, automation.prompt, {
         model: automation.model,
         effort: automation.effort,
         mode: automation.mode,
         permissionMode: automation.permissionMode,
+      }).catch((cause) => {
+        saveAutomationHistory(patchAutomationRun(get().automationRunHistory, runId, {
+          outcome: "error",
+          detail: redactAutomationDetail(cause),
+        }));
       });
       void notifyDesktop("已安排任务已启动", automation.title);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
+      saveAutomationHistory(patchAutomationRun(get().automationRunHistory, runId, {
+        outcome: "error",
+        detail: redactAutomationDetail(cause),
+      }));
       automations = get().automations.map((item) => item.id === id ? { ...item, lastError: message } : item);
       set({ automations });
       await persistAutomations(automations).catch(() => {});
@@ -961,6 +1031,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
   };
 
   const runDueAutomation = () => {
+    set({ automationLastTickAt: Date.now() });
     if (automationRunnerBusy) return;
     const due = dueAutomations(get().automations)[0];
     if (due) void executeAutomation(due.id);
@@ -1174,6 +1245,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
       case "session_ready": {
         if (loadDeletedSessions().has(e.session.id)) break;
+        const issuedNavigation = e.background ? null : pendingForegroundNavigation;
+        const attachesForeground = !e.background && (
+          !issuedNavigation || shouldCommitViewNavigation(issuedNavigation, viewNavigation)
+        );
+        if (!e.background) pendingForegroundNavigation = null;
+        const effectiveBackground = e.background || !attachesForeground;
         const filteredSession = {
           ...e.session,
           blocks: e.session.blocks.filter((block) => !isHiddenWorkflowControlPrompt(block)),
@@ -1235,7 +1312,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           lastStatus: nextSession.status,
           completionUnread: previousMeta?.completionUnread ?? false,
         };
-        const nextIndex = e.background && previousMeta
+        const nextIndex = effectiveBackground && previousMeta
           ? sessionIndex.map((item) => item.id === readySession.id ? indexedMeta : item)
           : [indexedMeta, ...sessionIndex.filter((item) => item.id !== readySession.id)];
         // Passive session bind must not resurrect a removed project row.
@@ -1260,19 +1337,22 @@ export const useDesktop = create<DesktopState>((set, get) => {
         );
         persistSessionComposers(sessionComposers);
         const remainsActive = state.activeId === readySession.id && state.view === "session";
-        if (!e.background || remainsActive) bridge.setPermissionMode(composer.permissionMode);
+        if (attachesForeground || remainsActive) bridge.setPermissionMode(composer.permissionMode);
         const nextSessions = e.background
           ? sessions
           : Object.fromEntries(Object.entries(sessions).filter(([id]) => !isEphemeralSessionId(id)));
         const readyProjectId = projects.some((project) => samePath(project.path, readySession.cwd))
           ? projectId(readySession.cwd)
           : null;
+        if (attachesForeground) {
+          viewNavigation = nextViewNavigation(viewNavigation, readySession.id, readySession.cwd);
+        }
         set({
           sessions: { ...nextSessions, [readySession.id]: nextSession },
           sessionIndex: nextIndex,
           projects,
           sessionComposers,
-          ...(!e.background ? {
+          ...(attachesForeground ? {
             workspace: readySession.cwd,
             activeProjectId: readyProjectId,
             activeId: readySession.id,
@@ -1446,6 +1526,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
               : item);
             set({ automations });
             void persistAutomations(automations).catch(() => {});
+            saveAutomationHistory(failLatestAutomationSessionRun(
+              get().automationRunHistory,
+              e.sessionId,
+              formatGroxError(e.error),
+            ));
           }
         }
         if (e.error.holdQueue) {
@@ -1554,6 +1639,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
       localStorage.getItem("grox.accountSetupComplete") !== "1" && bridge.kind !== "mock",
     automations: [],
     automationRunningId: null,
+    automationRunHistory: loadAutomationRunHistory(),
+    automationLastTickAt: null,
     workspaceFiles: [],
     workspaceDiffs: [],
     workspaceDiffReady: false,
@@ -1786,6 +1873,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
     })),
 
     goHome: () => {
+      bridge.invalidateWorkspaceSelection();
+      viewNavigation = nextViewNavigation(viewNavigation, null);
       const state = get();
       const currentId = state.activeId;
       const current = currentId ? state.sessions[currentId] : undefined;
@@ -1806,12 +1895,15 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     async openSession(id) {
       const beforeOpen = get();
+      bridge.invalidateWorkspaceSelection();
+      const meta = beforeOpen.sessionIndex.find((entry) => entry.id === id);
+      const navigation = nextViewNavigation(viewNavigation, id, meta?.cwd);
+      viewNavigation = navigation;
       const currentId = beforeOpen.activeId;
       const current = currentId ? beforeOpen.sessions[currentId] : undefined;
       if (shouldCloseDetachedSession({ currentId, nextId: id, status: current?.status })) {
         void bridge.closeSession(currentId!).catch(() => {});
       }
-      const meta = beforeOpen.sessionIndex.find((entry) => entry.id === id);
       if (meta?.completionUnread) {
         const sessionIndex = beforeOpen.sessionIndex.map((entry) =>
           entry.id === id ? { ...entry, completionUnread: false } : entry,
@@ -1819,7 +1911,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
         persistSessionCatalog(sessionIndex);
         set({ sessionIndex });
       }
-      if (meta && !samePath(meta.cwd, get().workspace)) await get().setWorkspace(meta.cwd);
+      if (meta) {
+        if (!samePath(meta.cwd, get().workspace)) {
+          await get().setWorkspace(meta.cwd, { navigation });
+        } else {
+          // Even when the visible project already matches, issue a workspace
+          // selection so an older cross-project validation cannot win later.
+          await bridge.setWorkspace(meta.cwd);
+        }
+      }
+      if (!shouldCommitViewNavigation(navigation, viewNavigation)) return;
       const state = get();
       let existing = state.sessions[id];
       const composer = state.sessionComposers[id];
@@ -1950,6 +2051,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     async newSession(launch) {
       const beforeNew = get();
+      bridge.invalidateWorkspaceSelection();
+      viewNavigation = nextViewNavigation(viewNavigation, null, beforeNew.workspace);
       const currentId = beforeNew.activeId;
       const current = currentId ? beforeNew.sessions[currentId] : undefined;
       if (shouldCloseDetachedSession({ currentId, nextId: null, status: current?.status })) {
@@ -1964,6 +2067,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (!hasLaunch) {
         pendingLaunch = undefined;
         const draftId = `draft-${uid()}`;
+        viewNavigation = nextViewNavigation(viewNavigation, draftId, beforeNew.workspace);
         const now = Date.now();
         const workspace = get().workspace;
         const recovered = loadDraftBuffer(workspace);
@@ -2031,6 +2135,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
         attachments: launchAttachments,
       };
       const pendingId = `pending-${uid()}`;
+      viewNavigation = nextViewNavigation(viewNavigation, pendingId, beforeNew.workspace);
+      pendingForegroundNavigation = viewNavigation;
       const now = Date.now();
       set((state) => ({
         view: "session",
@@ -2074,6 +2180,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         // or ACP) can fail after we already left the draft shell.
         const failedLaunch = pendingLaunch;
         pendingLaunch = undefined;
+        pendingForegroundNavigation = null;
         const draftId = `draft-${uid()}`;
         const workspace = get().workspace;
         const restored = buildDraftRestoreAfterSessionNewFailure({
@@ -2257,9 +2364,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async setWorkspace(cwd, options) {
+      const navigation = options?.navigation
+        ?? nextViewNavigation(viewNavigation, null, cwd);
+      if (!options?.navigation) viewNavigation = navigation;
+      const isCurrentSelection = () => shouldCommitViewNavigation(navigation, viewNavigation);
       await bridge.setWorkspace(cwd);
+      if (!isCurrentSelection()) return;
       const workspace = await bridge.getWorkspace();
+      if (!isCurrentSelection()) return;
       const fetchedSessions = await bridge.listSessions(workspace);
+      if (!isCurrentSelection()) return;
       const sessionIndex = mergeSessions(get().sessionIndex, fetchedSessions, workspace);
       const projects = ensureProject(get().projects, workspace, {
         restore: Boolean(options?.restoreProject),
@@ -2282,6 +2396,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         previewFile: null,
         planPreviewOpen: false,
       });
+      if (!isCurrentSelection()) return;
       void get().refreshWorkspaceFiles();
       void get().refreshWorkspaceDiffs();
       void get().refreshProjectPreview(false);
@@ -2538,6 +2653,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
       await executeAutomation(id, true);
     },
 
+    clearAutomationRunHistory() {
+      saveAutomationHistory([]);
+    },
+
     setAccountSetupOpen: (accountSetupOpen) => set({ accountSetupOpen }),
 
     async refreshWorkspaceFiles() {
@@ -2605,7 +2724,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           cwd: get().workspace,
           path,
         });
-        if (["html", "video", "audio", "pdf"].includes(previewFile.kind)) {
+        if (["html", "image", "video", "audio", "pdf"].includes(previewFile.kind)) {
           const url = await invoke<string>("start_file_preview", {
             cwd: get().workspace,
             path,
@@ -2889,13 +3008,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         savePromptQueues(promptQueues);
         return true;
       }
-      suppressedQueueDrain.delete(session.id);
       markPromptInFlight(session.id);
-      if (get().queueDrainParked[session.id]) {
-        set({
-          queueDrainParked: nextQueueDrainParked(get().queueDrainParked, session.id, false),
-        });
-      }
       const internalWorkflowControl = /^\/workflow\s+(?:pause|resume|stop)\s+\S+(?:\s|$)/i.test(trimmed);
       const titleText = trimmed || attachments.map((attachment) => attachment.name).join(", ");
       const nextIndex = get().sessionIndex.map((m) =>
@@ -3046,12 +3159,25 @@ export const useDesktop = create<DesktopState>((set, get) => {
       savePromptQueues(promptQueues);
     },
 
+    resumePromptQueue(sessionId) {
+      const id = sessionId ?? get().activeId;
+      if (!id) return;
+      suppressedQueueDrain.delete(id);
+      set({
+        queueDrainParked: nextQueueDrainParked(get().queueDrainParked, id, false),
+      });
+      window.setTimeout(() => drainPromptQueue(id), 0);
+    },
+
     clearPromptQueue(sessionId) {
       const id = sessionId ?? get().activeId;
       if (!id) return;
       suppressedQueueDrain.delete(id);
       const promptQueues = { ...get().promptQueues, [id]: [] };
-      set({ promptQueues });
+      set({
+        promptQueues,
+        queueDrainParked: nextQueueDrainParked(get().queueDrainParked, id, false),
+      });
       savePromptQueues(promptQueues);
     },
 

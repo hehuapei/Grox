@@ -91,7 +91,7 @@ export function PreviewPane() {
           ) : file.kind === "image" ? (
             <div className="flex min-h-full items-center justify-center p-4 checkerboard">
               <img
-                src={`data:${file.mime};base64,${file.content}`}
+                src={file.url ?? `data:${file.mime};base64,${file.content}`}
                 alt={file.name}
                 className="max-h-full max-w-full object-contain shadow-2xl"
               />

@@ -58,6 +58,7 @@ export function Composer() {
   const updateQueuedPrompt = useDesktop((s) => s.updateQueuedPrompt);
   const moveQueuedPrompt = useDesktop((s) => s.moveQueuedPrompt);
   const moveQueuedAttachment = useDesktop((s) => s.moveQueuedAttachment);
+  const resumePromptQueue = useDesktop((s) => s.resumePromptQueue);
   const clearPromptQueue = useDesktop((s) => s.clearPromptQueue);
   const activeId = useDesktop((s) => s.activeId);
   const workspace = useDesktop((s) => s.workspace);
@@ -98,6 +99,7 @@ export function Composer() {
   const runtimeCommands = useDesktop((s) => s.activeId ? s.slashCommands[s.activeId] ?? NO_RUNTIME_COMMANDS : NO_RUNTIME_COMMANDS);
   const promptQueues = useDesktop((s) => s.promptQueues);
   const queue = activeId ? promptQueues[activeId] ?? NO_QUEUED_PROMPTS : NO_QUEUED_PROMPTS;
+  const queueParked = useDesktop((s) => Boolean(activeId && s.queueDrainParked[activeId]));
 
   const openExtensionSettings = (section: "mcp" | "skills" | "plugins") => {
     setSettingsOpen(true);
@@ -404,13 +406,32 @@ export function Composer() {
           {queue.length > 0 && (
             <div className="border-t border-line px-3 py-2">
               <div className="mb-1.5 flex items-center justify-between">
-                <span className="font-mono text-[9.5px] text-dim">
-                  {language === "zh-CN" ? `等待发送 ${queue.length}` : `${queue.length} queued`}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className={`font-mono text-[9.5px] ${queueParked ? "text-gold" : "text-dim"}`}>
+                    {queueParked
+                      ? (language === "zh-CN" ? `队列已暂停 · ${queue.length} 条待确认` : `Queue paused · ${queue.length} held`)
+                      : (language === "zh-CN" ? `等待发送 ${queue.length}` : `${queue.length} queued`)}
+                  </span>
+                  {queueParked && (
+                    <button
+                      onClick={() => resumePromptQueue(activeId ?? undefined)}
+                      className="rounded border border-gold/35 bg-gold/10 px-1.5 py-0.5 font-mono text-[9px] text-gold transition-colors hover:bg-gold/20"
+                    >
+                      {language === "zh-CN" ? "确认并继续" : "Review & resume"}
+                    </button>
+                  )}
+                </div>
                 <button onClick={() => clearPromptQueue(activeId ?? undefined)} className="font-mono text-[9px] text-faint hover:text-red">
                   {language === "zh-CN" ? "清空" : "Clear"}
                 </button>
               </div>
+              {queueParked && (
+                <p className="mb-1.5 text-[9.5px] leading-relaxed text-mute">
+                  {language === "zh-CN"
+                    ? "上次停止或异常后，Grox 不会自动发送这些内容。请先核对最后一轮结果。"
+                    : "Grox will not auto-send these after a stop or incident. Review the previous result first."}
+                </p>
+              )}
               <div className="space-y-1">
                 {queue.map((item, index) => (
                   <div key={item.id} className="rounded-lg bg-high/60 px-2 py-1.5">

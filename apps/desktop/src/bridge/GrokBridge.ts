@@ -51,6 +51,8 @@ export interface GrokBridge {
   /** Active workspace used by new sessions and the catalogue. */
   getWorkspace(): Promise<string>;
   setWorkspace(cwd: string): Promise<void>;
+  /** Supersede any pending async workspace selection without starting I/O. */
+  invalidateWorkspaceSelection(): void;
 
   /** Authentication state and interactive browser login. */
   getAuthState(): Promise<AuthState>;

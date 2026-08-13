@@ -120,6 +120,8 @@ export class MockBridge implements GrokBridge {
     return this.workspace;
   }
 
+  invalidateWorkspaceSelection(): void {}
+
   async setWorkspace(cwd: string): Promise<void> {
     this.workspace = cwd;
   }

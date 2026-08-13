@@ -551,6 +551,7 @@ struct OpenAiModelsResponse {
 
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_IMAGE_PREVIEW_BYTES: u64 = 40 * 1024 * 1024;
 const MAX_STREAMABLE_PREVIEW_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_ACP_TEXT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_WORKSPACE_ENTRIES: usize = 2_000;
@@ -3679,6 +3680,8 @@ async fn handle_static_preview_request(
         || mime == "application/pdf";
     let max_bytes = if streamable {
         MAX_STREAMABLE_PREVIEW_BYTES
+    } else if mime.starts_with("image/") {
+        MAX_IMAGE_PREVIEW_BYTES
     } else {
         MAX_PREVIEW_BYTES
     };
@@ -3724,8 +3727,13 @@ async fn start_file_preview(
 ) -> Result<String, String> {
     let root = checked_workspace(&cwd)?;
     let file = checked_workspace_file(&root, &path)?;
-    if !file.is_file() || !matches!(preview_type(&file).0, "html" | "video" | "audio" | "pdf") {
-        return Err("只能流式预览 HTML、视频、音频或 PDF 文件".into());
+    if !file.is_file()
+        || !matches!(
+            preview_type(&file).0,
+            "html" | "image" | "video" | "audio" | "pdf"
+        )
+    {
+        return Err("只能通过安全回环地址预览 HTML、图片、视频、音频或 PDF 文件".into());
     }
     // Scope the static server to the HTML file's directory so a hostile page
     // cannot read unrelated workspace paths via the preview token.
@@ -3803,29 +3811,29 @@ fn read_preview_file(cwd: String, path: String) -> Result<PreviewFile, String> {
     if kind == "unsupported" {
         return Err("暂不支持预览该文件类型".into());
     }
-    let streamable = matches!(kind, "video" | "audio" | "pdf");
-    let max_bytes = if streamable {
+    let delivered_by_url = matches!(kind, "image" | "video" | "audio" | "pdf");
+    let max_bytes = if matches!(kind, "video" | "audio" | "pdf") {
         MAX_STREAMABLE_PREVIEW_BYTES
+    } else if kind == "image" {
+        MAX_IMAGE_PREVIEW_BYTES
     } else {
         MAX_PREVIEW_BYTES
     };
     if metadata.len() > max_bytes {
-        return Err(if streamable {
+        return Err(if matches!(kind, "video" | "audio" | "pdf") {
             "媒体预览文件不能超过 4 GB".into()
+        } else if kind == "image" {
+            "图片预览文件不能超过 40 MB".into()
         } else {
             "预览文件不能超过 16 MB".into()
         });
     }
-    let content = if streamable {
+    let content = if delivered_by_url {
         String::new()
     } else {
         let bytes = fs::read(&file)
             .map_err(|error| format!("无法读取 {}：{error}", file.display()))?;
-        if kind == "image" {
-            BASE64.encode(bytes)
-        } else {
-            String::from_utf8(bytes).map_err(|_| "文件不是有效的 UTF-8 文本".to_string())?
-        }
+        String::from_utf8(bytes).map_err(|_| "文件不是有效的 UTF-8 文本".to_string())?
     };
     Ok(PreviewFile {
         path: path_for_webview(&file),

@@ -1119,6 +1119,7 @@ export class AcpBridge implements GrokBridge {
   private computerUseEnabled = localStorage.getItem("grox.computerUseEnabled") !== "0";
   private browserUseEnabled = localStorage.getItem("grox.browserUseEnabled") !== "0";
   private workspace = "";
+  private workspaceSelectionGeneration = 0;
   private sessionWorkspaces = new Map<string, string>();
   private computerLeases = new Map<string, string>();
   private browserLeases = new Map<string, string>();
@@ -3002,9 +3003,18 @@ export class AcpBridge implements GrokBridge {
     return this.workspace;
   }
 
+  invalidateWorkspaceSelection(): void {
+    this.workspaceSelectionGeneration += 1;
+  }
+
   async setWorkspace(cwd: string): Promise<void> {
+    const generation = ++this.workspaceSelectionGeneration;
     await this.ensureReady();
+    if (generation !== this.workspaceSelectionGeneration) return;
     const validated = await invoke<string>("validate_workspace", { cwd });
+    // 快速跨项目切换时，较早的路径校验可能较晚返回；旧结果不能覆盖
+    // 最后一次用户选择。
+    if (generation !== this.workspaceSelectionGeneration) return;
     this.workspace = validated;
     localStorage.setItem("grok.workspace", validated);
   }
