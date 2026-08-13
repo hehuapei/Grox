@@ -31,11 +31,15 @@ jobs:
         with:
           node-version: 24
 
-      - name: Install official Grok Build v1.0.0
+      - name: Resolve integration target
+        shell: bash
+        run: node -e 'const state=require("./.grox/official-cli.json"); const version=state.integrationTarget?.publicVersion; if (!version) throw new Error("integrationTarget.publicVersion is required"); console.log(`GROK_EXPECTED_VERSION=${version}`)' >> "$GITHUB_ENV"
+
+      - name: Install official Grok Build integration target
         shell: bash
         run: |
           export GROK_BIN_DIR="$RUNNER_TEMP/grok-bin"
-          curl -fsSL https://x.ai/cli/install.sh | bash -s -- 1.0.0
+          curl -fsSL https://x.ai/cli/install.sh | bash -s -- "$GROK_EXPECTED_VERSION"
           echo "$GROK_BIN_DIR" >> "$GITHUB_PATH"
 
       - name: Verify native architecture and official ACP integration

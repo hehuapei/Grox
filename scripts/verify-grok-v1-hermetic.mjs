@@ -10,6 +10,7 @@ const grokHome = mkdtempSync(join(tmpdir(), "grox-v1-hermetic-"));
 const requests = [];
 let foregroundTurns = 0;
 let imageForwardedToModel = false;
+let imageTextForwardedToModel = false;
 
 function json(response, status, value) {
   response.writeHead(status, { "content-type": "application/json" });
@@ -65,7 +66,10 @@ const server = http.createServer((request, response) => {
       return json(response, 200, { userId: "grox-ci", email: "ci@test.invalid", subscriptionTier: "supergrok" });
     }
     if (request.method === "POST" && request.url === "/v1/chat/completions") {
-      if (body.includes("GROX_LARGE_IMAGE_OK") && body.includes("data:image/")) imageForwardedToModel = true;
+      if (body.includes("data:image/")) imageForwardedToModel = true;
+      // 1.0.3 may replace the text immediately before an image with its ACP
+      // placeholder, but the unique suffix must still survive into the model.
+      if (body.includes("_LARGE_IMAGE_OK")) imageTextForwardedToModel = true;
       const id = `chatcmpl-grox-${++foregroundTurns}`;
       const namedTool = (name) => Array.isArray(parsed.tools)
         ? parsed.tools.find((entry) => (entry?.function?.name ?? entry?.name) === name)
@@ -88,8 +92,9 @@ const server = http.createServer((request, response) => {
         return toolCall(useTool, { tool_name: qualifiedName, tool_input: {} });
       }
       if (foregroundTurns === 3) {
-        const transcript = JSON.stringify(parsed.messages);
-        if (!transcript.includes("GROX_LARGE_IMAGE_OK")) return json(response, 500, { error: "large image MCP result missing" });
+        if (!imageForwardedToModel || !imageTextForwardedToModel) {
+          return json(response, 500, { error: "large image MCP result missing" });
+        }
       }
       return sse(response, [
         { id, object: "chat.completion.chunk", created: 1, model: "grok-build", choices: [{ index: 0, delta: { role: "assistant", content: "GROX_V1_SMOKE_OK" }, finish_reason: null }] },
@@ -134,12 +139,14 @@ try {
   if (!result.ok || !result.largeMcpImage || !result.sessionForkLoadClose) throw new Error(`验证结果不完整：${stdout}`);
   if (foregroundTurns < 3) throw new Error("MCP 搜索、调用与最终回答链路未完整执行");
   if (!imageForwardedToModel) throw new Error("大型 MCP 图片未进入后续模型请求");
+  if (!imageTextForwardedToModel) throw new Error("大型 MCP 图片的配套文本未进入后续模型请求");
   console.log(JSON.stringify({
     ...result,
     hermetic: true,
     platform: process.platform,
     arch: process.arch,
     imageForwardedToModel,
+    imageTextForwardedToModel,
     inferenceRequests: requests.map(({ method, url, bytes, toolNames }) => ({ method, url, bytes, toolNames })),
   }, null, 2));
 } finally {

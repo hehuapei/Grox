@@ -121,6 +121,16 @@ mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    // 被测实现使用进程级目录与缓存；并行测试会互相覆盖临时文件和缓存。
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn isolate_process_state() -> std::sync::MutexGuard<'static, ()> {
+        let guard = TEST_LOCK.lock().unwrap();
+        *PREFS_CACHE.lock().unwrap() = None;
+        *PREFS_DIR.lock().unwrap() = None;
+        guard
+    }
+
     fn temp_dir() -> PathBuf {
         let n = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -131,6 +141,7 @@ mod tests {
 
     #[test]
     fn roundtrip_and_gate_cache() {
+        let _test = isolate_process_state();
         let dir = temp_dir();
         let _ = fs::remove_dir_all(&dir);
         let mut p = HostPrefs::default();
@@ -150,6 +161,7 @@ mod tests {
 
     #[test]
     fn migrate_only_when_host_off() {
+        let _test = isolate_process_state();
         let dir = temp_dir();
         let _ = fs::remove_dir_all(&dir);
         let p = HostPrefs::default();
@@ -165,6 +177,7 @@ mod tests {
 
     #[test]
     fn migrate_does_not_reopen_after_host_opt_out() {
+        let _test = isolate_process_state();
         let dir = temp_dir();
         let _ = fs::remove_dir_all(&dir);
         // First boot: FE had CU on → migrate opens host gate once.
