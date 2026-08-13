@@ -47,3 +47,4 @@
 - 功能建议先描述问题和期望结果，再讨论实现。社区来源统一使用 `from:community` 标签。
 - v0.3.2 正式发布至少包含 Windows x64 安装包与便携包、macOS Apple Silicon/Intel DMG、Linux x64 AppImage/deb/rpm，以及 `SHA256SUMS`。
 - 版本号必须在 `package.json`、`Cargo.toml`、`Cargo.lock` 和 `tauri.conf.json` 中一致；发布说明必须列出已知限制和各平台资产。
+- PR 与 main 推送必须通过前端类型检查、单元测试、生产构建，以及 Linux、Windows、macOS 原生测试；发布构建不能成为第一次跨平台验证。
