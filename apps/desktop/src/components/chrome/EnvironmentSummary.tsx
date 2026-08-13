@@ -29,6 +29,14 @@ interface GitWorktree {
   prunable: boolean;
 }
 
+interface SessionJournalStatus {
+  count: number;
+  totalBytes: number;
+  latestSavedAt?: number;
+  migrationPending: number;
+  unreadableCount: number;
+}
+
 interface SummarySource {
   id: string;
   kind: "attachment" | "link";
@@ -60,6 +68,7 @@ export function EnvironmentSummary() {
   const [open, setOpen] = useState(false);
   const [summary, setSummary] = useState<GitSummary | null>(null);
   const [worktrees, setWorktrees] = useState<GitWorktree[]>([]);
+  const [journalStatus, setJournalStatus] = useState<SessionJournalStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState<"checkout" | "commit" | "push" | "worktree" | null>(null);
   const [error, setError] = useState("");
@@ -107,12 +116,14 @@ export function EnvironmentSummary() {
     setError("");
     try {
       if (inTauri()) {
-        const [nextSummary, nextWorktrees] = await Promise.all([
+        const [nextSummary, nextWorktrees, nextJournalStatus] = await Promise.all([
           invoke<GitSummary>("git_summary", { cwd: workspace }),
           invoke<GitWorktree[]>("git_worktrees", { cwd: workspace }).catch(() => [] as GitWorktree[]),
+          invoke<SessionJournalStatus>("session_journal_status"),
         ]);
         setSummary(nextSummary);
         setWorktrees(nextWorktrees);
+        setJournalStatus(nextJournalStatus);
       } else {
         setSummary({
           isRepository: true,
@@ -127,6 +138,7 @@ export function EnvironmentSummary() {
           behind: 0,
         });
         setWorktrees([]);
+        setJournalStatus({ count: 12, totalBytes: 1_480_000, latestSavedAt: Date.now(), migrationPending: 0, unreadableCount: 0 });
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -279,6 +291,23 @@ export function EnvironmentSummary() {
               <span className="max-w-[150px] truncate font-mono text-[9px] text-faint">{workspace}</span>
               <Icon name="external" size={10} className="text-faint" />
             </button>
+
+            <SummaryRow icon="clock" label={zh ? "会话 journal" : "Session journal"}>
+              <span
+                className={`ml-auto font-mono text-[9.5px] ${journalStatus?.unreadableCount ? "text-red" : journalStatus?.migrationPending ? "text-gold" : "text-dim"}`}
+                title={journalStatus?.latestSavedAt
+                  ? `${zh ? "最近写入" : "Latest write"}: ${new Date(journalStatus.latestSavedAt).toLocaleString()}`
+                  : undefined}
+              >
+                {journalStatus
+                  ? journalStatus.unreadableCount > 0
+                    ? (zh ? `${journalStatus.unreadableCount} 个无法读取` : `${journalStatus.unreadableCount} unreadable`)
+                    : journalStatus.migrationPending > 0
+                      ? (zh ? `${journalStatus.migrationPending} 个待迁移` : `${journalStatus.migrationPending} to migrate`)
+                      : `${journalStatus.count} · ${(journalStatus.totalBytes / 1024 / 1024).toFixed(1)} MB`
+                  : "—"}
+              </span>
+            </SummaryRow>
 
             <div className="mx-2 mb-2 grid grid-cols-4 gap-1">
               {([
@@ -488,7 +517,7 @@ export function EnvironmentSummary() {
   );
 }
 
-function SummaryRow({ icon, label, children }: { icon: "edit" | "branch"; label: string; children?: React.ReactNode }) {
+function SummaryRow({ icon, label, children }: { icon: "edit" | "branch" | "clock"; label: string; children?: React.ReactNode }) {
   return (
     <div className="summary-row">
       <Icon name={icon} size={14} className="text-mute" />

@@ -1,0 +1,77 @@
+import type { Session, SessionBlock } from "../bridge/types";
+import { blockContentKey, mergeOfflineWithLive } from "./offlineMerge";
+import type { SessionJournalSnapshot } from "./sessionCache";
+
+export const POST_TURN_RECONCILE_DELAYS_MS = [0, 125, 375, 750] as const;
+
+export type SessionJournalReconcileOutcome =
+  | "journal_only"
+  | "agent_only"
+  | "reconciled"
+  | "interrupted"
+  | "missing";
+
+export interface SessionJournalReconcileResult {
+  session: Session | null;
+  outcome: SessionJournalReconcileOutcome;
+  changed: boolean;
+}
+
+function interruptedBlock(snapshot: SessionJournalSnapshot): SessionBlock {
+  return {
+    type: "system",
+    id: `journal-interrupted-${snapshot.appSessionId}-${snapshot.savedAt}`,
+    text: "上次运行在回合完成前中断。已恢复可确认的本地记录；提示队列已暂停，请检查末尾内容后再恢复发送。",
+    ts: snapshot.savedAt,
+    kind: "error",
+  };
+}
+
+function withInterruptedGate(session: Session, snapshot: SessionJournalSnapshot): Session {
+  const marker = interruptedBlock(snapshot);
+  const blocks = session.blocks.some((block) => block.id === marker.id)
+    ? session.blocks
+    : [...session.blocks, marker];
+  return { ...session, status: "failed", preview: true, blocks };
+}
+
+/** Stable enough to decide whether a disk reconcile added transcript facts. */
+export function sessionTranscriptSignature(session: Session | null | undefined): string {
+  if (!session) return "";
+  return JSON.stringify(session.blocks.map((block) => {
+    if (block.type === "tool") {
+      return [blockContentKey(block), block.call.status, block.call.input, block.call.output];
+    }
+    if ("text" in block) return [blockContentKey(block), block.text];
+    return [blockContentKey(block), block];
+  }));
+}
+
+/**
+ * App journal owns UI continuity; Agent history owns model context. Reconcile
+ * both without treating an active crash snapshot as a successfully settled turn.
+ */
+export function reconcileSessionJournal(
+  snapshot: SessionJournalSnapshot | null,
+  agentSession: Session | null,
+): SessionJournalReconcileResult {
+  if (!snapshot && !agentSession) return { session: null, outcome: "missing", changed: false };
+  if (!snapshot) return { session: agentSession, outcome: "agent_only", changed: false };
+
+  const before = sessionTranscriptSignature(snapshot.session);
+  const merged = agentSession
+    ? mergeOfflineWithLive(agentSession, snapshot.session)
+    : snapshot.session;
+  if (snapshot.turnState === "active") {
+    return {
+      session: withInterruptedGate(merged, snapshot),
+      outcome: "interrupted",
+      changed: sessionTranscriptSignature(merged) !== before,
+    };
+  }
+  return {
+    session: merged,
+    outcome: agentSession ? "reconciled" : "journal_only",
+    changed: sessionTranscriptSignature(merged) !== before,
+  };
+}

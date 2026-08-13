@@ -46,13 +46,14 @@ import type {
 import { DEMO_CWD } from "../demo/data";
 import {
   clearDraftBuffer,
-  cancelPendingSessionCache,
-  flushAllPendingSessionCaches,
-  flushSessionCache,
+  cancelPendingSessionJournal,
+  flushAllPendingSessionJournals,
+  flushSessionJournal,
   loadDraftBuffer,
   saveDraftBuffer,
-  scheduleSaveSessionCache,
-  scrubSessionCacheOrphans,
+  scheduleSaveSessionJournal,
+  scrubSessionJournalOrphans,
+  setSessionJournalFailureHandler,
 } from "../lib/sessionCache";
 import { readStoredPermissionMode } from "../lib/permissionMode";
 import { turnHasLiveText } from "../lib/processFold";
@@ -132,7 +133,14 @@ import {
   shouldRetainDraftBufferUntilSessionReady,
 } from "../lib/draftLaunchRecovery";
 import { sessionShellFromMeta } from "../lib/sessionShell";
-import { hydrateSessionOffline, preferRicherSession } from "../lib/offlineSessionHydrate";
+import {
+  hydrateSessionOfflineDetailed,
+  preferRicherSession,
+} from "../lib/offlineSessionHydrate";
+import {
+  POST_TURN_RECONCILE_DELAYS_MS,
+  sessionTranscriptSignature,
+} from "../lib/sessionJournalReconcile";
 import { isUnavailableSessionError } from "../lib/sessionUnavailable";
 
 export type View = "home" | "session";
@@ -360,7 +368,7 @@ interface DesktopState {
   setComputerUseEnabled(enabled: boolean): void;
   setBrowserUseEnabled(enabled: boolean): void;
   setDraft(text: string): void;
-  /** Flush UI session cache + catalog for crash durability (visibility/pagehide). */
+  /** Flush the app session journal + catalog for crash durability. */
   flushDurableState(): void;
   setComposerAttachments(attachments: PromptAttachment[]): void;
   setInspectorTab(tab: InspectorTab): void;
@@ -377,6 +385,9 @@ const suppressedQueueDrain = new Set<string>();
 /** Prompt RPC already returned; late thinking/tools are a continuation, not a new turn. */
 const promptReturnedSessions = new Set<string>();
 const continuationSettleTimers = new Map<string, number>();
+/** A newer prompt invalidates every delayed disk reconcile from the prior turn. */
+const postTurnReconcileGenerations = new Map<string, number>();
+const postTurnReconcilePendingGenerations = new Map<string, number>();
 /** Upgrade generation: force background load once per session after shell bump. */
 let upgradeForceOfflineRescan = false;
 const upgradeForceRescanned = new Set<string>();
@@ -764,6 +775,51 @@ export const useDesktop = create<DesktopState>((set, get) => {
     }));
   };
 
+  const publishJournalReadError = (sessionId: string, cause: unknown) => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    publishRuntimeError(cause, {
+      domain: "environment",
+      code: "SESSION_JOURNAL_READ_FAILED",
+      message: `会话 ${sessionId} 的应用 journal 无法读取`,
+      recoverable: true,
+      action: "已继续尝试 Agent 磁盘历史；请检查应用数据目录、磁盘健康和文件权限",
+    });
+  };
+
+  const publishAgentHistoryReadError = (sessionId: string, cause: unknown) => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    publishRuntimeError(cause, {
+      domain: "environment",
+      code: "AGENT_HISTORY_READ_FAILED",
+      message: `会话 ${sessionId} 的 Agent 历史无法读取`,
+      recoverable: true,
+      action: "应用 journal 仍可用于展示；请检查 GROK_HOME、会话文件权限和磁盘健康",
+    });
+  };
+
+  const parkInterruptedSession = (sessionId: string) => {
+    suppressedQueueDrain.add(sessionId);
+    const state = get();
+    set({ queueDrainParked: nextQueueDrainParked(state.queueDrainParked, sessionId, true) });
+    publishRuntimeError(new Error("应用在回合完成前退出"), {
+      domain: "environment",
+      code: "SESSION_TURN_INTERRUPTED",
+      message: "检测到未完成的会话回合，提示队列已暂停",
+      recoverable: true,
+      action: "检查会话末尾后，使用“恢复队列”继续发送",
+    });
+  };
+
+  setSessionJournalFailureHandler((sessionId, cause) => {
+    publishRuntimeError(cause, {
+      domain: "environment",
+      code: "SESSION_JOURNAL_WRITE_FAILED",
+      message: `会话 ${sessionId} 的应用 journal 未能写入磁盘`,
+      recoverable: true,
+      action: "当前窗口仍保留内容；请检查应用数据目录的可用空间和写入权限",
+    });
+  });
+
   const savePromptQueues = (queues: Record<string, QueuedPrompt[]>) => {
     void persistPromptQueues(queues).catch((cause) => {
       publishRuntimeError(cause, {
@@ -810,7 +866,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
       status: session.status,
       providerSwitching: state.providerSwitching,
       restoring: state.restoringSessionId === sessionId,
-      suppressed: suppressedQueueDrain.has(sessionId) || Boolean(state.queueDrainParked[sessionId]),
+      suppressed: suppressedQueueDrain.has(sessionId)
+        || postTurnReconcilePendingGenerations.has(sessionId)
+        || Boolean(state.queueDrainParked[sessionId]),
       queueLength: queue.length,
       hasLiveProcess: turnHasLiveText(session.blocks),
     })) return;
@@ -1047,6 +1105,66 @@ export const useDesktop = create<DesktopState>((set, get) => {
   const markPromptInFlight = (sessionId: string) => {
     promptReturnedSessions.delete(sessionId);
     clearContinuationSettle(sessionId);
+    postTurnReconcileGenerations.set(
+      sessionId,
+      (postTurnReconcileGenerations.get(sessionId) ?? 0) + 1,
+    );
+    postTurnReconcilePendingGenerations.delete(sessionId);
+  };
+
+  const lastPrimaryPromptText = (session: Session | undefined): string | null => {
+    const block = [...session?.blocks ?? []].reverse().find(
+      (item) => item.type === "user" && !item.interjected,
+    );
+    return block?.type === "user" ? block.text : null;
+  };
+
+  const schedulePostTurnReconcile = (sessionId: string) => {
+    const initial = get().sessions[sessionId];
+    const expectedPrompt = lastPrimaryPromptText(initial);
+    if (!initial || !expectedPrompt) return;
+    const generation = (postTurnReconcileGenerations.get(sessionId) ?? 0) + 1;
+    postTurnReconcileGenerations.set(sessionId, generation);
+    postTurnReconcilePendingGenerations.set(sessionId, generation);
+    const startedAt = Date.now();
+
+    void (async () => {
+      try {
+        for (const targetDelay of POST_TURN_RECONCILE_DELAYS_MS) {
+          const remaining = targetDelay - (Date.now() - startedAt);
+          if (remaining > 0) await new Promise<void>((resolve) => window.setTimeout(resolve, remaining));
+          if (postTurnReconcileGenerations.get(sessionId) !== generation) return;
+          const current = get().sessions[sessionId];
+          if (!current || !isSessionTerminal(current.status) || lastPrimaryPromptText(current) !== expectedPrompt) return;
+
+          const hydration = await hydrateSessionOfflineDetailed(sessionId, current);
+          if (postTurnReconcileGenerations.get(sessionId) !== generation) return;
+          const latest = get().sessions[sessionId];
+          if (!latest || !isSessionTerminal(latest.status) || lastPrimaryPromptText(latest) !== expectedPrompt) return;
+          if (hydration.journalError) publishJournalReadError(sessionId, hydration.journalError);
+          if (hydration.agentError) publishAgentHistoryReadError(sessionId, hydration.agentError);
+          if (!hydration.session) continue;
+          // An active snapshot is only crash evidence during startup. In the live
+          // process an idle event can race ahead of the queued settled write.
+          if (hydration.outcome === "interrupted") continue;
+
+          const candidate = mergeOfflineWithLive(hydration.session, latest);
+          candidate.status = latest.status;
+          if (sessionTranscriptSignature(candidate) === sessionTranscriptSignature(latest)) continue;
+          const next = { ...candidate, updatedAt: Date.now() };
+          set({ sessions: { ...get().sessions, [sessionId]: next } });
+          flushSessionJournal(next);
+          return;
+        }
+      } finally {
+        if (postTurnReconcilePendingGenerations.get(sessionId) === generation) {
+          postTurnReconcilePendingGenerations.delete(sessionId);
+          if (Date.now() - startedAt >= POST_PROMPT_SETTLE_MS) {
+            window.setTimeout(() => drainPromptQueue(sessionId), 0);
+          }
+        }
+      }
+    })();
   };
 
   const applyPostPromptContinuation = (sessionId: string) => {
@@ -1114,8 +1232,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (!s) return;
       const next = { ...fn(s), updatedAt: Date.now() };
       // Terminal turns flush cache immediately (BSOD window); live turns debounce.
-      if (isSessionTerminal(next.status)) flushSessionCache(next);
-      else scheduleSaveSessionCache(next);
+      if (isSessionTerminal(next.status)) flushSessionJournal(next);
+      else scheduleSaveSessionJournal(next);
       if (!touchCatalogue) {
         set({ sessions: { ...state.sessions, [sessionId]: next } });
         if (isSessionTerminal(next.status)) applyQueuedModel(sessionId);
@@ -1257,7 +1375,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           preview: e.preview === true,
         };
         const existing = sessions[filteredSession.id];
-        scheduleSaveSessionCache(filteredSession);
+        scheduleSaveSessionJournal(filteredSession);
         const localPreviewSuffix = e.background && !e.preview && existing?.preview
           ? existing.blocks.filter((block) => !block.id.startsWith(`preview-${filteredSession.id}-`))
           : [];
@@ -1503,6 +1621,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         );
         applyPostPromptContinuation(e.sessionId);
         if (e.status === "idle") {
+          schedulePostTurnReconcile(e.sessionId);
           window.setTimeout(() => drainPromptQueue(e.sessionId), POST_PROMPT_SETTLE_MS);
         }
         break;
@@ -1831,7 +1950,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             }, 1_500);
 
             window.setTimeout(() => {
-              void scrubSessionCacheOrphans();
+              void scrubSessionJournalOrphans();
             }, 4_000);
             window.setTimeout(() => {
               if (!get().auth.inProgress && get().historySyncedAt === 0) void get().refreshHistory();
@@ -1985,12 +2104,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
       // Local cache + disk jsonl first (fast paint). ACP may fail with "找不到会话"
       // when the CLI catalogue no longer lists a sidebar id.
       if (openMeta && (!existing || existing.blocks.length === 0 || existing.preview)) {
-        void hydrateSessionOffline(id, openMeta).then((offline) => {
+        void hydrateSessionOfflineDetailed(id, openMeta).then((hydration) => {
+          if (hydration.journalError) publishJournalReadError(id, hydration.journalError);
+          if (hydration.agentError) publishAgentHistoryReadError(id, hydration.agentError);
+          if (hydration.outcome === "interrupted") parkInterruptedSession(id);
+          const offline = hydration.session;
           if (!offline) return;
           const latest = get();
           if (latest.activeId !== id) return;
           const currentSession = latest.sessions[id];
-          const next = preferRicherSession(currentSession, offline);
+          const next = hydration.outcome === "interrupted"
+            ? offline
+            : preferRicherSession(currentSession, offline);
           if (next === currentSession) return;
           set({ sessions: { ...latest.sessions, [id]: next } });
         });
@@ -2002,12 +2127,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
         void bridge.loadSession(id, { background: true }).catch((error) => {
           const message = error instanceof Error ? error.message : String(error);
           void (async () => {
-            const offline = openMeta ? await hydrateSessionOffline(id, openMeta) : null;
+            const hydration = openMeta ? await hydrateSessionOfflineDetailed(id, openMeta) : null;
+            if (hydration?.journalError) publishJournalReadError(id, hydration.journalError);
+            if (hydration?.agentError) publishAgentHistoryReadError(id, hydration.agentError);
+            if (hydration?.outcome === "interrupted") parkInterruptedSession(id);
+            const offline = hydration?.session ?? null;
             set((latest) => {
               if (latest.activeId !== id) return latest;
               const shell = latest.sessions[id];
               if (offline && offline.blocks.length > 0) {
-                const next = preferRicherSession(shell, offline);
+                const next = hydration?.outcome === "interrupted"
+                  ? offline
+                  : preferRicherSession(shell, offline);
                 return {
                   // Soft notice — offline history is still usable.
                   startupError: `会话未能绑定到 CLI（已显示本地历史）：${message}`,
@@ -2749,7 +2880,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       markSessionsDeleted([id]);
       clearSessionFlags([id]);
       // 取消尚未落盘的 debounce；否则删除完成后旧缓存可能被定时器重新写回。
-      cancelPendingSessionCache(id);
+      cancelPendingSessionJournal(id);
       const { sessionIndex, sessions, activeId, sessionComposers, workflows } = get();
       const rest = { ...sessions };
       delete rest[id];
@@ -3400,7 +3531,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
     flushDurableState() {
       const state = get();
-      flushAllPendingSessionCaches(state.sessions);
+      flushAllPendingSessionJournals(state.sessions);
       if (catalogPersistTimer !== undefined) {
         window.clearTimeout(catalogPersistTimer);
         catalogPersistTimer = undefined;

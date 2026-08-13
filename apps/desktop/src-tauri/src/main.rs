@@ -1190,8 +1190,12 @@ fn atomic_orphan_writer_pid(orphan_name: &str) -> Option<u32> {
 }
 
 fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
-    if content.len() as u64 > MAX_CONFIG_BYTES {
-        return Err("配置文档不能超过 4 MB".into());
+    atomic_write_bounded(path, content, MAX_CONFIG_BYTES)
+}
+
+fn atomic_write_bounded(path: &Path, content: &str, max_bytes: u64) -> Result<(), String> {
+    if content.len() as u64 > max_bytes {
+        return Err(format!("文档不能超过 {} MB", max_bytes / 1024 / 1024));
     }
     let parent = path
         .parent()
@@ -1314,72 +1318,202 @@ fn scrub_atomic_write_orphans(dir: &Path, max_age: std::time::Duration) -> u32 {
     removed
 }
 
-fn scrub_session_cache_dir(app: &tauri::AppHandle) {
-    let Ok(dir) = app.path().app_config_dir().map(|d| d.join("session-cache")) else {
-        return;
-    };
-    if !dir.is_dir() {
-        return;
-    }
-    // Temps older than 30s are safe leftovers; immediate cleanup of all .tmp
-    // is fine because live writers hold exclusive create_new names.
-    let removed = scrub_atomic_write_orphans(&dir, std::time::Duration::from_secs(30));
-    if removed > 0 {
-        eprintln!("grox: scrubbed {removed} orphan session-cache temp/bak files");
-    }
-}
-
-const SESSION_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const SESSION_JOURNAL_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const PROMPT_QUEUES_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
-fn session_cache_path(app: &tauri::AppHandle, id: &str) -> Result<PathBuf, String> {
-    let safe = id
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-        .take(80)
-        .collect::<String>();
-    if safe.is_empty() {
+fn safe_session_storage_id(id: &str) -> Result<&str, String> {
+    if id.is_empty()
+        || id.len() > 80
+        || !id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
         return Err("无效的会话 ID".into());
     }
+    Ok(id)
+}
+
+fn legacy_session_cache_path(app: &tauri::AppHandle, id: &str) -> Result<PathBuf, String> {
+    let safe = safe_session_storage_id(id)?;
     app.path()
         .app_config_dir()
         .map(|directory| directory.join("session-cache").join(format!("{safe}.json")))
         .map_err(|error| format!("无法定位会话缓存目录：{error}"))
 }
 
-#[tauri::command]
-fn read_session_cache(app: tauri::AppHandle, id: String) -> Result<Option<String>, String> {
-    let path = session_cache_path(&app, &id)?;
-    if !path.is_file() {
-        return Ok(None);
-    }
-    read_bounded_text(&path, SESSION_CACHE_MAX_BYTES)
-        .map(|content| if content.trim().is_empty() { None } else { Some(content) })
-        .or(Ok(None))
+fn session_journal_dir(app: &tauri::AppHandle, id: &str) -> Result<PathBuf, String> {
+    let safe = safe_session_storage_id(id)?;
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("sessions").join(safe))
+        .map_err(|error| format!("无法定位应用会话目录：{error}"))
 }
 
-#[tauri::command]
-fn write_session_cache(app: tauri::AppHandle, id: String, content: String) -> Result<(), String> {
-    if content.len() as u64 > SESSION_CACHE_MAX_BYTES {
-        return Err("会话缓存不能超过 4 MB".into());
-    }
-    let value: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|error| format!("会话缓存必须是 JSON：{error}"))?;
-    if !value.is_object() {
-        return Err("会话缓存必须是 JSON 对象".into());
-    }
-    let path = session_cache_path(&app, &id)?;
-    atomic_write(&path, &content)?;
-    restrict_private_file(&path)
+fn session_journal_path(app: &tauri::AppHandle, id: &str) -> Result<PathBuf, String> {
+    Ok(session_journal_dir(app, id)?.join("journal.json"))
 }
 
-#[tauri::command]
-fn delete_session_cache(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    let path = session_cache_path(&app, &id)?;
-    if path.is_file() {
-        fs::remove_file(&path).map_err(|error| format!("无法删除会话缓存：{error}"))?;
+fn validate_session_journal(content: &str, id: &str) -> Result<(), String> {
+    let value: serde_json::Value = serde_json::from_str(content)
+        .map_err(|error| format!("应用会话 journal 必须是 JSON：{error}"))?;
+    let object = value
+        .as_object()
+        .ok_or_else(|| "应用会话 journal 必须是 JSON 对象".to_string())?;
+    if object.get("version").and_then(|value| value.as_u64()) != Some(1)
+        || object.get("appSessionId").and_then(|value| value.as_str()) != Some(id)
+        || object.get("agentSessionId").and_then(|value| value.as_str()).is_none()
+        || object.get("savedAt").and_then(|value| value.as_u64()).is_none()
+        || !matches!(
+            object.get("turnState").and_then(|value| value.as_str()),
+            Some("active" | "settled")
+        )
+        || object
+            .get("session")
+            .and_then(|value| value.as_object())
+            .and_then(|session| session.get("id"))
+            .and_then(|value| value.as_str())
+            != Some(id)
+    {
+        return Err("应用会话 journal 格式无效或会话身份不匹配".into());
     }
     Ok(())
+}
+
+#[tauri::command]
+fn read_session_journal(app: tauri::AppHandle, id: String) -> Result<Option<String>, String> {
+    let path = session_journal_path(&app, &id)?;
+    let source = if path.is_file() {
+        path
+    } else {
+        let legacy = legacy_session_cache_path(&app, &id)?;
+        if !legacy.is_file() {
+            return Ok(None);
+        }
+        legacy
+    };
+    read_bounded_text(&source, SESSION_JOURNAL_MAX_BYTES)
+        .map(|content| if content.trim().is_empty() { None } else { Some(content) })
+        .map_err(|error| format!("无法读取应用会话 journal：{error}"))
+}
+
+#[tauri::command]
+fn write_session_journal(app: tauri::AppHandle, id: String, content: String) -> Result<(), String> {
+    if content.len() as u64 > SESSION_JOURNAL_MAX_BYTES {
+        return Err("应用会话 journal 不能超过 16 MB".into());
+    }
+    safe_session_storage_id(&id)?;
+    validate_session_journal(&content, &id)?;
+    let path = session_journal_path(&app, &id)?;
+    atomic_write_bounded(&path, &content, SESSION_JOURNAL_MAX_BYTES)?;
+    restrict_private_file(&path)?;
+    let legacy = legacy_session_cache_path(&app, &id)?;
+    if legacy.is_file() {
+        if let Err(error) = fs::remove_file(&legacy) {
+            // The v1 write already succeeded. Keep this non-fatal and expose
+            // the remaining legacy row through session_journal_status.
+            eprintln!("grox: 新版 journal 已写入，但无法清理旧版会话缓存：{error}");
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_session_journal(app: tauri::AppHandle, id: String) -> Result<(), String> {
+    let path = session_journal_path(&app, &id)?;
+    if path.is_file() {
+        fs::remove_file(&path).map_err(|error| format!("无法删除应用会话 journal：{error}"))?;
+    }
+    let dir = session_journal_dir(&app, &id)?;
+    if dir.is_dir()
+        && dir
+            .read_dir()
+            .map_err(|error| format!("无法检查应用会话目录：{error}"))?
+            .next()
+            .is_none()
+    {
+        fs::remove_dir(&dir).map_err(|error| format!("无法删除空应用会话目录：{error}"))?;
+    }
+    let legacy = legacy_session_cache_path(&app, &id)?;
+    if legacy.is_file() {
+        fs::remove_file(&legacy).map_err(|error| format!("无法删除旧版会话缓存：{error}"))?;
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionJournalStatus {
+    count: u32,
+    total_bytes: u64,
+    latest_saved_at: Option<u64>,
+    migration_pending: u32,
+    unreadable_count: u32,
+}
+
+fn add_journal_status(path: &Path, status: &mut SessionJournalStatus) {
+    if !path.is_file() {
+        return;
+    }
+    status.count += 1;
+    if let Ok(metadata) = path.metadata() {
+        status.total_bytes = status.total_bytes.saturating_add(metadata.len());
+    }
+    let saved_at = read_bounded_text(path, SESSION_JOURNAL_MAX_BYTES)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .and_then(|value| {
+            value
+                .get("savedAt")
+                .or_else(|| value.get("updatedAt"))
+                .and_then(serde_json::Value::as_u64)
+        });
+    match saved_at {
+        Some(saved_at) => {
+            status.latest_saved_at = Some(status.latest_saved_at.unwrap_or(0).max(saved_at));
+        }
+        None => status.unreadable_count += 1,
+    }
+}
+
+#[tauri::command]
+fn session_journal_status(app: tauri::AppHandle) -> Result<SessionJournalStatus, String> {
+    let config = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("无法定位应用会话目录：{error}"))?;
+    let mut status = SessionJournalStatus {
+        count: 0,
+        total_bytes: 0,
+        latest_saved_at: None,
+        migration_pending: 0,
+        unreadable_count: 0,
+    };
+    let sessions = config.join("sessions");
+    if sessions.is_dir() {
+        for entry in fs::read_dir(&sessions)
+            .map_err(|error| format!("无法读取应用会话目录 {}：{error}", sessions.display()))?
+            .filter_map(Result::ok)
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                add_journal_status(&path.join("journal.json"), &mut status);
+            }
+        }
+    }
+    let legacy = config.join("session-cache");
+    if legacy.is_dir() {
+        for entry in fs::read_dir(&legacy)
+            .map_err(|error| format!("无法读取旧版会话缓存目录 {}：{error}", legacy.display()))?
+            .filter_map(Result::ok)
+        {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
+                status.migration_pending += 1;
+                add_journal_status(&path, &mut status);
+            }
+        }
+    }
+    Ok(status)
 }
 
 fn prompt_queues_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -1454,12 +1588,12 @@ fn delete_session_data(app: tauri::AppHandle, id: String) -> Result<bool, String
         return Err("无效会话 ID".into());
     }
     let history = grok_home().and_then(|home| delete_session_history_data(&home, &id));
-    let cache = delete_session_cache(app, id);
-    match (history, cache) {
+    let journal = delete_session_journal(app, id);
+    match (history, journal) {
         (Ok(removed), Ok(())) => Ok(removed),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-        (Err(history_error), Err(cache_error)) => {
-            Err(format!("{history_error}；同时无法删除会话缓存：{cache_error}"))
+        (Err(history_error), Err(journal_error)) => {
+            Err(format!("{history_error}；同时无法删除应用会话 journal：{journal_error}"))
         }
     }
 }
@@ -1468,25 +1602,39 @@ fn delete_session_data(app: tauri::AppHandle, id: String) -> Result<bool, String
 fn delete_project_session_data(app: tauri::AppHandle, cwd: String) -> Result<Vec<String>, String> {
     let ids = delete_project_session_history_data(&grok_home()?, &cwd)?;
     for id in &ids {
-        delete_session_cache(app.clone(), id.clone())?;
+        delete_session_journal(app.clone(), id.clone())?;
     }
     Ok(ids)
 }
 
-#[tauri::command]
-fn scrub_session_cache_orphans(app: tauri::AppHandle) -> Result<u32, String> {
-    let dir = app
+fn scrub_session_journal_dirs(app: &tauri::AppHandle, minimum_age: Duration) -> Result<u32, String> {
+    let config = app
         .path()
         .app_config_dir()
-        .map(|directory| directory.join("session-cache"))
-        .map_err(|error| format!("无法定位会话缓存目录：{error}"))?;
-    if !dir.is_dir() {
-        return Ok(0);
+        .map_err(|error| format!("无法定位应用会话目录：{error}"))?;
+    let mut removed = 0;
+    let legacy = config.join("session-cache");
+    if legacy.is_dir() {
+        removed += scrub_atomic_write_orphans(&legacy, minimum_age);
     }
-    Ok(scrub_atomic_write_orphans(
-        &dir,
-        std::time::Duration::from_secs(0),
-    ))
+    let sessions = config.join("sessions");
+    if sessions.is_dir() {
+        for entry in fs::read_dir(&sessions)
+            .map_err(|error| format!("无法读取应用会话目录 {}：{error}", sessions.display()))?
+            .filter_map(Result::ok)
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                removed += scrub_atomic_write_orphans(&path, minimum_age);
+            }
+        }
+    }
+    Ok(removed)
+}
+
+#[tauri::command]
+fn scrub_session_journal_orphans(app: tauri::AppHandle) -> Result<u32, String> {
+    scrub_session_journal_dirs(&app, Duration::from_secs(0))
 }
 
 #[cfg(unix)]
@@ -7235,8 +7383,15 @@ fn main() {
                 if let Err(error) = provision_grox_deep_research_workflow() {
                     eprintln!("grox: 无法安装完整 deep-research 工作流：{error}");
                 }
-                // Crash / BSOD leftovers: orphan .tmp/.bak under session-cache.
-                scrub_session_cache_dir(&handle);
+                // Crash leftovers may live in either the v1 journal tree or the
+                // legacy flat cache while migration is still pending.
+                match scrub_session_journal_dirs(&handle, Duration::from_secs(30)) {
+                    Ok(removed) if removed > 0 => {
+                        eprintln!("grox: scrubbed {removed} orphan session journal files");
+                    }
+                    Err(error) => eprintln!("grox: 无法清理应用会话 journal：{error}"),
+                    _ => {}
+                }
             });
             Ok(())
         })
@@ -7244,16 +7399,17 @@ fn main() {
             desktop_environment,
             preview_session_from_disk,
             search_session_history,
-            read_session_cache,
-            write_session_cache,
-            delete_session_cache,
+            read_session_journal,
+            write_session_journal,
+            delete_session_journal,
+            session_journal_status,
             read_prompt_queues,
             write_prompt_queues,
             read_automations,
             write_automations,
             delete_session_data,
             delete_project_session_data,
-            scrub_session_cache_orphans,
+            scrub_session_journal_orphans,
             validate_workspace,
             pick_workspace,
             list_workspace_files,
@@ -7433,6 +7589,35 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_journal_validation_binds_version_and_app_identity() {
+        let valid = serde_json::json!({
+            "version": 1,
+            "appSessionId": "session-1",
+            "agentSessionId": "session-1",
+            "savedAt": 42,
+            "turnState": "active",
+            "session": { "id": "session-1", "blocks": [] }
+        });
+        assert!(validate_session_journal(&valid.to_string(), "session-1").is_ok());
+
+        let mut wrong_identity = valid.clone();
+        wrong_identity["session"]["id"] = serde_json::json!("session-2");
+        assert!(validate_session_journal(&wrong_identity.to_string(), "session-1").is_err());
+
+        let mut unknown_version = valid;
+        unknown_version["version"] = serde_json::json!(2);
+        assert!(validate_session_journal(&unknown_version.to_string(), "session-1").is_err());
+    }
+
+    #[test]
+    fn session_journal_storage_id_is_collision_free() {
+        assert_eq!(safe_session_storage_id("019f-ab_cd"), Ok("019f-ab_cd"));
+        assert!(safe_session_storage_id("../session").is_err());
+        assert!(safe_session_storage_id("会话").is_err());
+        assert!(safe_session_storage_id(&"x".repeat(81)).is_err());
     }
 
     #[test]

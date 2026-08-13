@@ -2,13 +2,32 @@ import { invoke } from "@tauri-apps/api/core";
 import type { Session, SessionBlock } from "../bridge/types";
 import { isSessionTerminal } from "../bridge/types";
 
-const MAX_CACHED_BLOCKS = 160;
-const MAX_BODY_TEXT = 24_000;
-const MAX_TOOL_TEXT = 8_000;
-/** Live streaming debounce — short enough that a hard crash loses little UI cache. */
+const MAX_JOURNAL_BLOCKS = 600;
+const MAX_BODY_TEXT = 64_000;
+const MAX_TOOL_TEXT = 16_000;
+/** Live streaming debounce — short enough that a hard crash loses little UI journal. */
 const LIVE_SAVE_DEBOUNCE_MS = 250;
 /** Completed turns flush immediately (0). */
 const TERMINAL_SAVE_DEBOUNCE_MS = 0;
+
+export type SessionJournalTurnState = "active" | "settled";
+
+export interface SessionJournalSnapshot {
+  version: 1;
+  appSessionId: string;
+  /** v0.3.2 仍与应用会话同 ID；字段为后续身份拆分保留稳定迁移点。 */
+  agentSessionId: string;
+  savedAt: number;
+  turnState: SessionJournalTurnState;
+  session: Session;
+}
+
+type SessionJournalFailureHandler = (sessionId: string, cause: unknown) => void;
+let journalFailureHandler: SessionJournalFailureHandler | null = null;
+
+export function setSessionJournalFailureHandler(handler: SessionJournalFailureHandler | null): void {
+  journalFailureHandler = handler;
+}
 
 const truncate = (value: string | undefined, limit: number) => {
   if (value == null || value.length <= limit) return value;
@@ -40,7 +59,7 @@ function freezeBlock(block: SessionBlock): SessionBlock {
  */
 export function sliceCacheBlocks(
   blocks: readonly SessionBlock[],
-  max = MAX_CACHED_BLOCKS,
+  max = MAX_JOURNAL_BLOCKS,
 ): SessionBlock[] {
   if (blocks.length <= max) return [...blocks];
   let start = blocks.length - max;
@@ -63,20 +82,60 @@ export function compactSession(session: Session): Session {
     ...session,
     status: "idle",
     preview: true,
-    blocks: sliceCacheBlocks(session.blocks, MAX_CACHED_BLOCKS).map(freezeBlock),
+    blocks: sliceCacheBlocks(session.blocks, MAX_JOURNAL_BLOCKS).map(freezeBlock),
   };
 }
 
-export async function loadSessionCache(id: string): Promise<Session | null> {
-  try {
-    const raw = await invoke<string | null>("read_session_cache", { id });
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Session;
-    if (parsed.id !== id || !Array.isArray(parsed.blocks)) return null;
-    return compactSession(parsed);
-  } catch {
-    return null;
+export function sessionJournalSnapshot(session: Session, savedAt = Date.now()): SessionJournalSnapshot {
+  return {
+    version: 1,
+    appSessionId: session.id,
+    agentSessionId: session.id,
+    savedAt,
+    turnState: isSessionTerminal(session.status) ? "settled" : "active",
+    session: compactSession(session),
+  };
+}
+
+export function parseSessionJournal(raw: string, id: string): SessionJournalSnapshot {
+  const parsed = JSON.parse(raw) as Partial<SessionJournalSnapshot> & Partial<Session>;
+  // v0.3.1/v0.3.2 early builds wrote a bare Session into session-cache.
+  if (parsed.version !== 1) {
+    if (parsed.id !== id || !Array.isArray(parsed.blocks)) throw new Error("应用会话 journal 与目标会话不匹配");
+    const session = compactSession(parsed as Session);
+    return {
+      version: 1,
+      appSessionId: id,
+      agentSessionId: id,
+      savedAt: Number(parsed.updatedAt) || Date.now(),
+      turnState: "settled",
+      session,
+    };
   }
+  if (
+    parsed.appSessionId !== id
+    || typeof parsed.agentSessionId !== "string"
+    || typeof parsed.savedAt !== "number"
+    || !["active", "settled"].includes(String(parsed.turnState))
+    || !parsed.session
+    || parsed.session.id !== id
+    || !Array.isArray(parsed.session.blocks)
+  ) {
+    throw new Error("应用会话 journal 格式无效或会话身份不匹配");
+  }
+  return {
+    version: 1,
+    appSessionId: id,
+    agentSessionId: parsed.agentSessionId,
+    savedAt: parsed.savedAt,
+    turnState: parsed.turnState as SessionJournalTurnState,
+    session: compactSession(parsed.session),
+  };
+}
+
+export async function loadSessionJournal(id: string): Promise<SessionJournalSnapshot | null> {
+  const raw = await invoke<string | null>("read_session_journal", { id });
+  return raw ? parseSessionJournal(raw, id) : null;
 }
 
 const timers = new Map<string, number>();
@@ -99,10 +158,10 @@ function writePayload(id: string, content: string): Promise<void> {
       const toWrite = pendingPayloads.get(id);
       if (toWrite === undefined) return;
       pendingPayloads.delete(id);
-      await invoke("write_session_cache", { id, content: toWrite });
+      await invoke("write_session_journal", { id, content: toWrite });
     })
-    .catch(() => {
-      // Best-effort cache; CLI disk history remains authoritative.
+    .catch((cause) => {
+      journalFailureHandler?.(id, cause);
     })
     .finally(() => {
       if (inFlight.get(id) === next) inFlight.delete(id);
@@ -115,11 +174,11 @@ function writePayload(id: string, content: string): Promise<void> {
  * Schedule a durable UI snapshot. Terminal sessions flush immediately so a
  * BSOD right after turn completion still has a cache of the finished transcript.
  */
-export function scheduleSaveSessionCache(session: Session): void {
+export function scheduleSaveSessionJournal(session: Session): void {
   if (!session.id || session.blocks.length === 0) return;
   if (session.id.startsWith("draft-") || session.id.startsWith("pending-")) return;
 
-  const content = JSON.stringify(compactSession(session));
+  const content = JSON.stringify(sessionJournalSnapshot(session));
   const delay = isSessionTerminal(session.status) ? TERMINAL_SAVE_DEBOUNCE_MS : LIVE_SAVE_DEBOUNCE_MS;
 
   const previous = timers.get(session.id);
@@ -138,20 +197,20 @@ export function scheduleSaveSessionCache(session: Session): void {
 }
 
 /** Force any debounced snapshot for one session to disk now. */
-export function flushSessionCache(session: Session): void {
+export function flushSessionJournal(session: Session): void {
   if (!session.id || session.blocks.length === 0) return;
   if (session.id.startsWith("draft-") || session.id.startsWith("pending-")) return;
   const previous = timers.get(session.id);
   if (previous !== undefined) window.clearTimeout(previous);
   timers.delete(session.id);
-  void writePayload(session.id, JSON.stringify(compactSession(session)));
+  void writePayload(session.id, JSON.stringify(sessionJournalSnapshot(session)));
 }
 
 /**
  * Flush every pending debounce using the last scheduled payload map and any
  * timers. Call on visibility hidden / pagehide for crash-window shrinkage.
  */
-export function flushAllPendingSessionCaches(
+export function flushAllPendingSessionJournals(
   sessions: Record<string, Session>,
 ): void {
   for (const [id, timer] of [...timers.entries()]) {
@@ -159,26 +218,21 @@ export function flushAllPendingSessionCaches(
     timers.delete(id);
     const session = sessions[id];
     if (session && session.blocks.length > 0) {
-      void writePayload(id, JSON.stringify(compactSession(session)));
+      void writePayload(id, JSON.stringify(sessionJournalSnapshot(session)));
     }
   }
 }
 
-export function cancelPendingSessionCache(id: string): void {
+export function cancelPendingSessionJournal(id: string): void {
   const timer = timers.get(id);
   if (timer !== undefined) window.clearTimeout(timer);
   timers.delete(id);
   pendingPayloads.delete(id);
 }
 
-export function removeSessionCache(id: string): void {
-  cancelPendingSessionCache(id);
-  void invoke("delete_session_cache", { id }).catch(() => {});
-}
-
-export async function scrubSessionCacheOrphans(): Promise<number> {
+export async function scrubSessionJournalOrphans(): Promise<number> {
   try {
-    return await invoke<number>("scrub_session_cache_orphans");
+    return await invoke<number>("scrub_session_journal_orphans");
   } catch {
     return 0;
   }

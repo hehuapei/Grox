@@ -4,7 +4,9 @@ import {
   clearDraftBuffer,
   compactSession,
   loadDraftBuffer,
+  parseSessionJournal,
   saveDraftBuffer,
+  sessionJournalSnapshot,
   sliceCacheBlocks,
 } from "./sessionCache";
 
@@ -28,11 +30,23 @@ describe("compactSession", () => {
     expect(result.blocks[0]).toMatchObject({ type: "assistant", streaming: false });
   });
 
-  it("只保留最后 160 个块", () => {
-    const blocks = Array.from({ length: 170 }, (_, index) => ({ type: "user" as const, id: String(index), text: String(index), ts: index }));
+  it("journal 在体积边界内保留最近 600 个块", () => {
+    const blocks = Array.from({ length: 610 }, (_, index) => ({ type: "user" as const, id: String(index), text: String(index), ts: index }));
     const result = compactSession(session(blocks));
-    expect(result.blocks).toHaveLength(160);
+    expect(result.blocks).toHaveLength(600);
     expect(result.blocks[0].id).toBe("10");
+  });
+
+  it("版本化 journal 保留崩溃前的回合活动事实", () => {
+    const snapshot = sessionJournalSnapshot(session([], "running"), 42);
+    expect(snapshot).toMatchObject({ version: 1, appSessionId: "session-1", agentSessionId: "session-1", savedAt: 42, turnState: "active" });
+    expect(snapshot.session.status).toBe("idle");
+    expect(parseSessionJournal(JSON.stringify(snapshot), "session-1")).toEqual(snapshot);
+  });
+
+  it("读取旧版裸 Session 时迁移为 settled journal", () => {
+    const migrated = parseSessionJournal(JSON.stringify(session([], "idle")), "session-1");
+    expect(migrated).toMatchObject({ version: 1, appSessionId: "session-1", turnState: "settled" });
   });
 });
 
