@@ -50,7 +50,7 @@ export function PreviewPane() {
             <div className="ml-1 flex max-w-[62%] shrink-0 items-center gap-0.5 overflow-x-auto border-l border-line pl-1">
               <PreviewAction label={languageLabel(language, "files")} icon="folder" onClick={() => setInspectorTab("files")} />
               <PreviewAction label={languageLabel(language, "copyPath")} icon="copy" onClick={() => run(() => navigator.clipboard.writeText(file.path).then(() => undefined))} />
-              {file.kind !== "image" && <PreviewAction label={languageLabel(language, "copyContents")} icon="copy" onClick={() => run(() => navigator.clipboard.writeText(file.content).then(() => undefined))} />}
+              {!(["image", "video", "audio", "pdf"] as string[]).includes(file.kind) && <PreviewAction label={languageLabel(language, "copyContents")} icon="copy" onClick={() => run(() => navigator.clipboard.writeText(file.content).then(() => undefined))} />}
               <PreviewAction label={languageLabel(language, "reveal")} icon="folder" onClick={() => run(() => invoke("reveal_in_explorer", { cwd: workspace, path: file.path }))} />
               <PreviewAction label={languageLabel(language, "openDefault")} icon="external" onClick={() => run(() => openFileWithConfiguredApplication(workspace, file.path))} />
               <PreviewAction label={languageLabel(language, "openWith")} icon="external" onClick={() => run(() => invoke("open_file_with_dialog", { cwd: workspace, path: file.path }))} />
@@ -96,6 +96,16 @@ export function PreviewPane() {
                 className="max-h-full max-w-full object-contain shadow-2xl"
               />
             </div>
+          ) : file.kind === "video" ? (
+            <div className="flex min-h-full items-center justify-center bg-black p-3">
+              <video src={file.url} controls preload="metadata" className="max-h-full max-w-full" />
+            </div>
+          ) : file.kind === "audio" ? (
+            <div className="flex min-h-full items-center justify-center p-6">
+              <audio src={file.url} controls preload="metadata" className="w-full max-w-xl" />
+            </div>
+          ) : file.kind === "pdf" ? (
+            <iframe title={file.name} src={file.url} className="h-full min-h-[420px] w-full border-0 bg-white" />
           ) : (
             <pre className="min-h-full whitespace-pre-wrap p-4 font-mono text-[11px] leading-relaxed text-fg2 select-text">
               {file.content}

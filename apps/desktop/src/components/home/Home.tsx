@@ -13,11 +13,12 @@ import { ChipSelect } from "../common/ChipSelect";
 import { PromptOptionsMenu, ProviderSwitcher } from "../common/PromptControls";
 import { useI18n } from "../../lib/i18n";
 import { MediaStudio } from "./MediaStudio";
+import { AutomationsStudio } from "./AutomationsStudio";
 import { useImeGuard } from "../../lib/ime";
 
 export function Home() {
   const { language, t } = useI18n();
-  const [workspaceMode, setWorkspaceMode] = useState<"conversation" | "image" | "video">("conversation");
+  const [workspaceMode, setWorkspaceMode] = useState<"conversation" | "image" | "video" | "automations">("conversation");
   const [q, setQ] = useState("");
   const [attachments, setAttachments] = useState<PromptAttachment[]>([]);
   const [attachmentError, setAttachmentError] = useState("");
@@ -134,7 +135,9 @@ export function Home() {
         <div className="home-nebula opacity-40" />
         <WorkspaceTabs mode={workspaceMode} onChange={setWorkspaceMode} />
         <StageTransition stageKey={workspaceMode} variant="panel" className="relative z-[1]">
-          <MediaStudio mode={workspaceMode} />
+          {workspaceMode === "automations"
+            ? <AutomationsStudio />
+            : <MediaStudio mode={workspaceMode} />}
         </StageTransition>
       </div>
     );
@@ -256,7 +259,7 @@ export function Home() {
   );
 }
 
-function WorkspaceTabs({ mode, onChange }: { mode: "conversation" | "image" | "video"; onChange(mode: "conversation" | "image" | "video"): void }) {
+function WorkspaceTabs({ mode, onChange }: { mode: "conversation" | "image" | "video" | "automations"; onChange(mode: "conversation" | "image" | "video" | "automations"): void }) {
   const { language } = useI18n();
   const zh = language === "zh-CN";
   return (
@@ -265,13 +268,14 @@ function WorkspaceTabs({ mode, onChange }: { mode: "conversation" | "image" | "v
         ["conversation", zh ? "对话" : "CHAT"],
         ["image", zh ? "图片" : "IMAGE"],
         ["video", zh ? "视频" : "VIDEO"],
+        ["automations", zh ? "已安排" : "SCHEDULED"],
       ] as const).map(([id, label]) => (
         <button
           key={id}
           onClick={() => onChange(id)}
           className={`flex h-8 items-center gap-1.5 rounded-full px-4 text-[12px] transition-colors ${mode === id ? "bg-acc text-base" : "text-dim hover:bg-high hover:text-fg2"}`}
         >
-          {id === "conversation" ? <Icon name="command" size={11} /> : id === "image" ? <Icon name="layers" size={11} /> : <Icon name="play" size={11} />}
+          {id === "conversation" ? <Icon name="command" size={11} /> : id === "image" ? <Icon name="layers" size={11} /> : id === "video" ? <Icon name="play" size={11} /> : <Icon name="clock" size={11} />}
           {label}
         </button>
       ))}

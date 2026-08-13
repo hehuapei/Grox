@@ -18,7 +18,7 @@ mod process_job;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
-    io::{Read as _, Write as _},
+    io::{Read as _, SeekFrom, Write as _},
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{
@@ -40,7 +40,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager};
 use toml_edit::{value as toml_value, Document, Item, Table, TableLike};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     process::{Child, ChildStdin, Command},
     sync::Mutex,
@@ -551,6 +551,7 @@ struct OpenAiModelsResponse {
 
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_STREAMABLE_PREVIEW_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_ACP_TEXT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_WORKSPACE_ENTRIES: usize = 2_000;
 static CONFIG_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -1328,6 +1329,7 @@ fn scrub_session_cache_dir(app: &tauri::AppHandle) {
 }
 
 const SESSION_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const PROMPT_QUEUES_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 fn session_cache_path(app: &tauri::AppHandle, id: &str) -> Result<PathBuf, String> {
     let safe = id
@@ -1377,6 +1379,72 @@ fn delete_session_cache(app: tauri::AppHandle, id: String) -> Result<(), String>
         fs::remove_file(&path).map_err(|error| format!("无法删除会话缓存：{error}"))?;
     }
     Ok(())
+}
+
+fn prompt_queues_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("prompt-queues.json"))
+        .map_err(|error| format!("无法定位提示队列文件：{error}"))
+}
+
+#[tauri::command]
+fn read_prompt_queues(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let path = prompt_queues_path(&app)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    read_bounded_text(&path, PROMPT_QUEUES_MAX_BYTES)
+        .map(|content| if content.trim().is_empty() { None } else { Some(content) })
+        .map_err(|error| format!("无法读取提示队列：{error}"))
+}
+
+#[tauri::command]
+fn write_prompt_queues(app: tauri::AppHandle, content: String) -> Result<(), String> {
+    if content.len() as u64 > PROMPT_QUEUES_MAX_BYTES {
+        return Err("提示队列不能超过 64 MB".into());
+    }
+    let value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|error| format!("提示队列必须是 JSON：{error}"))?;
+    if !value.is_object() {
+        return Err("提示队列必须是 JSON 对象".into());
+    }
+    let path = prompt_queues_path(&app)?;
+    atomic_write(&path, &content)?;
+    restrict_private_file(&path)
+}
+
+fn automations_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("automations.json"))
+        .map_err(|error| format!("无法定位自动化文件：{error}"))
+}
+
+#[tauri::command]
+fn read_automations(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    let path = automations_path(&app)?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    read_bounded_text(&path, 4 * 1024 * 1024)
+        .map(|content| if content.trim().is_empty() { None } else { Some(content) })
+        .map_err(|error| format!("无法读取自动化文件：{error}"))
+}
+
+#[tauri::command]
+fn write_automations(app: tauri::AppHandle, content: String) -> Result<(), String> {
+    if content.len() > 4 * 1024 * 1024 {
+        return Err("自动化文件不能超过 4 MB".into());
+    }
+    let value: serde_json::Value = serde_json::from_str(&content)
+        .map_err(|error| format!("自动化文件必须是 JSON：{error}"))?;
+    if !value.is_array() {
+        return Err("自动化文件必须是 JSON 数组".into());
+    }
+    let path = automations_path(&app)?;
+    atomic_write(&path, &content)?;
+    restrict_private_file(&path)
 }
 
 #[tauri::command]
@@ -1854,6 +1922,15 @@ fn preview_type(path: &Path) -> (&'static str, &'static str) {
         "webp" => ("image", "image/webp"),
         "svg" => ("image", "image/svg+xml"),
         "bmp" => ("image", "image/bmp"),
+        "mp4" | "m4v" => ("video", "video/mp4"),
+        "webm" => ("video", "video/webm"),
+        "mov" => ("video", "video/quicktime"),
+        "mp3" => ("audio", "audio/mpeg"),
+        "m4a" => ("audio", "audio/mp4"),
+        "wav" => ("audio", "audio/wav"),
+        "ogg" | "oga" => ("audio", "audio/ogg"),
+        "flac" => ("audio", "audio/flac"),
+        "pdf" => ("pdf", "application/pdf"),
         "txt" | "log" | "json" | "jsonl" | "toml" | "yaml" | "yml" | "xml" | "css" | "js"
         | "jsx" | "ts" | "tsx" | "rs" | "py" | "go" | "java" | "c" | "h" | "cpp" | "hpp" | "sh"
         | "ps1" => ("text", "text/plain"),
@@ -3343,8 +3420,108 @@ fn static_preview_mime(path: &Path) -> &'static str {
         "otf" => "font/otf",
         "wasm" => "application/wasm",
         "pdf" => "application/pdf",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "wav" => "audio/wav",
+        "ogg" | "oga" => "audio/ogg",
+        "flac" => "audio/flac",
         _ => "application/octet-stream",
     }
+}
+
+fn preview_byte_range(request: &str, length: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(value) = request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("range").then(|| value.trim())
+    }) else {
+        return Ok(None);
+    };
+    let value = value.strip_prefix("bytes=").ok_or(())?;
+    if value.contains(',') || length == 0 {
+        return Err(());
+    }
+    let (start, end) = value.split_once('-').ok_or(())?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| ())?;
+        if suffix == 0 {
+            return Err(());
+        }
+        let start = length.saturating_sub(suffix.min(length));
+        return Ok(Some((start, length - 1)));
+    }
+    let start = start.parse::<u64>().map_err(|_| ())?;
+    if start >= length {
+        return Err(());
+    }
+    let end = if end.is_empty() {
+        length - 1
+    } else {
+        end.parse::<u64>().map_err(|_| ())?.min(length - 1)
+    };
+    if end < start {
+        return Err(());
+    }
+    Ok(Some((start, end)))
+}
+
+fn static_preview_csp(mime: &str) -> &'static str {
+    // 预览 URL 自带不可猜测的文档令牌；仅允许 Grox 的生产协议和本地开发
+    // Origin 嵌入，避免 frame-ancestors 'none' 把 HTML/PDF 自己挡在 iframe 外。
+    if mime.starts_with("text/html") {
+        "default-src 'none'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'none'; font-src 'self' data:; media-src 'self' data: blob:; connect-src 'none'; frame-ancestors tauri: http://tauri.localhost https://tauri.localhost http://localhost:* http://127.0.0.1:*; form-action 'none'; base-uri 'none'; object-src 'none'"
+    } else {
+        "default-src 'none'; frame-ancestors tauri: http://tauri.localhost https://tauri.localhost http://localhost:* http://127.0.0.1:*"
+    }
+}
+
+async fn send_static_preview_file(
+    stream: &mut TcpStream,
+    path: &Path,
+    mime: &str,
+    length: u64,
+    range: Option<(u64, u64)>,
+    head_only: bool,
+) {
+    let (status, start, end) = match range {
+        Some((start, end)) => ("206 Partial Content", start, end),
+        None => ("200 OK", 0, length.saturating_sub(1)),
+    };
+    let body_length = if length == 0 { 0 } else { end - start + 1 };
+    let csp = static_preview_csp(mime);
+    let content_range = range
+        .map(|_| format!("Content-Range: bytes {start}-{end}/{length}\r\n"))
+        .unwrap_or_default();
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {body_length}\r\nAccept-Ranges: bytes\r\n{content_range}Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: {csp}\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(header.as_bytes()).await.is_err() || head_only || body_length == 0 {
+        let _ = stream.shutdown().await;
+        return;
+    }
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
+        let _ = stream.shutdown().await;
+        return;
+    };
+    if file.seek(SeekFrom::Start(start)).await.is_err() {
+        let _ = stream.shutdown().await;
+        return;
+    }
+    let mut remaining = body_length;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buffer.len() as u64) as usize;
+        let Ok(read) = file.read(&mut buffer[..want]).await else {
+            break;
+        };
+        if read == 0 || stream.write_all(&buffer[..read]).await.is_err() {
+            break;
+        }
+        remaining -= read as u64;
+    }
+    let _ = stream.shutdown().await;
 }
 
 async fn send_static_preview_response(
@@ -3354,11 +3531,7 @@ async fn send_static_preview_response(
     body: &[u8],
     head_only: bool,
 ) {
-    let csp = if mime.starts_with("text/html") {
-        "default-src 'none'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'none'; font-src 'self' data:; media-src 'self' data: blob:; connect-src 'none'; frame-ancestors 'none'; form-action 'none'; base-uri 'none'; object-src 'none'"
-    } else {
-        "default-src 'none'; frame-ancestors 'none'"
-    };
+    let csp = static_preview_csp(mime);
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: {csp}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -3500,7 +3673,16 @@ async fn handle_static_preview_request(
         .await;
         return;
     };
-    if metadata.len() > MAX_PREVIEW_BYTES {
+    let mime = static_preview_mime(&candidate);
+    let streamable = mime.starts_with("video/")
+        || mime.starts_with("audio/")
+        || mime == "application/pdf";
+    let max_bytes = if streamable {
+        MAX_STREAMABLE_PREVIEW_BYTES
+    } else {
+        MAX_PREVIEW_BYTES
+    };
+    if metadata.len() > max_bytes {
         send_static_preview_response(
             &mut stream,
             "413 Content Too Large",
@@ -3511,22 +3693,24 @@ async fn handle_static_preview_request(
         .await;
         return;
     }
-    let Ok(body) = fs::read(&candidate) else {
-        send_static_preview_response(
-            &mut stream,
-            "500 Internal Server Error",
-            "text/plain",
-            b"Read failed",
-            head_only,
-        )
-        .await;
-        return;
+    let range = match preview_byte_range(&request, metadata.len()) {
+        Ok(range) => range,
+        Err(()) => {
+            let header = format!(
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                metadata.len(),
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.shutdown().await;
+            return;
+        }
     };
-    send_static_preview_response(
+    send_static_preview_file(
         &mut stream,
-        "200 OK",
-        static_preview_mime(&candidate),
-        &body,
+        &candidate,
+        mime,
+        metadata.len(),
+        range,
         head_only,
     )
     .await;
@@ -3540,8 +3724,8 @@ async fn start_file_preview(
 ) -> Result<String, String> {
     let root = checked_workspace(&cwd)?;
     let file = checked_workspace_file(&root, &path)?;
-    if !file.is_file() || !matches!(preview_type(&file).0, "html") {
-        return Err("只能在浏览器预览 HTML 文件".into());
+    if !file.is_file() || !matches!(preview_type(&file).0, "html" | "video" | "audio" | "pdf") {
+        return Err("只能流式预览 HTML、视频、音频或 PDF 文件".into());
     }
     // Scope the static server to the HTML file's directory so a hostile page
     // cannot read unrelated workspace paths via the preview token.
@@ -3615,18 +3799,33 @@ fn read_preview_file(cwd: String, path: String) -> Result<PreviewFile, String> {
     if !metadata.is_file() {
         return Err("只能预览文件".into());
     }
-    if metadata.len() > MAX_PREVIEW_BYTES {
-        return Err("预览文件不能超过 16 MB".into());
-    }
     let (kind, mime) = preview_type(&file);
     if kind == "unsupported" {
         return Err("暂不支持预览该文件类型".into());
     }
-    let bytes = fs::read(&file).map_err(|error| format!("无法读取 {}：{error}", file.display()))?;
-    let content = if kind == "image" {
-        BASE64.encode(bytes)
+    let streamable = matches!(kind, "video" | "audio" | "pdf");
+    let max_bytes = if streamable {
+        MAX_STREAMABLE_PREVIEW_BYTES
     } else {
-        String::from_utf8(bytes).map_err(|_| "文件不是有效的 UTF-8 文本".to_string())?
+        MAX_PREVIEW_BYTES
+    };
+    if metadata.len() > max_bytes {
+        return Err(if streamable {
+            "媒体预览文件不能超过 4 GB".into()
+        } else {
+            "预览文件不能超过 16 MB".into()
+        });
+    }
+    let content = if streamable {
+        String::new()
+    } else {
+        let bytes = fs::read(&file)
+            .map_err(|error| format!("无法读取 {}：{error}", file.display()))?;
+        if kind == "image" {
+            BASE64.encode(bytes)
+        } else {
+            String::from_utf8(bytes).map_err(|_| "文件不是有效的 UTF-8 文本".to_string())?
+        }
     };
     Ok(PreviewFile {
         path: path_for_webview(&file),
@@ -4502,10 +4701,12 @@ fn open_file_with_application(cwd: String, path: String, application: String) ->
 /// suffix is chosen instead of overwriting an existing directory.
 #[tauri::command]
 fn create_permanent_worktree(cwd: String) -> Result<String, String> {
-    let root = checked_workspace(&cwd)?;
-    if !root.join(".git").exists() {
-        return Err("当前项目不是 Git 仓库，无法创建永久工作树".into());
-    }
+    let requested = checked_workspace(&cwd)?;
+    let top_level = git_text(&requested, &["rev-parse", "--show-toplevel"])
+        .map_err(|_| "当前项目不是 Git 仓库，无法创建永久工作树".to_string())?;
+    let root = PathBuf::from(top_level)
+        .canonicalize()
+        .map_err(|error| format!("无法解析 Git 仓库根目录：{error}"))?;
     let parent = root
         .parent()
         .ok_or_else(|| "无法确定工作树所在目录".to_string())?;
@@ -7038,6 +7239,10 @@ fn main() {
             read_session_cache,
             write_session_cache,
             delete_session_cache,
+            read_prompt_queues,
+            write_prompt_queues,
+            read_automations,
+            write_automations,
             delete_session_data,
             delete_project_session_data,
             scrub_session_cache_orphans,
@@ -8178,6 +8383,24 @@ UNRELATED=value
         assert!(is_media_https_host_allowed(Some("images.cdn.x.ai")));
         assert!(!is_media_https_host_allowed(Some("x.ai.evil.example")));
         assert!(!is_media_https_host_allowed(Some("evil.example")));
+    }
+
+    #[test]
+    fn preview_ranges_support_seek_suffix_and_reject_invalid_ranges() {
+        assert_eq!(
+            preview_byte_range("GET / HTTP/1.1\r\nRange: bytes=10-19\r\n", 100),
+            Ok(Some((10, 19)))
+        );
+        assert_eq!(
+            preview_byte_range("GET / HTTP/1.1\r\nrange: bytes=90-\r\n", 100),
+            Ok(Some((90, 99)))
+        );
+        assert_eq!(
+            preview_byte_range("GET / HTTP/1.1\r\nRange: bytes=-10\r\n", 100),
+            Ok(Some((90, 99)))
+        );
+        assert!(preview_byte_range("Range: bytes=100-101\r\n", 100).is_err());
+        assert!(preview_byte_range("Range: bytes=0-1,3-4\r\n", 100).is_err());
     }
 
     #[test]

@@ -16,10 +16,32 @@ export function StatusBar() {
   const session = useDesktop((s) => (s.activeId ? s.sessions[s.activeId] : null));
   const model = useDesktop((s) => s.model);
   const effort = useDesktop((s) => s.effort);
+  const runtimeConnection = useDesktop((s) => s.runtimeConnection);
   const workspace = useDesktop((s) => s.workspace);
   const [branch, setBranch] = useState<string | null>(null);
 
   const status = session?.status ?? "idle";
+  const presentation = runtimeConnection === "reconnecting"
+    ? { zh: "正在重连", en: "Reconnecting", tone: "text-gold", spin: "slow" as const }
+    : runtimeConnection === "offline"
+      ? { zh: "运行时离线", en: "Runtime offline", tone: "text-red", spin: false as const }
+      : runtimeConnection === "starting"
+        ? { zh: "正在连接", en: "Connecting", tone: "text-mute", spin: "slow" as const }
+        : status === "connecting"
+          ? { zh: "正在恢复", en: "Restoring", tone: "text-mute", spin: "slow" as const }
+          : status === "running"
+            ? { zh: "处理中", en: "Working", tone: "text-acc", spin: true as const }
+            : status === "stopping"
+              ? { zh: "正在停止", en: "Stopping", tone: "text-gold", spin: "slow" as const }
+              : status === "disconnected"
+                ? { zh: "连接已中断", en: "Disconnected", tone: "text-red", spin: false as const }
+                : status === "failed"
+                  ? { zh: "失败", en: "Failed", tone: "text-red", spin: false as const }
+                  : status === "awaiting_permission"
+                    ? { zh: "等待批准", en: "Awaiting approval", tone: "text-gold", spin: "slow" as const }
+                    : status === "awaiting_input"
+                      ? { zh: "等待输入", en: "Awaiting input", tone: "text-gold", spin: "slow" as const }
+                      : { zh: "已完成", en: "Completed", tone: "text-mute", spin: false as const };
   const usage = session?.usage;
   const ctxPct =
     usage && usage.contextMax > 0
@@ -47,21 +69,9 @@ export function StatusBar() {
   return (
     <footer className="flex h-8 shrink-0 items-center justify-between border-t border-line bg-panel px-3 text-[11px] text-dim select-none">
       <div className="flex items-center gap-2">
-        <BlackHole size={13} spin={status === "running"} />
-        <span
-          className={
-            status === "running"
-              ? "text-acc"
-            : status === "failed"
-              ? "text-red"
-              : status === "awaiting_permission" || status === "awaiting_input"
-                ? "text-gold"
-                : "text-mute"
-          }
-        >
-          {language === "zh-CN"
-            ? status === "running" ? "处理中" : status === "failed" ? "失败" : status === "awaiting_permission" ? "等待批准" : status === "awaiting_input" ? "等待输入" : "已完成"
-            : status === "running" ? "Working" : status === "failed" ? "Failed" : status === "awaiting_permission" ? "Awaiting approval" : status === "awaiting_input" ? "Awaiting input" : "Completed"}
+        <BlackHole size={13} spin={presentation.spin} />
+        <span className={presentation.tone}>
+          {language === "zh-CN" ? presentation.zh : presentation.en}
         </span>
         {branch && (
           <>

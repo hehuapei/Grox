@@ -249,10 +249,38 @@ export interface Usage {
   turns: number;
 }
 
-export type SessionStatus = "idle" | "running" | "awaiting_permission" | "awaiting_input" | "failed";
+export type SessionStatus =
+  | "connecting"
+  | "idle"
+  | "running"
+  | "awaiting_permission"
+  | "awaiting_input"
+  | "stopping"
+  | "disconnected"
+  | "failed";
 
 /** A terminal turn accepts a new prompt; `failed` remains visible until then. */
 export const isSessionTerminal = (status: SessionStatus) => status === "idle" || status === "failed";
+
+/** ACP 进程连接状态。它与单个会话的一轮是否结束是两条独立事实。 */
+export type RuntimeConnectionState = "starting" | "ready" | "reconnecting" | "offline";
+
+export type GroxErrorDomain = "protocol" | "operation" | "environment";
+
+/**
+ * 进入 UI 的稳定错误契约。`message` 面向用户，协议/环境细节留在 `detail`，
+ * 避免把所有失败都伪装成同一种“连接错误”。
+ */
+export interface GroxError {
+  domain: GroxErrorDomain;
+  code: string;
+  message: string;
+  recoverable: boolean;
+  fatal: boolean;
+  holdQueue: boolean;
+  action?: string;
+  detail?: string;
+}
 
 export interface SessionMeta {
   id: string;
@@ -441,7 +469,7 @@ export interface ConfigDocument {
 export interface PreviewFile {
   path: string;
   name: string;
-  kind: "markdown" | "html" | "image" | "text";
+  kind: "markdown" | "html" | "image" | "video" | "audio" | "pdf" | "text";
   mime: string;
   content: string;
   url?: string;
@@ -475,6 +503,7 @@ export type PermissionMode = "default" | "auto" | "bypass";
 /** Events a bridge pushes into the store. Wire-level naming kept close to ACP. */
 export type BridgeEvent =
   | { type: "auth_state"; state: AuthState }
+  | { type: "runtime_state"; state: RuntimeConnectionState }
   | { type: "model_state"; state: ModelState }
   | { type: "mode_state"; sessionId: string; mode: AgentMode }
   | { type: "available_commands"; sessionId: string; commands: SlashCommand[] }
@@ -495,7 +524,7 @@ export type BridgeEvent =
   | { type: "status"; sessionId: string; status: SessionStatus }
   | { type: "usage"; sessionId: string; usage: Usage }
   | { type: "runtime_notice"; notice: RuntimeNotice }
-  | { type: "error"; sessionId: string; message: string };
+  | { type: "error"; sessionId: string; error: GroxError };
 
 export interface RuntimeNotice {
   id: string;
@@ -508,5 +537,7 @@ export interface PromptOptions {
   model: string;
   effort: Effort;
   mode: AgentMode;
+  /** 随这一轮发送，避免共享 ACP 进程中的权限模式串到其它会话。 */
+  permissionMode?: PermissionMode;
   attachments?: PromptAttachment[];
 }

@@ -41,6 +41,7 @@ import type {
   SlashCommand,
   WorkflowRun,
   RuntimeNotice,
+  RuntimeConnectionState,
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
 import {
@@ -78,7 +79,24 @@ import {
   filterQueueGhostsByLiveText,
   nextLocalDrainIndex,
   moveQueueEntry,
+  rehomeHeldQueueForRecovery,
 } from "../lib/promptQueue";
+import {
+  loadPromptQueues,
+  loadPromptQueuesFromBrowser,
+  mergeHydratedPromptQueues,
+  persistPromptQueues,
+} from "../lib/promptQueuePersistence";
+import type { PersistedQueuedPrompt } from "../lib/promptQueuePersistence";
+import { formatGroxError, runtimeNoticeFromError, toGroxError } from "../lib/errorModel";
+import type { ErrorFallback } from "../lib/errorModel";
+import {
+  advanceAutomation,
+  dueAutomations,
+  loadAutomations,
+  persistAutomations,
+} from "../lib/automations";
+import type { Automation } from "../lib/automations";
 import {
   isComputerUseOperatorEnabled,
   setComputerUseHostEnvEnabled,
@@ -177,24 +195,13 @@ export interface SessionComposerState {
   permissionMode: PermissionMode;
 }
 
-export interface QueuedPrompt {
-  id: string;
-  text: string;
-  attachments: PromptAttachment[];
-  model: string;
-  effort: Effort;
-  mode: AgentMode;
-  permissionMode: PermissionMode;
-  createdAt: number;
-  source?: "local" | "cli";
-  state?: "queued" | "interjected" | "sending";
-  heldByCli?: boolean;
-}
+export type QueuedPrompt = PersistedQueuedPrompt;
 
 interface DesktopState {
   ready: boolean;
   startupError: string | null;
   runtimeNotices: RuntimeNotice[];
+  runtimeConnection: RuntimeConnectionState;
   auth: AuthState;
   bridgeKind: "mock" | "acp";
   workspace: string;
@@ -217,6 +224,8 @@ interface DesktopState {
   runtimeBusy: boolean;
   accountLoading: boolean;
   accountSetupOpen: boolean;
+  automations: Automation[];
+  automationRunningId: string | null;
 
   workspaceFiles: WorkspaceEntry[];
   workspaceDiffs: DiffHunk[];
@@ -295,6 +304,10 @@ interface DesktopState {
   deleteProviderProfile(id: string): Promise<void>;
   refreshRuntime(): Promise<void>;
   installOfficialRuntime(): Promise<void>;
+  saveAutomation(automation: Automation): void;
+  deleteAutomation(id: string): void;
+  setAutomationEnabled(id: string, enabled: boolean): void;
+  runAutomation(id: string): Promise<void>;
   setAccountSetupOpen(open: boolean): void;
   refreshWorkspaceFiles(): Promise<void>;
   refreshWorkspaceDiffs(): Promise<void>;
@@ -670,6 +683,8 @@ function providerDefaultModel(profile?: ProviderProfileSummary) {
 /* StrictMode mounts effects twice in dev — subscribe once, ever. */
 let bridgeSubscribed = false;
 let workspaceWatchTimer: number | undefined;
+let automationTimer: number | undefined;
+let automationRunnerBusy = false;
 let workspaceWatchTick = 0;
 let pendingLaunch: { text: string; attachments: PromptAttachment[] } | undefined;
 let providerRestoreGeneration = 0;
@@ -724,6 +739,25 @@ function blocksBeforePrompt(blocks: SessionBlock[], targetPromptIndex: number): 
 }
 
 export const useDesktop = create<DesktopState>((set, get) => {
+  const publishRuntimeError = (cause: unknown, fallback: ErrorFallback) => {
+    const notice = runtimeNoticeFromError(toGroxError(cause, fallback));
+    set((state) => ({
+      runtimeNotices: [...state.runtimeNotices.filter((item) => item.id !== notice.id), notice],
+    }));
+  };
+
+  const savePromptQueues = (queues: Record<string, QueuedPrompt[]>) => {
+    void persistPromptQueues(queues).catch((cause) => {
+      publishRuntimeError(cause, {
+        domain: "environment",
+        code: "PROMPT_QUEUE_WRITE_FAILED",
+        message: "提示队列未能写入本地磁盘",
+        recoverable: true,
+        action: "请检查应用数据目录的可用空间和写入权限",
+      });
+    });
+  };
+
   const drainPromptQueue = (sessionId: string) => {
     const state = get();
     const session = state.sessions[sessionId];
@@ -735,7 +769,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
     const liveText = lastUser && lastUser.type === "user" ? lastUser.text : null;
     queue = filterQueueGhostsByLiveText(queue, liveText);
     if (queue.length !== (state.promptQueues[sessionId] ?? []).length) {
-      set({ promptQueues: { ...state.promptQueues, [sessionId]: queue } });
+      const promptQueues = { ...state.promptQueues, [sessionId]: queue };
+      set({ promptQueues });
+      savePromptQueues(promptQueues);
     }
     if (!session || !shouldDrainLocalQueue({
       status: session.status,
@@ -771,14 +807,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
       },
     };
     persistSessionComposers(sessionComposers);
+    const promptQueues = { ...state.promptQueues, [sessionId]: rest };
     set({
-      promptQueues: { ...state.promptQueues, [sessionId]: rest },
+      promptQueues,
       sessionComposers,
     });
+    savePromptQueues(promptQueues);
     const accepted = get().sendPrompt(next.text, next.attachments, sessionId, next.mode);
     if (!accepted) {
       const current = get().promptQueues[sessionId] ?? [];
-      set({ promptQueues: { ...get().promptQueues, [sessionId]: [next, ...current] } });
+      const restoredQueues = { ...get().promptQueues, [sessionId]: [next, ...current] };
+      set({ promptQueues: restoredQueues });
+      savePromptQueues(restoredQueues);
     }
   };
 
@@ -808,6 +848,122 @@ export const useDesktop = create<DesktopState>((set, get) => {
       sessionComposers,
       ...(state.activeId === sessionId ? { model } : {}),
     });
+  };
+
+  const executeAutomation = async (id: string, manual = false) => {
+    if (automationRunnerBusy) return;
+    const state = get();
+    const automation = state.automations.find((item) => item.id === id);
+    if (!automation || !automation.enabled) return;
+    const runtimeBusy = Object.values(state.sessions).some((session) => (
+      !isSessionTerminal(session.status)
+    ));
+    // 自动化不能抢占正在流式、门禁、恢复或停止中的会话。
+    if (runtimeBusy || state.providerSwitching || state.runtimeConnection !== "ready") {
+      if (manual) {
+        const error = toGroxError("已有会话或运行时正在忙碌", {
+          domain: "operation",
+          code: "AUTOMATION_RUNTIME_BUSY",
+          message: "现在不能启动已安排任务",
+          recoverable: true,
+          action: "等待当前回合、门禁、恢复或供应商切换结束后重试",
+        });
+        const notice = runtimeNoticeFromError(error);
+        set((latest) => ({ runtimeNotices: [...latest.runtimeNotices.filter((item) => item.id !== notice.id), notice] }));
+      }
+      return;
+    }
+
+    automationRunnerBusy = true;
+    set({ automationRunningId: id });
+    const claimed = advanceAutomation(automation);
+    let automations = state.automations.map((item) => item.id === id ? claimed : item);
+    set({ automations });
+    try {
+      // 先原子认领再创建会话；认领落盘失败时绝不能继续执行，否则崩溃后会重复触发。
+      await persistAutomations(automations);
+      const sessionId = await bridge.newBackgroundSession(automation.cwd);
+      const created = get().sessions[sessionId];
+      if (created) {
+        const updated: Session = {
+          ...created,
+          title: automation.title,
+          status: "running",
+          updatedAt: Date.now(),
+          blocks: [{ type: "user", id: uid(), text: automation.prompt, ts: Date.now() }],
+        };
+        const sessionIndex = get().sessionIndex.map((item) => item.id === sessionId ? {
+          ...item,
+          title: automation.title,
+          lastStatus: "running" as const,
+          updatedAt: updated.updatedAt,
+        } : item);
+        const sessionComposers = {
+          ...get().sessionComposers,
+          [sessionId]: {
+            text: "",
+            attachments: [],
+            model: automation.model,
+            effort: automation.effort,
+            mode: automation.mode,
+            permissionMode: automation.permissionMode,
+          },
+        };
+        persistSessionCatalog(sessionIndex);
+        persistSessionComposers(sessionComposers);
+        set({
+          sessions: { ...get().sessions, [sessionId]: updated },
+          sessionIndex,
+          sessionComposers,
+        });
+        void bridge.renameSession(sessionId, automation.title).catch((cause) => {
+          publishRuntimeError(cause, {
+            domain: "operation",
+            code: "AUTOMATION_RENAME_FAILED",
+            message: "自动化会话已启动，但标题同步失败",
+            recoverable: true,
+            action: "可以在会话侧栏中手动重命名",
+          });
+        });
+      }
+      automations = get().automations.map((item) => item.id === id ? {
+        ...item,
+        lastSessionId: sessionId,
+        lastError: undefined,
+      } : item);
+      set({ automations });
+      await persistAutomations(automations);
+      void bridge.prompt(sessionId, automation.prompt, {
+        model: automation.model,
+        effort: automation.effort,
+        mode: automation.mode,
+        permissionMode: automation.permissionMode,
+      });
+      void notifyDesktop("已安排任务已启动", automation.title);
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : String(cause);
+      automations = get().automations.map((item) => item.id === id ? { ...item, lastError: message } : item);
+      set({ automations });
+      await persistAutomations(automations).catch(() => {});
+      const error = toGroxError(cause, {
+        domain: "environment",
+        code: "AUTOMATION_START_FAILED",
+        message: `已安排任务“${automation.title}”启动失败`,
+        recoverable: true,
+        action: "检查项目路径、CLI 与认证；任务不会在同一分钟反复重试",
+      });
+      const notice = runtimeNoticeFromError(error);
+      set((latest) => ({ runtimeNotices: [...latest.runtimeNotices.filter((item) => item.id !== notice.id), notice] }));
+    } finally {
+      automationRunnerBusy = false;
+      set({ automationRunningId: null });
+    }
+  };
+
+  const runDueAutomation = () => {
+    if (automationRunnerBusy) return;
+    const due = dueAutomations(get().automations)[0];
+    if (due) void executeAutomation(due.id);
   };
 
   const clearContinuationSettle = (sessionId: string) => {
@@ -863,7 +1019,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           ...get().sessions,
           [sessionId]: {
             ...current,
-            status: "idle",
+            status: "connecting",
             updatedAt: Date.now(),
             blocks: settleLiveTextBlocks(current.blocks),
           },
@@ -923,6 +1079,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
         if (!e.state.required && !e.state.inProgress && get().historySyncedAt === 0 && !get().historySyncing) {
           window.setTimeout(() => void get().refreshHistory(), 250);
         }
+        break;
+      case "runtime_state":
+        set({ runtimeConnection: e.state });
         break;
       case "model_state":
         {
@@ -1136,6 +1295,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             model: composer.model,
             effort: composer.effort,
             mode: composer.mode,
+            permissionMode: composer.permissionMode,
             attachments: launch.attachments,
           });
         }
@@ -1278,19 +1438,54 @@ export const useDesktop = create<DesktopState>((set, get) => {
         void notifyDesktop(e.notice.title, e.notice.message);
         break;
       case "error":
+        {
+          const automation = get().automations.find((item) => item.lastSessionId === e.sessionId);
+          if (automation) {
+            const automations = get().automations.map((item) => item.id === automation.id
+              ? { ...item, lastError: formatGroxError(e.error) }
+              : item);
+            set({ automations });
+            void persistAutomations(automations).catch(() => {});
+          }
+        }
+        if (e.error.holdQueue) {
+          suppressedQueueDrain.add(e.sessionId);
+          const state = get();
+          const recoverable = (state.promptQueues[e.sessionId] ?? []).map((item) => ({
+            ...item,
+            state: item.state ?? ("queued" as const),
+          }));
+          const promptQueues = {
+            ...state.promptQueues,
+            [e.sessionId]: rehomeHeldQueueForRecovery(recoverable),
+          };
+          set({
+            promptQueues,
+            queueDrainParked: nextQueueDrainParked(state.queueDrainParked, e.sessionId, true),
+          });
+          savePromptQueues(promptQueues);
+        }
         withSession(
           e.sessionId,
           (s) => ({
             ...s,
-            status: "failed",
+            status: e.error.fatal ? "failed" : s.status,
             blocks: [
               ...s.blocks,
-              { type: "system", id: uid(), text: e.message, ts: Date.now(), kind: "error" },
+              { type: "system", id: uid(), text: formatGroxError(e.error), ts: Date.now(), kind: "error" },
             ],
           }),
           true,
-          false,
+          e.error.fatal ? false : undefined,
         );
+        if (e.error.domain === "environment") {
+          const notice = runtimeNoticeFromError(e.error);
+          set((state) => ({
+            runtimeNotices: state.runtimeNotices.some((item) => item.id === notice.id)
+              ? state.runtimeNotices
+              : [...state.runtimeNotices, notice],
+          }));
+        }
         break;
     }
   };
@@ -1335,6 +1530,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     ready: false,
     startupError: null,
     runtimeNotices: [],
+    runtimeConnection: bridge.kind === "mock" ? "ready" : "starting",
     auth: { required: false, inProgress: false },
     bridgeKind: bridge.kind,
     workspace: DEMO_CWD,
@@ -1356,6 +1552,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
     accountLoading: false,
     accountSetupOpen:
       localStorage.getItem("grox.accountSetupComplete") !== "1" && bridge.kind !== "mock",
+    automations: [],
+    automationRunningId: null,
     workspaceFiles: [],
     workspaceDiffs: [],
     workspaceDiffReady: false,
@@ -1377,7 +1575,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     computerUseEnabled: isComputerUseOperatorEnabled(),
     browserUseEnabled: localStorage.getItem("grox.browserUseEnabled") !== "0",
     sessionComposers: loadSessionComposers(),
-    promptQueues: {},
+    promptQueues: loadPromptQueuesFromBrowser(),
     pendingSessionModels: {},
     queueDrainParked: {} as Record<string, boolean>,
 
@@ -1441,10 +1639,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
             const feCu = localStorage.getItem("grox.computerUseEnabled") !== "0";
             void invoke("host_prefs_migrate_computer_use", { feEnabled: feCu }).catch(() => {});
 
-            const [hostPrefs, envOn, env] = await Promise.all([
+            const [hostPrefs, envOn, env, promptQueueLoad, automationLoad] = await Promise.all([
               invoke<{ computerUseEnabled?: boolean }>("host_prefs_get").catch(() => null),
               invoke<boolean>("computer_use_env_enabled").catch(() => false),
               invoke<{ appVersion?: string }>("desktop_environment").catch(() => null),
+              loadPromptQueues().then(
+                (value) => ({ value, error: null as unknown }),
+                (error: unknown) => ({ value: null, error }),
+              ),
+              loadAutomations().then(
+                (value) => ({ value, error: null as unknown }),
+                (error: unknown) => ({ value: null, error }),
+              ),
             ]);
             if (hostPrefs && typeof hostPrefs.computerUseEnabled === "boolean") {
               setComputerUseHostPrefsEnabled(hostPrefs.computerUseEnabled);
@@ -1454,7 +1660,31 @@ export const useDesktop = create<DesktopState>((set, get) => {
               upgradeForceOfflineRescan = true;
               upgradeForceRescanned.clear();
             }
-            set({ computerUseEnabled: isComputerUseOperatorEnabled() });
+            set((state) => ({
+              computerUseEnabled: isComputerUseOperatorEnabled(),
+              ...(promptQueueLoad.value
+                ? { promptQueues: mergeHydratedPromptQueues(promptQueueLoad.value, state.promptQueues) }
+                : {}),
+              ...(automationLoad.value ? { automations: automationLoad.value } : {}),
+            }));
+            for (const [code, message, error] of [
+              ["PROMPT_QUEUE_READ_FAILED", "无法恢复已持久化的提示队列", promptQueueLoad.error],
+              ["AUTOMATION_READ_FAILED", "无法恢复已安排任务", automationLoad.error],
+            ] as const) {
+              if (!error) continue;
+              const notice = runtimeNoticeFromError(toGroxError(error, {
+                domain: "environment",
+                code,
+                message,
+                recoverable: true,
+                action: "请检查应用数据目录的文件权限或磁盘状态",
+              }));
+              set((state) => ({ runtimeNotices: [...state.runtimeNotices.filter((item) => item.id !== notice.id), notice] }));
+            }
+            if (automationTimer === undefined) {
+              automationTimer = window.setInterval(runDueAutomation, 30_000);
+              window.setTimeout(runDueAutomation, 2_000);
+            }
           } catch {
             // Host prefs are non-fatal.
           }
@@ -1598,7 +1828,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
       // Never leave activeId set with sessions[id] missing — that paints the
       // infinite black "RESTORING MISSION" spinner when cache/ACP is slow.
       if (!existing && meta) {
-        existing = sessionShellFromMeta(meta, meta.lastStatus === "failed" ? "failed" : "idle");
+        const shellStatus = meta.lastStatus && !isSessionTerminal(meta.lastStatus)
+          ? "disconnected"
+          : meta.lastStatus === "failed"
+            ? "failed"
+            : "idle";
+        existing = sessionShellFromMeta(meta, shellStatus);
         set({
           activeId: id,
           view: "session",
@@ -2254,6 +2489,55 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
     },
 
+    saveAutomation(automation) {
+      const automations = [
+        ...get().automations.filter((item) => item.id !== automation.id),
+        automation,
+      ].sort((a, b) => a.nextRunAt - b.nextRunAt);
+      set({ automations });
+      void persistAutomations(automations).catch((cause) => {
+        publishRuntimeError(cause, {
+          domain: "environment",
+          code: "AUTOMATION_WRITE_FAILED",
+          message: "自动化未能写入本地磁盘",
+          recoverable: true,
+          action: "当前进程仍保留任务；请检查磁盘空间和应用数据目录权限",
+        });
+      });
+    },
+
+    deleteAutomation(id) {
+      const automations = get().automations.filter((item) => item.id !== id);
+      set({ automations });
+      void persistAutomations(automations).catch((cause) => {
+        publishRuntimeError(cause, {
+          domain: "environment",
+          code: "AUTOMATION_DELETE_WRITE_FAILED",
+          message: "自动化删除结果未能写入本地磁盘",
+          recoverable: true,
+          action: "任务可能在重启后重新出现；请检查应用数据目录权限后再次删除",
+        });
+      });
+    },
+
+    setAutomationEnabled(id, enabled) {
+      const automations = get().automations.map((item) => item.id === id ? { ...item, enabled } : item);
+      set({ automations });
+      void persistAutomations(automations).catch((cause) => {
+        publishRuntimeError(cause, {
+          domain: "environment",
+          code: "AUTOMATION_STATE_WRITE_FAILED",
+          message: "自动化启停状态未能写入本地磁盘",
+          recoverable: true,
+          action: "当前进程已更新；重启前请检查应用数据目录权限",
+        });
+      });
+    },
+
+    async runAutomation(id) {
+      await executeAutomation(id, true);
+    },
+
     setAccountSetupOpen: (accountSetupOpen) => set({ accountSetupOpen }),
 
     async refreshWorkspaceFiles() {
@@ -2321,7 +2605,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           cwd: get().workspace,
           path,
         });
-        if (previewFile.kind === "html") {
+        if (["html", "video", "audio", "pdf"].includes(previewFile.kind)) {
           const url = await invoke<string>("start_file_preview", {
             cwd: get().workspace,
             path,
@@ -2354,10 +2638,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
       delete nextComposers[id];
       const nextWorkflows = { ...workflows };
       delete nextWorkflows[id];
+      const promptQueues = { ...get().promptQueues };
+      delete promptQueues[id];
       const pendingSessionModels = { ...get().pendingSessionModels };
       delete pendingSessionModels[id];
       persistSessionComposers(nextComposers);
       persistWorkflowRuns(nextWorkflows);
+      savePromptQueues(promptQueues);
       const nextIndex = sessionIndex.filter((m) => m.id !== id);
       persistSessionCatalog(nextIndex);
       set({
@@ -2365,6 +2652,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         sessions: rest,
         sessionComposers: nextComposers,
         workflows: nextWorkflows,
+        promptQueues,
         pendingSessionModels,
         startupError: null,
         ...(activeId === id ? { activeId: null, view: "home" as View } : {}),
@@ -2486,7 +2774,15 @@ export const useDesktop = create<DesktopState>((set, get) => {
         const path = await invoke<string>("create_permanent_worktree", { cwd: meta.cwd });
         const session = get().sessions[id];
         const lastUser = [...(session?.blocks ?? [])].reverse().find((block) => block.type === "user");
-        const text = `请在这个新的工作树中继续处理任务：${lastUser?.type === "user" ? lastUser.text : meta.title}`;
+        const lastAssistant = [...(session?.blocks ?? [])].reverse().find((block) => block.type === "assistant");
+        const text = [
+          `请在这个隔离的 Git 工作树中继续原会话 ${id} 的任务。`,
+          `原始请求：${lastUser?.type === "user" ? lastUser.text : meta.title}`,
+          lastAssistant?.type === "assistant"
+            ? `上一会话的最新结果：${lastAssistant.text.slice(-2_000)}`
+            : "",
+          "先检查当前分支与工作区状态，再继续修改；不要假设原工作树中的未提交改动已出现在这里。",
+        ].filter(Boolean).join("\n\n");
         await get().setWorkspace(path);
         await get().newSession({ text });
       } catch (error) {
@@ -2585,10 +2881,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
           createdAt: Date.now(),
         };
         persistSessionComposers(nextComposers);
+        const promptQueues = { ...get().promptQueues, [session.id]: [...queue, queued] };
         set({
           sessionComposers: nextComposers,
-          promptQueues: { ...get().promptQueues, [session.id]: [...queue, queued] },
+          promptQueues,
         });
+        savePromptQueues(promptQueues);
         return true;
       }
       suppressedQueueDrain.delete(session.id);
@@ -2650,6 +2948,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         model: composer.model,
         effort: composer.effort,
         mode: composer.mode,
+        permissionMode: composer.permissionMode,
         attachments,
       });
       return true;
@@ -2692,7 +2991,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
           model: composer.model, effort: composer.effort, mode: composer.mode,
           permissionMode: composer.permissionMode, createdAt: Date.now(),
         };
-        set({ promptQueues: { ...get().promptQueues, [sessionId]: [queued, ...queue] } });
+        const promptQueues = { ...get().promptQueues, [sessionId]: [queued, ...queue] };
+        set({ promptQueues });
+        savePromptQueues(promptQueues);
         const nextComposers = {
           ...get().sessionComposers,
           [sessionId]: { ...composer, text: "", attachments: [] },
@@ -2708,44 +3009,50 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     removeQueuedPrompt(sessionId, queueId) {
       const queue = get().promptQueues[sessionId] ?? [];
-      set({ promptQueues: { ...get().promptQueues, [sessionId]: queue.filter((item) => item.id !== queueId) } });
+      const promptQueues = { ...get().promptQueues, [sessionId]: queue.filter((item) => item.id !== queueId) };
+      set({ promptQueues });
+      savePromptQueues(promptQueues);
     },
 
     updateQueuedPrompt(sessionId, queueId, text) {
       const queue = get().promptQueues[sessionId] ?? [];
-      set({
-        promptQueues: {
+      const promptQueues = {
           ...get().promptQueues,
           [sessionId]: queue.map((item) => item.id === queueId ? { ...item, text } : item),
-        },
-      });
+      };
+      set({ promptQueues });
+      savePromptQueues(promptQueues);
     },
 
     moveQueuedPrompt(sessionId, queueId, direction) {
       const queue = get().promptQueues[sessionId] ?? [];
       const index = queue.findIndex((item) => item.id === queueId);
-      set({ promptQueues: { ...get().promptQueues, [sessionId]: moveQueueEntry(queue, index, direction) } });
+      const promptQueues = { ...get().promptQueues, [sessionId]: moveQueueEntry(queue, index, direction) };
+      set({ promptQueues });
+      savePromptQueues(promptQueues);
     },
 
     moveQueuedAttachment(sessionId, queueId, attachmentId, direction) {
       const queue = get().promptQueues[sessionId] ?? [];
-      set({
-        promptQueues: {
+      const promptQueues = {
           ...get().promptQueues,
           [sessionId]: queue.map((item) => {
             if (item.id !== queueId) return item;
             const index = item.attachments.findIndex((attachment) => attachment.id === attachmentId);
             return { ...item, attachments: moveQueueEntry(item.attachments, index, direction) };
           }),
-        },
-      });
+      };
+      set({ promptQueues });
+      savePromptQueues(promptQueues);
     },
 
     clearPromptQueue(sessionId) {
       const id = sessionId ?? get().activeId;
       if (!id) return;
       suppressedQueueDrain.delete(id);
-      set({ promptQueues: { ...get().promptQueues, [id]: [] } });
+      const promptQueues = { ...get().promptQueues, [id]: [] };
+      set({ promptQueues });
+      savePromptQueues(promptQueues);
     },
 
     stop() {
@@ -2755,20 +3062,20 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({ queueDrainParked: nextQueueDrainParked(queueDrainParked, activeId, true) });
         bridge.cancel(activeId);
         const session = sessions[activeId];
-        if (session && promptReturnedSessions.has(activeId)) {
+        if (session) {
+          const returned = promptReturnedSessions.has(activeId);
           set({
             sessions: {
               ...get().sessions,
               [activeId]: {
                 ...session,
-                status: "idle",
+                status: returned ? "idle" : "stopping",
                 updatedAt: Date.now(),
-                blocks: settleLiveProcessBlocks(session.blocks),
+                blocks: returned ? settleLiveProcessBlocks(session.blocks) : session.blocks,
               },
             },
           });
         }
-        markPromptInFlight(activeId);
       }
     },
 

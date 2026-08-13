@@ -2,7 +2,12 @@ import type { Session, SessionBlock, SessionStatus } from "../bridge/types";
 
 /** True when the live session must not be forced idle by a disk merge. */
 export function isLiveBusyStatus(status: SessionStatus | undefined): boolean {
-  return status === "running" || status === "awaiting_permission" || status === "awaiting_input";
+  return status === "connecting"
+    || status === "running"
+    || status === "awaiting_permission"
+    || status === "awaiting_input"
+    || status === "stopping"
+    || status === "disconnected";
 }
 
 /**

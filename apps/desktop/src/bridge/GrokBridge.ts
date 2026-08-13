@@ -94,6 +94,9 @@ export interface GrokBridge {
   /** ACP: session/new — emits session_ready. */
   newSession(cwd: string): Promise<void>;
 
+  /** 为自动化创建不抢占当前视图的会话，并返回 Agent 会话 ID。 */
+  newBackgroundSession(cwd: string): Promise<string>;
+
   /** ACP: session/load — emits session_ready with the restored transcript. */
   loadSession(id: string, options?: { background?: boolean }): Promise<void>;
 

@@ -50,6 +50,21 @@ describe("deriveSessionSnapshot", () => {
       busy: false,
       sendable: true,
     });
+    expect(deriveSessionSnapshot({ status: "connecting", blocks: [] })).toMatchObject({
+      phase: "connecting",
+      busy: true,
+      sendable: false,
+    });
+    expect(deriveSessionSnapshot({ status: "stopping", blocks: [] })).toMatchObject({
+      phase: "stopping",
+      busy: true,
+      sendable: false,
+    });
+    expect(deriveSessionSnapshot({ status: "disconnected", blocks: [] })).toMatchObject({
+      phase: "disconnected",
+      busy: true,
+      sendable: false,
+    });
   });
 });
 

@@ -11,10 +11,13 @@ import { isSessionTerminal } from "../bridge/types";
 import { isOpenToolStatus } from "./promptTurnTimeout";
 
 export type SessionPhase =
+  | "connecting"
   | "idle"
   | "working"
   | "waiting_permission"
   | "waiting_input"
+  | "stopping"
+  | "disconnected"
   | "failed";
 
 export interface SessionSnapshot {
@@ -98,7 +101,13 @@ export function deriveSessionSnapshot(args: {
   const status = reconcileIncomingStatus(blocks, rawStatus, rawStatus);
   const session = { id: "snapshot", status, blocks } as Session;
   const busy = !isSessionTerminal(status);
-  const phase: SessionPhase = status === "failed"
+  const phase: SessionPhase = status === "connecting"
+    ? "connecting"
+    : status === "stopping"
+      ? "stopping"
+      : status === "disconnected"
+        ? "disconnected"
+        : status === "failed"
     ? "failed"
     : status === "awaiting_permission"
       ? "waiting_permission"

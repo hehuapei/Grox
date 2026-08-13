@@ -54,6 +54,13 @@ import {
   promptTurnTimeoutMessage,
   shouldFirePromptStallWatchdog,
 } from "../lib/promptTurnTimeout";
+import {
+  formatGroxError,
+  groxFailure,
+  runtimeNoticeFromError,
+  toGroxError,
+} from "../lib/errorModel";
+import type { ErrorFallback } from "../lib/errorModel";
 
 export const ACP_METHODS = {
   initialize: "initialize",
@@ -963,6 +970,7 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
     case "workflow_update":
     case "workflow_trace_update":
     case "runtime_notice":
+    case "runtime_state":
       return session;
     case "session_meta":
       return { ...session, ...event.patch };
@@ -1044,10 +1052,10 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
     case "error":
       return {
         ...session,
-        status: "failed",
+        status: event.error.fatal ? "failed" : session.status,
         blocks: [
           ...session.blocks,
-          { type: "system", id: uid(), text: event.message, ts: Date.now(), kind: "error" },
+          { type: "system", id: uid(), text: formatGroxError(event.error), ts: Date.now(), kind: "error" },
         ],
       };
     case "session_ready":
@@ -1079,6 +1087,7 @@ export class AcpBridge implements GrokBridge {
   private promptRpcBySession = new Map<string, RpcId>();
   private sessionSetModelUnsupported = false;
   private activePromptSessions = new Set<string>();
+  private stoppingSessions = new Set<string>();
   private promptDrainWaiters = new Set<() => void>();
   private knownSessions = new Set<string>();
   private loadPromises = new Map<string, Promise<void>>();
@@ -1106,6 +1115,7 @@ export class AcpBridge implements GrokBridge {
   private runtimeCommands: SlashCommand[] = [];
   private runtimeCommandTags = new Map<string, string>();
   private permissionMode: PermissionMode = readStoredPermissionMode(localStorage.getItem("grok.permissionMode"));
+  private pendingPermissionModeSync: PermissionMode | null = null;
   private computerUseEnabled = localStorage.getItem("grox.computerUseEnabled") !== "0";
   private browserUseEnabled = localStorage.getItem("grox.browserUseEnabled") !== "0";
   private workspace = "";
@@ -1157,6 +1167,12 @@ export class AcpBridge implements GrokBridge {
   private setAuthState(patch: Partial<AuthState>) {
     this.authState = { ...this.authState, ...patch };
     this.emit({ type: "auth_state", state: { ...this.authState } });
+  }
+
+  private emitError(sessionId: string, cause: unknown, fallback: ErrorFallback) {
+    const error = toGroxError(cause, fallback);
+    this.emit({ type: "error", sessionId, error });
+    return error;
   }
 
   private emit(event: BridgeEvent) {
@@ -1243,6 +1259,7 @@ export class AcpBridge implements GrokBridge {
   }
 
   private async connect(): Promise<void> {
+    this.emit({ type: "runtime_state", state: "starting" });
     const environment = await invoke<DesktopEnvironment>("desktop_environment");
     this.workspace = localStorage.getItem("grok.workspace") ?? environment.defaultWorkspace;
 
@@ -1260,7 +1277,23 @@ export class AcpBridge implements GrokBridge {
       }),
     );
 
-    await this.initializeAgent();
+    try {
+      await this.initializeAgent();
+      this.emit({ type: "runtime_state", state: "ready" });
+    } catch (error) {
+      this.emit({ type: "runtime_state", state: "offline" });
+      this.emit({
+        type: "runtime_notice",
+        notice: runtimeNoticeFromError(toGroxError(error, {
+          domain: "environment",
+          code: "ACP_START_FAILED",
+          message: "无法启动或初始化 Grok Build CLI",
+          recoverable: true,
+          action: "请检查 CLI 安装、认证与当前工作目录后重试",
+        })),
+      });
+      throw error;
+    }
   }
 
   private async initializeAgent(): Promise<void> {
@@ -1320,6 +1353,7 @@ export class AcpBridge implements GrokBridge {
   }
 
   private async restartAgent(): Promise<void> {
+    this.emit({ type: "runtime_state", state: "starting" });
     this.flushStreamAppends();
     this.flushToolPatches();
     const error = new Error("模型服务已切换，请重新发送尚未完成的请求");
@@ -1345,7 +1379,13 @@ export class AcpBridge implements GrokBridge {
     this.runtimeCommandTags.clear();
     const next = this.initializeAgent();
     this.boot = next;
-    await next;
+    try {
+      await next;
+      this.emit({ type: "runtime_state", state: "ready" });
+    } catch (error) {
+      this.emit({ type: "runtime_state", state: "offline" });
+      throw error;
+    }
   }
 
   private async waitForActivePrompts(): Promise<void> {
@@ -1360,6 +1400,11 @@ export class AcpBridge implements GrokBridge {
     if (this.activePromptSessions.size !== 0) return;
     for (const resolve of this.promptDrainWaiters) resolve();
     this.promptDrainWaiters.clear();
+    if (this.pendingPermissionModeSync) {
+      const mode = this.pendingPermissionModeSync;
+      this.pendingPermissionModeSync = null;
+      this.syncPermissionMode(mode);
+    }
   }
 
   private async configureAuthentication(responseValue: unknown) {
@@ -1430,49 +1475,105 @@ export class AcpBridge implements GrokBridge {
     const message = `Grok Agent 已退出${payload.code == null ? "" : `（代码 ${payload.code}）`}${
       diagnostic ? `：${diagnostic}` : ""
     }`;
+    const affected = [...this.knownSessions];
+    const interrupted = new Set(
+      affected.filter((sessionId) => this.activePromptSessions.has(sessionId)),
+    );
+    for (const sessionId of affected) {
+      this.emit({ type: "status", sessionId, status: "disconnected" });
+    }
+    for (const interaction of this.interactions.values()) {
+      if (interaction.kind === "question") {
+        this.emit({
+          type: "question_resolved",
+          sessionId: interaction.sessionId,
+          blockId: interaction.blockId,
+          response: { outcome: "cancelled" },
+        });
+      } else {
+        this.emit({
+          type: "permission_resolved",
+          sessionId: interaction.sessionId,
+          blockId: interaction.blockId,
+          option: "deny",
+        });
+      }
+    }
+    this.interactions.clear();
+    const exitFailure = groxFailure({
+      domain: "environment",
+      code: "ACP_PROCESS_EXITED",
+      message,
+      recoverable: true,
+      fatal: true,
+      holdQueue: true,
+      action: "Agent 重连后检查最后一轮结果，再决定是否重新发送",
+    });
     for (const request of this.pending.values()) {
       if (request.timeoutId !== undefined) window.clearTimeout(request.timeoutId);
-      request.reject(new Error(message));
+      request.reject(exitFailure);
     }
     this.pending.clear();
-    const affected = [...this.knownSessions];
     this.knownSessions.clear();
     this.loadPromises.clear();
     this.cursors.clear();
     this.sessionOptions.clear();
-    this.beginReconnect(affected, message);
+    this.beginReconnect(affected, interrupted, message);
   }
 
-  private beginReconnect(sessionIds: string[], reason: string) {
+  private beginReconnect(sessionIds: string[], interrupted: ReadonlySet<string>, reason: string) {
     if (this.reconnecting) return;
+    this.emit({ type: "runtime_state", state: "reconnecting" });
     const reconnect = (async () => {
       let lastError = reason;
       for (let attempt = 1; attempt <= 2; attempt += 1) {
-        this.setAuthState({ inProgress: true, error: `Agent 异常退出，正在自动重连（${attempt}/2）…` });
         await new Promise((resolve) => window.setTimeout(resolve, attempt * 800));
         try {
           await this.initializeAgent();
-          this.setAuthState({ inProgress: false, error: undefined });
+          this.emit({ type: "runtime_state", state: "ready" });
           for (const sessionId of sessionIds) {
             this.emit({
               type: "block_add",
               sessionId,
               block: { type: "system", id: uid(), text: "Agent 已自动重连；下次发送会重新绑定会话", ts: Date.now(), kind: "info" },
             });
-            this.emit({ type: "status", sessionId, status: "idle" });
+            this.emit({
+              type: "status",
+              sessionId,
+              status: interrupted.has(sessionId) ? "failed" : "idle",
+            });
           }
           return;
         } catch (error) {
           lastError = errorText(error);
         }
       }
-      this.setAuthState({ inProgress: false, error: `Agent 自动重连失败：${lastError}` });
-      for (const sessionId of sessionIds) this.emit({ type: "error", sessionId, message: lastError });
+      this.emit({ type: "runtime_state", state: "offline" });
+      for (const sessionId of sessionIds) {
+        this.emitError(sessionId, lastError, {
+          domain: "environment",
+          code: "ACP_RECONNECT_FAILED",
+          message: `Agent 自动重连失败：${lastError}`,
+          recoverable: true,
+          fatal: true,
+          holdQueue: true,
+          action: "检查 Grok Build CLI 与网络后重新发送",
+        });
+      }
       throw new Error(lastError);
     })();
-    this.reconnecting = reconnect.finally(() => { this.reconnecting = null; });
-    this.boot = this.reconnecting;
-    void this.reconnecting.catch(() => {});
+    const tracked = reconnect.finally(() => {
+      if (this.reconnecting === tracked) this.reconnecting = null;
+    });
+    const retryableBoot = tracked.catch((error) => {
+      // 自动重连耗尽后允许下一次用户操作重新拉起 CLI；保留 rejected
+      // boot 会让 ensureReady 永久复用同一个失败 Promise。
+      if (this.boot === retryableBoot) this.boot = null;
+      throw error;
+    });
+    this.reconnecting = tracked;
+    this.boot = retryableBoot;
+    void retryableBoot.catch(() => {});
   }
 
   private onLine(line: string) {
@@ -1481,12 +1582,38 @@ export class AcpBridge implements GrokBridge {
       message = normalizeInboundExtension(JSON.parse(line) as JsonRpcMessage);
     } catch {
       this.diagnostics.push(`无效 ACP JSON：${line.slice(0, 500)}`);
+      this.emit({
+        type: "runtime_notice",
+        notice: runtimeNoticeFromError({
+          domain: "protocol",
+          code: "ACP_INVALID_JSON",
+          message: "Grok Build 返回了无法解析的 ACP 消息",
+          recoverable: true,
+          fatal: false,
+          holdQueue: false,
+          action: "若持续出现，请升级 CLI 并导出会话诊断",
+        }),
+      });
       return;
     }
 
     if (message.id !== undefined && !message.method) {
       const pending = this.pending.get(message.id);
-      if (!pending) return;
+      if (!pending) {
+        this.emit({
+          type: "runtime_notice",
+          notice: runtimeNoticeFromError({
+            domain: "protocol",
+            code: "ACP_ORPHAN_RESPONSE",
+            message: "收到无法归属到当前请求的 ACP 响应",
+            recoverable: true,
+            fatal: false,
+            holdQueue: false,
+            action: "若会话状态异常，请重新打开该会话",
+          }),
+        });
+        return;
+      }
       this.pending.delete(message.id);
       if (pending.timeoutId !== undefined) window.clearTimeout(pending.timeoutId);
       if (message.error !== undefined) {
@@ -1634,12 +1761,14 @@ export class AcpBridge implements GrokBridge {
       const params = record(paramsValue);
       const sessionId = string(params?.sessionId);
       if (sessionId) this.handleSessionUpdate(sessionId, params?.update);
+      else this.emitMissingSessionNotice(method);
       return;
     }
     if (method === "x.ai/session_notification") {
       const params = record(paramsValue);
       const sessionId = string(params?.sessionId);
       if (sessionId) this.handleXaiUpdate(sessionId, params?.update);
+      else this.emitMissingSessionNotice(method);
       return;
     }
     if (method === "x.ai/models/update") {
@@ -1666,8 +1795,27 @@ export class AcpBridge implements GrokBridge {
     if (method === "x.ai/session/prompt_complete") {
       const params = record(paramsValue);
       const sessionId = string(params?.sessionId);
-      if (sessionId) this.finishTurn(sessionId, record(params?.usage));
+      // 该扩展通知可能早于 `session/prompt` RPC 返回；只能更新用量，不能
+      // 宣布回合结束。RPC 的 resolve/reject 才是 turn lifetime 的权威。
+      const usage = record(params?.usage);
+      if (sessionId && usage) this.emitUsage(sessionId, usage);
+      else if (!sessionId) this.emitMissingSessionNotice(method);
     }
+  }
+
+  private emitMissingSessionNotice(method: string) {
+    this.emit({
+      type: "runtime_notice",
+      notice: runtimeNoticeFromError({
+        domain: "protocol",
+        code: "ACP_MISSING_SESSION_ID",
+        message: `${method} 缺少 sessionId，事件已被隔离`,
+        recoverable: true,
+        fatal: false,
+        holdQueue: false,
+        action: "升级 Grok Build CLI；事件不会写入当前查看的其它会话",
+      }),
+    });
   }
 
   private trackWorkflowStatus(sessionId: string, workflow: WorkflowRun) {
@@ -1885,7 +2033,7 @@ export class AcpBridge implements GrokBridge {
       }
       case "turn_completed":
         this.rejectPromptOnInvalidEffortUpdate(sessionId, update);
-        this.finishTurn(sessionId, record(update.usage));
+        if (record(update.usage)) this.emitUsage(sessionId, record(update.usage)!);
         return;
       default:
         return;
@@ -2040,7 +2188,7 @@ export class AcpBridge implements GrokBridge {
       }
       case "turn_completed":
         this.rejectPromptOnInvalidEffortUpdate(sessionId, update);
-        this.finishTurn(sessionId, record(update.usage));
+        if (record(update.usage)) this.emitUsage(sessionId, record(update.usage)!);
         break;
       case "auto_compact_started":
         this.emit({
@@ -2057,10 +2205,14 @@ export class AcpBridge implements GrokBridge {
         break;
       case "auto_compact_failed":
       case "auto_recovery_exhausted":
-        this.emit({
-          type: "error",
-          sessionId,
-          message: string(update.error) ?? "Grok Agent 恢复失败",
+        this.emitError(sessionId, string(update.error) ?? "Grok Agent 恢复失败", {
+          domain: "protocol",
+          code: string(update.sessionUpdate) === "auto_compact_failed"
+            ? "AUTO_COMPACT_FAILED"
+            : "AUTO_RECOVERY_EXHAUSTED",
+          fatal: true,
+          holdQueue: true,
+          action: "检查当前会话状态后再继续发送",
         });
         break;
       case "retry_state": {
@@ -2174,6 +2326,14 @@ export class AcpBridge implements GrokBridge {
       if (interaction.sessionId === sessionId) return true;
     }
     return false;
+  }
+
+  private sessionGateStatus(sessionId: string): SessionStatus | null {
+    for (const interaction of this.interactions.values()) {
+      if (interaction.sessionId !== sessionId) continue;
+      return interaction.kind === "question" ? "awaiting_input" : "awaiting_permission";
+    }
+    return null;
   }
 
   /**
@@ -2516,6 +2676,14 @@ export class AcpBridge implements GrokBridge {
     }
     this.permissionMode = mode;
     localStorage.setItem("grok.permissionMode", mode);
+    if (this.activePromptSessions.size > 0) {
+      this.pendingPermissionModeSync = mode;
+      return;
+    }
+    this.syncPermissionMode(mode);
+  }
+
+  private syncPermissionMode(mode: PermissionMode) {
     void this.notify("x.ai/yolo_mode_changed", {
       clientIdentifier: UPSTREAM_CLI_CLIENT_IDENTIFIER,
       permission_mode:
@@ -2523,9 +2691,18 @@ export class AcpBridge implements GrokBridge {
       yolo_mode: mode === "bypass",
       auto_mode: mode === "auto",
     }).catch((error) => {
-      for (const sessionId of this.knownSessions) {
-        this.emit({ type: "error", sessionId, message: errorText(error) });
-      }
+      this.emit({
+        type: "runtime_notice",
+        notice: runtimeNoticeFromError(toGroxError(error, {
+          domain: "protocol",
+          code: "PERMISSION_MODE_SYNC_FAILED",
+          message: "全局权限提示未能同步到 Grok Build",
+          recoverable: true,
+          fatal: false,
+          holdQueue: false,
+          action: "每一轮仍携带会话级权限参数；若反复出现请升级 CLI",
+        })),
+      });
     });
   }
 
@@ -2611,11 +2788,11 @@ export class AcpBridge implements GrokBridge {
     return { pluginDirs, computerLeaseId, browserLeaseId };
   }
 
-  private sessionPermissionMeta() {
+  private sessionPermissionMeta(mode: PermissionMode = this.permissionMode) {
     return {
       clientIdentifier: UPSTREAM_CLI_CLIENT_IDENTIFIER,
-      yoloMode: this.permissionMode === "bypass",
-      autoMode: this.permissionMode === "auto",
+      yoloMode: mode === "bypass",
+      autoMode: mode === "auto",
     };
   }
 
@@ -2653,6 +2830,7 @@ export class AcpBridge implements GrokBridge {
     // previously selected API gateway can keep owning the next ACP child.
     const provider = await this.getProviderStatus();
     if (provider.kind !== "oauth") {
+      await this.waitForActivePrompts();
       await invoke("configure_provider", { request: { kind: "oauth" } });
       await this.restartAgent();
     }
@@ -2689,6 +2867,7 @@ export class AcpBridge implements GrokBridge {
   }
 
   async logout(): Promise<void> {
+    await this.waitForActivePrompts();
     await this.callExtension("x.ai/auth/logout", {});
     await invoke("configure_provider", { request: { kind: "oauth" } });
     await this.restartAgent();
@@ -2864,13 +3043,23 @@ export class AcpBridge implements GrokBridge {
     const creationLock = `session/new:${++this.requestId}`;
     this.activePromptSessions.add(creationLock);
     try {
-      await this.createSession(cwd);
+      await this.createSession(cwd, false);
     } finally {
       this.markPromptFinished(creationLock);
     }
   }
 
-  private async createSession(cwd: string): Promise<void> {
+  async newBackgroundSession(cwd: string): Promise<string> {
+    const creationLock = `session/new-background:${++this.requestId}`;
+    this.activePromptSessions.add(creationLock);
+    try {
+      return await this.createSession(cwd, true);
+    } finally {
+      this.markPromptFinished(creationLock);
+    }
+  }
+
+  private async createSession(cwd: string, background: boolean): Promise<string> {
     const metaRequest = await this.sessionMeta(cwd);
     const preferredModel = localStorage.getItem("grok.model")?.trim();
     const reasoningEffort = storedEffort();
@@ -2946,8 +3135,9 @@ export class AcpBridge implements GrokBridge {
     this.catalogue.set(sessionId, meta);
     this.cursors.set(sessionId, { toolBlocks: new Map() });
     this.usage.set(sessionId, { ...EMPTY_USAGE });
-    this.emit({ type: "session_ready", session: emptySession(meta) });
+    this.emit({ type: "session_ready", session: emptySession(meta), background });
     this.emit({ type: "available_commands", sessionId, commands: this.runtimeCommands });
+    return sessionId;
   }
 
   async loadSession(id: string, options?: { background?: boolean }): Promise<void> {
@@ -2970,6 +3160,9 @@ export class AcpBridge implements GrokBridge {
     this.activePromptSessions.add(loadingLock);
     try {
       await this.restoreSession(id, background);
+    } catch (error) {
+      this.emit({ type: "status", sessionId: id, status: "failed" });
+      throw error;
     } finally {
       this.markPromptFinished(loadingLock);
     }
@@ -2999,6 +3192,7 @@ export class AcpBridge implements GrokBridge {
       }
     }
 
+    this.emit({ type: "status", sessionId: id, status: "connecting" });
     this.sessionWorkspaces.set(id, meta.cwd);
     this.cursors.set(id, { toolBlocks: new Map() });
     this.replaying.set(id, emptySession(meta));
@@ -3054,7 +3248,7 @@ export class AcpBridge implements GrokBridge {
       const finalized: Session = {
         ...replayed,
         usage: this.usage.get(id) ?? replayed.usage,
-        status: "idle",
+        status: this.sessionGateStatus(id) ?? "idle",
         blocks: replayed.blocks.map((block) =>
           block.type === "assistant"
             ? { ...block, streaming: false }
@@ -3379,7 +3573,10 @@ export class AcpBridge implements GrokBridge {
         const promptRequest = this.requestRaw(ACP_METHODS.sessionPrompt, {
           sessionId,
           prompt: promptContent(dispatchText, options.attachments ?? []),
-          _meta: { reasoningEffort: effort },
+          _meta: {
+            reasoningEffort: effort,
+            ...this.sessionPermissionMeta(options.permissionMode),
+          },
         }, 0, (id) => {
           promptRpcId = id;
           this.promptRpcBySession.set(sessionId, id);
@@ -3412,7 +3609,7 @@ export class AcpBridge implements GrokBridge {
                 : "Grok Agent 长时间没有任何响应：上游服务可能无返回。请检查网络、模型或供应商配置后重试。",
             ),
           );
-          this.cancel(sessionId);
+          this.cancel(sessionId, false);
         }, 15_000);
         try {
           const result = await promptRequest;
@@ -3484,15 +3681,25 @@ export class AcpBridge implements GrokBridge {
       if (promptUsage) this.emitUsage(sessionId, promptUsage);
       await this.refreshSessionInfo(sessionId);
     } catch (error) {
-      terminalStatus = "failed";
+      const cancelled = this.stoppingSessions.has(sessionId);
+      terminalStatus = cancelled ? "idle" : "failed";
       if (isInvalidReasoningEffortError(error)) {
         // Force next send to re-run set_model + fallback chain.
         this.sessionOptions.delete(sessionId);
       }
-      this.emit({ type: "error", sessionId, message: errorText(error) });
+      if (!cancelled) {
+        this.emitError(sessionId, error, {
+          domain: "protocol",
+          code: "SESSION_PROMPT_FAILED",
+          fatal: true,
+          holdQueue: true,
+          action: "检查最后一轮是否已在 CLI 侧完成，再决定是否重新发送",
+        });
+      }
     } finally {
       this.promptRpcBySession.delete(sessionId);
       this.finishTurn(sessionId, undefined, terminalStatus);
+      this.stoppingSessions.delete(sessionId);
       this.markPromptFinished(sessionId);
     }
   }
@@ -3528,7 +3735,9 @@ export class AcpBridge implements GrokBridge {
     return true;
   }
 
-  cancel(sessionId: string): void {
+  cancel(sessionId: string, userInitiated = true): void {
+    if (userInitiated) this.stoppingSessions.add(sessionId);
+    this.emit({ type: "status", sessionId, status: "stopping" });
     for (const [blockId, interaction] of this.interactions) {
       if (interaction.sessionId !== sessionId) continue;
       this.interactions.delete(blockId);
@@ -3542,7 +3751,15 @@ export class AcpBridge implements GrokBridge {
       sessionId,
       _meta: { trigger: "user", cancelSubagents: true },
     }).catch((error) => {
-      this.emit({ type: "error", sessionId, message: errorText(error) });
+      this.emitError(sessionId, error, {
+        domain: "operation",
+        code: "SESSION_CANCEL_FAILED",
+        message: "停止请求未被 Agent 接受",
+        recoverable: true,
+        fatal: false,
+        holdQueue: true,
+        action: "等待当前回合结束，或重启运行时",
+      });
     });
   }
 
@@ -3571,7 +3788,14 @@ export class AcpBridge implements GrokBridge {
       });
       await this.refreshSessionInfo(sessionId);
     } catch (error) {
-      this.emit({ type: "error", sessionId, message: errorText(error) });
+      this.emitError(sessionId, error, {
+        domain: "operation",
+        code: "COMPACT_FAILED",
+        message: "会话上下文压缩失败",
+        recoverable: true,
+        fatal: false,
+        holdQueue: false,
+      });
     }
   }
 
@@ -3612,7 +3836,15 @@ export class AcpBridge implements GrokBridge {
         : { outcome: { outcome: "cancelled" } };
     }
     void this.sendRaw({ jsonrpc: "2.0", id: pending.rpcId, result }).catch((error) => {
-      this.emit({ type: "error", sessionId, message: errorText(error) });
+      this.emitError(sessionId, error, {
+        domain: "operation",
+        code: "PERMISSION_RESPONSE_FAILED",
+        message: "权限决定未能送达 Agent",
+        recoverable: true,
+        fatal: false,
+        holdQueue: true,
+        action: "重新打开会话；失效的批准不会发送到其它会话",
+      });
     });
     this.emit({ type: "permission_resolved", sessionId, blockId, option });
   }
@@ -3645,7 +3877,15 @@ export class AcpBridge implements GrokBridge {
     }
 
     void this.sendRaw({ jsonrpc: "2.0", id: pending.rpcId, result }).catch((error) => {
-      this.emit({ type: "error", sessionId, message: errorText(error) });
+      this.emitError(sessionId, error, {
+        domain: "operation",
+        code: "QUESTION_RESPONSE_FAILED",
+        message: "回答未能送达 Agent",
+        recoverable: true,
+        fatal: false,
+        holdQueue: true,
+        action: "重新打开会话；回答不会发送到其它会话",
+      });
     });
     this.emit({ type: "question_resolved", sessionId, blockId, response });
   }

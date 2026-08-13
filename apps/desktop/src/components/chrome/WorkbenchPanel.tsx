@@ -7,6 +7,7 @@ import { Icon } from "../fx/Icon";
 import { TerminalPanel } from "../terminal/TerminalPanel";
 import { ResizeHandle } from "../common/ResizeHandle";
 import { usePreferences } from "../../state/preferences";
+import { deriveSessionSnapshot } from "../../lib/sessionRuntime";
 
 type Tab = "terminal" | "side";
 
@@ -19,7 +20,9 @@ export function WorkbenchPanel() {
   const activeId = useDesktop((state) => state.activeId);
   const session = useDesktop((state) => (state.activeId ? state.sessions[state.activeId] : null));
   const newSession = useDesktop((state) => state.newSession);
-  const running = Object.values(useDesktop((state) => state.sessions)).filter((item) => item.status === "running").length;
+  const running = Object.values(useDesktop((state) => state.sessions)).filter((item) => (
+    deriveSessionSnapshot({ status: item.status, blocks: item.blocks }).busy
+  )).length;
   const width = usePreferences((state) => state.inspectorWidth);
   const setWidth = usePreferences((state) => state.setInspectorWidth);
 

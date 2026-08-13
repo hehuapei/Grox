@@ -149,7 +149,7 @@ function buildFileTree(entries: WorkspaceEntry[]): FileNode[] {
   return sort(root.children);
 }
 
-const canPreview = (path: string) => /\.(md|mdx|markdown|html?|png|jpe?g|gif|webp|svg|bmp|txt|json|toml|ya?ml|css|[jt]sx?|rs|py)$/i.test(path);
+const canPreview = (path: string) => /\.(md|mdx|markdown|html?|png|jpe?g|gif|webp|svg|bmp|mp4|m4v|webm|mov|mp3|m4a|wav|ogg|oga|flac|pdf|txt|json|toml|ya?ml|css|[jt]sx?|rs|py)$/i.test(path);
 
 function FileTreeNode({ node, onOpen, workspace }: { node: FileNode; onOpen(path: string): void; workspace: string }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -231,7 +231,9 @@ function FileActionMenu({
   }, false);
   const copyContent = () => run(async () => {
     const file = await invoke<PreviewFile>("read_preview_file", { cwd: workspace, path });
-    if (file.kind === "image") throw new Error(zh ? "图片没有可复制的文本内容" : "Images do not have text content to copy");
+    if (["image", "video", "audio", "pdf"].includes(file.kind)) {
+      throw new Error(zh ? "二进制媒体没有可复制的文本内容" : "Binary media does not have text content to copy");
+    }
     await navigator.clipboard.writeText(file.content);
     setNotice(zh ? "已复制文件内容" : "Contents copied");
   }, false);
@@ -250,7 +252,7 @@ function FileActionMenu({
         <FileAction label={zh ? "打开方式…" : "Open with…"} icon="external" onClick={() => void run(() => invoke("open_file_with_dialog", { cwd: workspace, path }))} />
         <FileAction label={zh ? "在 Finder 中显示" : "Reveal in Finder"} icon="folder" onClick={() => void run(() => invoke("reveal_in_explorer", { cwd: workspace, path }))} />
         <FileAction label={zh ? "复制路径" : "Copy path"} icon="copy" onClick={() => void copyPath()} />
-        {previewable && !/\.(png|jpe?g|gif|webp|svg|bmp)$/i.test(path) && <FileAction label={zh ? "复制文件内容" : "Copy contents"} icon="copy" onClick={() => void copyContent()} />}
+        {previewable && !/\.(png|jpe?g|gif|webp|svg|bmp|mp4|m4v|webm|mov|mp3|m4a|wav|ogg|oga|flac|pdf)$/i.test(path) && <FileAction label={zh ? "复制文件内容" : "Copy contents"} icon="copy" onClick={() => void copyContent()} />}
         {notice && <p className="border-t border-line px-2 py-1.5 font-mono text-[8.5px] leading-relaxed text-red">{notice}</p>}
       </div>}
     </div>

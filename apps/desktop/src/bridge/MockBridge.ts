@@ -252,6 +252,14 @@ export class MockBridge implements GrokBridge {
   }
 
   async newSession(cwd: string): Promise<void> {
+    await this.createSession(cwd, false);
+  }
+
+  async newBackgroundSession(cwd: string): Promise<string> {
+    return this.createSession(cwd, true);
+  }
+
+  private async createSession(cwd: string, background: boolean): Promise<string> {
     const now = Date.now();
     const session: Session = {
       id: uid(),
@@ -265,7 +273,8 @@ export class MockBridge implements GrokBridge {
       status: "idle",
     };
     this.sessions.set(session.id, session);
-    this.emit({ type: "session_ready", session });
+    this.emit({ type: "session_ready", session, background });
+    return session.id;
   }
 
   async loadSession(id: string, options?: { background?: boolean }): Promise<void> {
@@ -425,7 +434,18 @@ export class MockBridge implements GrokBridge {
     this.runTurn(sessionId, text, firstTurn, ac.signal)
       .catch((err) => {
         if ((err as DOMException)?.name !== "AbortError") {
-          this.emit({ type: "error", sessionId, message: String(err) });
+          this.emit({
+            type: "error",
+            sessionId,
+            error: {
+              domain: "operation",
+              code: "MOCK_PROMPT_FAILED",
+              message: String(err),
+              recoverable: true,
+              fatal: true,
+              holdQueue: true,
+            },
+          });
         }
       })
       .finally(() => {

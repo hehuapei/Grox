@@ -11,6 +11,8 @@ describe("queue turn policy", () => {
     const base = { status: "idle" as const, providerSwitching: false, restoring: false, suppressed: false, queueLength: 1 };
     expect(shouldDrainLocalQueue(base)).toBe(true);
     expect(shouldDrainLocalQueue({ ...base, status: "running" })).toBe(false);
+    expect(shouldDrainLocalQueue({ ...base, status: "stopping" })).toBe(false);
+    expect(shouldDrainLocalQueue({ ...base, status: "disconnected" })).toBe(false);
     expect(shouldDrainLocalQueue({ ...base, providerSwitching: true })).toBe(false);
     expect(shouldDrainLocalQueue({ ...base, suppressed: true })).toBe(false);
     expect(shouldDrainLocalQueue({ ...base, hasLiveProcess: true })).toBe(false);
