@@ -88,6 +88,8 @@ const MEDIA_HTTPS_HOST_ALLOWLIST: &[&str] = &[
     "imagine.x.ai",
 ];
 const MAX_SESSION_PREVIEW_MESSAGES: usize = 200;
+const MAX_SESSION_PREVIEW_TEXT_CHARS: usize = 64 * 1024;
+const MAX_SESSION_PREVIEW_TOOL_INPUT_CHARS: usize = 16 * 1024;
 const MAX_SESSION_SEARCH_IDS: usize = 2_000;
 const MAX_SESSION_SEARCH_HITS: usize = 500;
 const MAX_SESSION_SEARCH_FILE_BYTES: u64 = 4 * 1024 * 1024;
@@ -133,10 +135,34 @@ struct AcpExitPayload {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+struct AgentRuntimeStatus {
+    topology: &'static str,
+    process_capacity: u8,
+    running: bool,
+    generation: Option<u64>,
+    pid: Option<u32>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct DesktopEnvironment {
     default_workspace: String,
     grok_command: String,
     app_version: String,
+}
+
+#[tauri::command]
+async fn agent_runtime_status(
+    state: tauri::State<'_, Arc<AcpState>>,
+) -> Result<AgentRuntimeStatus, String> {
+    let process = state.process.lock().await;
+    Ok(AgentRuntimeStatus {
+        topology: "shared_process",
+        process_capacity: 1,
+        running: process.is_some(),
+        generation: process.as_ref().map(|process| process.generation),
+        pid: process.as_ref().and_then(|process| process.child.id()),
+    })
 }
 
 #[derive(Clone, Serialize)]
@@ -583,17 +609,101 @@ fn grok_home() -> Result<PathBuf, String> {
 }
 
 #[derive(Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionPreviewMessage {
-    role: String,
-    text: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SessionPreviewEntry {
+    Message {
+        role: String,
+        text: String,
+    },
+    Tool {
+        id: String,
+        name: String,
+        title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        status: SessionPreviewToolStatus,
+    },
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionPreviewToolStatus {
+    Done,
+    Cancelled,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionDiskPreview {
-    messages: Vec<SessionPreviewMessage>,
+    entries: Vec<SessionPreviewEntry>,
     truncated: bool,
+}
+
+fn capped_session_preview_text(text: &str, limit: usize, truncated: &mut bool) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    *truncated = true;
+    let mut output = text.chars().take(limit).collect::<String>();
+    output.push_str("\n… [Grox 已截断过长的磁盘预览内容]");
+    output
+}
+
+fn push_session_preview_entry(
+    entries: &mut VecDeque<SessionPreviewEntry>,
+    limit: usize,
+    entry: SessionPreviewEntry,
+    truncated: &mut bool,
+) {
+    if limit == 0 {
+        return;
+    }
+    if entries.len() == limit {
+        entries.pop_front();
+        *truncated = true;
+    }
+    entries.push_back(entry);
+}
+
+fn session_preview_tool_call(
+    call: &serde_json::Value,
+    truncated: &mut bool,
+) -> Option<SessionPreviewEntry> {
+    let id = call
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
+    let name = call
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("tool")
+        .to_string();
+    let input = call
+        .get("arguments")
+        .and_then(session_history_text)
+        .filter(|input| !input.trim().is_empty())
+        .map(|input| {
+            capped_session_preview_text(
+                &input,
+                MAX_SESSION_PREVIEW_TOOL_INPUT_CHARS,
+                truncated,
+            )
+        });
+    Some(SessionPreviewEntry::Tool {
+        id: id.to_string(),
+        title: name.clone(),
+        name,
+        input,
+        output: None,
+        // No result in durable history means the call was interrupted or is
+        // still active; the preview must never imply success.
+        status: SessionPreviewToolStatus::Cancelled,
+    })
 }
 
 fn session_history_text(content: &serde_json::Value) -> Option<String> {
@@ -620,18 +730,15 @@ fn parse_session_disk_preview(
     reader: impl std::io::BufRead,
     limit: usize,
 ) -> Result<SessionDiskPreview, String> {
-    let mut messages = VecDeque::with_capacity(limit.min(MAX_SESSION_PREVIEW_MESSAGES));
+    let limit = limit.min(MAX_SESSION_PREVIEW_MESSAGES);
+    let mut entries = VecDeque::with_capacity(limit);
     let mut truncated = false;
     for line in reader.lines() {
         let line = line.map_err(|error| format!("无法读取会话预览：{error}"))?;
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        let Some(role @ ("user" | "assistant")) =
-            value.get("type").and_then(serde_json::Value::as_str)
-        else {
-            continue;
-        };
+        let role = value.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
         if role == "user"
             && value
                 .get("synthetic_reason")
@@ -640,23 +747,120 @@ fn parse_session_disk_preview(
         {
             continue;
         }
-        let Some(text) = value.get("content").and_then(session_history_text) else {
+        if matches!(role, "user" | "assistant") {
+            if let Some(text) = value.get("content").and_then(session_history_text) {
+                if !text.trim().is_empty() && limit > 0 {
+                    let text = capped_session_preview_text(
+                        &text,
+                        MAX_SESSION_PREVIEW_TEXT_CHARS,
+                        &mut truncated,
+                    );
+                    push_session_preview_entry(
+                        &mut entries,
+                        limit,
+                        SessionPreviewEntry::Message {
+                            role: role.to_string(),
+                            text,
+                        },
+                        &mut truncated,
+                    );
+                }
+            }
+
+            // Current Grok Build stores calls on assistant rows, then writes a
+            // separate tool_result row. Preserve those public events so an
+            // offline restore still explains what the agent executed.
+            if role == "assistant" && limit > 0 {
+                for call in value
+                    .get("tool_calls")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let Some(entry) = session_preview_tool_call(call, &mut truncated) else {
+                        continue;
+                    };
+                    let id = match &entry {
+                        SessionPreviewEntry::Tool { id, .. } => id.clone(),
+                        SessionPreviewEntry::Message { .. } => unreachable!(),
+                    };
+                    if let Some(SessionPreviewEntry::Tool {
+                        name,
+                        title,
+                        input,
+                        ..
+                    }) = entries.iter_mut().find(|known| {
+                        matches!(known, SessionPreviewEntry::Tool { id: known_id, .. } if known_id == &id)
+                    }) {
+                        if let SessionPreviewEntry::Tool {
+                            name: new_name,
+                            title: new_title,
+                            input: new_input,
+                            ..
+                        } = entry
+                        {
+                            *name = new_name;
+                            *title = new_title;
+                            *input = new_input;
+                        }
+                        continue;
+                    }
+                    push_session_preview_entry(&mut entries, limit, entry, &mut truncated);
+                }
+            }
+            continue;
+        }
+
+        if role != "tool_result" || limit == 0 {
+            continue;
+        }
+        let Some(id) = value
+            .get("tool_call_id")
+            .or_else(|| value.get("toolCallId"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
             continue;
         };
-        if text.trim().is_empty() || limit == 0 {
+        let output = value
+            .get("content")
+            .and_then(session_history_text)
+            .filter(|output| !output.trim().is_empty())
+            .map(|output| {
+                capped_session_preview_text(
+                    &output,
+                    MAX_SESSION_PREVIEW_TEXT_CHARS,
+                    &mut truncated,
+                )
+            });
+        if let Some(SessionPreviewEntry::Tool {
+            output: known_output,
+            status,
+            ..
+        }) = entries.iter_mut().find(|entry| {
+            matches!(entry, SessionPreviewEntry::Tool { id: known_id, .. } if known_id == id)
+        }) {
+            *known_output = output;
+            *status = SessionPreviewToolStatus::Done;
             continue;
         }
-        if messages.len() == limit {
-            messages.pop_front();
-            truncated = true;
-        }
-        messages.push_back(SessionPreviewMessage {
-            role: role.to_string(),
-            text,
-        });
+        push_session_preview_entry(
+            &mut entries,
+            limit,
+            SessionPreviewEntry::Tool {
+                id: id.to_string(),
+                name: "tool".into(),
+                title: "工具调用".into(),
+                input: None,
+                output,
+                status: SessionPreviewToolStatus::Done,
+            },
+            &mut truncated,
+        );
     }
     Ok(SessionDiskPreview {
-        messages: messages.into(),
+        entries: entries.into(),
         truncated,
     })
 }
@@ -7568,6 +7772,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             desktop_environment,
+            agent_runtime_status,
             preview_session_from_disk,
             search_session_history,
             read_session_journal,
@@ -7713,25 +7918,35 @@ mod tests {
     }
 
     #[test]
-    fn session_disk_preview_keeps_recent_visible_conversation() {
+    fn session_disk_preview_keeps_recent_public_events() {
         let history = concat!(
             "{\"type\":\"system\",\"content\":\"hidden\"}\n",
             "{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"first\"}]}\n",
             "{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"reminder\"}],\"synthetic_reason\":\"system_reminder\"}\n",
-            "{\"type\":\"tool_result\",\"content\":\"hidden tool output\"}\n",
-            "{\"type\":\"assistant\",\"content\":\"answer\"}\n",
+            "{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"hidden reasoning\"}]}\n",
+            "{\"type\":\"assistant\",\"content\":\"answer\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}]}\n",
+            "{\"type\":\"tool_result\",\"tool_call_id\":\"call-1\",\"content\":\"file body\"}\n",
+            "{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}]}\n",
             "{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"latest\"}]}\n",
         );
-        let preview = parse_session_disk_preview(std::io::Cursor::new(history), 2).unwrap();
+        let preview = parse_session_disk_preview(std::io::Cursor::new(history), 3).unwrap();
         assert_eq!(
             preview,
             SessionDiskPreview {
-                messages: vec![
-                    SessionPreviewMessage {
+                entries: vec![
+                    SessionPreviewEntry::Message {
                         role: "assistant".into(),
                         text: "answer".into(),
                     },
-                    SessionPreviewMessage {
+                    SessionPreviewEntry::Tool {
+                        id: "call-1".into(),
+                        name: "read_file".into(),
+                        title: "read_file".into(),
+                        input: Some("{\"path\":\"README.md\"}".into()),
+                        output: Some("file body".into()),
+                        status: SessionPreviewToolStatus::Done,
+                    },
+                    SessionPreviewEntry::Message {
                         role: "user".into(),
                         text: "latest".into(),
                     },

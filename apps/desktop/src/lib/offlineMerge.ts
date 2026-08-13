@@ -122,8 +122,8 @@ export function insertLiveOnlyIntoOffline(
   // shift after earlier inserts at that index.
   for (let li = 0; li < liveBlocks.length; li += 1) {
     const block = liveBlocks[li];
-    // chat_history preview tools use disk-tool-* ids / kind "other"; updates scan
-    // uses real ACP call ids. Treating them as live-only duplicates every tool card.
+    // Older preview journals used disk-tool-* ids while canonical ACP replay has
+    // real call ids. Treating those legacy rows as live-only duplicates cards.
     if (block.type === "tool" && isSyntheticToolCallId(block.call?.id)) {
       continue;
     }

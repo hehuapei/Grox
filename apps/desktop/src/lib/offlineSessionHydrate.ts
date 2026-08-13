@@ -6,34 +6,7 @@ import {
   type SessionJournalReconcileOutcome,
 } from "./sessionJournalReconcile";
 import { sanitizeSessionForOpen } from "./sessionOpenPolicy";
-
-type SessionDiskPreview = {
-  messages: Array<{ role: "user" | "assistant"; text: string }>;
-  truncated: boolean;
-};
-
-function sessionFromDiskPreview(meta: SessionMeta, preview: SessionDiskPreview): Session {
-  return {
-    ...meta,
-    blocks: preview.messages.map((message, index) => ({
-      type: message.role,
-      id: `preview-${meta.id}-${index}`,
-      text: message.text,
-      ts: meta.createdAt + index,
-    })),
-    usage: {
-      inputTokens: 0,
-      outputTokens: 0,
-      cacheReadTokens: 0,
-      costUSD: 0,
-      contextUsed: 0,
-      contextMax: 0,
-      turns: 0,
-    },
-    status: "idle",
-    preview: true,
-  };
-}
+import { sessionFromDiskPreview, type SessionDiskPreview } from "./sessionDiskPreview";
 
 /**
  * When ACP catalogue no longer knows a sidebar mission (stale id / other CLI),
@@ -62,7 +35,7 @@ export async function hydrateSessionOfflineDetailed(
   ]);
   const snapshot = journalResult.status === "fulfilled" ? journalResult.value : null;
   const preview = agentResult.status === "fulfilled" ? agentResult.value : null;
-  const agentSession = preview?.messages?.length ? sessionFromDiskPreview(meta, preview) : null;
+  const agentSession = preview?.entries?.length ? sessionFromDiskPreview(meta, preview) : null;
   const reconciled = reconcileSessionJournal(snapshot, agentSession);
   return {
     ...reconciled,

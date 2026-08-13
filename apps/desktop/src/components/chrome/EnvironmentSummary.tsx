@@ -37,6 +37,14 @@ interface SessionJournalStatus {
   unreadableCount: number;
 }
 
+interface AgentRuntimeStatus {
+  topology: "shared_process";
+  processCapacity: number;
+  running: boolean;
+  generation?: number;
+  pid?: number;
+}
+
 interface SummarySource {
   id: string;
   kind: "attachment" | "link";
@@ -69,6 +77,7 @@ export function EnvironmentSummary() {
   const [summary, setSummary] = useState<GitSummary | null>(null);
   const [worktrees, setWorktrees] = useState<GitWorktree[]>([]);
   const [journalStatus, setJournalStatus] = useState<SessionJournalStatus | null>(null);
+  const [runtimeStatus, setRuntimeStatus] = useState<AgentRuntimeStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState<"checkout" | "commit" | "push" | "worktree" | null>(null);
   const [error, setError] = useState("");
@@ -116,14 +125,16 @@ export function EnvironmentSummary() {
     setError("");
     try {
       if (inTauri()) {
-        const [nextSummary, nextWorktrees, nextJournalStatus] = await Promise.all([
+        const [nextSummary, nextWorktrees, nextJournalStatus, nextRuntimeStatus] = await Promise.all([
           invoke<GitSummary>("git_summary", { cwd: workspace }),
           invoke<GitWorktree[]>("git_worktrees", { cwd: workspace }).catch(() => [] as GitWorktree[]),
           invoke<SessionJournalStatus>("session_journal_status"),
+          invoke<AgentRuntimeStatus>("agent_runtime_status"),
         ]);
         setSummary(nextSummary);
         setWorktrees(nextWorktrees);
         setJournalStatus(nextJournalStatus);
+        setRuntimeStatus(nextRuntimeStatus);
       } else {
         setSummary({
           isRepository: true,
@@ -139,6 +150,7 @@ export function EnvironmentSummary() {
         });
         setWorktrees([]);
         setJournalStatus({ count: 12, totalBytes: 1_480_000, latestSavedAt: Date.now(), migrationPending: 0, unreadableCount: 0 });
+        setRuntimeStatus({ topology: "shared_process", processCapacity: 1, running: true, generation: 1, pid: 12345 });
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -305,6 +317,23 @@ export function EnvironmentSummary() {
                     : journalStatus.migrationPending > 0
                       ? (zh ? `${journalStatus.migrationPending} 个待迁移` : `${journalStatus.migrationPending} to migrate`)
                       : `${journalStatus.count} · ${(journalStatus.totalBytes / 1024 / 1024).toFixed(1)} MB`
+                  : "—"}
+              </span>
+            </SummaryRow>
+
+            <SummaryRow icon="bolt" label={zh ? "Agent 运行时" : "Agent runtime"}>
+              <span
+                className={`ml-auto font-mono text-[9.5px] ${runtimeStatus?.running ? "text-green" : "text-dim"}`}
+                title={runtimeStatus
+                  ? [
+                      runtimeStatus.running ? (zh ? "进程运行中" : "Process running") : (zh ? "按需启动" : "Starts on demand"),
+                      runtimeStatus.pid ? `PID ${runtimeStatus.pid}` : "",
+                      runtimeStatus.generation ? `${zh ? "代次" : "Generation"} ${runtimeStatus.generation}` : "",
+                    ].filter(Boolean).join(" · ")
+                  : undefined}
+              >
+                {runtimeStatus
+                  ? `${zh ? "共享运行时" : "Shared runtime"} · ${runtimeStatus.processCapacity} ${zh ? "进程" : "process"}`
                   : "—"}
               </span>
             </SummaryRow>
@@ -517,7 +546,7 @@ export function EnvironmentSummary() {
   );
 }
 
-function SummaryRow({ icon, label, children }: { icon: "edit" | "branch" | "clock"; label: string; children?: React.ReactNode }) {
+function SummaryRow({ icon, label, children }: { icon: "edit" | "branch" | "clock" | "bolt"; label: string; children?: React.ReactNode }) {
   return (
     <div className="summary-row">
       <Icon name={icon} size={14} className="text-mute" />
