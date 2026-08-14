@@ -127,6 +127,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - 未绑定会话、跨代次、重复 rpc id、越界路径和超限响应都由 Host 明确拒绝，不再用 `AcpBridge.workspace` 猜 cwd；原先暴露给 WebView 的 `acp_read_*` / `acp_write_*` commands 已移除；
 - `clientCapabilities.terminal` 继续为 false。官方 ACP 要求只有完整实现 create/output/wait/kill/release 后才能宣告；本切片没有用半成品 shell 执行器扩大 Agent 权限；
 - 自动化执行不再定向派发给 `main` WebView；供应商、认证或全局配置切换会先暂停 runner，并取得 Host lifecycle permit 后才替换进程，因此能够等待 Host 后台回合而不是只观察 `activePromptSessions`；
+- `agent_auth` 持有显式 OAuth 的唯一活动事务：认证方法只从 Host initialize 快照解析，并发点击附着同一次登录；URL 轮询、系统浏览器、五分钟 watchdog、用户取消、请求清算和 generation 换代均不再依赖 WebView promise 或 localStorage；
 - 主窗口关闭与进程退出已经拆分：存在已启用自动化或 Host 正在执行会话/生命周期事务时，CloseRequested 只隐藏窗口并保留托盘；没有后台责任时关闭才进入真正退出；
 - 托盘恢复窗口不重建 WebView 或 AgentRuntime；托盘“退出”、普通关闭退出、系统退出和更新退出都汇入幂等的 Host shutdown 事务，统一清算请求、门禁、callback、MCP、ACP 和预览子进程；
 - 运行时切换已删除前端 `promptDrainWaiters` 第二门控，只等待 SessionCoordinator 的 lifecycle permit；`activePromptSessions` 仅保留 UI 中断标记与权限提示延迟，不再裁决进程替换；
@@ -136,9 +137,9 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - 旧版裸 Session 只保留只读迁移入口，损坏的现有 journal 不会被新快照静默覆盖。
 
 本切片没有把完整 SessionManager 伪装成已经迁移：连接初始化、非交互认证、建会话/恢复、
-自动化完整生命周期、普通前台回合、持久化提示队列和权限/计划/提问交互生命周期已属于 Host。
-标准文件 client callback 与其会话工作区绑定也已属于 Host。用户显式触发的 OAuth 回调、
-尚未宣告的 terminal client callback 与其它仍分散的 Host 服务待迁移；
+自动化完整生命周期、普通前台回合、持久化提示队列、权限/计划/提问交互和显式 OAuth 生命周期已属于 Host。
+标准文件 client callback 与其会话工作区绑定也已属于 Host。尚未宣告的 terminal client callback
+与其它仍分散的 Host 服务待迁移；
 在这些职责迁完之前不会另起一个简化 CLI 进程冒充后台运行时。
 
 ## 完整后端对照结论
@@ -153,6 +154,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 持久化 | 前端组装完整 JSON，Host 原子写 | store + 锁 + journal 对账 | Host 提供语义操作和锁内 RMW |
 | 队列 | Store/localStorage 主导 | Host 运行时可观察 busy/退出 | 队列状态与发送事务绑定 |
 | 自动化 | Host 已拥有认领、建会话、运行时注册、能力租约、模型/模式、Prompt、崩溃去重与结算；页面只做 started/settled 投影 | runner 复用 SessionManager | 前台与后台共用 SessionCoordinator/turn_runtime，页面登记屏障已删除 |
+| 认证 | WebView 曾持有 authenticate promise、URL 轮询和取消时序 | 单例认证事务、可取消子进程、硬超时、认证后淘汰旧 runtime | `agent_auth` 按 generation 持有 ACP OAuth；页面只 start/cancel/status 并消费事件 |
 | 工作树 | 命令安全性已有，生命周期仍偏 UI | worktree 与 session metadata 绑定 | 引入 Host 所有权记录和清理策略 |
 | 权限/提问 | Host 已按 session + generation 持有反向 RPC，WebView 只用 block id 投影；持久 allow cache 尚未统一 | 每会话策略、allow cache、Host resolve | 交互生命周期已迁移，下一步统一权限策略与审计 |
 | 媒体 | 工具图已落盘，预览/生成分散 | token loopback + path scope | 统一 MediaService 与会话授权 |
@@ -163,7 +165,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 
 ## Consequences
 
-- WebView 刷新或隐藏不再决定任务是否创建、执行或结算，也不会丢失仍在 Host 等待的权限/提问；已创建会话但未结算的自动化在租约过期后会标记结果未知并禁止自动重放。完全退出 Grox 进程后调度仍会暂停，这是明确限制。
+- WebView 刷新或隐藏不再决定任务是否创建、执行或结算，也不会丢失仍在 Host 等待的权限/提问或正在进行的 OAuth；已创建会话但未结算的自动化在租约过期后会标记结果未知并禁止自动重放。完全退出 Grox 进程后调度仍会暂停，这是明确限制。
 - 迁移期间仍保留一个共享 CLI 进程；这是真实限制，不伪装成进程池。
 - `AcpBridge` 会逐步缩小为投影器，Zustand 只保存 UI 需要的快照。
 - Host 模块会增加，但每次拆分必须伴随职责迁移、测试或不变量，禁止只为了缩短文件。

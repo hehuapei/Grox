@@ -315,6 +315,7 @@ interface DesktopState {
   /** `restoreProject`: explicit add (folder picker) may undismiss a removed project. */
   setWorkspace(cwd: string, options?: { restoreProject?: boolean; navigation?: ViewNavigationIntent }): Promise<void>;
   authenticate(): Promise<void>;
+  cancelAuthentication(): Promise<void>;
   logout(): Promise<void>;
   refreshAccount(): Promise<void>;
   refreshModels(): Promise<void>;
@@ -1096,6 +1097,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({ auth: e.state });
         if (!e.state.required && !e.state.inProgress && get().historySyncedAt === 0 && !get().historySyncing) {
           window.setTimeout(() => void get().refreshHistory(), 250);
+        }
+        if (!e.state.required && !e.state.inProgress) {
+          window.setTimeout(() => void get().refreshAccount(), 250);
         }
         break;
       case "runtime_state":
@@ -2523,11 +2527,23 @@ export const useDesktop = create<DesktopState>((set, get) => {
         void get().refreshAccount();
         void get().refreshHistory();
       } catch (error) {
+        let code = "";
+        if (typeof error === "object" && error !== null) {
+          const failure = error as { code?: unknown; error?: { code?: unknown } };
+          code = String(failure.code ?? failure.error?.code ?? "");
+        }
         set({
           auth: await bridge.getAuthState(),
-          startupError: error instanceof Error ? error.message : String(error),
+          startupError: code === "AUTH_CANCELLED"
+            ? null
+            : error instanceof Error ? error.message : String(error),
         });
       }
+    },
+
+    async cancelAuthentication() {
+      await bridge.cancelAuthentication();
+      set({ auth: await bridge.getAuthState(), startupError: null });
     },
 
     async logout() {

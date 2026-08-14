@@ -34,6 +34,7 @@ export function Home() {
   const workspace = useDesktop((s) => s.workspace);
   const startupError = useDesktop((s) => s.startupError);
   const auth = useDesktop((s) => s.auth);
+  const cancelAuthentication = useDesktop((s) => s.cancelAuthentication);
   const setAccountSetupOpen = useDesktop((s) => s.setAccountSetupOpen);
   const model = useDesktop((s) => s.model);
   const models = useDesktop((s) => s.models);
@@ -225,10 +226,10 @@ export function Home() {
         </div>
 
         {auth.required && (
-          <button onClick={() => setAccountSetupOpen(true)} disabled={auth.inProgress} className="mt-3 flex items-center gap-2 rounded-full px-3 py-1.5 text-[12px] text-gold hover:bg-gold/5 disabled:opacity-50">
+          <button onClick={() => auth.inProgress ? void cancelAuthentication() : setAccountSetupOpen(true)} className="mt-3 flex items-center gap-2 rounded-full px-3 py-1.5 text-[12px] text-gold hover:bg-gold/5">
             <span className={`h-1.5 w-1.5 rounded-full ${auth.inProgress ? "animate-pulse bg-gold" : "bg-gold"}`} />
             {auth.inProgress ? (language === "zh-CN" ? "正在连接账户…" : "Connecting account…") : (auth.error ?? (language === "zh-CN" ? "发送前需要登录或配置服务" : "Sign in or configure a provider before sending"))}
-            <span className="text-fg2">{t("account")} →</span>
+            <span className="text-fg2">{auth.inProgress ? (language === "zh-CN" ? "取消" : "Cancel") : `${t("account")} →`}</span>
           </button>
         )}
 

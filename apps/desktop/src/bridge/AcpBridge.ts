@@ -56,6 +56,7 @@ import {
 } from "../lib/promptTurnTimeout";
 import {
   formatGroxError,
+  groxFailure,
   runtimeNoticeFromError,
   toGroxError,
 } from "../lib/errorModel";
@@ -100,6 +101,8 @@ interface AgentRuntimeConnection {
   initialize: unknown;
   auth: AuthState & { methodId?: string };
 }
+
+type HostAuthenticationState = AuthState & { methodId?: string };
 
 interface ForegroundTurnResult {
   response: unknown;
@@ -995,7 +998,6 @@ export class AcpBridge implements GrokBridge {
   /** 与原生 ACP 子进程绑定，防止旧异步请求写入新子进程。 */
   private acpGeneration = 0;
   private reconnecting: Promise<void> | null = null;
-  private authMethodId: string | undefined;
   private authState: AuthState = { required: false, inProgress: false };
   private modelState: ModelState = { models: MODELS, currentId: MODELS[0].id };
   private runtimeCommandBase: SlashCommand[] = [];
@@ -1028,13 +1030,6 @@ export class AcpBridge implements GrokBridge {
   ensureReady(): Promise<void> {
     if (!this.boot) {
       this.boot = this.connect()
-        .then(() => {
-          if (localStorage.getItem("grox.pendingOAuth") !== "1") return;
-          localStorage.removeItem("grox.pendingOAuth");
-          void this.authenticate().catch(() => {
-            // authenticate() already publishes the actionable error through auth_state.
-          });
-        })
         .catch((error) => {
           // Allow a later caller to retry after a failed first boot.
           this.boot = null;
@@ -1049,8 +1044,20 @@ export class AcpBridge implements GrokBridge {
     return () => this.listeners.delete(callback);
   }
 
-  private setAuthState(patch: Partial<AuthState>) {
-    this.authState = { ...this.authState, ...patch };
+  private projectAuthState(state: AuthState) {
+    const next = {
+      required: state.required,
+      inProgress: state.inProgress,
+      label: state.label,
+      error: state.error,
+    };
+    if (
+      this.authState.required === next.required
+      && this.authState.inProgress === next.inProgress
+      && this.authState.label === next.label
+      && this.authState.error === next.error
+    ) return;
+    this.authState = next;
     this.emit({ type: "auth_state", state: { ...this.authState } });
   }
 
@@ -1205,6 +1212,9 @@ export class AcpBridge implements GrokBridge {
         this.diagnostics = this.diagnostics.slice(-20);
       }),
       await listen<ExitPayload>("acp-exit", ({ payload }) => this.onExit(payload)),
+      await listen<HostAuthenticationState>("agent-runtime-auth-state", ({ payload }) => {
+        this.projectAuthState(payload);
+      }),
       await listen<RuntimeOccupancy>("session-runtime-occupancy", ({ payload }) => {
         this.emit({ type: "runtime_occupancy", occupancy: payload });
       }),
@@ -1326,10 +1336,9 @@ export class AcpBridge implements GrokBridge {
     await this.syncHostInteractions();
     this.captureModelState(connection.initialize);
     this.captureRuntimeCommands(connection.initialize);
-    this.authMethodId = connection.auth.methodId;
-    this.setAuthState({
+    this.projectAuthState({
       required: connection.auth.required,
-      inProgress: false,
+      inProgress: connection.auth.inProgress,
       label: connection.auth.label,
       error: connection.auth.error,
     });
@@ -1355,7 +1364,6 @@ export class AcpBridge implements GrokBridge {
     this.knownSessions.clear();
     this.workflowChildTraces.clear();
     this.cancelledWorkflowRuns.clear();
-    this.authMethodId = undefined;
     this.modelState = { models: MODELS, currentId: MODELS[0].id };
     this.runtimeCommandBase = [];
     this.runtimeCommands = [];
@@ -2479,6 +2487,8 @@ export class AcpBridge implements GrokBridge {
 
   async getAuthState(): Promise<AuthState> {
     await this.ensureReady();
+    const state = await invoke<HostAuthenticationState>("agent_runtime_auth_status");
+    this.projectAuthState(state);
     return { ...this.authState };
   }
 
@@ -2560,36 +2570,25 @@ export class AcpBridge implements GrokBridge {
     if (provider.kind !== "oauth") {
       await this.reconfigureRuntime(() => invoke("configure_provider", { request: { kind: "oauth" } }));
     }
-    if (!this.authMethodId) throw new Error("Grok Agent 没有可用的交互认证方式");
-    if (this.authState.inProgress) return;
-    this.setAuthState({ required: true, inProgress: true, error: undefined });
-    const requestSeq = Date.now();
     try {
-      const auth = this.requestRaw("authenticate", {
-        methodId: this.authMethodId,
-        _meta: { use_oauth: true, force_interactive: true, request_seq: requestSeq },
-      }, 5 * 60_000).then(
-        () => ({ error: undefined }),
-        (error: unknown) => ({ error }),
-      );
-      let authUrl: string | undefined;
-      for (let attempt = 0; attempt < 60 && !authUrl; attempt += 1) {
-        if (attempt > 0) {
-          await new Promise((resolve) => window.setTimeout(resolve, 50));
-        }
-        const urlResponse = record(await this.requestRaw("x.ai/auth/get_url", {}));
-        authUrl = string(urlResponse?.auth_url) ?? string(urlResponse?.authUrl);
-      }
-      if (!authUrl) throw new Error("Grok Agent 未返回登录链接，请重试");
-      await invoke("open_external", { url: authUrl });
-      const authResult = await auth;
-      if (authResult.error) throw authResult.error;
-      this.setAuthState({ required: false, inProgress: false, error: undefined });
-    } catch (error) {
-      void this.requestRaw("x.ai/auth/cancel", { request_seq: requestSeq }).catch(() => {});
-      this.setAuthState({ required: true, inProgress: false, error: errorText(error) });
-      throw error;
+      const state = await invoke<HostAuthenticationState>("agent_runtime_authenticate");
+      this.projectAuthState(state);
+    } catch (cause) {
+      throw groxFailure(toGroxError(cause, {
+        domain: "environment",
+        code: "AUTH_FAILED",
+        message: "Grok 登录未完成",
+        recoverable: true,
+        fatal: false,
+        holdQueue: false,
+        action: "检查登录页、网络或认证错误后重试",
+      }));
     }
+  }
+
+  async cancelAuthentication(): Promise<void> {
+    const state = await invoke<HostAuthenticationState>("agent_runtime_auth_cancel");
+    this.projectAuthState(state);
   }
 
   async logout(): Promise<void> {

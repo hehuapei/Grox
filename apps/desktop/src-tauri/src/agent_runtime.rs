@@ -12,7 +12,7 @@ use crate::{
 const INITIALIZE_TIMEOUT_MS: u64 = 15_000;
 const AUTHENTICATE_TIMEOUT_MS: u64 = 10_000;
 
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentAuthenticationState {
     pub(crate) required: bool,
@@ -195,6 +195,15 @@ fn authentication_plan(initialize: &Value) -> AuthenticationPlan {
     }
 }
 
+pub(crate) fn interactive_auth_method(initialize: &Value) -> Option<(String, String)> {
+    let plan = authentication_plan(initialize);
+    Some((
+        plan.interactive_method_id?,
+        plan.interactive_label
+            .unwrap_or_else(|| "Sign in to Grok".into()),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,5 +268,18 @@ mod tests {
         assert!(plan.requires_interaction_first);
         assert_eq!(plan.method_id.as_deref(), Some("oidc"));
         assert_eq!(plan.interactive_method_id.as_deref(), Some("oidc"));
+    }
+
+    #[test]
+    fn interactive_method_is_derived_from_host_initialize_snapshot() {
+        assert_eq!(
+            interactive_auth_method(&json!({
+                "authMethods": [
+                    { "id": "api_key", "name": "API key" },
+                    { "id": "grok.com", "name": "Grok account" }
+                ]
+            })),
+            Some(("grok.com".into(), "Grok account".into()))
+        );
     }
 }

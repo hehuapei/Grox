@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod acp_host;
+mod agent_auth;
 mod agent_runtime;
 mod automation_runner;
 mod automation_store;
@@ -44,7 +45,11 @@ use std::{
 };
 
 use acp_host::{AcpHostError, AcpRequestBroker};
-use agent_runtime::AgentRuntimeConnection;
+use agent_auth::{
+    agent_runtime_auth_cancel, agent_runtime_auth_status, agent_runtime_authenticate,
+    AgentAuthenticationLifecycle,
+};
+use agent_runtime::{AgentAuthenticationState, AgentRuntimeConnection};
 use automation_runner::{storage_error as automation_storage_error, AutomationRunner};
 use automation_store::AutomationStore;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -148,6 +153,7 @@ struct AcpState {
     paused_generation: AtomicU64,
     runtime_phase: AtomicU8,
     requests: AcpRequestBroker,
+    authentication: AgentAuthenticationLifecycle,
     sessions: Arc<SessionCoordinator>,
     foreground_turns: Arc<ForegroundTurnRegistry>,
     interactions: Arc<InteractionRegistry>,
@@ -212,7 +218,11 @@ impl AcpState {
         self.cached_connection(generation)
     }
 
-    fn mark_authenticated(&self, generation: u64) {
+    fn set_authentication_state(
+        &self,
+        generation: u64,
+        auth: AgentAuthenticationState,
+    ) -> bool {
         let mut cached = self
             .connection
             .write()
@@ -221,11 +231,10 @@ impl AcpState {
             .as_mut()
             .filter(|connection| connection.generation == generation)
         else {
-            return;
+            return false;
         };
-        connection.auth.required = false;
-        connection.auth.in_progress = false;
-        connection.auth.error = None;
+        connection.auth = auth;
+        true
     }
 
     async fn pause_runtime(&self) -> Result<(), AcpHostError> {
@@ -339,6 +348,13 @@ impl AcpState {
             || (self.ready_generation.load(Ordering::Acquire) == 0
                 && self.paused_generation.load(Ordering::Acquire) == 0)
         {
+            self.authentication.reset(AcpHostError::environment(
+                "AUTH_RUNTIME_CHANGED",
+                "认证期间 Agent 运行时已退出或被替换",
+                false,
+                false,
+                "重新连接 Agent 后再次登录",
+            ));
             self.clear_cached_connection(Some(generation));
             self.set_runtime_phase(phase);
         }
@@ -3430,6 +3446,13 @@ async fn install_official_grok_cli(
     // child before invoking its official updater; the webview reload below
     // starts the freshly installed binary again.
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    state.authentication.reset(AcpHostError::environment(
+        "AUTH_RUNTIME_CHANGED",
+        "CLI 更新取消了正在进行的登录",
+        false,
+        false,
+        "CLI 更新完成后重新登录",
+    ));
     state.foreground_turns.reset(generation);
     state.interactions.reset(generation);
     state.client_callbacks.reset(generation).await;
@@ -7694,6 +7717,13 @@ async fn spawn_acp_process(
     // or stderr lines after `kill`; those lines must not reach the new ACP
     // connection.
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    state.authentication.reset(AcpHostError::environment(
+        "AUTH_RUNTIME_CHANGED",
+        "Agent 重连取消了旧通道上的登录",
+        false,
+        false,
+        "连接稳定后重新登录",
+    ));
     state.foreground_turns.reset(generation);
     state.interactions.reset(generation);
     state.client_callbacks.reset(generation).await;
@@ -8314,15 +8344,6 @@ async fn acp_request_inner(
             }
         }
     };
-    if method == "authenticate"
-        && response.as_ref().is_ok_and(|response| {
-            serde_json::from_str::<serde_json::Value>(response)
-                .ok()
-                .is_some_and(|message| message.get("error").is_none())
-        })
-    {
-        state.mark_authenticated(generation);
-    }
     response
 }
 
@@ -8469,6 +8490,10 @@ async fn acp_kill(
     state.clear_cached_connection(None);
     state.set_runtime_phase(RuntimePhase::Stopped);
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    state.authentication.reset(AcpHostError::operation(
+        "AUTH_CANCELLED",
+        "Agent 已停止，登录同步取消",
+    ));
     state.foreground_turns.reset(generation);
     state.interactions.reset(generation);
     state.client_callbacks.reset(generation).await;
@@ -8956,12 +8981,17 @@ fn main_window_close_keeps_host_alive(app: &tauri::AppHandle) -> bool {
     let host_busy = !occupancy.active_turn_session_ids.is_empty()
         || occupancy.lifecycle_active
         || occupancy.pending_lifecycle > 0
+        || state.authentication.is_active()
         || app.state::<AutomationRunner>().is_dispatching();
     automation_runner::should_keep_process_alive_on_close(any_enabled_automation, host_busy)
 }
 
 async fn shutdown_host(app: &tauri::AppHandle) {
     let state = app.state::<Arc<AcpState>>().inner().clone();
+    state.authentication.reset(AcpHostError::operation(
+        "AUTH_CANCELLED",
+        "Grox 正在退出，登录已取消",
+    ));
     state.ready_generation.store(0, Ordering::Release);
     state.paused_generation.store(0, Ordering::Release);
     state.clear_cached_connection(None);
@@ -9180,6 +9210,9 @@ fn main() {
             save_media_reference,
             generate_media,
             agent_runtime_connect,
+            agent_runtime_auth_status,
+            agent_runtime_authenticate,
+            agent_runtime_auth_cancel,
             execute_foreground_turn,
             cancel_foreground_turn,
             interaction_status,
@@ -9247,9 +9280,16 @@ mod tests {
 
         assert!(state.cached_connection(6).is_none());
         assert!(state.cached_connection(7).unwrap().auth.required);
-        state.mark_authenticated(6);
+        let authenticated = agent_runtime::AgentAuthenticationState {
+            required: false,
+            in_progress: false,
+            method_id: Some("grok.com".into()),
+            label: Some("Sign in to Grok".into()),
+            error: None,
+        };
+        assert!(!state.set_authentication_state(6, authenticated.clone()));
         assert!(state.cached_connection(7).unwrap().auth.required);
-        state.mark_authenticated(7);
+        assert!(state.set_authentication_state(7, authenticated));
         assert!(!state.cached_connection(7).unwrap().auth.required);
 
         state.clear_cached_connection(Some(6));

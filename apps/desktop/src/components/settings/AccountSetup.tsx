@@ -14,6 +14,8 @@ export function AccountSetup() {
   const setOpen = useDesktop((state) => state.setAccountSetupOpen);
   const runtime = useDesktop((state) => state.runtime);
   const runtimeBusy = useDesktop((state) => state.runtimeBusy);
+  const auth = useDesktop((state) => state.auth);
+  const cancelAuthentication = useDesktop((state) => state.cancelAuthentication);
   const installOfficialRuntime = useDesktop((state) => state.installOfficialRuntime);
   const [kind, setKind] = useState<ProviderKind>("oauth");
   const [apiKey, setApiKey] = useState("");
@@ -151,17 +153,20 @@ export function AccountSetup() {
         {kind === "oauth" && (
           <div className="mt-4 rounded-[7px] border border-line bg-raise px-3 py-2.5 text-[11.5px] leading-relaxed text-dim">
             {t("oauth")} 会打开 Grok 官方登录页。登录后可读取订阅等级与上游实际提供的周额度；当前 Grok Build 接口没有独立五小时额度字段。
+            {auth.error && <p className="mt-2 text-red">{auth.error}</p>}
           </div>
         )}
 
         {error && <p className="mt-3 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{error}</p>}
 
         <div className="mt-5 flex items-center justify-between gap-3 border-t border-line pt-4">
-          <button onClick={deferSetup} disabled={busy} className="h-9 rounded-full px-3 text-[12px] text-dim hover:bg-high hover:text-fg2 disabled:opacity-50">
-            {language === "zh-CN" ? "稍后设置，先进入应用" : "Set up later"}
+          <button onClick={() => auth.inProgress ? void cancelAuthentication() : deferSetup()} disabled={busy && !auth.inProgress} className="h-9 rounded-full px-3 text-[12px] text-dim hover:bg-high hover:text-fg2 disabled:opacity-50">
+            {auth.inProgress
+              ? (language === "zh-CN" ? "取消登录" : "Cancel sign-in")
+              : (language === "zh-CN" ? "稍后设置，先进入应用" : "Set up later")}
           </button>
           <button
-            disabled={busy}
+            disabled={busy || auth.inProgress}
             onClick={() => void submit()}
             className="flex h-9 min-w-[132px] items-center justify-center gap-2 rounded-full bg-acc px-5 text-[12px] font-medium text-base hover:bg-acc-deep disabled:opacity-50"
           >

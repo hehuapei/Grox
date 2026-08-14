@@ -132,6 +132,8 @@ export class MockBridge implements GrokBridge {
 
   async authenticate(): Promise<void> {}
 
+  async cancelAuthentication(): Promise<void> {}
+
   async logout(): Promise<void> {}
 
   async getAccountInfo() {

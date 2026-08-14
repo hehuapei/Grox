@@ -57,6 +57,7 @@ export interface GrokBridge {
   /** Authentication state and interactive browser login. */
   getAuthState(): Promise<AuthState>;
   authenticate(): Promise<void>;
+  cancelAuthentication(): Promise<void>;
   logout(): Promise<void>;
   getAccountInfo(): Promise<AccountInfo>;
   getBillingInfo(): Promise<BillingInfo>;
