@@ -42,6 +42,8 @@ interface AgentRuntimeStatus {
   topology: "shared_process";
   processCapacity: number;
   running: boolean;
+  ready: boolean;
+  phase: "stopped" | "starting" | "initializing" | "authenticating" | "ready" | "paused" | "offline";
   generation?: number;
   pid?: number;
   pendingRequests: number;
@@ -153,7 +155,7 @@ export function EnvironmentSummary() {
         });
         setWorktrees([]);
         setJournalStatus({ count: 12, totalBytes: 1_480_000, latestSavedAt: Date.now(), migrationPending: 0, unreadableCount: 0 });
-        setRuntimeStatus({ topology: "shared_process", processCapacity: 1, running: true, generation: 1, pid: 12345, pendingRequests: 0 });
+        setRuntimeStatus({ topology: "shared_process", processCapacity: 1, running: true, ready: true, phase: "ready", generation: 1, pid: 12345, pendingRequests: 0 });
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -270,6 +272,15 @@ export function EnvironmentSummary() {
       : activeTurns > 0
         ? `${activeTurns} ${zh ? "活跃" : "active"}`
         : "";
+  const runtimePhaseLabel = runtimeStatus && ({
+    stopped: zh ? "已停止" : "stopped",
+    starting: zh ? "启动中" : "starting",
+    initializing: zh ? "初始化中" : "initializing",
+    authenticating: zh ? "认证中" : "authenticating",
+    ready: zh ? "已就绪" : "ready",
+    paused: zh ? "已暂停" : "paused",
+    offline: zh ? "离线" : "offline",
+  } as const)[runtimeStatus.phase];
 
   return (
     <div ref={rootRef} className="relative">
@@ -336,10 +347,11 @@ export function EnvironmentSummary() {
 
             <SummaryRow icon="bolt" label={zh ? "Agent 运行时" : "Agent runtime"}>
               <span
-                className={`ml-auto font-mono text-[9.5px] ${runtimeStatus?.running ? "text-green" : "text-dim"}`}
+                className={`ml-auto font-mono text-[9.5px] ${runtimeStatus?.ready ? "text-green" : runtimeStatus?.running ? "text-gold" : "text-dim"}`}
                 title={runtimeStatus
                   ? [
                       runtimeStatus.running ? (zh ? "进程运行中" : "Process running") : (zh ? "按需启动" : "Starts on demand"),
+                      `${zh ? "连接阶段" : "Connection phase"}: ${runtimePhaseLabel}`,
                       runtimeStatus.pid ? `PID ${runtimeStatus.pid}` : "",
                       runtimeStatus.generation ? `${zh ? "代次" : "Generation"} ${runtimeStatus.generation}` : "",
                       runtimeStatus.pendingRequests > 0
@@ -356,6 +368,7 @@ export function EnvironmentSummary() {
                 {runtimeStatus
                   ? [
                       `${zh ? "共享" : "Shared"} · ${runtimeStatus.processCapacity} ${zh ? "进程" : "process"}`,
+                      runtimeStatus.ready ? "" : runtimePhaseLabel,
                       runtimeOccupancyLabel,
                     ].filter(Boolean).join(" · ")
                   : "—"}

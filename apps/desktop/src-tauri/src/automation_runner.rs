@@ -28,7 +28,6 @@ const RPC_TIMEOUT_MS: u64 = 30_000;
 #[derive(Default)]
 pub(crate) struct AutomationRunner {
     started: AtomicBool,
-    ready_generation: AtomicU64,
     last_tick_at: AtomicU64,
 }
 
@@ -82,41 +81,6 @@ impl AutomationRunner {
         });
     }
 
-    pub(crate) async fn mark_runtime_ready(
-        &self,
-        state: &AcpState,
-        generation: u64,
-    ) -> Result<(), AcpHostError> {
-        let process = state.process.lock().await;
-        if !process
-            .as_ref()
-            .is_some_and(|process| process.generation == generation)
-        {
-            return Err(AcpHostError::environment(
-                "AUTOMATION_RUNTIME_GENERATION_STALE",
-                "自动化运行时就绪信号属于已替换的 ACP 通道",
-                false,
-                false,
-                "等待 Agent 重连完成后重试",
-            ));
-        }
-        self.ready_generation.store(generation, Ordering::Release);
-        Ok(())
-    }
-
-    pub(crate) fn mark_runtime_unready(&self) {
-        self.ready_generation.store(0, Ordering::Release);
-    }
-
-    pub(crate) fn mark_generation_unready(&self, generation: u64) {
-        let _ = self.ready_generation.compare_exchange(
-            generation,
-            0,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
-    }
-
     pub(crate) async fn status(&self, state: &AcpState) -> AutomationRunnerStatus {
         let occupancy = state.sessions.snapshot();
         AutomationRunnerStatus {
@@ -147,7 +111,7 @@ impl AutomationRunner {
     }
 
     pub(crate) async fn ready_generation(&self, state: &AcpState) -> Result<u64, AcpHostError> {
-        let ready_generation = self.ready_generation.load(Ordering::Acquire);
+        let ready_generation = state.ready_generation.load(Ordering::Acquire);
         if ready_generation != 0
             && state
                 .process

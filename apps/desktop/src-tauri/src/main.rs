@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod acp_host;
+mod agent_runtime;
 mod automation_runner;
 mod automation_store;
 mod browser_mcp;
@@ -31,13 +32,14 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicU8, Ordering},
         Arc,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use acp_host::{AcpHostError, AcpRequestBroker};
+use agent_runtime::AgentRuntimeConnection;
 use automation_runner::{storage_error as automation_storage_error, AutomationRunner};
 use automation_store::{AutomationCompletion, AutomationStore};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -127,8 +129,12 @@ struct AgentProcess {
 #[derive(Default)]
 struct AcpState {
     process: Mutex<Option<AgentProcess>>,
+    connect_lock: Mutex<()>,
     next_generation: AtomicU64,
     next_host_request_id: AtomicU64,
+    ready_generation: AtomicU64,
+    paused_generation: AtomicU64,
+    runtime_phase: AtomicU8,
     requests: AcpRequestBroker,
     sessions: Arc<SessionCoordinator>,
 }
@@ -145,6 +151,155 @@ impl AcpState {
             .wrapping_add(1)
             & HOST_REQUEST_SEQUENCE_MASK;
         HOST_REQUEST_NAMESPACE | sequence.max(1)
+    }
+
+    fn set_runtime_phase(&self, phase: RuntimePhase) {
+        self.runtime_phase.store(phase as u8, Ordering::Release);
+    }
+
+    async fn pause_runtime(&self) -> Result<(), AcpHostError> {
+        let generation = self.ready_generation.load(Ordering::Acquire);
+        let process = self.process.lock().await;
+        if generation == 0
+            || !process
+                .as_ref()
+                .is_some_and(|process| process.generation == generation)
+        {
+            return Err(AcpHostError::operation(
+                "ACP_RUNTIME_NOT_READY",
+                "只有已完成握手的运行时才能暂停",
+            ));
+        }
+        self.paused_generation.store(generation, Ordering::Release);
+        if self
+            .ready_generation
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.paused_generation.store(0, Ordering::Release);
+            return Err(AcpHostError::operation(
+                "ACP_RUNTIME_STATE_CHANGED",
+                "运行时状态已变化，请重新执行当前操作",
+            ));
+        }
+        self.set_runtime_phase(RuntimePhase::Paused);
+        drop(process);
+        Ok(())
+    }
+
+    async fn mark_runtime_ready(&self, generation: u64) -> Result<(), AcpHostError> {
+        let process = self.process.lock().await;
+        if !process
+            .as_ref()
+            .is_some_and(|process| process.generation == generation)
+        {
+            return Err(AcpHostError::environment(
+                "ACP_RUNTIME_GENERATION_STALE",
+                "运行时就绪信号属于已替换的 ACP 通道",
+                false,
+                false,
+                "等待 Agent 重连完成后重试",
+            ));
+        }
+        self.paused_generation.store(0, Ordering::Release);
+        self.ready_generation.store(generation, Ordering::Release);
+        self.set_runtime_phase(RuntimePhase::Ready);
+        drop(process);
+        Ok(())
+    }
+
+    async fn resume_runtime(&self, generation: u64) -> Result<(), AcpHostError> {
+        if self.paused_generation.load(Ordering::Acquire) != generation {
+            return Err(AcpHostError::operation(
+                "ACP_RUNTIME_RESUME_NOT_ALLOWED",
+                "运行时没有可恢复的已就绪代次",
+            ));
+        }
+        let process = self.process.lock().await;
+        if !process
+            .as_ref()
+            .is_some_and(|process| process.generation == generation)
+        {
+            self.paused_generation.store(0, Ordering::Release);
+            self.set_runtime_phase(RuntimePhase::Offline);
+            return Err(AcpHostError::environment(
+                "ACP_RUNTIME_GENERATION_STALE",
+                "待恢复的 ACP 通道已退出或被替换",
+                false,
+                false,
+                "等待 Agent 重连完成后重试",
+            ));
+        }
+        if self
+            .paused_generation
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(AcpHostError::operation(
+                "ACP_RUNTIME_RESUME_NOT_ALLOWED",
+                "运行时恢复凭据已被消费",
+            ));
+        }
+        self.ready_generation.store(generation, Ordering::Release);
+        self.set_runtime_phase(RuntimePhase::Ready);
+        drop(process);
+        Ok(())
+    }
+
+    fn mark_generation_unready(&self, generation: u64, phase: RuntimePhase) {
+        let was_ready = self
+            .ready_generation
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        let was_paused = self
+            .paused_generation
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if was_ready
+            || was_paused
+            || (self.ready_generation.load(Ordering::Acquire) == 0
+                && self.paused_generation.load(Ordering::Acquire) == 0)
+        {
+            self.set_runtime_phase(phase);
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum RuntimePhase {
+    Stopped = 0,
+    Starting = 1,
+    Initializing = 2,
+    Authenticating = 3,
+    Ready = 4,
+    Paused = 5,
+    Offline = 6,
+}
+
+impl RuntimePhase {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            1 => Self::Starting,
+            2 => Self::Initializing,
+            3 => Self::Authenticating,
+            4 => Self::Ready,
+            5 => Self::Paused,
+            6 => Self::Offline,
+            _ => Self::Stopped,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Starting => "starting",
+            Self::Initializing => "initializing",
+            Self::Authenticating => "authenticating",
+            Self::Ready => "ready",
+            Self::Paused => "paused",
+            Self::Offline => "offline",
+        }
     }
 }
 
@@ -177,6 +332,8 @@ struct AgentRuntimeStatus {
     topology: &'static str,
     process_capacity: u8,
     running: bool,
+    ready: bool,
+    phase: &'static str,
     generation: Option<u64>,
     pid: Option<u32>,
     pending_requests: usize,
@@ -206,6 +363,10 @@ async fn agent_runtime_status(
         topology: "shared_process",
         process_capacity: 1,
         running,
+        ready: generation.is_some_and(|generation| {
+            state.ready_generation.load(Ordering::Acquire) == generation
+        }),
+        phase: RuntimePhase::from_raw(state.runtime_phase.load(Ordering::Acquire)).as_str(),
         generation,
         pid,
         pending_requests: state.requests.len().await,
@@ -1963,26 +2124,24 @@ fn automation_claim_error(message: String) -> AcpHostError {
 }
 
 #[tauri::command]
-async fn automation_runner_runtime_ready(
+async fn agent_runtime_resume(
     window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<AcpState>>,
-    runner: tauri::State<'_, AutomationRunner>,
     generation: u64,
 ) -> Result<(), AcpHostError> {
     ensure_main_acp_owner(window.label())
         .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
-    runner.mark_runtime_ready(state.inner(), generation).await
+    state.resume_runtime(generation).await
 }
 
 #[tauri::command]
-fn automation_runner_runtime_pause(
+async fn agent_runtime_pause(
     window: tauri::WebviewWindow,
-    runner: tauri::State<'_, AutomationRunner>,
+    state: tauri::State<'_, Arc<AcpState>>,
 ) -> Result<(), AcpHostError> {
     ensure_main_acp_owner(window.label())
         .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
-    runner.mark_runtime_unready();
-    Ok(())
+    state.pause_runtime().await
 }
 
 #[tauri::command]
@@ -7307,22 +7466,116 @@ fn ensure_main_acp_owner(window_label: &str) -> Result<(), String> {
     }
 }
 
-/// Start a fresh ACP child and stream each stdout JSON-RPC line to the webview.
-/// A repeated call intentionally replaces the old child so a webview reload
-/// cannot initialize the same agent process twice.
 #[tauri::command]
-async fn acp_spawn(
+async fn agent_runtime_connect(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<AcpState>>,
     leases: tauri::State<'_, Arc<McpLeaseStore>>,
-    automation_runner: tauri::State<'_, AutomationRunner>,
     cwd: String,
-    computer_use_enabled: Option<bool>,
     reasoning_effort: Option<String>,
-) -> Result<u64, String> {
-    ensure_main_acp_owner(window.label())?;
-    automation_runner.mark_runtime_unready();
+) -> Result<AgentRuntimeConnection, AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    let _connect_guard = state.connect_lock.lock().await;
+    state.ready_generation.store(0, Ordering::Release);
+    state.paused_generation.store(0, Ordering::Release);
+    state.set_runtime_phase(RuntimePhase::Starting);
+
+    let (generation, client_version) = match spawn_acp_process(
+        &app,
+        state.inner(),
+        leases.inner(),
+        cwd,
+        reasoning_effort,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            state.set_runtime_phase(RuntimePhase::Offline);
+            return Err(AcpHostError::environment(
+                "ACP_SPAWN_FAILED",
+                error,
+                true,
+                true,
+                "请检查 CLI 安装、权限与当前工作目录后重试",
+            ));
+        }
+    };
+
+    state.set_runtime_phase(RuntimePhase::Initializing);
+    let initialize = match agent_runtime::initialize(
+        state.inner(),
+        leases.inner(),
+        generation,
+        client_version.as_deref(),
+    )
+    .await
+    {
+        Ok(initialize) => initialize,
+        Err(error) => {
+            discard_failed_runtime(state.inner(), leases.inner(), generation, error.clone()).await;
+            return Err(error);
+        }
+    };
+
+    state.set_runtime_phase(RuntimePhase::Authenticating);
+    let auth = agent_runtime::authenticate(
+        state.inner(),
+        leases.inner(),
+        generation,
+        &initialize,
+    )
+    .await;
+    if let Err(error) = state.mark_runtime_ready(generation).await {
+        discard_failed_runtime(state.inner(), leases.inner(), generation, error.clone()).await;
+        return Err(error);
+    }
+    Ok(AgentRuntimeConnection {
+        generation,
+        initialize,
+        auth,
+    })
+}
+
+async fn discard_failed_runtime(
+    state: &AcpState,
+    leases: &McpLeaseStore,
+    generation: u64,
+    failure: AcpHostError,
+) {
+    state.mark_generation_unready(generation, RuntimePhase::Offline);
+    state.requests.reject_generation(generation, failure).await;
+    shutdown_all_mcp_resources(leases);
+    let process = {
+        let mut process = state.process.lock().await;
+        if process
+            .as_ref()
+            .is_some_and(|process| process.generation == generation)
+        {
+            process.take()
+        } else {
+            None
+        }
+    };
+    if let Some(process) = process {
+        let next_generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        state.sessions.reset(next_generation);
+        terminate_process(process).await;
+    }
+}
+
+/// Start a fresh ACP child and stream each stdout JSON-RPC line to the webview.
+/// Only the Host connection transaction calls this helper, so a spawned child
+/// can never be mistaken for an initialized runtime.
+async fn spawn_acp_process(
+    app: &tauri::AppHandle,
+    state: &Arc<AcpState>,
+    leases: &Arc<McpLeaseStore>,
+    cwd: String,
+    reasoning_effort: Option<String>,
+) -> Result<(u64, Option<String>), String> {
     let cwd = checked_workspace(&cwd)?;
 
     // Invalidate the previous readers before terminating their process. On a
@@ -7341,15 +7594,19 @@ async fn acp_spawn(
             "Agent 重连后检查最后一轮结果，再决定是否重新发送",
         ))
         .await;
-    shutdown_all_mcp_resources(leases.inner());
+    shutdown_all_mcp_resources(leases);
 
     if let Some(old) = state.process.lock().await.take() {
         terminate_process(old).await;
     }
 
-    let runtime = configured_grok_command(&app);
-    // Host gate only (env | host_prefs). FE `computer_use_enabled` is not authority.
-    let _ = computer_use_enabled;
+    let runtime = configured_grok_command(app);
+    let client_version = runtime
+        .version
+        .as_deref()
+        .and_then(cli_version_number)
+        .map(|version| version.to_string());
+    // Host gate only (env | host_prefs); WebView state is not authorization.
     let computer_plugin = if computer_use_gate_open() {
         Some(
             ensure_computer_plugin()
@@ -7439,7 +7696,7 @@ async fn acp_spawn(
     });
 
     let stdout_app = app.clone();
-    let stdout_state = state.inner().clone();
+    let stdout_state = state.clone();
     tauri::async_runtime::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         loop {
@@ -7479,9 +7736,7 @@ async fn acp_spawn(
             }
         };
         if let Some(mut process) = process {
-            stdout_app
-                .state::<AutomationRunner>()
-                .mark_generation_unready(generation);
+            stdout_state.mark_generation_unready(generation, RuntimePhase::Offline);
             shutdown_all_mcp_resources(stdout_app.state::<Arc<McpLeaseStore>>().inner());
             let next_generation = stdout_state
                 .next_generation
@@ -7529,7 +7784,7 @@ async fn acp_spawn(
     });
 
     let stderr_app = app.clone();
-    let stderr_state = state.inner().clone();
+    let stderr_state = state.clone();
     tauri::async_runtime::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -7545,7 +7800,7 @@ async fn acp_spawn(
         }
     });
 
-    Ok(generation)
+    Ok((generation, client_version))
 }
 
 /// Methods the desktop shell may write on the ACP stdin channel.
@@ -7948,10 +8203,11 @@ async fn acp_kill(
     window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<AcpState>>,
     leases: tauri::State<'_, Arc<McpLeaseStore>>,
-    automation_runner: tauri::State<'_, AutomationRunner>,
 ) -> Result<(), String> {
     ensure_main_acp_owner(window.label())?;
-    automation_runner.mark_runtime_unready();
+    state.ready_generation.store(0, Ordering::Release);
+    state.paused_generation.store(0, Ordering::Release);
+    state.set_runtime_phase(RuntimePhase::Stopped);
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
     state.sessions.reset(generation);
     state
@@ -7972,6 +8228,7 @@ async fn acp_kill(
             },
         );
     }
+    state.set_runtime_phase(RuntimePhase::Stopped);
     Ok(())
 }
 
@@ -8516,8 +8773,8 @@ fn main() {
             patch_prompt_queues,
             read_automations,
             patch_automations,
-            automation_runner_runtime_ready,
-            automation_runner_runtime_pause,
+            agent_runtime_resume,
+            agent_runtime_pause,
             automation_runner_status,
             run_automation_now,
             renew_automation_dispatch,
@@ -8590,7 +8847,7 @@ fn main() {
             browser_shutdown_all_leases,
             save_media_reference,
             generate_media,
-            acp_spawn,
+            agent_runtime_connect,
             acp_request,
             acp_cancel_request,
             acp_send,
@@ -8598,8 +8855,10 @@ fn main() {
         ])
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) && window.label() == "main" {
-                window.state::<AutomationRunner>().mark_runtime_unready();
                 let state = window.state::<Arc<AcpState>>().inner().clone();
+                state.ready_generation.store(0, Ordering::Release);
+                state.paused_generation.store(0, Ordering::Release);
+                state.set_runtime_phase(RuntimePhase::Stopped);
                 let leases = window.state::<Arc<McpLeaseStore>>().inner().clone();
                 let preview_state = window.state::<Arc<PreviewState>>().inner().clone();
                 tauri::async_runtime::spawn(async move {
@@ -8642,6 +8901,21 @@ mod tests {
         assert!(first > (1_u64 << 52));
         assert!(second <= (1_u64 << 53) - 1);
         assert_eq!(second, first + 1);
+    }
+
+    #[test]
+    fn runtime_pause_cannot_manufacture_a_ready_generation() {
+        let state = AcpState::default();
+        let error = tauri::async_runtime::block_on(state.pause_runtime()).unwrap_err();
+        assert_eq!(error.code, "ACP_RUNTIME_NOT_READY");
+        let error = tauri::async_runtime::block_on(state.resume_runtime(7)).unwrap_err();
+        assert_eq!(error.code, "ACP_RUNTIME_RESUME_NOT_ALLOWED");
+        assert_eq!(state.ready_generation.load(Ordering::Acquire), 0);
+        assert_eq!(state.paused_generation.load(Ordering::Acquire), 0);
+        assert_eq!(
+            RuntimePhase::from_raw(state.runtime_phase.load(Ordering::Acquire)).as_str(),
+            "stopped"
+        );
     }
 
     #[test]

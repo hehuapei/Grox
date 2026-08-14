@@ -1,7 +1,6 @@
 /* Real Grok Build bridge over ACP / newline-delimited JSON-RPC 2.0. */
 
 import { invoke } from "@tauri-apps/api/core";
-import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { GrokBridge } from "./GrokBridge";
 import { EFFORTS, MODELS } from "./types";
@@ -18,7 +17,6 @@ import type {
   PromptOptions,
   QuestionItem,
   QuestionResponse,
-  GrokRuntimeInfo,
   ModelState,
   Effort,
   Session,
@@ -98,6 +96,12 @@ export const ACP_METHODS = {
 const UPSTREAM_CLI_CLIENT_IDENTIFIER = "grok-shell";
 
 type JsonObject = Record<string, unknown>;
+
+interface AgentRuntimeConnection {
+  generation: number;
+  initialize: unknown;
+  auth: AuthState & { methodId?: string };
+}
 type RpcId = string | number;
 
 interface JsonRpcMessage extends JsonObject {
@@ -1330,36 +1334,20 @@ export class AcpBridge implements GrokBridge {
     // Diagnostics belong to one concrete child process. Keeping stderr from a
     // process replaced during a Tauri hot reload produces misleading errors.
     this.diagnostics = [];
-    this.acpGeneration = await invoke<number>("acp_spawn", {
+    const connection = await invoke<AgentRuntimeConnection>("agent_runtime_connect", {
       cwd: this.workspace,
-      computerUseEnabled: this.computerUseEnabled,
       reasoningEffort: storedEffort(),
     });
-    // The inference proxy gates on the client version, so never assert a
-    // hardcoded one: report the actual CLI version whenever it is detectable.
-    const clientVersion = await this.detectCliVersion();
-    const response = await this.requestRaw(ACP_METHODS.initialize, {
-      protocolVersion: 1,
-      clientCapabilities: {
-        fs: { readTextFile: true, writeTextFile: true },
-        terminal: false,
-      },
-      clientInfo: {
-        name: UPSTREAM_CLI_CLIENT_IDENTIFIER,
-        title: "Grok Build CLI",
-        version: clientVersion ?? (await getVersion().catch(() => "0.2.0")),
-      },
-      _meta: {
-        clientIdentifier: UPSTREAM_CLI_CLIENT_IDENTIFIER,
-        clientType: "shell",
-        ...(clientVersion ? { clientVersion } : {}),
-      },
-    }, 15_000);
-    this.captureModelState(response);
-    this.captureRuntimeCommands(response);
-    await this.configureAuthentication(response);
-    // Host 只在 ACP 初始化及认证配置完成后派发任务，租约不会消耗在半连接状态。
-    await invoke("automation_runner_runtime_ready", { generation: this.acpGeneration });
+    this.acpGeneration = connection.generation;
+    this.captureModelState(connection.initialize);
+    this.captureRuntimeCommands(connection.initialize);
+    this.authMethodId = connection.auth.methodId;
+    this.setAuthState({
+      required: connection.auth.required,
+      inProgress: false,
+      label: connection.auth.label,
+      error: connection.auth.error,
+    });
     // v1 source snapshots make startup structurally non-blocking: initialize
     // may expose a cached/bundled catalog before the authenticated fetch ends.
     // Refresh in the background so desktop readiness never waits on network.
@@ -1370,18 +1358,6 @@ export class AcpBridge implements GrokBridge {
           this.diagnostics.push(`模型目录后台刷新失败：${errorText(error)}`);
         }
       });
-  }
-
-  /** Best-effort version of the spawned `grok` CLI ("grok 0.2.106 (abc) [stable]" → "0.2.106"). */
-  private async detectCliVersion(): Promise<string | undefined> {
-    try {
-      const runtime = await invoke<GrokRuntimeInfo>("grok_runtime_info");
-      return runtime.version
-        ?.split(/\s+/)
-        .find((token) => /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(token));
-    } catch {
-      return undefined;
-    }
   }
 
   private async restartAgent(): Promise<void> {
@@ -1420,7 +1396,7 @@ export class AcpBridge implements GrokBridge {
    */
   private async reconfigureRuntime<T>(change: () => Promise<T>): Promise<T> {
     const previousGeneration = this.acpGeneration;
-    await invoke("automation_runner_runtime_pause");
+    await invoke("agent_runtime_pause");
     try {
       await this.waitForActivePrompts();
       return await this.withLifecycleGate(async () => {
@@ -1429,7 +1405,7 @@ export class AcpBridge implements GrokBridge {
         return result;
       });
     } catch (error) {
-      await invoke("automation_runner_runtime_ready", { generation: previousGeneration }).catch((resumeError) => {
+      await invoke("agent_runtime_resume", { generation: previousGeneration }).catch((resumeError) => {
         this.diagnostics.push(`自动化调度未能恢复：${errorText(resumeError)}`);
       });
       throw error;
@@ -1452,56 +1428,6 @@ export class AcpBridge implements GrokBridge {
       const mode = this.pendingPermissionModeSync;
       this.pendingPermissionModeSync = null;
       this.syncPermissionMode(mode);
-    }
-  }
-
-  private async configureAuthentication(responseValue: unknown) {
-    const response = record(responseValue);
-    const methods = array(response?.authMethods).map((value) => record(value) ?? {});
-    if (methods.length === 0) {
-      // Per ACP semantics an empty authMethods list means the agent needs no
-      // authentication — treating it as "required" wedges the UI with no
-      // usable recovery path (the OAuth button has no method id to call).
-      this.setAuthState({ required: false, inProgress: false, error: undefined });
-      return;
-    }
-
-    const first = methods[0];
-    const firstId = string(first.id);
-    const firstInteractive = firstId === "grok.com" || firstId === "oidc";
-    const meta = record(response?._meta);
-    const defaultId = string(meta?.defaultAuthMethodId);
-    this.authMethodId = firstInteractive
-      ? firstId
-      : defaultId && methods.some((method) => string(method.id) === defaultId)
-        ? defaultId
-        : firstId;
-
-    if (firstInteractive) {
-      this.setAuthState({
-        required: true,
-        inProgress: false,
-        label: string(first.name) ?? "Sign in to Grok",
-        error: undefined,
-      });
-      return;
-    }
-
-    try {
-      await this.requestRaw("authenticate", { methodId: this.authMethodId });
-      this.setAuthState({ required: false, inProgress: false, error: undefined });
-    } catch (error) {
-      const interactive = methods.find((method) => {
-        const id = string(method.id);
-        return id === "grok.com" || id === "oidc";
-      });
-      this.authMethodId = string(interactive?.id);
-      this.setAuthState({
-        required: Boolean(this.authMethodId),
-        inProgress: false,
-        label: string(interactive?.name) ?? "Sign in to Grok",
-        error: this.authMethodId ? undefined : errorText(error),
-      });
     }
   }
 
@@ -2866,7 +2792,8 @@ export class AcpBridge implements GrokBridge {
     }
     const meta = record(subscription.meta) ?? {};
     return {
-      authenticated: Boolean(subscription.authenticated) || !this.authState.required,
+      authenticated: Boolean(subscription.authenticated)
+        || (!this.authState.required && !this.authState.error),
       methodId: string(authInfo.methodId),
       email: string(authInfo.email) ?? string(meta.email),
       firstName: string(authInfo.firstName),

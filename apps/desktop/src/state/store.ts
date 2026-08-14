@@ -1930,7 +1930,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }, 0);
 
       // ── Phase 2: agent boot only after idle (or immediately for deep links).
-      // Keep the shell fully interactive for ~2s before any acp_spawn work.
+      // Keep the shell fully interactive for ~2s before the Host starts ACP connection work.
       const bootAgent = () => {
         void (async () => {
           try {

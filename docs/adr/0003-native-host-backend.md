@@ -79,6 +79,10 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - Host 为退出、通道替换、超时、停滞、取消和协议校验返回稳定错误代码，前端不再用字符串正则覆盖这些分类；
 - 环境摘要和支持包记录 Host 悬挂请求数；
 - WebView 只解释已经归属的响应，未知广播响应仍呈现为协议错误。
+- `agent_runtime_connect` 在 Host 连接锁内完成 CLI 检测、进程替换、`initialize`、非交互认证和 ready 提交；WebView 不再用 `acp_spawn`、`initialize` 和 `runtime_ready` 三次调用拼出连接事实；
+- 初始化失败或进程在握手中退出会清算该代请求、能力租约和半连接子进程；运行时快照区分 starting、initializing、authenticating、ready、paused 与 offline，不再把“有 PID”等同于“可派发”；
+- `ready_generation` 只存在于 `AcpState`，自动化直接读取同一 Host 状态；供应商/认证配置事务暂停时由 Host 保存一次性的已就绪代次，恢复必须消费同一进程的凭据，页面不能在握手中制造 ready 或单独宣布 runner 就绪；
+- 交互式 OAuth 仍需用户显式点击，Host 只返回方法与标签，不在后台连接时擅自打开浏览器；非交互认证失败会保留结构化错误，也不会再被账户投影反向推断成已登录。
 - `session_coordinator::SessionCoordinator` 在 Host 内维护活动回合、FIFO 生命周期队列和进程代次；
 - `session/new`、`session/load`、`session/prompt` 必须携带 Host 签发且与方法、会话、代次匹配的许可；
 - 生命周期排队会阻止新回合抢占，不同已绑定会话仍可并发运行；等待任务取消、进程自然退出、替换、停止、CLI 更新和主窗口退出都会清除旧许可；
@@ -104,11 +108,11 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - `session_journal_store::SessionJournalStore` 校验现有和提交快照，前端以磁盘 savedAt 为基线生成单调逻辑版本；旧窗口的等版本/低版本写入会明确冲突并停止续写，不能覆盖新 journal；
 - 旧版裸 Session 只保留只读迁移入口，损坏的现有 journal 不会被新快照静默覆盖。
 
-本切片没有把完整 SessionManager 伪装成已经迁移：建会话/恢复和自动化协议回合已属于
-Host，但 CLI initialize/authenticate、普通前台回合的流停滞监督、权限/问题交互，以及
-提示队列何时 claim/发送/恢复仍在 Bridge/Store。后续必须把这些路径迁入同一个 Host
-会话服务，才能删除 `activePromptSessions` 与 WebView 执行器；在此之前不会另起一个
-简化 CLI 进程冒充后台运行时。
+本切片没有把完整 SessionManager 伪装成已经迁移：连接初始化、非交互认证、建会话/恢复
+和自动化协议回合已属于 Host，但用户触发的交互 OAuth、普通前台回合的流停滞监督、
+权限/问题交互，以及提示队列何时 claim/发送/恢复仍在 Bridge/Store。后续必须把这些路径
+迁入同一个 Host 会话服务，才能删除 `activePromptSessions` 与 WebView 执行器；在此之前
+不会另起一个简化 CLI 进程冒充后台运行时。
 
 ## 完整后端对照结论
 
