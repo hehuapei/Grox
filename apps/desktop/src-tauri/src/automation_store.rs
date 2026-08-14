@@ -61,6 +61,11 @@ pub(crate) struct AutomationCompletion<'a> {
     pub(crate) completed_at: u64,
 }
 
+pub(crate) struct ClaimedAutomation {
+    pub(crate) automation: Value,
+    pub(crate) lease_expires_at: u64,
+}
+
 impl AutomationStore {
     pub(crate) fn read(&self, path: &Path, max_bytes: u64) -> Result<Option<String>, String> {
         let _transaction = self.lock_transaction();
@@ -206,11 +211,40 @@ impl AutomationStore {
             .iter_mut()
             .find(|automation| automation_id(automation) == Some(id))
             .ok_or_else(|| format!("自动化任务不存在：{id}"))?;
-        let runtime = claim_runtime_mut(automation, token)?;
-        let expires_at = now_ms.saturating_add(CLAIM_LEASE_MS);
-        runtime.insert("leaseExpiresAt".to_string(), Value::from(expires_at));
+        let expires_at = renew_claim_runtime(automation, token, now_ms)?;
         self.write_locked(path, automations, max_bytes)?;
         Ok(expires_at)
+    }
+
+    /// WebView 创建完带本机能力租约的会话后，将执行权原子移交给 Host。
+    /// 读取配置、校验 token 和首次续租必须在同一事务内，不能让前端提交另一份配置快照。
+    pub(crate) fn begin_execution(
+        &self,
+        path: &Path,
+        id: &str,
+        token: &str,
+        now_ms: u64,
+        max_bytes: u64,
+    ) -> Result<ClaimedAutomation, String> {
+        validate_automation_id(id)?;
+        validate_claim_token(token)?;
+        let _transaction = self.lock_transaction();
+        let mut automations = self.read_locked(path, max_bytes)?;
+        let automation = automations
+            .iter_mut()
+            .find(|automation| automation_id(automation) == Some(id))
+            .ok_or_else(|| format!("自动化任务不存在：{id}"))?;
+        let lease_expires_at = renew_claim_runtime(automation, token, now_ms)?;
+        let mut payload = automation.clone();
+        payload
+            .as_object_mut()
+            .expect("validated automation must be an object")
+            .remove(HOST_RUNTIME_KEY);
+        self.write_locked(path, automations, max_bytes)?;
+        Ok(ClaimedAutomation {
+            automation: payload,
+            lease_expires_at,
+        })
     }
 
     pub(crate) fn complete_claim(
@@ -634,6 +668,13 @@ fn claim_runtime_mut<'a>(
     }
 }
 
+fn renew_claim_runtime(automation: &mut Value, token: &str, now_ms: u64) -> Result<u64, String> {
+    let runtime = claim_runtime_mut(automation, token)?;
+    let expires_at = now_ms.saturating_add(CLAIM_LEASE_MS);
+    runtime.insert("leaseExpiresAt".to_string(), Value::from(expires_at));
+    Ok(expires_at)
+}
+
 fn validate_claim_token(token: &str) -> Result<(), String> {
     if token.is_empty()
         || token.len() > 192
@@ -838,6 +879,35 @@ mod tests {
 
         let persisted: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(persisted[0][HOST_RUNTIME_KEY]["token"], dispatch.token);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn begin_execution_reads_claimed_config_and_renews_in_one_transaction() {
+        let path = temp_file("begin-execution");
+        fs::write(
+            &path,
+            serde_json::json!([automation("a", true)]).to_string(),
+        )
+        .unwrap();
+        let store = AutomationStore::default();
+        let dispatch = store.claim_due(&path, 10, 1024 * 1024).unwrap().unwrap();
+
+        let claimed = store
+            .begin_execution(&path, "a", &dispatch.token, 40, 1024 * 1024)
+            .unwrap();
+
+        assert_eq!(claimed.automation["id"], "a");
+        assert!(claimed.automation.get(HOST_RUNTIME_KEY).is_none());
+        assert_eq!(claimed.lease_expires_at, 40 + CLAIM_LEASE_MS);
+        let persisted: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted[0][HOST_RUNTIME_KEY]["leaseExpiresAt"],
+            40 + CLAIM_LEASE_MS
+        );
+        assert!(store
+            .begin_execution(&path, "a", "stale-token", 50, 1024 * 1024)
+            .is_err());
         let _ = fs::remove_file(path);
     }
 

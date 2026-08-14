@@ -122,8 +122,24 @@ struct AgentProcess {
 struct AcpState {
     process: Mutex<Option<AgentProcess>>,
     next_generation: AtomicU64,
+    next_host_request_id: AtomicU64,
     requests: AcpRequestBroker,
     sessions: Arc<SessionCoordinator>,
+}
+
+impl AcpState {
+    fn issue_host_request_id(&self) -> u64 {
+        // Grok Build 的 ACP 适配器可能由 JavaScript 实现；请求 id 必须保持
+        // Number-safe，同时与从 1 递增的 WebView 请求留出不可实际跨越的空间。
+        const HOST_REQUEST_NAMESPACE: u64 = 1 << 52;
+        const HOST_REQUEST_SEQUENCE_MASK: u64 = HOST_REQUEST_NAMESPACE - 1;
+        let sequence = self
+            .next_host_request_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+            & HOST_REQUEST_SEQUENCE_MASK;
+        HOST_REQUEST_NAMESPACE | sequence.max(1)
+    }
 }
 
 struct PreviewProcess {
@@ -2076,6 +2092,50 @@ fn complete_automation_dispatch(
             AUTOMATIONS_MAX_BYTES,
         )
         .map_err(automation_claim_error)
+}
+
+/// 会话创建后的自动化回合由 Host 完整拥有：模型/模式绑定、prompt、长回合续租和结算。
+#[tauri::command]
+async fn execute_automation_session(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    leases: tauri::State<'_, Arc<McpLeaseStore>>,
+    runner: tauri::State<'_, AutomationRunner>,
+    automations: tauri::State<'_, AutomationStore>,
+    id: String,
+    token: String,
+    session_id: String,
+) -> Result<automation_runner::AutomationSessionResult, AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    let result = automation_runner::execute_claimed_session(
+        &app,
+        &window,
+        state.inner(),
+        leases.inner(),
+        runner.inner(),
+        automations.inner(),
+        &id,
+        &token,
+        &session_id,
+    )
+    .await;
+    if let Err(error) = &result {
+        let _ = window.emit(
+            "automation-session-settled",
+            automation_runner::AutomationSessionSettled {
+                session_id,
+                model: None,
+                mode: None,
+                requested_effort: None,
+                effective_effort: None,
+                usage: None,
+                error: Some(error.clone()),
+            },
+        );
+    }
+    result
 }
 
 #[tauri::command]
@@ -7727,7 +7787,28 @@ async fn acp_request(
     ensure_main_acp_owner(window.label()).map_err(|error| {
         AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error)
     })?;
-    let line = prepare_acp_line(line, leases.inner())
+    acp_request_inner(
+        state.inner(),
+        leases.inner(),
+        line,
+        request_id,
+        generation,
+        timeout_ms,
+        gate_token,
+    )
+    .await
+}
+
+async fn acp_request_inner(
+    state: &AcpState,
+    leases: &McpLeaseStore,
+    line: String,
+    request_id: u64,
+    generation: u64,
+    timeout_ms: u64,
+    gate_token: Option<u64>,
+) -> Result<String, AcpHostError> {
+    let line = prepare_acp_line(line, leases)
         .map_err(|error| AcpHostError::protocol("ACP_INVALID_REQUEST", error))?;
     let message = serde_json::from_str::<serde_json::Value>(&line)
         .map_err(|error| AcpHostError::protocol("ACP_INVALID_REQUEST", format!("ACP 消息不是合法 JSON：{error}")))?;
@@ -7756,7 +7837,7 @@ async fn acp_request(
         .requests
         .register(request_id, generation, method.clone())
         .await?;
-    if let Err(error) = write_acp_line(state.inner(), &line, generation).await {
+    if let Err(error) = write_acp_line(state, &line, generation).await {
         let failure = AcpHostError::environment(
             "ACP_WRITE_FAILED",
             error,
@@ -7811,6 +7892,94 @@ async fn acp_request(
         }
     };
     response
+}
+
+/// Host 服务使用与 WebView 完全相同的请求表、代次校验和 stdio 写通道。
+/// JavaScript 安全整数的高位命名空间避免与 WebView 递增请求 id 相撞。
+pub(crate) async fn request_acp_json(
+    state: &AcpState,
+    leases: &McpLeaseStore,
+    method: &str,
+    params: serde_json::Value,
+    generation: u64,
+    timeout_ms: u64,
+    gate_token: Option<u64>,
+) -> Result<serde_json::Value, AcpHostError> {
+    let request_id = state.issue_host_request_id();
+    let line = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": method,
+        "params": params,
+    })
+    .to_string();
+    let response = acp_request_inner(
+        state,
+        leases,
+        line,
+        request_id,
+        generation,
+        timeout_ms,
+        gate_token,
+    )
+    .await?;
+    decode_host_acp_response(&response, request_id, method)
+}
+
+fn decode_host_acp_response(
+    line: &str,
+    request_id: u64,
+    method: &str,
+) -> Result<serde_json::Value, AcpHostError> {
+    let response = serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
+        AcpHostError::protocol(
+            "ACP_INVALID_RESPONSE",
+            format!("Grok Build 返回了无法解析的 ACP 响应：{error}"),
+        )
+    })?;
+    let object = response.as_object().ok_or_else(|| {
+        AcpHostError::protocol("ACP_INVALID_RESPONSE", "Grok Build 的 ACP 响应不是对象")
+    })?;
+    if object.get("id").and_then(serde_json::Value::as_u64) != Some(request_id)
+        || object.get("method").is_some()
+    {
+        return Err(AcpHostError::protocol(
+            "ACP_INVALID_RESPONSE",
+            format!("Grok Build 返回了无法归属的 ACP 响应 · {method}"),
+        ));
+    }
+    if let Some(error) = object.get("error") {
+        return Err(acp_rpc_error(method, error));
+    }
+    let result = object
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if method.starts_with("x.ai/") {
+        if let Some(error) = result.get("error").filter(|error| !error.is_null()) {
+            return Err(acp_rpc_error(method, error));
+        }
+        if let Some(nested) = result.get("result") {
+            return Ok(nested.clone());
+        }
+    }
+    Ok(result)
+}
+
+fn acp_rpc_error(method: &str, error: &serde_json::Value) -> AcpHostError {
+    let code = error.get("code").and_then(serde_json::Value::as_i64);
+    let detail = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string());
+    let detail = detail.chars().take(3_500).collect::<String>();
+    let stable_code = match code {
+        Some(-32601) => "ACP_RPC_METHOD_NOT_FOUND",
+        Some(-32602) => "ACP_RPC_INVALID_PARAMS",
+        _ => "ACP_RPC_FAILED",
+    };
+    AcpHostError::protocol(stable_code, format!("{detail} · {method}"))
 }
 
 /// 会话 watchdog/协议恢复只取消一个 Host 请求，不影响同进程内其他会话。
@@ -8426,6 +8595,7 @@ fn main() {
             run_automation_now,
             renew_automation_dispatch,
             complete_automation_dispatch,
+            execute_automation_session,
             delete_session_data,
             delete_project_session_data,
             scrub_session_journal_orphans,
@@ -8534,6 +8704,38 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_acp_request_ids_use_a_disjoint_javascript_safe_namespace() {
+        let state = AcpState::default();
+        let first = state.issue_host_request_id();
+        let second = state.issue_host_request_id();
+        assert!(first > (1_u64 << 52));
+        assert!(second <= (1_u64 << 53) - 1);
+        assert_eq!(second, first + 1);
+    }
+
+    #[test]
+    fn host_acp_response_decoder_preserves_protocol_failure_kind() {
+        let error = decode_host_acp_response(
+            r#"{"jsonrpc":"2.0","id":9,"error":{"code":-32602,"message":"invalid params"}}"#,
+            9,
+            "session/set_model",
+        )
+        .unwrap_err();
+        assert_eq!(error.domain, "protocol");
+        assert_eq!(error.code, "ACP_RPC_INVALID_PARAMS");
+        assert!(error.message.contains("session/set_model"));
+        assert_eq!(
+            decode_host_acp_response(
+                r#"{"jsonrpc":"2.0","id":10,"result":{"ok":true}}"#,
+                10,
+                "session/prompt",
+            )
+            .unwrap()["ok"],
+            true
+        );
+    }
 
     fn test_release(tag_name: &str, draft: bool, prerelease: bool) -> GitHubRelease {
         GitHubRelease {

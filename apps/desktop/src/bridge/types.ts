@@ -546,6 +546,22 @@ export interface AutomationRunnerStatus {
   runtimeBusy: boolean;
 }
 
+export interface AutomationSessionSettled {
+  sessionId: string;
+  model?: string | null;
+  mode?: AgentMode | null;
+  requestedEffort?: Effort | null;
+  effectiveEffort?: Effort | null;
+  usage?: Record<string, unknown> | null;
+  error?: GroxError | null;
+}
+
+export interface AutomationSessionResult {
+  automation?: AutomationDispatch["automation"] | null;
+  effectiveEffort: Effort;
+  error?: GroxError | null;
+}
+
 /** Events a bridge pushes into the store. Wire-level naming kept close to ACP. */
 export type BridgeEvent =
   | { type: "auth_state"; state: AuthState }

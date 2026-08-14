@@ -45,6 +45,7 @@ import type {
   RuntimeOccupancy,
   AutomationDispatch,
   AutomationRunnerStatus,
+  AutomationSessionSettled,
   GroxError,
   SlashCommand,
   WorkflowAgentTrace,
@@ -1267,6 +1268,40 @@ export class AcpBridge implements GrokBridge {
       await listen<GroxError>("automation-runner-error", ({ payload }) => {
         this.emit({ type: "runtime_notice", notice: runtimeNoticeFromError(payload) });
       }),
+      await listen<AutomationSessionSettled>("automation-session-settled", ({ payload }) => {
+        if (payload.model && payload.effectiveEffort && payload.mode) {
+          this.sessionOptions.set(payload.sessionId, {
+            model: payload.model,
+            effort: payload.effectiveEffort,
+            mode: payload.mode,
+          });
+        }
+        if (
+          payload.requestedEffort
+          && payload.effectiveEffort
+          && payload.requestedEffort !== payload.effectiveEffort
+        ) {
+          this.emit({
+            type: "block_add",
+            sessionId: payload.sessionId,
+            block: {
+              type: "system",
+              id: uid(),
+              text: `推理强度 ${payload.requestedEffort} 不被当前模型/API 接受，已自动改用 ${payload.effectiveEffort} 继续。`,
+              ts: Date.now(),
+              kind: "info",
+            },
+          });
+        }
+        this.finishTurn(
+          payload.sessionId,
+          record(payload.usage),
+          payload.error ? "failed" : "idle",
+        );
+        if (payload.error) {
+          this.emit({ type: "error", sessionId: payload.sessionId, error: payload.error });
+        }
+      }),
       await listen("computer-emergency-shortcut", () => {
         for (const sessionId of this.activeComputerSessions) {
           void this.emergencyStopComputer(sessionId);
@@ -1398,9 +1433,11 @@ export class AcpBridge implements GrokBridge {
     await invoke("automation_runner_runtime_pause");
     try {
       await this.waitForActivePrompts();
-      const result = await change();
-      await this.restartAgent();
-      return result;
+      return await this.withLifecycleGate(async () => {
+        const result = await change();
+        await this.restartAgent();
+        return result;
+      });
     } catch (error) {
       await invoke("automation_runner_runtime_ready", { generation: previousGeneration }).catch((resumeError) => {
         this.diagnostics.push(`自动化调度未能恢复：${errorText(resumeError)}`);

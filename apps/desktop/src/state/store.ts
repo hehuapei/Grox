@@ -44,6 +44,7 @@ import type {
   RuntimeConnectionState,
   RuntimeOccupancy,
   AutomationDispatch,
+  AutomationSessionResult,
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
 import {
@@ -980,6 +981,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     let sessionId: string | undefined;
     let executionError: unknown;
+    let hostOwnsExecution = false;
     let renewalFailureReported = false;
     const renewLease = () => {
       void invoke<number>("renew_automation_dispatch", {
@@ -997,7 +999,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
         });
       });
     };
-    const heartbeat = window.setInterval(renewLease, 30_000);
+    let heartbeat: number | undefined = window.setInterval(renewLease, 30_000);
+
+    const stopCreationHeartbeat = () => {
+      if (heartbeat === undefined) return;
+      window.clearInterval(heartbeat);
+      heartbeat = undefined;
+    };
 
     try {
       sessionId = await bridge.newBackgroundSession(automation.cwd);
@@ -1050,12 +1058,25 @@ export const useDesktop = create<DesktopState>((set, get) => {
         detail: "Host 已认领任务，提示已交给当前 Agent 运行时。",
       }));
       void notifyDesktop("已安排任务已启动", automation.title);
-      await bridge.prompt(sessionId, automation.prompt, {
-        model: automation.model,
-        effort: automation.effort,
-        mode: automation.mode,
-        permissionMode: automation.permissionMode,
+      // session/new 仍需 WebView 组装 Computer/Browser 能力租约；从这里开始，
+      // 模型/模式、prompt、长回合续租和最终结算都只由 Host 裁决。
+      stopCreationHeartbeat();
+      hostOwnsExecution = true;
+      const result = await invoke<AutomationSessionResult>("execute_automation_session", {
+        id: automation.id,
+        token: dispatch.token,
+        sessionId,
       });
+      if (result.automation) {
+        set({ automations: adoptNativeAutomation(result.automation as Automation) });
+      }
+      if (result.error) {
+        executionError = result.error;
+        saveAutomationHistory(patchAutomationRun(get().automationRunHistory, runId, {
+          outcome: "error",
+          detail: result.error.message,
+        }));
+      }
     } catch (cause) {
       executionError = cause;
       saveAutomationHistory(patchAutomationRun(get().automationRunHistory, runId, {
@@ -1064,27 +1085,28 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }));
     }
 
-    try {
-      const updated = await invoke<Automation>("complete_automation_dispatch", {
-        id: automation.id,
-        token: dispatch.token,
-        sessionId,
-        ...(executionError ? { error: redactAutomationDetail(executionError) } : {}),
-      });
-      set({ automations: adoptNativeAutomation(updated) });
-    } catch (cause) {
-      publishRuntimeError(cause, {
-        domain: "environment",
-        code: "AUTOMATION_COMPLETE_FAILED",
-        message: `已安排任务“${automation.title}”的 Host 结算失败`,
-        recoverable: true,
-        action: "任务会话仍会保留；Host 将按租约状态决定是否恢复排程",
-      });
-    } finally {
-      window.clearInterval(heartbeat);
-      automationRunnerBusy = false;
-      set({ automationRunningId: null });
+    if (!hostOwnsExecution) {
+      try {
+        const updated = await invoke<Automation>("complete_automation_dispatch", {
+          id: automation.id,
+          token: dispatch.token,
+          sessionId,
+          ...(executionError ? { error: redactAutomationDetail(executionError) } : {}),
+        });
+        set({ automations: adoptNativeAutomation(updated) });
+      } catch (cause) {
+        publishRuntimeError(cause, {
+          domain: "environment",
+          code: "AUTOMATION_COMPLETE_FAILED",
+          message: `已安排任务“${automation.title}”的 Host 结算失败`,
+          recoverable: true,
+          action: "任务会话仍会保留；Host 将按租约状态决定是否恢复排程",
+        });
+      }
     }
+    stopCreationHeartbeat();
+    automationRunnerBusy = false;
+    set({ automationRunningId: null });
 
     if (executionError) {
       publishRuntimeError(executionError, {

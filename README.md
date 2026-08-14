@@ -60,7 +60,7 @@ Rust 原生进程层
 grok agent stdio
 ```
 
-WebView 不直接启动任意命令。Rust 层只托管已解析的 Grok Build 可执行文件，并把逐行 ACP 消息转发给前端。
+WebView 不直接启动任意命令。Rust Host 托管已解析的 Grok Build 可执行文件，负责 ACP 请求归属、进程代次、会话门禁和后台自动化回合；前端只消费会话事件与已归属结果。
 
 ## 快速开始
 
