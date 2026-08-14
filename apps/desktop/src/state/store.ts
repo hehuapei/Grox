@@ -1058,8 +1058,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
         detail: "Host 已认领任务，提示已交给当前 Agent 运行时。",
       }));
       void notifyDesktop("已安排任务已启动", automation.title);
-      // session/new 仍需 WebView 组装 Computer/Browser 能力租约；从这里开始，
-      // 模型/模式、prompt、长回合续租和最终结算都只由 Host 裁决。
+      // Host 已原子完成 session/new、系统提示与 Computer/Browser 租约绑定；
+      // 页面登记完会话后，模型/模式、prompt、续租和结算继续由 Host 裁决。
       stopCreationHeartbeat();
       hostOwnsExecution = true;
       const result = await invoke<AutomationSessionResult>("execute_automation_session", {

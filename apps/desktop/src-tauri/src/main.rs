@@ -7,8 +7,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod acp_host;
-mod automation_store;
 mod automation_runner;
+mod automation_store;
 mod browser_mcp;
 mod computer_mcp;
 mod git_confirm;
@@ -18,8 +18,9 @@ mod path_sandbox;
 #[cfg(windows)]
 mod process_job;
 mod prompt_queue_store;
-mod session_journal_store;
 mod session_coordinator;
+mod session_journal_store;
+mod session_runtime;
 mod session_storage;
 mod support_bundle;
 
@@ -37,8 +38,8 @@ use std::{
 };
 
 use acp_host::{AcpHostError, AcpRequestBroker};
-use automation_store::{AutomationCompletion, AutomationStore};
 use automation_runner::{storage_error as automation_storage_error, AutomationRunner};
+use automation_store::{AutomationCompletion, AutomationStore};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use git_confirm::GitConfirmStore;
 use mcp_leases::McpLeaseStore;
@@ -49,17 +50,22 @@ use path_sandbox::{
 use percent_encoding::percent_decode_str;
 use prompt_queue_store::PromptQueueStore;
 use serde::{Deserialize, Serialize};
-use session_journal_store::SessionJournalStore;
 use session_coordinator::{SessionCoordinator, SessionRuntimeOccupancy};
+use session_journal_store::SessionJournalStore;
+use session_runtime::{
+    browser_shutdown_all_leases, close_agent_session, computer_emergency_stop_session,
+    computer_shutdown_all_leases, delete_agent_session, open_agent_session,
+    shutdown_all_mcp_resources,
+};
 use session_storage::SessionStorageState;
 use tauri::{Emitter, Manager};
-use toml_edit::{value as toml_value, Document, Item, Table, TableLike};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     process::{Child, ChildStdin, Command},
     sync::Mutex,
 };
+use toml_edit::{value as toml_value, Document, Item, Table, TableLike};
 
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GROX_BUILD_COMMIT: &str = env!("GROX_BUILD_COMMIT");
@@ -370,24 +376,6 @@ struct OpenApplicationOption {
     launch_target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     icon_data_url: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ComputerSessionExtensions {
-    /// Intentionally empty: bearer tokens stay in native `McpLeaseStore` and
-    /// are injected by `acp_send` when `_meta.groxComputerLeaseId` is set.
-    mcp_servers: Vec<serde_json::Value>,
-    plugin_dirs: Vec<String>,
-    lease_id: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserSessionExtensions {
-    /// Intentionally empty — see `ComputerSessionExtensions`.
-    mcp_servers: Vec<serde_json::Value>,
-    lease_id: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -3944,7 +3932,9 @@ fn git_worktrees(cwd: String) -> Result<Vec<GitWorktree>, String> {
             });
             continue;
         }
-        let Some(item) = current.as_mut() else { continue };
+        let Some(item) = current.as_mut() else {
+            continue;
+        };
         if let Some(branch) = line.strip_prefix("branch refs/heads/") {
             item.branch = Some(branch.to_string());
         } else if line == "bare" {
@@ -4910,7 +4900,9 @@ fn application_search_roots() -> Vec<PathBuf> {
 #[cfg(target_os = "macos")]
 fn discovered_application_paths() -> Vec<PathBuf> {
     fn collect_bundles(root: &Path, depth: u8, paths: &mut BTreeSet<PathBuf>) {
-        let Ok(entries) = fs::read_dir(root) else { return };
+        let Ok(entries) = fs::read_dir(root) else {
+            return;
+        };
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
             if path.extension().is_some_and(|value| value == "app") && path.is_dir() {
@@ -5049,7 +5041,11 @@ fn inspect_application(path: &Path) -> Option<OpenApplicationOption> {
     let bundle_id = plist_string(&plist, "CFBundleIdentifier")?;
     let name = plist_string(&plist, "CFBundleDisplayName")
         .or_else(|| plist_string(&plist, "CFBundleName"))
-        .or_else(|| path.file_stem().and_then(|value| value.to_str()).map(str::to_string))?;
+        .or_else(|| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+        })?;
     let lower = format!("{} {}", bundle_id, name).to_ascii_lowercase();
     let is_finder = bundle_id == "com.apple.finder" || lower.contains("finder");
     let is_terminal = [
@@ -5220,7 +5216,11 @@ fn list_windows_open_applications() -> Result<Vec<OpenApplicationOption>, String
     let mut applications = values
         .into_iter()
         .filter_map(|value| serde_json::from_value::<OpenApplicationOption>(value).ok())
-        .filter(|item| item.launch_target.as_deref().is_some_and(|target| Path::new(target).is_absolute()))
+        .filter(|item| {
+            item.launch_target
+                .as_deref()
+                .is_some_and(|target| Path::new(target).is_absolute())
+        })
         .collect::<Vec<_>>();
     applications.sort_by_cached_key(|item| item.name.to_ascii_lowercase());
     let mut seen = BTreeSet::new();
@@ -5440,7 +5440,11 @@ fn inspect_desktop_application(path: &Path) -> Option<OpenApplicationOption> {
         || lower.contains("pcmanfm");
     let source_mime = fields
         .get("MimeType")
-        .map(|value| value.split(';').any(|mime| mime.starts_with("text/x-") || mime.contains("javascript") || mime.contains("json")))
+        .map(|value| {
+            value.split(';').any(|mime| {
+                mime.starts_with("text/x-") || mime.contains("javascript") || mime.contains("json")
+            })
+        })
         .unwrap_or(false);
     if !terminal && !editor && !file_manager && !source_mime {
         return None;
@@ -5458,7 +5462,9 @@ fn inspect_desktop_application(path: &Path) -> Option<OpenApplicationOption> {
 fn list_linux_open_applications() -> Vec<OpenApplicationOption> {
     let mut applications = Vec::new();
     for root in linux_application_dirs() {
-        let Ok(entries) = fs::read_dir(root) else { continue };
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) == Some("desktop") {
@@ -6129,7 +6135,9 @@ fn model_table_mut<'a>(document: &'a mut Document, model_id: &str) -> Result<(&'
     let models = root
         .get_mut("model")
         .and_then(Item::as_table_like_mut)
-        .ok_or_else(|| "Grok config.toml 中的 [model] 不是 TOML 表，无法安全写入兼容服务认证".to_string())?;
+        .ok_or_else(|| {
+            "Grok config.toml 中的 [model] 不是 TOML 表，无法安全写入兼容服务认证".to_string()
+        })?;
     let existed = models.contains_key(model_id);
     if !existed {
         models.insert(model_id, Item::Table(Table::new()));
@@ -6996,93 +7004,6 @@ Use only the grox_desktop_computer MCP tools for an explicit `/computer` or `@Co
     Ok(root)
 }
 
-#[tauri::command]
-fn computer_session_extensions(
-    leases: tauri::State<'_, Arc<McpLeaseStore>>,
-) -> Result<ComputerSessionExtensions, String> {
-    // Soft-fail when host gate closed: empty lists, no lease (FE must not cache control).
-    if !computer_use_gate_open() {
-        return Ok(ComputerSessionExtensions {
-            mcp_servers: Vec::new(),
-            plugin_dirs: Vec::new(),
-            lease_id: String::new(),
-        });
-    }
-    let mut lease_bytes = [0_u8; 16];
-    getrandom::fill(&mut lease_bytes)
-        .map_err(|error| format!("无法创建 Computer Use 租约：{error}"))?;
-    let lease_id = lease_bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    computer_mcp::clear_emergency_stop(&lease_id)?;
-    // Prefer a real desktop harness wherever we can observe the screen.
-    // Windows keeps the full UIA controller; macOS/Linux expose the same MCP
-    // surface with platform-limited executors so agents degrade gracefully.
-    let plugin = ensure_computer_plugin()?;
-    let endpoint = computer_mcp::serve_http(lease_id.clone())?;
-    leases.put_computer(
-        lease_id.clone(),
-        mcp_leases::computer_server_config(&endpoint.url, &endpoint.token),
-    )?;
-    Ok(ComputerSessionExtensions {
-        mcp_servers: Vec::new(),
-        plugin_dirs: vec![path_for_webview(&plugin)],
-        lease_id,
-    })
-}
-
-#[tauri::command]
-fn computer_shutdown_lease(
-    leases: tauri::State<'_, Arc<McpLeaseStore>>,
-    lease_id: String,
-) -> Result<(), String> {
-    leases.remove_computer(&lease_id);
-    computer_mcp::shutdown_http(&lease_id);
-    Ok(())
-}
-
-#[tauri::command]
-fn computer_emergency_stop(lease_id: String) -> Result<(), String> {
-    computer_mcp::mark_emergency_stop(&lease_id)
-}
-
-#[tauri::command]
-fn computer_clear_emergency_stop(lease_id: String) -> Result<(), String> {
-    computer_mcp::clear_emergency_stop(&lease_id)
-}
-
-#[tauri::command]
-fn browser_session_extensions(
-    leases: tauri::State<'_, Arc<McpLeaseStore>>,
-) -> Result<BrowserSessionExtensions, String> {
-    let mut lease_bytes = [0_u8; 16];
-    getrandom::fill(&mut lease_bytes)
-        .map_err(|error| format!("无法创建 Browser Use 租约：{error}"))?;
-    let lease_id = lease_bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let endpoint = browser_mcp::serve_http(lease_id.clone())?;
-    leases.put_browser(
-        lease_id.clone(),
-        mcp_leases::browser_server_config(&endpoint.url, &endpoint.token),
-    )?;
-    Ok(BrowserSessionExtensions {
-        mcp_servers: Vec::new(),
-        lease_id,
-    })
-}
-
-#[tauri::command]
-fn browser_shutdown_lease(
-    leases: tauri::State<'_, Arc<McpLeaseStore>>,
-    lease_id: String,
-) -> Result<(), String> {
-    leases.remove_browser(&lease_id);
-    browser_mcp::shutdown_http(&lease_id);
-    Ok(())
-}
 
 #[cfg(windows)]
 fn register_computer_emergency_shortcut(app: tauri::AppHandle) {
@@ -7394,6 +7315,7 @@ async fn acp_spawn(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<AcpState>>,
+    leases: tauri::State<'_, Arc<McpLeaseStore>>,
     automation_runner: tauri::State<'_, AutomationRunner>,
     cwd: String,
     computer_use_enabled: Option<bool>,
@@ -7419,6 +7341,7 @@ async fn acp_spawn(
             "Agent 重连后检查最后一轮结果，再决定是否重新发送",
         ))
         .await;
+    shutdown_all_mcp_resources(leases.inner());
 
     if let Some(old) = state.process.lock().await.take() {
         terminate_process(old).await;
@@ -7559,6 +7482,7 @@ async fn acp_spawn(
             stdout_app
                 .state::<AutomationRunner>()
                 .mark_generation_unready(generation);
+            shutdown_all_mcp_resources(stdout_app.state::<Arc<McpLeaseStore>>().inner());
             let next_generation = stdout_state
                 .next_generation
                 .compare_exchange(
@@ -7644,12 +7568,15 @@ fn acp_method_allowed(method: &str) -> bool {
     }
     // Only x.ai extension notifications use the optional wire-level `_` prefix.
     // Do not let the prefix turn arbitrary standard namespaces into aliases.
-    let m = method.strip_prefix("_x.ai/").map(|suffix| format!("x.ai/{suffix}"));
+    let m = method
+        .strip_prefix("_x.ai/")
+        .map(|suffix| format!("x.ai/{suffix}"));
     let m = m.as_deref().unwrap_or(method);
     matches!(
         m,
         "session/new"
             | "session/load"
+            | "session/close"
             | "session/prompt"
             | "session/cancel"
             | "session/delete"
@@ -7784,9 +7711,8 @@ async fn acp_request(
     timeout_ms: u64,
     gate_token: Option<u64>,
 ) -> Result<String, AcpHostError> {
-    ensure_main_acp_owner(window.label()).map_err(|error| {
-        AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error)
-    })?;
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
     acp_request_inner(
         state.inner(),
         leases.inner(),
@@ -7810,8 +7736,12 @@ async fn acp_request_inner(
 ) -> Result<String, AcpHostError> {
     let line = prepare_acp_line(line, leases)
         .map_err(|error| AcpHostError::protocol("ACP_INVALID_REQUEST", error))?;
-    let message = serde_json::from_str::<serde_json::Value>(&line)
-        .map_err(|error| AcpHostError::protocol("ACP_INVALID_REQUEST", format!("ACP 消息不是合法 JSON：{error}")))?;
+    let message = serde_json::from_str::<serde_json::Value>(&line).map_err(|error| {
+        AcpHostError::protocol(
+            "ACP_INVALID_REQUEST",
+            format!("ACP 消息不是合法 JSON：{error}"),
+        )
+    })?;
     let wire_id = message
         .get("id")
         .and_then(serde_json::Value::as_u64)
@@ -8005,16 +7935,11 @@ async fn acp_cancel_request(
             true,
             "检查网络、模型或供应商配置，并确认最后一轮结果后重试",
         ),
-        "protocol_recovery" => {
-            AcpHostError::protocol("ACP_REQUEST_ABORTED_FOR_RECOVERY", reason)
-        }
+        "protocol_recovery" => AcpHostError::protocol("ACP_REQUEST_ABORTED_FOR_RECOVERY", reason),
         "user" => AcpHostError::operation("ACP_REQUEST_CANCELLED", reason),
         _ => return Err("ACP 取消类型无效".into()),
     };
-    Ok(state
-        .requests
-        .reject(request_id, generation, failure)
-        .await)
+    Ok(state.requests.reject(request_id, generation, failure).await)
 }
 
 #[tauri::command]
@@ -8022,6 +7947,7 @@ async fn acp_kill(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<AcpState>>,
+    leases: tauri::State<'_, Arc<McpLeaseStore>>,
     automation_runner: tauri::State<'_, AutomationRunner>,
 ) -> Result<(), String> {
     ensure_main_acp_owner(window.label())?;
@@ -8035,6 +7961,7 @@ async fn acp_kill(
             "Grok Agent 已停止",
         ))
         .await;
+    shutdown_all_mcp_resources(leases.inner());
     if let Some(process) = state.process.lock().await.take() {
         terminate_process(process).await;
         let _ = app.emit(
@@ -8596,6 +8523,9 @@ fn main() {
             renew_automation_dispatch,
             complete_automation_dispatch,
             execute_automation_session,
+            open_agent_session,
+            close_agent_session,
+            delete_agent_session,
             delete_session_data,
             delete_project_session_data,
             scrub_session_journal_orphans,
@@ -8655,12 +8585,9 @@ fn main() {
             host_prefs_migrate_computer_use,
             host_prefs_set_computer_use,
             host_prefs_set_permission_mode,
-            computer_session_extensions,
-            computer_shutdown_lease,
-            computer_emergency_stop,
-            computer_clear_emergency_stop,
-            browser_session_extensions,
-            browser_shutdown_lease,
+            computer_shutdown_all_leases,
+            computer_emergency_stop_session,
+            browser_shutdown_all_leases,
             save_media_reference,
             generate_media,
             acp_spawn,
@@ -8673,6 +8600,7 @@ fn main() {
             if matches!(event, tauri::WindowEvent::Destroyed) && window.label() == "main" {
                 window.state::<AutomationRunner>().mark_runtime_unready();
                 let state = window.state::<Arc<AcpState>>().inner().clone();
+                let leases = window.state::<Arc<McpLeaseStore>>().inner().clone();
                 let preview_state = window.state::<Arc<PreviewState>>().inner().clone();
                 tauri::async_runtime::spawn(async move {
                     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
@@ -8687,6 +8615,7 @@ fn main() {
                             "重新打开 Grox 后检查最后一轮结果",
                         ))
                         .await;
+                    shutdown_all_mcp_resources(&leases);
                     if let Some(process) = state.process.lock().await.take() {
                         terminate_process(process).await;
                     }

@@ -39,6 +39,26 @@ pub(crate) struct SessionCoordinator {
     occupancy: watch::Sender<SessionRuntimeOccupancy>,
 }
 
+/// Host 自有许可在成功、失败和取消路径都会自动释放。
+/// WebView 调用仍使用显式 token，但原生事务不能依赖后续 IPC 才完成清理。
+pub(crate) struct SessionPermit {
+    coordinator: Arc<SessionCoordinator>,
+    token: u64,
+    generation: u64,
+}
+
+impl SessionPermit {
+    pub(crate) fn token(&self) -> u64 {
+        self.token
+    }
+}
+
+impl Drop for SessionPermit {
+    fn drop(&mut self) {
+        self.coordinator.release(self.token, self.generation);
+    }
+}
+
 impl Default for SessionCoordinator {
     fn default() -> Self {
         let (occupancy, _) = watch::channel(SessionRuntimeOccupancy::default());
@@ -107,6 +127,19 @@ impl SessionCoordinator {
         }
     }
 
+    pub(crate) async fn acquire_turn(
+        self: &Arc<Self>,
+        session_id: String,
+        generation: u64,
+    ) -> Result<SessionPermit, AcpHostError> {
+        let token = self.enter_turn(session_id, generation).await?;
+        Ok(SessionPermit {
+            coordinator: Arc::clone(self),
+            token,
+            generation,
+        })
+    }
+
     pub(crate) async fn enter_lifecycle(
         self: &Arc<Self>,
         generation: u64,
@@ -141,6 +174,18 @@ impl SessionCoordinator {
             }
             changed.await;
         }
+    }
+
+    pub(crate) async fn acquire_lifecycle(
+        self: &Arc<Self>,
+        generation: u64,
+    ) -> Result<SessionPermit, AcpHostError> {
+        let token = self.enter_lifecycle(generation).await?;
+        Ok(SessionPermit {
+            coordinator: Arc::clone(self),
+            token,
+            generation,
+        })
     }
 
     pub(crate) fn release(&self, token: u64, generation: u64) -> bool {
@@ -458,6 +503,26 @@ mod tests {
                     .code,
                 "SESSION_GATE_REQUIRED"
             );
+        });
+    }
+
+    #[test]
+    fn host_permit_releases_on_drop() {
+        tauri::async_runtime::block_on(async {
+            let coordinator = Arc::new(SessionCoordinator::default());
+            coordinator.reset(6);
+            {
+                let permit = coordinator.acquire_lifecycle(6).await.unwrap();
+                assert!(coordinator
+                    .verify_request(
+                        "session/new",
+                        &serde_json::json!({}),
+                        Some(permit.token()),
+                        6
+                    )
+                    .is_ok());
+            }
+            assert!(!coordinator.snapshot().lifecycle_active);
         });
     }
 }

@@ -5,10 +5,7 @@
 
 use std::{
     path::Path,
-    sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc,
-    },
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -20,9 +17,7 @@ use crate::{
     automation_store::{AutomationCompletion, AutomationDispatch, AutomationStore},
     automations_path,
     mcp_leases::McpLeaseStore,
-    request_acp_json,
-    session_coordinator::SessionCoordinator,
-    AcpState, AUTOMATIONS_MAX_BYTES, UPSTREAM_CLI_CLIENT_NAME,
+    request_acp_json, AcpState, AUTOMATIONS_MAX_BYTES, UPSTREAM_CLI_CLIENT_NAME,
 };
 
 const BOOT_DELAY_MS: u64 = 2_000;
@@ -68,18 +63,6 @@ pub(crate) struct AutomationSessionResult {
 struct AutomationTurnResult {
     effective_effort: String,
     usage: Option<Value>,
-}
-
-struct HostTurnPermit {
-    coordinator: Arc<SessionCoordinator>,
-    token: u64,
-    generation: u64,
-}
-
-impl Drop for HostTurnPermit {
-    fn drop(&mut self) {
-        self.coordinator.release(self.token, self.generation);
-    }
 }
 
 impl AutomationRunner {
@@ -318,15 +301,11 @@ async fn run_claimed_turn(
     prompt: &str,
 ) -> Result<AutomationTurnResult, AcpHostError> {
     let generation = runner.ready_generation(state).await?;
-    let gate_token = state
+    let permit = state
         .sessions
-        .enter_turn(session_id.to_string(), generation)
+        .acquire_turn(session_id.to_string(), generation)
         .await?;
-    let permit = HostTurnPermit {
-        coordinator: Arc::clone(&state.sessions),
-        token: gate_token,
-        generation,
-    };
+    let gate_token = permit.token();
 
     renew_execution_claim(store, path, id, token)?;
     let mut effective_effort = bind_model(
@@ -336,11 +315,11 @@ async fn run_claimed_turn(
         model,
         requested_effort,
         generation,
-        permit.token,
+        gate_token,
     )
     .await?;
     renew_execution_claim(store, path, id, token)?;
-    bind_mode(state, leases, session_id, mode, generation, permit.token).await?;
+    bind_mode(state, leases, session_id, mode, generation, gate_token).await?;
 
     let dispatch_prompt = complete_deep_research_prompt(prompt);
     let mut attempted = std::collections::BTreeSet::new();
@@ -357,7 +336,7 @@ async fn run_claimed_turn(
         &effective_effort,
         permission_mode,
         generation,
-        permit.token,
+        gate_token,
     )
     .await;
 
@@ -379,13 +358,7 @@ async fn run_claimed_turn(
         }));
         for candidate in effort_fallback_chain(requested_effort) {
             let bound = bind_model(
-                state,
-                leases,
-                session_id,
-                model,
-                candidate,
-                generation,
-                permit.token,
+                state, leases, session_id, model, candidate, generation, gate_token,
             )
             .await?;
             if !attempted.insert(bound.clone()) {
@@ -404,7 +377,7 @@ async fn run_claimed_turn(
                 &effective_effort,
                 permission_mode,
                 generation,
-                permit.token,
+                gate_token,
             )
             .await
             {
