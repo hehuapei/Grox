@@ -61,7 +61,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | --- | --- | --- |
 | 1 | Native ACP transport | Host 关联请求/响应并负责超时、取消、退出清算；已落地 |
 | 2 | SessionCoordinator | Host 签发/校验 lifecycle 与 turn 许可并发布占用快照；已落地 |
-| 3 | Native repositories | journal、队列、草稿、自动化改为带锁事务；localStorage 只留临时镜像 |
+| 3 | Native repositories | PromptQueueStore 已迁移；journal、草稿、自动化继续改为带锁语义事务 |
 | 4 | Background execution | 自动化、恢复、后台多会话通过 SessionCoordinator 执行；再评估按会话进程池 |
 | 5 | Host services | worktree、权限、媒体、密钥统一使用会话/项目身份和路径授权 |
 | 6 | Command facade | 将 `main.rs` 按领域迁出，Tauri command 只校验 DTO 并调用服务 |
@@ -84,10 +84,15 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - 生命周期排队会阻止新回合抢占，不同已绑定会话仍可并发运行；等待任务取消、进程自然退出、替换、停止、CLI 更新和主窗口退出都会清除旧许可；
 - 占用快照由 Host 通过事件和查询命令发布，环境摘要与支持包不再依赖 WebView 自报门控状态；
 - 前端 `SharedAcpLifecycleGate` 及其平行测试已删除，兼容重试、回放收尾和模型/模式预绑定仍保持在同一 Host 许可窗口内。
+- `prompt_queue_store::PromptQueueStore` 在 Host 锁内按会话合并 patch 并原子替换文件，前端不再提交整个队列文件；
+- 不同会话的并发队列写不会互相覆盖，Host 会校验队列条目/附件契约、容量和重复 id；
+- 旧 localStorage 队列只在原生仓储从未初始化时迁移一次，原生空对象也是初始化标记，避免已删除队列在重启后再次导入；
+- 删除会话/项目会在同一 tombstone 锁序内删除提示队列，晚到 upsert 会被 Host 拒绝，不能让已删除会话复活。
 
-本切片没有把供应商切换的“发送意图等待”、提示队列和自动化调度伪装成已经迁移：
+本切片没有把供应商切换的“发送意图等待”、队列调度策略和自动化调度伪装成已经迁移：
 它们仍在 Bridge/Store，后续必须通过同一个 SessionCoordinator 的维护操作与后台执行入口
-迁入 Host，才能删除 `activePromptSessions` 等剩余前端运行时权威。
+迁入 Host，才能删除 `activePromptSessions` 等剩余前端运行时权威。提示队列持久化事务
+已经迁入 Host，但何时 claim、发送和恢复仍属于 Background execution 切片。
 
 ## 完整后端对照结论
 

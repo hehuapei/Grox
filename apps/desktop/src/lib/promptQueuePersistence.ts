@@ -20,6 +20,9 @@ export type PersistedPromptQueues = Record<string, PersistedQueuedPrompt[]>;
 
 const STORAGE_KEY = "grox.promptQueues.v1";
 let nativeWriteChain = Promise.resolve();
+let nativeCommittedQueues: PersistedPromptQueues = {};
+let nativeDesiredQueues: PersistedPromptQueues = {};
+let nativePersistenceStarted = false;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -96,7 +99,7 @@ export function parsePromptQueues(raw: string | null | undefined): PersistedProm
   );
 }
 
-export function loadPromptQueuesFromBrowser(): PersistedPromptQueues {
+function readLegacyPromptQueues(): PersistedPromptQueues {
   try {
     return parsePromptQueues(localStorage.getItem(STORAGE_KEY));
   } catch {
@@ -104,9 +107,37 @@ export function loadPromptQueuesFromBrowser(): PersistedPromptQueues {
   }
 }
 
+export function loadPromptQueuesFromBrowser(): PersistedPromptQueues {
+  // Tauri 的旧数据由异步原生迁移读取；首屏不能先把已删除的 localStorage 队列复活。
+  if ("__TAURI_INTERNALS__" in window) return {};
+  return readLegacyPromptQueues();
+}
+
 export async function loadPromptQueues(): Promise<PersistedPromptQueues> {
   if (!("__TAURI_INTERNALS__" in window)) return loadPromptQueuesFromBrowser();
-  return parsePromptQueues(await invoke<string | null>("read_prompt_queues"));
+  const raw = await invoke<string | null>("read_prompt_queues");
+  const persisted = parsePromptQueues(raw);
+  if (raw === null) {
+    // 仅在原生仓储从未初始化时导入旧 localStorage；`{}` 也是有效初始化标记。
+    const legacy = readLegacyPromptQueues();
+    nativeDesiredQueues = nativePersistenceStarted
+      ? mergeHydratedPromptQueues(legacy, nativeDesiredQueues)
+      : snapshotPromptQueues(legacy);
+    nativeWriteChain = nativeWriteChain.catch(() => {}).then(async () => {
+      const target = snapshotPromptQueues(nativeDesiredQueues);
+      await invoke("patch_prompt_queues", { upserts: target, deletes: [] });
+      nativeCommittedQueues = target;
+    });
+    await nativeWriteChain;
+    clearLegacyPromptQueues();
+    return snapshotPromptQueues(nativeDesiredQueues);
+  }
+  nativeCommittedQueues = snapshotPromptQueues(persisted);
+  nativeDesiredQueues = nativePersistenceStarted
+    ? mergeHydratedPromptQueues(persisted, nativeDesiredQueues)
+    : snapshotPromptQueues(persisted);
+  clearLegacyPromptQueues();
+  return persisted;
 }
 
 /**
@@ -128,19 +159,76 @@ export function mergeHydratedPromptQueues(
   return result;
 }
 
+export interface PromptQueuePatch {
+  upserts: PersistedPromptQueues;
+  deletes: string[];
+}
+
+/** 只提交变化的会话；Host 会在锁内合并，不能再由前端覆盖整个队列文件。 */
+export function diffPromptQueues(
+  previous: PersistedPromptQueues,
+  next: PersistedPromptQueues,
+): PromptQueuePatch {
+  const upserts: PersistedPromptQueues = {};
+  const deletes: string[] = [];
+  const ids = new Set([...Object.keys(previous), ...Object.keys(next)]);
+  for (const sessionId of ids) {
+    const before = previous[sessionId] ?? [];
+    const after = next[sessionId] ?? [];
+    if (after.length === 0) {
+      if (before.length > 0) deletes.push(sessionId);
+      continue;
+    }
+    if (JSON.stringify(before) !== JSON.stringify(after)) {
+      upserts[sessionId] = after;
+    }
+  }
+  return { upserts, deletes: deletes.sort() };
+}
+
+function snapshotPromptQueues(queues: PersistedPromptQueues): PersistedPromptQueues {
+  return Object.fromEntries(
+    Object.entries(queues)
+      .filter(([, rows]) => rows.length > 0)
+      .map(([sessionId, rows]) => [
+        sessionId,
+        rows.map((row) => ({
+          ...row,
+          attachments: row.attachments.map((attachment) => ({ ...attachment })),
+        })),
+      ]),
+  );
+}
+
+function clearLegacyPromptQueues(): void {
+  try {
+    localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // 原生仓储已经提交成功；浏览器隐私模式阻止清理时不回滚磁盘事务。
+  }
+}
+
 export function persistPromptQueues(queues: PersistedPromptQueues): Promise<void> {
-  const content = JSON.stringify(queues);
   if (!("__TAURI_INTERNALS__" in window)) {
     try {
-      localStorage.setItem(STORAGE_KEY, content);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(queues));
       return Promise.resolve();
     } catch (error) {
       return Promise.reject(error);
     }
   }
-  // 串行化原子写，防止较早的慢写覆盖较新的队列快照。
-  nativeWriteChain = nativeWriteChain.catch(() => {}).then(() => (
-    invoke("write_prompt_queues", { content })
-  ));
+  nativePersistenceStarted = true;
+  nativeDesiredQueues = snapshotPromptQueues(queues);
+  // Promise 链只负责提交顺序；真正的 RMW 与跨窗口互斥在 Host 内完成。
+  nativeWriteChain = nativeWriteChain.catch(() => {}).then(async () => {
+    const target = snapshotPromptQueues(nativeDesiredQueues);
+    const patch = diffPromptQueues(nativeCommittedQueues, target);
+    if (Object.keys(patch.upserts).length === 0 && patch.deletes.length === 0) return;
+    await invoke("patch_prompt_queues", {
+      upserts: patch.upserts,
+      deletes: patch.deletes,
+    });
+    nativeCommittedQueues = target;
+  });
   return nativeWriteChain;
 }

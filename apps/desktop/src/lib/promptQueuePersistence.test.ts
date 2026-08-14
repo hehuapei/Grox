@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { mergeHydratedPromptQueues, parsePromptQueues } from "./promptQueuePersistence";
+import {
+  diffPromptQueues,
+  loadPromptQueuesFromBrowser,
+  mergeHydratedPromptQueues,
+  parsePromptQueues,
+} from "./promptQueuePersistence";
 
 const row = (id: string) => ({
   id,
@@ -36,5 +41,27 @@ describe("promptQueuePersistence", () => {
       ["same", "newer"],
       ["live", "live"],
     ]);
+  });
+
+  it("只 patch 变化的会话并把空队列表达为删除", () => {
+    expect(diffPromptQueues(
+      { a: [row("same")], b: [row("remove")], c: [row("old")] },
+      { a: [row("same")], b: [], c: [row("new")], d: [row("add")] },
+    )).toEqual({
+      upserts: { c: [row("new")], d: [row("add")] },
+      deletes: ["b"],
+    });
+  });
+
+  it("Tauri 首屏不从旧 localStorage 复活已删除队列", () => {
+    localStorage.setItem("grox.promptQueues.v1", JSON.stringify({ stale: [row("old")] }));
+    const tauriWindow = window as unknown as Record<string, unknown>;
+    tauriWindow.__TAURI_INTERNALS__ = {};
+    try {
+      expect(loadPromptQueuesFromBrowser()).toEqual({});
+    } finally {
+      delete tauriWindow.__TAURI_INTERNALS__;
+      localStorage.removeItem("grox.promptQueues.v1");
+    }
   });
 });

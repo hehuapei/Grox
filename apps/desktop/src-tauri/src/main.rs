@@ -15,6 +15,7 @@ mod mcp_leases;
 mod path_sandbox;
 #[cfg(windows)]
 mod process_job;
+mod prompt_queue_store;
 mod session_coordinator;
 mod support_bundle;
 
@@ -40,6 +41,7 @@ use path_sandbox::{
     path_for_webview,
 };
 use percent_encoding::percent_decode_str;
+use prompt_queue_store::PromptQueueStore;
 use serde::{Deserialize, Serialize};
 use session_coordinator::{SessionCoordinator, SessionRuntimeOccupancy};
 use tauri::{Emitter, Manager};
@@ -137,6 +139,20 @@ impl SessionStorageState {
             .lock()
             .map_err(|_| "会话存储门禁已损坏".to_string())?;
         deleted.insert(id.to_string());
+        Ok(deleted)
+    }
+
+    fn lock_writable_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<std::sync::MutexGuard<'_, BTreeSet<String>>, String> {
+        let deleted = self
+            .deleted
+            .lock()
+            .map_err(|_| "会话存储门禁已损坏".to_string())?;
+        if let Some(id) = ids.iter().find(|id| deleted.contains(*id)) {
+            return Err(format!("会话 {id} 已删除，拒绝再次写入提示队列"));
+        }
         Ok(deleted)
     }
 }
@@ -1946,29 +1962,30 @@ fn prompt_queues_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-fn read_prompt_queues(app: tauri::AppHandle) -> Result<Option<String>, String> {
+fn read_prompt_queues(
+    app: tauri::AppHandle,
+    queues: tauri::State<'_, PromptQueueStore>,
+) -> Result<Option<String>, String> {
     let path = prompt_queues_path(&app)?;
-    if !path.is_file() {
-        return Ok(None);
-    }
-    read_bounded_text(&path, PROMPT_QUEUES_MAX_BYTES)
-        .map(|content| if content.trim().is_empty() { None } else { Some(content) })
-        .map_err(|error| format!("无法读取提示队列：{error}"))
+    queues.read(&path, PROMPT_QUEUES_MAX_BYTES)
 }
 
 #[tauri::command]
-fn write_prompt_queues(app: tauri::AppHandle, content: String) -> Result<(), String> {
-    if content.len() as u64 > PROMPT_QUEUES_MAX_BYTES {
-        return Err("提示队列不能超过 64 MB".into());
+fn patch_prompt_queues(
+    app: tauri::AppHandle,
+    queues: tauri::State<'_, PromptQueueStore>,
+    storage: tauri::State<'_, SessionStorageState>,
+    upserts: BTreeMap<String, serde_json::Value>,
+    deletes: Vec<String>,
+) -> Result<(), String> {
+    let upsert_ids = upserts.keys().cloned().collect::<Vec<_>>();
+    for id in upsert_ids.iter().chain(deletes.iter()) {
+        safe_session_storage_id(id)?;
     }
-    let value: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|error| format!("提示队列必须是 JSON：{error}"))?;
-    if !value.is_object() {
-        return Err("提示队列必须是 JSON 对象".into());
-    }
+    // 与删除命令采用相同锁序：先 tombstone，再队列事务，防止延迟 patch 复活。
+    let _deleted = storage.lock_writable_ids(&upsert_ids)?;
     let path = prompt_queues_path(&app)?;
-    atomic_write(&path, &content)?;
-    restrict_private_file(&path)
+    queues.patch(&path, upserts, deletes, PROMPT_QUEUES_MAX_BYTES)
 }
 
 fn automations_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -2008,6 +2025,7 @@ fn write_automations(app: tauri::AppHandle, content: String) -> Result<(), Strin
 fn delete_session_data(
     app: tauri::AppHandle,
     storage: tauri::State<'_, SessionStorageState>,
+    queues: tauri::State<'_, PromptQueueStore>,
     id: String,
 ) -> Result<bool, String> {
     if !valid_session_id(&id) {
@@ -2016,12 +2034,24 @@ fn delete_session_data(
     let _deleted = storage.lock_deleted(&id)?;
     let history = grok_home().and_then(|home| delete_session_history_data(&home, &id));
     let journal = delete_session_journal_files(&app, &id);
-    match (history, journal) {
-        (Ok(removed), Ok(())) => Ok(removed),
-        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-        (Err(history_error), Err(journal_error)) => {
-            Err(format!("{history_error}；同时无法删除应用会话 journal：{journal_error}"))
-        }
+    let queue = prompt_queues_path(&app).and_then(|path| {
+        queues.delete_sessions(&path, std::slice::from_ref(&id), PROMPT_QUEUES_MAX_BYTES)
+    });
+    let removed = history.as_ref().copied().unwrap_or(false);
+    let mut errors = Vec::new();
+    if let Err(error) = history {
+        errors.push(error);
+    }
+    if let Err(error) = journal {
+        errors.push(format!("无法删除应用会话 journal：{error}"));
+    }
+    if let Err(error) = queue {
+        errors.push(format!("无法删除会话提示队列：{error}"));
+    }
+    if errors.is_empty() {
+        Ok(removed)
+    } else {
+        Err(errors.join("；"))
     }
 }
 
@@ -2029,6 +2059,7 @@ fn delete_session_data(
 fn delete_project_session_data(
     app: tauri::AppHandle,
     storage: tauri::State<'_, SessionStorageState>,
+    queues: tauri::State<'_, PromptQueueStore>,
     cwd: String,
 ) -> Result<Vec<String>, String> {
     let ids = delete_project_session_history_data(&grok_home()?, &cwd)?;
@@ -2036,6 +2067,8 @@ fn delete_project_session_data(
         let _deleted = storage.lock_deleted(id)?;
         delete_session_journal_files(&app, id)?;
     }
+    let path = prompt_queues_path(&app)?;
+    queues.delete_sessions(&path, &ids, PROMPT_QUEUES_MAX_BYTES)?;
     Ok(ids)
 }
 
@@ -8264,6 +8297,7 @@ fn main() {
         .manage(Arc::new(McpLeaseStore::default()))
         .manage(Arc::new(GitConfirmStore::default()))
         .manage(SessionStorageState::default())
+        .manage(PromptQueueStore::default())
         .setup(|app| {
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?;
             if let Some(window) = app.get_webview_window("main") {
@@ -8314,7 +8348,7 @@ fn main() {
             delete_session_journal,
             session_journal_status,
             read_prompt_queues,
-            write_prompt_queues,
+            patch_prompt_queues,
             read_automations,
             write_automations,
             delete_session_data,
@@ -8579,6 +8613,9 @@ mod tests {
         drop(storage.lock_writable("session-1").unwrap());
         drop(storage.lock_deleted("session-1").unwrap());
         assert!(storage.lock_writable("session-1").is_err());
+        assert!(storage
+            .lock_writable_ids(&["session-1".into(), "session-2".into()])
+            .is_err());
         assert!(storage.lock_writable("session-2").is_ok());
     }
 
