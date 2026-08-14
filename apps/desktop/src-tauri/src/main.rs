@@ -37,7 +37,7 @@ use std::{
     process::Stdio,
     sync::{
         atomic::{AtomicU64, AtomicU8, Ordering},
-        Arc,
+        Arc, RwLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -140,6 +140,7 @@ struct AgentProcess {
 struct AcpState {
     process: Mutex<Option<AgentProcess>>,
     connect_lock: Mutex<()>,
+    connection: RwLock<Option<AgentRuntimeConnection>>,
     next_generation: AtomicU64,
     next_host_request_id: AtomicU64,
     ready_generation: AtomicU64,
@@ -168,6 +169,62 @@ impl AcpState {
 
     fn set_runtime_phase(&self, phase: RuntimePhase) {
         self.runtime_phase.store(phase as u8, Ordering::Release);
+    }
+
+    fn cached_connection(&self, generation: u64) -> Option<AgentRuntimeConnection> {
+        self.connection
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .filter(|connection| connection.generation == generation)
+            .cloned()
+    }
+
+    fn clear_cached_connection(&self, generation: Option<u64>) {
+        let mut connection = self
+            .connection
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let should_clear = match generation {
+            None => true,
+            Some(generation) => connection
+                .as_ref()
+                .is_some_and(|connection| connection.generation == generation),
+        };
+        if should_clear {
+            *connection = None;
+        }
+    }
+
+    async fn ready_connection(&self) -> Option<AgentRuntimeConnection> {
+        let generation = self.ready_generation.load(Ordering::Acquire);
+        if generation == 0
+            || !self
+                .process
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|process| process.generation == generation)
+        {
+            return None;
+        }
+        self.cached_connection(generation)
+    }
+
+    fn mark_authenticated(&self, generation: u64) {
+        let mut cached = self
+            .connection
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(connection) = cached
+            .as_mut()
+            .filter(|connection| connection.generation == generation)
+        else {
+            return;
+        };
+        connection.auth.required = false;
+        connection.auth.in_progress = false;
+        connection.auth.error = None;
     }
 
     async fn pause_runtime(&self) -> Result<(), AcpHostError> {
@@ -200,7 +257,11 @@ impl AcpState {
         Ok(())
     }
 
-    async fn mark_runtime_ready(&self, generation: u64) -> Result<(), AcpHostError> {
+    async fn mark_runtime_ready(
+        &self,
+        connection: &AgentRuntimeConnection,
+    ) -> Result<(), AcpHostError> {
+        let generation = connection.generation;
         let process = self.process.lock().await;
         if !process
             .as_ref()
@@ -214,6 +275,10 @@ impl AcpState {
                 "等待 Agent 重连完成后重试",
             ));
         }
+        *self
+            .connection
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(connection.clone());
         self.paused_generation.store(0, Ordering::Release);
         self.ready_generation.store(generation, Ordering::Release);
         self.set_runtime_phase(RuntimePhase::Ready);
@@ -273,6 +338,7 @@ impl AcpState {
             || (self.ready_generation.load(Ordering::Acquire) == 0
                 && self.paused_generation.load(Ordering::Acquire) == 0)
         {
+            self.clear_cached_connection(Some(generation));
             self.set_runtime_phase(phase);
         }
     }
@@ -2175,13 +2241,26 @@ async fn run_automation_now(
 ) -> Result<(), AcpHostError> {
     ensure_main_acp_owner(window.label())
         .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
-    runner.ensure_dispatchable(state.inner()).await?;
+    runner.reserve_dispatch(state.inner()).await?;
     let now_ms = automation_runner::unix_time_ms();
-    let path = automations_path(&app).map_err(automation_storage_error)?;
-    let dispatch = automations
+    let path = match automations_path(&app).map_err(automation_storage_error) {
+        Ok(path) => path,
+        Err(error) => {
+            runner.release_dispatch();
+            return Err(error);
+        }
+    };
+    let dispatch = match automations
         .claim_now(&path, &id, now_ms, AUTOMATIONS_MAX_BYTES)
-        .map_err(automation_claim_error)?;
-    runner.launch(app, dispatch);
+        .map_err(automation_claim_error)
+    {
+        Ok(dispatch) => dispatch,
+        Err(error) => {
+            runner.release_dispatch();
+            return Err(error);
+        }
+    };
+    runner.launch_reserved(app, dispatch);
     Ok(())
 }
 
@@ -7398,18 +7477,60 @@ async fn agent_runtime_connect(
     leases: tauri::State<'_, Arc<McpLeaseStore>>,
     cwd: String,
     reasoning_effort: Option<String>,
+    force_reconnect: Option<bool>,
 ) -> Result<AgentRuntimeConnection, AcpHostError> {
     ensure_main_acp_owner(window.label())
         .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
-    let _connect_guard = state.connect_lock.lock().await;
-    state.ready_generation.store(0, Ordering::Release);
-    state.paused_generation.store(0, Ordering::Release);
-    state.set_runtime_phase(RuntimePhase::Starting);
-
-    let (generation, client_version) = match spawn_acp_process(
+    ensure_agent_runtime_ready(
         &app,
         state.inner(),
         leases.inner(),
+        cwd,
+        reasoning_effort,
+        force_reconnect.unwrap_or(false),
+    )
+    .await
+}
+
+/// Host 内唯一的 ACP 启动事务。页面首次加载、崩溃重连与自动化调度都从这里
+/// 取得同一个已握手代次；只有显式配置切换可以要求替换健康进程。
+pub(crate) async fn ensure_agent_runtime_ready(
+    app: &tauri::AppHandle,
+    state: &Arc<AcpState>,
+    leases: &Arc<McpLeaseStore>,
+    cwd: String,
+    reasoning_effort: Option<String>,
+    force_reconnect: bool,
+) -> Result<AgentRuntimeConnection, AcpHostError> {
+    let _connect_guard = state.connect_lock.lock().await;
+    if !force_reconnect {
+        if let Some(connection) = state.ready_connection().await {
+            return Ok(connection);
+        }
+        let paused_generation = state.paused_generation.load(Ordering::Acquire);
+        if paused_generation != 0
+            && state
+                .process
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|process| process.generation == paused_generation)
+        {
+            return Err(AcpHostError::operation(
+                "ACP_RUNTIME_PAUSED",
+                "Agent 运行时正在执行配置切换，暂不能启动新任务",
+            ));
+        }
+    }
+    state.ready_generation.store(0, Ordering::Release);
+    state.paused_generation.store(0, Ordering::Release);
+    state.clear_cached_connection(None);
+    state.set_runtime_phase(RuntimePhase::Starting);
+
+    let (generation, client_version) = match spawn_acp_process(
+        app,
+        state,
+        leases,
         cwd,
         reasoning_effort,
     )
@@ -7430,8 +7551,8 @@ async fn agent_runtime_connect(
 
     state.set_runtime_phase(RuntimePhase::Initializing);
     let initialize = match agent_runtime::initialize(
-        state.inner(),
-        leases.inner(),
+        state,
+        leases,
         generation,
         client_version.as_deref(),
     )
@@ -7439,28 +7560,29 @@ async fn agent_runtime_connect(
     {
         Ok(initialize) => initialize,
         Err(error) => {
-            discard_failed_runtime(state.inner(), leases.inner(), generation, error.clone()).await;
+            discard_failed_runtime(state, leases, generation, error.clone()).await;
             return Err(error);
         }
     };
 
     state.set_runtime_phase(RuntimePhase::Authenticating);
     let auth = agent_runtime::authenticate(
-        state.inner(),
-        leases.inner(),
+        state,
+        leases,
         generation,
         &initialize,
     )
     .await;
-    if let Err(error) = state.mark_runtime_ready(generation).await {
-        discard_failed_runtime(state.inner(), leases.inner(), generation, error.clone()).await;
-        return Err(error);
-    }
-    Ok(AgentRuntimeConnection {
+    let connection = AgentRuntimeConnection {
         generation,
         initialize,
         auth,
-    })
+    };
+    if let Err(error) = state.mark_runtime_ready(&connection).await {
+        discard_failed_runtime(state, leases, generation, error.clone()).await;
+        return Err(error);
+    }
+    Ok(connection)
 }
 
 async fn discard_failed_runtime(
@@ -8186,6 +8308,15 @@ async fn acp_request_inner(
             }
         }
     };
+    if method == "authenticate"
+        && response.as_ref().is_ok_and(|response| {
+            serde_json::from_str::<serde_json::Value>(response)
+                .ok()
+                .is_some_and(|message| message.get("error").is_none())
+        })
+    {
+        state.mark_authenticated(generation);
+    }
     response
 }
 
@@ -8329,6 +8460,7 @@ async fn acp_kill(
     ensure_main_acp_owner(window.label())?;
     state.ready_generation.store(0, Ordering::Release);
     state.paused_generation.store(0, Ordering::Release);
+    state.clear_cached_connection(None);
     state.set_runtime_phase(RuntimePhase::Stopped);
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
     state.foreground_turns.reset(generation);
@@ -8982,6 +9114,7 @@ fn main() {
                 let state = window.state::<Arc<AcpState>>().inner().clone();
                 state.ready_generation.store(0, Ordering::Release);
                 state.paused_generation.store(0, Ordering::Release);
+                state.clear_cached_connection(None);
                 state.set_runtime_phase(RuntimePhase::Stopped);
                 let leases = window.state::<Arc<McpLeaseStore>>().inner().clone();
                 let preview_state = window.state::<Arc<PreviewState>>().inner().clone();
@@ -9019,6 +9152,41 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runtime_connection(generation: u64, auth_required: bool) -> AgentRuntimeConnection {
+        AgentRuntimeConnection {
+            generation,
+            initialize: serde_json::json!({ "protocolVersion": 1 }),
+            auth: agent_runtime::AgentAuthenticationState {
+                required: auth_required,
+                in_progress: false,
+                method_id: auth_required.then(|| "grok.com".to_string()),
+                label: auth_required.then(|| "Sign in to Grok".to_string()),
+                error: None,
+            },
+        }
+    }
+
+    #[test]
+    fn runtime_connection_cache_is_generation_scoped_and_tracks_authentication() {
+        let state = AcpState::default();
+        *state
+            .connection
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(runtime_connection(7, true));
+
+        assert!(state.cached_connection(6).is_none());
+        assert!(state.cached_connection(7).unwrap().auth.required);
+        state.mark_authenticated(6);
+        assert!(state.cached_connection(7).unwrap().auth.required);
+        state.mark_authenticated(7);
+        assert!(!state.cached_connection(7).unwrap().auth.required);
+
+        state.clear_cached_connection(Some(6));
+        assert!(state.cached_connection(7).is_some());
+        state.clear_cached_connection(Some(7));
+        assert!(state.cached_connection(7).is_none());
+    }
 
     #[test]
     fn host_acp_request_ids_use_a_disjoint_javascript_safe_namespace() {

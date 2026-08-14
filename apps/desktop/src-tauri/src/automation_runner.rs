@@ -15,7 +15,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::{
     acp_host::AcpHostError,
     automation_store::{AutomationCompletion, AutomationDispatch, AutomationStore},
-    automations_path, host_prefs, host_prefs_dir_for_app,
+    automations_path, ensure_agent_runtime_ready, host_prefs, host_prefs_dir_for_app,
     mcp_leases::McpLeaseStore,
     request_acp_json,
     session_runtime::{open_agent_session_inner, OpenAgentSessionRequest},
@@ -23,7 +23,7 @@ use crate::{
         bind_mode, bind_model, complete_deep_research_prompt, effort_fallback_chain,
         is_invalid_reasoning_effort, prompt_result_invalid_effort,
     },
-    AcpState, AUTOMATIONS_MAX_BYTES, UPSTREAM_CLI_CLIENT_NAME,
+    AcpState, RuntimePhase, AUTOMATIONS_MAX_BYTES, UPSTREAM_CLI_CLIENT_NAME,
 };
 
 const BOOT_DELAY_MS: u64 = 2_000;
@@ -33,6 +33,7 @@ const CLAIM_RENEW_INTERVAL_MS: u64 = 30_000;
 #[derive(Default)]
 pub(crate) struct AutomationRunner {
     started: AtomicBool,
+    dispatching: AtomicBool,
     last_tick_at: AtomicU64,
 }
 
@@ -76,6 +77,14 @@ struct AutomationTurnResult {
     usage: Option<Value>,
 }
 
+struct DispatchReservation(AppHandle);
+
+impl Drop for DispatchReservation {
+    fn drop(&mut self) {
+        self.0.state::<AutomationRunner>().release_dispatch();
+    }
+}
+
 #[derive(Debug)]
 struct ClaimedAutomationConfig {
     id: String,
@@ -107,6 +116,7 @@ impl AutomationRunner {
 
     pub(crate) async fn status(&self, state: &AcpState) -> AutomationRunnerStatus {
         let occupancy = state.sessions.snapshot();
+        let phase = RuntimePhase::from_raw(state.runtime_phase.load(Ordering::Acquire));
         AutomationRunnerStatus {
             checked_at: match self.last_tick_at.load(Ordering::Acquire) {
                 0 => None,
@@ -115,23 +125,41 @@ impl AutomationRunner {
             runtime_ready: self.runtime_ready(state).await,
             runtime_busy: !occupancy.active_turn_session_ids.is_empty()
                 || occupancy.lifecycle_active
-                || occupancy.pending_lifecycle > 0,
+                || occupancy.pending_lifecycle > 0
+                || self.dispatching.load(Ordering::Acquire)
+                || runtime_phase_blocks_dispatch(phase),
         }
     }
 
-    pub(crate) async fn ensure_dispatchable(&self, state: &AcpState) -> Result<(), AcpHostError> {
-        self.ready_generation(state).await?;
+    pub(crate) async fn reserve_dispatch(&self, state: &AcpState) -> Result<(), AcpHostError> {
         let occupancy = state.sessions.snapshot();
         if !occupancy.active_turn_session_ids.is_empty()
             || occupancy.lifecycle_active
             || occupancy.pending_lifecycle > 0
+            || runtime_phase_blocks_dispatch(RuntimePhase::from_raw(
+                state.runtime_phase.load(Ordering::Acquire),
+            ))
         {
             return Err(AcpHostError::operation(
                 "AUTOMATION_RUNTIME_BUSY",
                 "已有会话、门禁或恢复流程占用 Agent 运行时",
             ));
         }
+        if self
+            .dispatching
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(AcpHostError::operation(
+                "AUTOMATION_RUNTIME_BUSY",
+                "已有自动化正在准备或使用 Agent 运行时",
+            ));
+        }
         Ok(())
+    }
+
+    pub(crate) fn release_dispatch(&self) {
+        self.dispatching.store(false, Ordering::Release);
     }
 
     pub(crate) async fn ready_generation(&self, state: &AcpState) -> Result<u64, AcpHostError> {
@@ -155,9 +183,11 @@ impl AutomationRunner {
         ))
     }
 
-    pub(crate) fn launch(&self, app: AppHandle, dispatch: AutomationDispatch) {
+    pub(crate) fn launch_reserved(&self, app: AppHandle, dispatch: AutomationDispatch) {
         tauri::async_runtime::spawn(async move {
+            let reservation = DispatchReservation(app.clone());
             let settled = execute_claimed_automation(&app, dispatch).await;
+            drop(reservation);
             if let Err(error) = app.emit("automation-session-settled", settled.clone()) {
                 eprintln!("grox: 无法投影自动化会话终态：{error}");
             }
@@ -232,12 +262,54 @@ async fn execute_claimed_automation(
     let state = app.state::<std::sync::Arc<AcpState>>();
     let leases = app.state::<std::sync::Arc<McpLeaseStore>>();
     let runner = app.state::<AutomationRunner>();
-    let generation = match runner.ready_generation(state.inner()).await {
-        Ok(generation) => generation,
+    let connection = match ensure_agent_runtime_ready(
+        app,
+        state.inner(),
+        leases.inner(),
+        config.cwd.clone(),
+        Some(config.requested_effort.clone()),
+        false,
+    )
+    .await
+    {
+        Ok(connection) => connection,
         Err(error) => {
             return complete_execution(&store, &path, &dispatch, settled, None, Some(error));
         }
     };
+    if connection.auth.required {
+        return complete_execution(
+            &store,
+            &path,
+            &dispatch,
+            settled,
+            None,
+            Some(AcpHostError::environment(
+                "ACP_AUTH_REQUIRED",
+                "Grok Build 需要用户完成登录，后台自动化不会擅自打开认证页面",
+                false,
+                true,
+                "打开 Grox，完成 Grok 登录后重新运行该任务",
+            )),
+        );
+    }
+    if let Some(error) = connection.auth.error {
+        return complete_execution(
+            &store,
+            &path,
+            &dispatch,
+            settled,
+            None,
+            Some(AcpHostError::environment(
+                "ACP_AUTH_FAILED",
+                format!("Grok Build 非交互认证失败：{error}"),
+                false,
+                true,
+                "检查当前 Provider 凭据或在 Grox 中重新登录",
+            )),
+        );
+    }
+    let generation = connection.generation;
     let prefs = host_prefs::load_prefs(&host_prefs_dir_for_app(app));
     let opened = match open_agent_session_inner(
         app,
@@ -644,19 +716,47 @@ async fn tick(app: &AppHandle) -> Result<(), AcpHostError> {
     runner.last_tick_at.store(checked_at, Ordering::Release);
     let status = runner.status(state.inner()).await;
     let _ = app.emit("automation-runner-tick", status.clone());
-    if !status.runtime_ready || status.runtime_busy {
+    if status.runtime_busy {
+        return Ok(());
+    }
+    if runner.reserve_dispatch(state.inner()).await.is_err() {
         return Ok(());
     }
 
-    let path = automations_path(app).map_err(storage_error)?;
+    let path = match automations_path(app).map_err(storage_error) {
+        Ok(path) => path,
+        Err(error) => {
+            runner.release_dispatch();
+            return Err(error);
+        }
+    };
     let store = app.state::<AutomationStore>();
-    if let Some(dispatch) = store
+    let dispatch = match store
         .claim_due(&path, checked_at, AUTOMATIONS_MAX_BYTES)
-        .map_err(storage_error)?
+        .map_err(storage_error)
     {
-        runner.launch(app.clone(), dispatch);
+        Ok(dispatch) => dispatch,
+        Err(error) => {
+            runner.release_dispatch();
+            return Err(error);
+        }
+    };
+    if let Some(dispatch) = dispatch {
+        runner.launch_reserved(app.clone(), dispatch);
+    } else {
+        runner.release_dispatch();
     }
     Ok(())
+}
+
+fn runtime_phase_blocks_dispatch(phase: RuntimePhase) -> bool {
+    matches!(
+        phase,
+        RuntimePhase::Starting
+            | RuntimePhase::Initializing
+            | RuntimePhase::Authenticating
+            | RuntimePhase::Paused
+    )
 }
 
 pub(crate) fn unix_time_ms() -> u64 {
@@ -711,5 +811,30 @@ mod tests {
         let error = claimed_automation_config(&value).unwrap_err();
         assert_eq!(error.code, "AUTOMATION_INVALID_RESULT");
         assert!(error.message.contains("cwd"));
+    }
+
+    #[test]
+    fn offline_runtime_can_be_claimed_but_transitions_cannot() {
+        assert!(!runtime_phase_blocks_dispatch(RuntimePhase::Stopped));
+        assert!(!runtime_phase_blocks_dispatch(RuntimePhase::Offline));
+        assert!(!runtime_phase_blocks_dispatch(RuntimePhase::Ready));
+        assert!(runtime_phase_blocks_dispatch(RuntimePhase::Starting));
+        assert!(runtime_phase_blocks_dispatch(RuntimePhase::Initializing));
+        assert!(runtime_phase_blocks_dispatch(RuntimePhase::Authenticating));
+        assert!(runtime_phase_blocks_dispatch(RuntimePhase::Paused));
+
+        tauri::async_runtime::block_on(async {
+            let state = AcpState::default();
+            let runner = AutomationRunner::default();
+            assert!(!runner.status(&state).await.runtime_ready);
+            runner.reserve_dispatch(&state).await.unwrap();
+            assert_eq!(
+                runner.reserve_dispatch(&state).await.unwrap_err().code,
+                "AUTOMATION_RUNTIME_BUSY"
+            );
+            runner.release_dispatch();
+            runner.reserve_dispatch(&state).await.unwrap();
+            runner.release_dispatch();
+        });
     }
 }

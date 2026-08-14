@@ -1313,13 +1313,14 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
-  private async initializeAgent(): Promise<void> {
-    // Diagnostics belong to one concrete child process. Keeping stderr from a
-    // process replaced during a Tauri hot reload produces misleading errors.
+  private async initializeAgent(forceReconnect = false): Promise<void> {
+    // Diagnostics belong to one concrete child process. A forced reconnect
+    // starts a fresh stream; an ordinary boot may reuse Host's live snapshot.
     this.diagnostics = [];
     const connection = await invoke<AgentRuntimeConnection>("agent_runtime_connect", {
       cwd: this.workspace,
       reasoningEffort: storedEffort(),
+      forceReconnect,
     });
     this.acpGeneration = connection.generation;
     await this.syncHostInteractions();
@@ -1359,7 +1360,7 @@ export class AcpBridge implements GrokBridge {
     this.runtimeCommandBase = [];
     this.runtimeCommands = [];
     this.runtimeCommandTags.clear();
-    const next = this.initializeAgent();
+    const next = this.initializeAgent(true);
     this.boot = next;
     try {
       await next;

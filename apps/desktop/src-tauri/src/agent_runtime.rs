@@ -25,7 +25,7 @@ pub(crate) struct AgentAuthenticationState {
     pub(crate) error: Option<String>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AgentRuntimeConnection {
     pub(crate) generation: u64,
