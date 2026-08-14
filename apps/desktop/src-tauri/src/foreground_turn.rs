@@ -369,19 +369,13 @@ impl ForegroundTurnLease {
             return WatchdogDecision::Ok;
         }
         let now = Instant::now();
-        let elapsed = duration_ms(now.duration_since(turn.started_at));
-        if elapsed >= absolute_ms {
-            return WatchdogDecision::Absolute(elapsed);
-        }
-        if !turn.open_tools.is_empty() || !turn.open_gates.is_empty() || turn.stall_notified {
-            return WatchdogDecision::Ok;
-        }
-        let silent = duration_ms(now.duration_since(turn.last_activity_at));
-        if silent >= SOFT_STALL_MS {
-            WatchdogDecision::SoftStall(silent)
-        } else {
-            WatchdogDecision::Ok
-        }
+        watchdog_decision_for(
+            duration_ms(now.saturating_duration_since(turn.started_at)),
+            duration_ms(now.saturating_duration_since(turn.last_activity_at)),
+            !turn.open_tools.is_empty() || !turn.open_gates.is_empty(),
+            turn.stall_notified,
+            absolute_ms,
+        )
     }
 
     fn mark_stall_notified(&self) -> bool {
@@ -958,6 +952,26 @@ fn duration_ms(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
 }
 
+fn watchdog_decision_for(
+    elapsed_ms: u64,
+    silent_ms: u64,
+    has_open_work: bool,
+    stall_notified: bool,
+    absolute_ms: u64,
+) -> WatchdogDecision {
+    if elapsed_ms >= absolute_ms {
+        return WatchdogDecision::Absolute(elapsed_ms);
+    }
+    if has_open_work || stall_notified {
+        return WatchdogDecision::Ok;
+    }
+    if silent_ms >= SOFT_STALL_MS {
+        WatchdogDecision::SoftStall(silent_ms)
+    } else {
+        WatchdogDecision::Ok
+    }
+}
+
 fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1040,36 +1054,16 @@ mod tests {
 
     #[test]
     fn soft_stall_never_overrides_open_work_but_absolute_timeout_does() {
-        let registry = Arc::new(ForegroundTurnRegistry::default());
-        registry.reset(4);
-        let turn = registry.begin("s1".into(), "turn-1".into(), 4).unwrap();
-        turn.mark_prompt_started().unwrap();
-        {
-            let mut state = registry.lock();
-            let active = state.active.get_mut("s1").unwrap();
-            active.started_at = Instant::now() - Duration::from_secs(6 * 60);
-            active.last_activity_at = active.started_at;
-        }
         assert!(matches!(
-            turn.watchdog_decision(4 * 60 * 60_000),
+            watchdog_decision_for(6 * 60_000, 6 * 60_000, false, false, 4 * 60 * 60_000,),
             WatchdogDecision::SoftStall(_)
         ));
-
-        {
-            let mut state = registry.lock();
-            state
-                .active
-                .get_mut("s1")
-                .unwrap()
-                .open_tools
-                .insert("tool-1".into());
-        }
         assert_eq!(
-            turn.watchdog_decision(4 * 60 * 60_000),
+            watchdog_decision_for(6 * 60_000, 6 * 60_000, true, false, 4 * 60 * 60_000,),
             WatchdogDecision::Ok
         );
         assert!(matches!(
-            turn.watchdog_decision(5 * 60_000),
+            watchdog_decision_for(6 * 60_000, 6 * 60_000, true, false, 5 * 60_000),
             WatchdogDecision::Absolute(_)
         ));
     }
