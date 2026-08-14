@@ -1,4 +1,4 @@
-export type AutomationRunOutcome = "starting" | "started" | "skipped" | "error" | "unknown";
+export type AutomationRunOutcome = "starting" | "started" | "completed" | "skipped" | "error" | "unknown";
 export type AutomationRunSource = "scheduled" | "run_now";
 
 export interface AutomationRunRecord {
@@ -37,7 +37,7 @@ function parseRecord(value: unknown): AutomationRunRecord | null {
     || typeof row.automationId !== "string"
     || typeof row.title !== "string"
     || typeof row.at !== "number"
-    || !["starting", "started", "skipped", "error", "unknown"].includes(String(row.outcome))
+    || !["starting", "started", "completed", "skipped", "error", "unknown"].includes(String(row.outcome))
     || !["scheduled", "run_now"].includes(String(row.source))
   ) return null;
   return {

@@ -45,7 +45,7 @@ use std::{
 use acp_host::{AcpHostError, AcpRequestBroker};
 use agent_runtime::AgentRuntimeConnection;
 use automation_runner::{storage_error as automation_storage_error, AutomationRunner};
-use automation_store::{AutomationCompletion, AutomationStore};
+use automation_store::AutomationStore;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use client_callbacks::{ClientCallbackInbound, ClientCallbackRegistry};
 use git_confirm::GitConfirmStore;
@@ -2181,120 +2181,8 @@ async fn run_automation_now(
     let dispatch = automations
         .claim_now(&path, &id, now_ms, AUTOMATIONS_MAX_BYTES)
         .map_err(automation_claim_error)?;
-    if let Err(error) = runner.emit_dispatch(&app, dispatch.clone()) {
-        if let Err(settle_error) = automations.complete_claim(
-            &path,
-            &id,
-            &dispatch.token,
-            AutomationCompletion {
-                session_id: None,
-                error: Some(&error.message),
-                completed_at: now_ms,
-            },
-            AUTOMATIONS_MAX_BYTES,
-        ) {
-            return Err(automation_storage_error(format!(
-                "{}；派发失败后的租约结算也失败：{settle_error}",
-                error.message
-            )));
-        }
-        return Err(error);
-    }
+    runner.launch(app, dispatch);
     Ok(())
-}
-
-#[tauri::command]
-fn renew_automation_dispatch(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    automations: tauri::State<'_, AutomationStore>,
-    id: String,
-    token: String,
-) -> Result<u64, AcpHostError> {
-    ensure_main_acp_owner(window.label())
-        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
-    let path = automations_path(&app).map_err(automation_storage_error)?;
-    automations
-        .renew_claim(
-            &path,
-            &id,
-            &token,
-            automation_runner::unix_time_ms(),
-            AUTOMATIONS_MAX_BYTES,
-        )
-        .map_err(automation_claim_error)
-}
-
-#[tauri::command]
-fn complete_automation_dispatch(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    automations: tauri::State<'_, AutomationStore>,
-    id: String,
-    token: String,
-    session_id: Option<String>,
-    error: Option<String>,
-) -> Result<serde_json::Value, AcpHostError> {
-    ensure_main_acp_owner(window.label())
-        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
-    let path = automations_path(&app).map_err(automation_storage_error)?;
-    automations
-        .complete_claim(
-            &path,
-            &id,
-            &token,
-            AutomationCompletion {
-                session_id: session_id.as_deref(),
-                error: error.as_deref(),
-                completed_at: automation_runner::unix_time_ms(),
-            },
-            AUTOMATIONS_MAX_BYTES,
-        )
-        .map_err(automation_claim_error)
-}
-
-/// 会话创建后的自动化回合由 Host 完整拥有：模型/模式绑定、prompt、长回合续租和结算。
-#[tauri::command]
-async fn execute_automation_session(
-    app: tauri::AppHandle,
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, Arc<AcpState>>,
-    leases: tauri::State<'_, Arc<McpLeaseStore>>,
-    runner: tauri::State<'_, AutomationRunner>,
-    automations: tauri::State<'_, AutomationStore>,
-    id: String,
-    token: String,
-    session_id: String,
-) -> Result<automation_runner::AutomationSessionResult, AcpHostError> {
-    ensure_main_acp_owner(window.label())
-        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
-    let result = automation_runner::execute_claimed_session(
-        &app,
-        &window,
-        state.inner(),
-        leases.inner(),
-        runner.inner(),
-        automations.inner(),
-        &id,
-        &token,
-        &session_id,
-    )
-    .await;
-    if let Err(error) = &result {
-        let _ = window.emit(
-            "automation-session-settled",
-            automation_runner::AutomationSessionSettled {
-                session_id,
-                model: None,
-                mode: None,
-                requested_effort: None,
-                effective_effort: None,
-                usage: None,
-                error: Some(error.clone()),
-            },
-        );
-    }
-    result
 }
 
 #[tauri::command]
@@ -3858,6 +3746,14 @@ fn host_prefs_migrate_computer_use(
 }
 
 #[tauri::command]
+fn host_prefs_migrate_browser_use(
+    app: tauri::AppHandle,
+    fe_enabled: bool,
+) -> Result<host_prefs::HostPrefs, String> {
+    host_prefs::migrate_browser_use_from_fe(&host_prefs_dir_for_app(&app), fe_enabled)
+}
+
+#[tauri::command]
 fn host_prefs_set_computer_use(
     app: tauri::AppHandle,
     enabled: bool,
@@ -3866,6 +3762,19 @@ fn host_prefs_set_computer_use(
     let mut prefs = host_prefs::load_prefs(&dir);
     prefs.computer_use_enabled = enabled;
     prefs.computer_use_fe_migrated = true;
+    host_prefs::save_prefs(&dir, &prefs)?;
+    Ok(prefs)
+}
+
+#[tauri::command]
+fn host_prefs_set_browser_use(
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<host_prefs::HostPrefs, String> {
+    let dir = host_prefs_dir_for_app(&app);
+    let mut prefs = host_prefs::load_prefs(&dir);
+    prefs.browser_use_enabled = enabled;
+    prefs.browser_use_fe_migrated = true;
     host_prefs::save_prefs(&dir, &prefs)?;
     Ok(prefs)
 }
@@ -8993,9 +8902,6 @@ fn main() {
             agent_runtime_pause,
             automation_runner_status,
             run_automation_now,
-            renew_automation_dispatch,
-            complete_automation_dispatch,
-            execute_automation_session,
             open_agent_session,
             close_agent_session,
             delete_agent_session,
@@ -9053,7 +8959,9 @@ fn main() {
             computer_use_env_enabled,
             host_prefs_get,
             host_prefs_migrate_computer_use,
+            host_prefs_migrate_browser_use,
             host_prefs_set_computer_use,
+            host_prefs_set_browser_use,
             host_prefs_set_permission_mode,
             computer_shutdown_all_leases,
             computer_emergency_stop_session,

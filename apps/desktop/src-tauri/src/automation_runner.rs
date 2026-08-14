@@ -1,7 +1,7 @@
 //! 进程级自动化调度器。
 //!
-//! Host 负责时钟、运行时门禁和持久化认领；WebView 只执行已经携带租约的派发。
-//! 这样页面重载不会重置调度时钟，也不能通过本地状态重复消费同一个任务。
+//! Host 负责时钟、持久化认领、会话创建、运行时注册、回合与结算。
+//! WebView 只观察 started/settled 投影；页面重载或窗口隐藏不会中断执行链。
 
 use std::{
     path::Path,
@@ -10,14 +10,15 @@ use std::{
 };
 
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager};
 
 use crate::{
     acp_host::AcpHostError,
     automation_store::{AutomationCompletion, AutomationDispatch, AutomationStore},
-    automations_path,
+    automations_path, host_prefs, host_prefs_dir_for_app,
     mcp_leases::McpLeaseStore,
     request_acp_json,
+    session_runtime::{open_agent_session_inner, OpenAgentSessionRequest},
     turn_runtime::{
         bind_mode, bind_model, complete_deep_research_prompt, effort_fallback_chain,
         is_invalid_reasoning_effort, prompt_result_invalid_effort,
@@ -46,26 +47,45 @@ pub(crate) struct AutomationRunnerStatus {
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AutomationSessionSettled {
-    pub(crate) session_id: String,
+    pub(crate) automation_id: String,
+    pub(crate) source: crate::automation_store::AutomationDispatchSource,
+    pub(crate) claimed_at: u64,
+    pub(crate) session_id: Option<String>,
     pub(crate) model: Option<String>,
     pub(crate) mode: Option<String>,
     pub(crate) requested_effort: Option<String>,
     pub(crate) effective_effort: Option<String>,
     pub(crate) usage: Option<Value>,
+    pub(crate) automation: Option<Value>,
     pub(crate) error: Option<AcpHostError>,
 }
 
-#[derive(serde::Serialize)]
+#[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct AutomationSessionResult {
-    pub(crate) automation: Option<Value>,
-    pub(crate) effective_effort: String,
-    pub(crate) error: Option<AcpHostError>,
+pub(crate) struct AutomationSessionStarted {
+    pub(crate) automation_id: String,
+    pub(crate) source: crate::automation_store::AutomationDispatchSource,
+    pub(crate) claimed_at: u64,
+    pub(crate) session_id: String,
+    pub(crate) automation: Value,
+    pub(crate) warnings: Vec<AcpHostError>,
 }
 
 struct AutomationTurnResult {
     effective_effort: String,
     usage: Option<Value>,
+}
+
+#[derive(Debug)]
+struct ClaimedAutomationConfig {
+    id: String,
+    title: String,
+    prompt: String,
+    cwd: String,
+    model: String,
+    mode: String,
+    requested_effort: String,
+    permission_mode: String,
 }
 
 impl AutomationRunner {
@@ -135,31 +155,17 @@ impl AutomationRunner {
         ))
     }
 
-    pub(crate) fn emit_dispatch(
-        &self,
-        app: &AppHandle,
-        dispatch: AutomationDispatch,
-    ) -> Result<(), AcpHostError> {
-        let window = app.get_webview_window("main").ok_or_else(|| {
-            AcpHostError::environment(
-                "AUTOMATION_WINDOW_UNAVAILABLE",
-                "主窗口不存在，无法消费自动化派发",
-                false,
-                false,
-                "重新打开 Grox 主窗口后等待 Host 恢复任务",
-            )
-        })?;
-        window
-            .emit("automation-dispatch", dispatch)
-            .map_err(|error| {
-                AcpHostError::environment(
-                    "AUTOMATION_DISPATCH_FAILED",
-                    format!("无法把已认领任务交给桌面运行时：{error}"),
-                    false,
-                    false,
-                    "保持 Grox 打开并重新运行任务",
-                )
-            })
+    pub(crate) fn launch(&self, app: AppHandle, dispatch: AutomationDispatch) {
+        tauri::async_runtime::spawn(async move {
+            let settled = execute_claimed_automation(&app, dispatch).await;
+            if let Err(error) = app.emit("automation-session-settled", settled.clone()) {
+                eprintln!("grox: 无法投影自动化会话终态：{error}");
+            }
+            if let Some(error) = settled.error {
+                eprintln!("grox: 自动化执行失败：{}", error.message);
+                let _ = app.emit("automation-runner-error", error);
+            }
+        });
     }
 
     async fn runtime_ready(&self, state: &AcpState) -> bool {
@@ -167,89 +173,255 @@ impl AutomationRunner {
     }
 }
 
-pub(crate) async fn execute_claimed_session(
+async fn execute_claimed_automation(
     app: &AppHandle,
-    window: &WebviewWindow,
-    state: &AcpState,
-    leases: &McpLeaseStore,
-    runner: &AutomationRunner,
-    store: &AutomationStore,
-    id: &str,
-    token: &str,
-    session_id: &str,
-) -> Result<AutomationSessionResult, AcpHostError> {
-    let path = automations_path(app).map_err(storage_error)?;
-    let claimed = store
-        .begin_execution(&path, id, token, unix_time_ms(), AUTOMATIONS_MAX_BYTES)
-        .map_err(crate::automation_claim_error)?;
+    dispatch: AutomationDispatch,
+) -> AutomationSessionSettled {
+    let automation_id = dispatch
+        .automation
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let mut settled = AutomationSessionSettled {
+        automation_id: automation_id.clone(),
+        source: dispatch.source.clone(),
+        claimed_at: dispatch.claimed_at,
+        session_id: None,
+        model: None,
+        mode: None,
+        requested_effort: None,
+        effective_effort: None,
+        usage: None,
+        automation: None,
+        error: None,
+    };
+    let path = match automations_path(app).map_err(storage_error) {
+        Ok(path) => path,
+        Err(error) => {
+            settled.error = Some(error);
+            return settled;
+        }
+    };
+    let store = app.state::<AutomationStore>();
+    let claimed = match store.begin_execution(
+        &path,
+        &automation_id,
+        &dispatch.token,
+        unix_time_ms(),
+        AUTOMATIONS_MAX_BYTES,
+    ) {
+        Ok(claimed) => claimed,
+        Err(error) => {
+            settled.error = Some(crate::automation_claim_error(error));
+            return settled;
+        }
+    };
     debug_assert!(claimed.lease_expires_at > unix_time_ms());
-    let automation = &claimed.automation;
-    let model = automation_string(automation, "model")?;
-    let mode = automation_string(automation, "mode")?;
-    let requested_effort = automation_string(automation, "effort")?;
-    let permission_mode = automation_string(automation, "permissionMode")?;
-    let prompt = automation_string(automation, "prompt")?;
+    let config = match claimed_automation_config(&claimed.automation) {
+        Ok(config) => config,
+        Err(error) => {
+            return complete_execution(&store, &path, &dispatch, settled, None, Some(error));
+        }
+    };
+    settled.model = Some(config.model.clone());
+    settled.mode = Some(config.mode.clone());
+    settled.requested_effort = Some(config.requested_effort.clone());
+    settled.effective_effort = Some(config.requested_effort.clone());
+
+    let state = app.state::<std::sync::Arc<AcpState>>();
+    let leases = app.state::<std::sync::Arc<McpLeaseStore>>();
+    let runner = app.state::<AutomationRunner>();
+    let generation = match runner.ready_generation(state.inner()).await {
+        Ok(generation) => generation,
+        Err(error) => {
+            return complete_execution(&store, &path, &dispatch, settled, None, Some(error));
+        }
+    };
+    let prefs = host_prefs::load_prefs(&host_prefs_dir_for_app(app));
+    let opened = match open_agent_session_inner(
+        app,
+        state.inner(),
+        leases.inner(),
+        OpenAgentSessionRequest {
+            cwd: config.cwd.clone(),
+            generation,
+            session_id: None,
+            preferred_model: Some(config.model.clone()),
+            reasoning_effort: Some(config.requested_effort.clone()),
+            permission_mode: config.permission_mode.clone(),
+            computer_use_enabled: prefs.computer_use_enabled,
+            browser_use_enabled: prefs.browser_use_enabled,
+        },
+    )
+    .await
+    {
+        Ok(opened) => opened,
+        Err(error) => {
+            return complete_execution(&store, &path, &dispatch, settled, None, Some(error));
+        }
+    };
+    let session_id = match opened
+        .response
+        .get("sessionId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(session_id) => session_id.to_string(),
+        None => {
+            return complete_execution(
+                &store,
+                &path,
+                &dispatch,
+                settled,
+                None,
+                Some(AcpHostError::protocol(
+                    "ACP_INVALID_RESPONSE",
+                    "session/new 未返回 sessionId",
+                )),
+            );
+        }
+    };
+    settled.session_id = Some(session_id.clone());
+    if let Err(error) = store.bind_claim_session(
+        &path,
+        &config.id,
+        &dispatch.token,
+        &session_id,
+        unix_time_ms(),
+        AUTOMATIONS_MAX_BYTES,
+    ) {
+        return complete_execution(
+            &store,
+            &path,
+            &dispatch,
+            settled,
+            Some(&session_id),
+            Some(crate::automation_claim_error(error)),
+        );
+    }
+    let started = AutomationSessionStarted {
+        automation_id: config.id.clone(),
+        source: dispatch.source.clone(),
+        claimed_at: dispatch.claimed_at,
+        session_id: session_id.clone(),
+        automation: claimed.automation.clone(),
+        warnings: opened.warnings,
+    };
+    if let Err(error) = app.emit("automation-session-started", started) {
+        eprintln!("grox: 无法投影自动化会话启动：{error}");
+    }
+    let rename_state = std::sync::Arc::clone(state.inner());
+    let rename_leases = std::sync::Arc::clone(leases.inner());
+    let rename_session_id = session_id.clone();
+    let rename_title = config.title.clone();
+    let rename_cwd = config.cwd.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(error) = request_acp_json(
+            rename_state.as_ref(),
+            rename_leases.as_ref(),
+            "x.ai/session/rename",
+            json!({
+                "sessionId": rename_session_id,
+                "title": rename_title,
+                "cwd": rename_cwd,
+                "kind": "build",
+            }),
+            generation,
+            30_000,
+            None,
+        )
+        .await
+        {
+            eprintln!("grox: 自动化会话标题同步失败：{}", error.message);
+        }
+    });
 
     let turn = run_claimed_turn(
-        state,
-        leases,
-        runner,
-        store,
+        state.inner(),
+        leases.inner(),
+        runner.inner(),
+        store.inner(),
         &path,
-        id,
-        token,
-        session_id,
-        &model,
-        &mode,
-        &requested_effort,
-        &permission_mode,
-        &prompt,
+        &config.id,
+        &dispatch.token,
+        &session_id,
+        &config.model,
+        &config.mode,
+        &config.requested_effort,
+        &opened.effective_permission_mode,
+        &config.prompt,
     )
     .await;
-    let (effective_effort, usage, execution_error) = match turn {
-        Ok(turn) => (turn.effective_effort, turn.usage, None),
-        Err(error) => (requested_effort.clone(), None, Some(error)),
+    let execution_error = match turn {
+        Ok(turn) => {
+            settled.effective_effort = Some(turn.effective_effort);
+            settled.usage = turn.usage;
+            None
+        }
+        Err(error) => Some(error),
     };
+    complete_execution(
+        &store,
+        &path,
+        &dispatch,
+        settled,
+        Some(&session_id),
+        execution_error,
+    )
+}
 
-    let settled = AutomationSessionSettled {
-        session_id: session_id.to_string(),
-        model: Some(model),
-        mode: Some(mode),
-        requested_effort: Some(requested_effort),
-        effective_effort: Some(effective_effort.clone()),
-        usage,
-        error: execution_error.clone(),
-    };
-    if let Err(error) = window.emit("automation-session-settled", settled) {
-        eprintln!("grox: 无法投影自动化会话终态：{error}");
-    }
-
+fn complete_execution(
+    store: &AutomationStore,
+    path: &Path,
+    dispatch: &AutomationDispatch,
+    mut settled: AutomationSessionSettled,
+    session_id: Option<&str>,
+    execution_error: Option<AcpHostError>,
+) -> AutomationSessionSettled {
     let error_detail = execution_error
         .as_ref()
         .map(|error| error.message.chars().take(3_500).collect::<String>());
-    let settlement = store.complete_claim(
-        &path,
-        id,
-        token,
+    match store.complete_claim(
+        path,
+        &settled.automation_id,
+        &dispatch.token,
         AutomationCompletion {
-            session_id: Some(session_id),
+            session_id,
             error: error_detail.as_deref(),
             completed_at: unix_time_ms(),
         },
         AUTOMATIONS_MAX_BYTES,
-    );
-    match settlement {
-        Ok(updated) => Ok(AutomationSessionResult {
-            automation: Some(updated),
-            effective_effort,
-            error: execution_error,
-        }),
-        Err(error) => Ok(AutomationSessionResult {
-            automation: None,
-            effective_effort,
-            error: Some(crate::automation_claim_error(error)),
-        }),
+    ) {
+        Ok(updated) => {
+            settled.automation = Some(updated);
+            settled.error = execution_error;
+        }
+        Err(error) => {
+            let mut settlement_error = crate::automation_claim_error(error);
+            if let Some(execution_error) = execution_error {
+                settlement_error.message = format!(
+                    "{}；自动化结算也失败：{}",
+                    execution_error.message, settlement_error.message
+                );
+            }
+            settled.error = Some(settlement_error);
+        }
     }
+    settled
+}
+
+fn claimed_automation_config(automation: &Value) -> Result<ClaimedAutomationConfig, AcpHostError> {
+    Ok(ClaimedAutomationConfig {
+        id: automation_string(automation, "id")?,
+        title: automation_string(automation, "title")?,
+        prompt: automation_string(automation, "prompt")?,
+        cwd: automation_string(automation, "cwd")?,
+        model: automation_string(automation, "model")?,
+        mode: automation_string(automation, "mode")?,
+        requested_effort: automation_string(automation, "effort")?,
+        permission_mode: automation_string(automation, "permissionMode")?,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -482,30 +654,7 @@ async fn tick(app: &AppHandle) -> Result<(), AcpHostError> {
         .claim_due(&path, checked_at, AUTOMATIONS_MAX_BYTES)
         .map_err(storage_error)?
     {
-        if let Err(error) = runner.emit_dispatch(app, dispatch.clone()) {
-            let id = dispatch
-                .automation
-                .get("id")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default();
-            if let Err(settle_error) = store.complete_claim(
-                &path,
-                id,
-                &dispatch.token,
-                AutomationCompletion {
-                    session_id: None,
-                    error: Some(&error.message),
-                    completed_at: checked_at,
-                },
-                AUTOMATIONS_MAX_BYTES,
-            ) {
-                return Err(storage_error(format!(
-                    "{}；派发失败后的租约结算也失败：{settle_error}",
-                    error.message
-                )));
-            }
-            return Err(error);
-        }
+        runner.launch(app.clone(), dispatch);
     }
     Ok(())
 }
@@ -526,4 +675,41 @@ pub(crate) fn storage_error(message: String) -> AcpHostError {
         false,
         "检查应用数据目录的权限和磁盘空间后重试",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn automation() -> Value {
+        json!({
+            "id": "auto-1",
+            "title": "Nightly review",
+            "prompt": "review the repository",
+            "cwd": "/tmp/repo",
+            "model": "grok-build",
+            "effort": "high",
+            "mode": "agent",
+            "permissionMode": "auto",
+        })
+    }
+
+    #[test]
+    fn claimed_config_contains_every_host_execution_input() {
+        let config = claimed_automation_config(&automation()).unwrap();
+        assert_eq!(config.id, "auto-1");
+        assert_eq!(config.title, "Nightly review");
+        assert_eq!(config.cwd, "/tmp/repo");
+        assert_eq!(config.requested_effort, "high");
+        assert_eq!(config.permission_mode, "auto");
+    }
+
+    #[test]
+    fn claimed_config_rejects_missing_host_inputs() {
+        let mut value = automation();
+        value.as_object_mut().unwrap().remove("cwd");
+        let error = claimed_automation_config(&value).unwrap_err();
+        assert_eq!(error.code, "AUTOMATION_INVALID_RESULT");
+        assert!(error.message.contains("cwd"));
+    }
 }

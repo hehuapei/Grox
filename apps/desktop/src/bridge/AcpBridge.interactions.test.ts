@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { AcpBridge } from "./AcpBridge";
-import type { BridgeEvent } from "./types";
+import type { AutomationSessionStarted, BridgeEvent } from "./types";
 
 interface HostInteraction {
   blockId: string;
@@ -14,6 +14,7 @@ interface InteractionInternals {
   reconcileHostInteractions(interactions: HostInteraction[]): void;
   onLine(line: string): void;
   sendRaw(message: unknown): Promise<void>;
+  projectAutomationSessionStarted(started: AutomationSessionStarted): void;
 }
 
 function bridgeHarness() {
@@ -107,5 +108,42 @@ describe("AcpBridge Host interaction projection", () => {
     );
     expect(notice?.notice.id).toBe("error-protocol-CLIENT_CALLBACK_HOST_BYPASSED");
     expect(replied).toBe(false);
+  });
+
+  it("projects a Host-created automation session without asking WebView to create it", () => {
+    const { events, internal } = bridgeHarness();
+    internal.projectAutomationSessionStarted({
+      automationId: "auto-1",
+      source: "scheduled",
+      claimedAt: 42,
+      sessionId: "session-host-1",
+      warnings: [],
+      automation: {
+        id: "auto-1",
+        title: "Nightly review",
+        prompt: "Review the repository",
+        cwd: "/tmp/repo",
+        model: "grok-build",
+        effort: "high",
+        mode: "agent",
+        permissionMode: "auto",
+        frequency: "daily",
+        time: "09:30",
+        enabled: true,
+        nextRunAt: 100,
+      },
+    });
+
+    const ready = events.find(
+      (event): event is Extract<BridgeEvent, { type: "session_ready" }> =>
+        event.type === "session_ready",
+    );
+    expect(ready?.background).toBe(true);
+    expect(ready?.session).toMatchObject({
+      id: "session-host-1",
+      title: "Nightly review",
+      status: "running",
+      blocks: [{ type: "user", text: "Review the repository" }],
+    });
   });
 });

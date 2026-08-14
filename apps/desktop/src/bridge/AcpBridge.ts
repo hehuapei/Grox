@@ -40,7 +40,7 @@ import type {
   RewindPoint,
   RewindResult,
   RuntimeOccupancy,
-  AutomationDispatch,
+  AutomationSessionStarted,
   AutomationRunnerStatus,
   AutomationSessionSettled,
   GroxError,
@@ -635,6 +635,7 @@ function mapPlanSteps(value: unknown): PlanStep[] {
 interface OpenAgentSessionResult {
   response: unknown;
   warnings: GroxError[];
+  effectivePermissionMode: PermissionMode;
 }
 
 function mapAvailableCommands(value: unknown): SlashCommand[] {
@@ -857,7 +858,8 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
     case "runtime_state":
     case "runtime_occupancy":
     case "prompt_queue_changed":
-    case "automation_dispatch":
+    case "automation_session_started":
+    case "automation_session_settled":
     case "automation_runner_tick":
       return session;
     case "session_meta":
@@ -1215,8 +1217,9 @@ export class AcpBridge implements GrokBridge {
           reason: payload.reason,
         });
       }),
-      await listen<AutomationDispatch>("automation-dispatch", ({ payload }) => {
-        this.emit({ type: "automation_dispatch", dispatch: payload });
+      await listen<AutomationSessionStarted>("automation-session-started", ({ payload }) => {
+        this.projectAutomationSessionStarted(payload);
+        this.emit({ type: "automation_session_started", started: payload });
       }),
       await listen<AutomationRunnerStatus>("automation-runner-tick", ({ payload }) => {
         this.emit({ type: "automation_runner_tick", status: payload });
@@ -1239,7 +1242,7 @@ export class AcpBridge implements GrokBridge {
         });
       }),
       await listen<AutomationSessionSettled>("automation-session-settled", ({ payload }) => {
-        if (payload.model && payload.effectiveEffort && payload.mode) {
+        if (payload.sessionId && payload.model && payload.effectiveEffort && payload.mode) {
           this.sessionOptions.set(payload.sessionId, {
             model: payload.model,
             effort: payload.effectiveEffort,
@@ -1247,7 +1250,8 @@ export class AcpBridge implements GrokBridge {
           });
         }
         if (
-          payload.requestedEffort
+          payload.sessionId
+          && payload.requestedEffort
           && payload.effectiveEffort
           && payload.requestedEffort !== payload.effectiveEffort
         ) {
@@ -1263,12 +1267,15 @@ export class AcpBridge implements GrokBridge {
             },
           });
         }
-        this.finishTurn(
-          payload.sessionId,
-          record(payload.usage),
-          payload.error ? "failed" : "idle",
-        );
-        if (payload.error) {
+        if (payload.sessionId) {
+          this.finishTurn(
+            payload.sessionId,
+            record(payload.usage),
+            payload.error ? "failed" : "idle",
+          );
+        }
+        this.emit({ type: "automation_session_settled", settled: payload });
+        if (payload.error && payload.sessionId) {
           this.emit({ type: "error", sessionId: payload.sessionId, error: payload.error });
         }
       }),
@@ -2780,6 +2787,44 @@ export class AcpBridge implements GrokBridge {
     for (const warning of warnings ?? []) {
       this.emit({ type: "runtime_notice", notice: runtimeNoticeFromError(warning) });
     }
+  }
+
+  private projectAutomationSessionStarted(started: AutomationSessionStarted): void {
+    const automation = started.automation;
+    const now = started.claimedAt || Date.now();
+    const meta: SessionMeta = {
+      id: started.sessionId,
+      title: automation.title || "Scheduled mission",
+      cwd: automation.cwd,
+      createdAt: now,
+      updatedAt: now,
+      model: automation.model,
+    };
+    this.emitHostWarnings(started.warnings);
+    this.knownSessions.add(started.sessionId);
+    this.sessionOptions.set(started.sessionId, {
+      model: automation.model,
+      effort: automation.effort,
+      mode: automation.mode,
+    });
+    this.catalogue.set(started.sessionId, meta);
+    this.cursors.set(started.sessionId, { toolBlocks: new Map() });
+    this.usage.set(started.sessionId, { ...EMPTY_USAGE });
+    this.emit({
+      type: "session_ready",
+      session: {
+        ...emptySession(meta),
+        status: "running",
+        blocks: [{
+          type: "user",
+          id: uid(),
+          text: automation.prompt,
+          ts: now,
+        }],
+      },
+      background: true,
+    });
+    this.emit({ type: "available_commands", sessionId: started.sessionId, commands: this.runtimeCommands });
   }
 
   private async createSession(cwd: string, background: boolean): Promise<string> {

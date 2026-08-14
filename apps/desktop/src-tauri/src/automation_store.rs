@@ -145,6 +145,9 @@ impl AutomationStore {
     ) -> Result<Option<AutomationDispatch>, String> {
         let _transaction = self.lock_transaction();
         let mut automations = self.read_locked(path, max_bytes)?;
+        if recover_expired_bound_claims(&mut automations, now_ms)? {
+            self.write_locked(path, automations.clone(), max_bytes)?;
+        }
         if automations
             .iter()
             .any(|automation| has_live_claim(automation, now_ms))
@@ -181,6 +184,9 @@ impl AutomationStore {
         validate_automation_id(id)?;
         let _transaction = self.lock_transaction();
         let mut automations = self.read_locked(path, max_bytes)?;
+        if recover_expired_bound_claims(&mut automations, now_ms)? {
+            self.write_locked(path, automations.clone(), max_bytes)?;
+        }
         if automations
             .iter()
             .any(|automation| has_live_claim(automation, now_ms))
@@ -216,8 +222,8 @@ impl AutomationStore {
         Ok(expires_at)
     }
 
-    /// WebView 创建完带本机能力租约的会话后，将执行权原子移交给 Host。
-    /// 读取配置、校验 token 和首次续租必须在同一事务内，不能让前端提交另一份配置快照。
+    /// Host 开始执行认领。读取配置、校验 token 和首次续租必须在同一事务内，
+    /// 后续页面 patch 不能把运行中的配置换成另一份快照。
     pub(crate) fn begin_execution(
         &self,
         path: &Path,
@@ -247,6 +253,42 @@ impl AutomationStore {
         })
     }
 
+    /// session/new 成功后立即把真实会话写进租约。此写入先于 prompt；进程若在
+    /// 最终结算前退出，下一次调度会把该次运行标成结果未知并禁止自动重放。
+    pub(crate) fn bind_claim_session(
+        &self,
+        path: &Path,
+        id: &str,
+        token: &str,
+        session_id: &str,
+        now_ms: u64,
+        max_bytes: u64,
+    ) -> Result<u64, String> {
+        validate_automation_id(id)?;
+        validate_claim_token(token)?;
+        validate_session_id(session_id)?;
+        let _transaction = self.lock_transaction();
+        let mut automations = self.read_locked(path, max_bytes)?;
+        let automation = automations
+            .iter_mut()
+            .find(|automation| automation_id(automation) == Some(id))
+            .ok_or_else(|| format!("自动化任务不存在：{id}"))?;
+        let runtime = claim_runtime_mut(automation, token)?;
+        if runtime
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .is_some_and(|bound| bound != session_id)
+        {
+            return Err("自动化认领已绑定到另一个会话".into());
+        }
+        let expires_at = now_ms.saturating_add(CLAIM_LEASE_MS);
+        runtime.insert("sessionId".to_string(), Value::from(session_id));
+        runtime.insert("sessionBoundAt".to_string(), Value::from(now_ms));
+        runtime.insert("leaseExpiresAt".to_string(), Value::from(expires_at));
+        self.write_locked(path, automations, max_bytes)?;
+        Ok(expires_at)
+    }
+
     pub(crate) fn complete_claim(
         &self,
         path: &Path,
@@ -262,12 +304,7 @@ impl AutomationStore {
         } = completion;
         validate_claim_token(token)?;
         if let Some(session_id) = session_id {
-            if session_id.trim().is_empty()
-                || session_id.len() > 256
-                || session_id.chars().any(char::is_control)
-            {
-                return Err("自动化结果包含无效会话 ID".into());
-            }
+            validate_session_id(session_id)?;
         }
         if error.is_some_and(|message| message.chars().count() > 4_000) {
             return Err("自动化错误详情不能超过 4000 个字符".into());
@@ -280,6 +317,11 @@ impl AutomationStore {
             .find(|automation| automation_id(automation) == Some(id))
             .ok_or_else(|| format!("自动化任务不存在：{id}"))?;
         let runtime = claim_runtime(automation, token)?;
+        if let Some(bound_session_id) = runtime.get("sessionId").and_then(Value::as_str) {
+            if session_id != Some(bound_session_id) {
+                return Err("自动化结算会话与已持久绑定的会话不一致".into());
+            }
+        }
         let source = runtime
             .get("source")
             .and_then(Value::as_str)
@@ -619,6 +661,80 @@ fn without_host_runtime(mut automation: Value) -> Value {
     automation
 }
 
+fn recover_expired_bound_claims(automations: &mut [Value], now_ms: u64) -> Result<bool, String> {
+    let mut changed = false;
+    for automation in automations {
+        let Some(runtime) = automation.get(HOST_RUNTIME_KEY) else {
+            continue;
+        };
+        if runtime.get("token").and_then(Value::as_str).is_none()
+            || timestamp_field(runtime, "leaseExpiresAt").is_some_and(|value| value > now_ms)
+        {
+            continue;
+        }
+        let Some(session_id) = runtime
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        validate_session_id(&session_id)?;
+        let source = runtime
+            .get("source")
+            .and_then(Value::as_str)
+            .and_then(AutomationDispatchSource::from_str)
+            .ok_or_else(|| "自动化认领来源无效".to_string())?;
+        let bound_at = timestamp_field(runtime, "sessionBoundAt").unwrap_or(now_ms);
+        let previous_retry_at = timestamp_field(runtime, "retryAfterAt");
+        let frequency = automation
+            .get("frequency")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let next_run_at = if matches!(source, AutomationDispatchSource::Scheduled)
+            && frequency.as_deref() != Some("once")
+        {
+            Some(next_automation_run(
+                automation,
+                now_ms.saturating_add(1_000),
+            )?)
+        } else {
+            None
+        };
+
+        let item = automation
+            .as_object_mut()
+            .expect("validated automation must be an object");
+        item.remove(HOST_RUNTIME_KEY);
+        item.insert("lastSessionId".to_string(), Value::from(session_id));
+        item.insert("lastRunAt".to_string(), Value::from(bound_at));
+        item.insert(
+            "lastError".to_string(),
+            Value::from("Host 在会话创建后退出；本次结果未知，已阻止自动重复执行"),
+        );
+        match source {
+            AutomationDispatchSource::Scheduled if frequency.as_deref() == Some("once") => {
+                item.insert("enabled".to_string(), Value::Bool(false));
+            }
+            AutomationDispatchSource::Scheduled => {
+                if let Some(next_run_at) = next_run_at {
+                    item.insert("nextRunAt".to_string(), Value::from(next_run_at));
+                }
+            }
+            AutomationDispatchSource::RunNow => {
+                if let Some(retry_at) = previous_retry_at.filter(|retry| *retry > now_ms) {
+                    item.insert(
+                        HOST_RUNTIME_KEY.to_string(),
+                        serde_json::json!({ "retryAfterAt": retry_at }),
+                    );
+                }
+            }
+        }
+        changed = true;
+    }
+    Ok(changed)
+}
+
 fn has_live_claim(automation: &Value, now_ms: u64) -> bool {
     automation
         .get(HOST_RUNTIME_KEY)
@@ -683,6 +799,17 @@ fn validate_claim_token(token: &str) -> Result<(), String> {
             .any(|byte| !byte.is_ascii_alphanumeric() && byte != b'-')
     {
         Err("自动化认领 token 无效".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_session_id(session_id: &str) -> Result<(), String> {
+    if session_id.trim().is_empty()
+        || session_id.len() > 256
+        || session_id.chars().any(char::is_control)
+    {
+        Err("自动化结果包含无效会话 ID".into())
     } else {
         Ok(())
     }
@@ -958,6 +1085,62 @@ mod tests {
 
         assert_ne!(recovered.token, first.token);
         assert_eq!(recovered.automation["id"], "a");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn created_session_is_durable_and_expiry_never_replays_the_schedule() {
+        let path = temp_file("bound-session-expiry");
+        fs::write(
+            &path,
+            serde_json::json!([automation("a", true)]).to_string(),
+        )
+        .unwrap();
+        let store = AutomationStore::default();
+        let dispatch = store.claim_due(&path, 10, 1024 * 1024).unwrap().unwrap();
+        let expires_at = store
+            .bind_claim_session(
+                &path,
+                "a",
+                &dispatch.token,
+                "session-created",
+                20,
+                1024 * 1024,
+            )
+            .unwrap();
+
+        let persisted: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            persisted[0][HOST_RUNTIME_KEY]["sessionId"],
+            "session-created"
+        );
+        assert!(store
+            .complete_claim(
+                &path,
+                "a",
+                &dispatch.token,
+                AutomationCompletion {
+                    session_id: Some("session-forged"),
+                    error: None,
+                    completed_at: 30,
+                },
+                1024 * 1024,
+            )
+            .is_err());
+        assert!(store
+            .claim_due(&path, expires_at + 1, 1024 * 1024)
+            .unwrap()
+            .is_none());
+
+        let recovered: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(recovered[0]["lastSessionId"], "session-created");
+        assert_eq!(recovered[0]["lastRunAt"], 20);
+        assert!(recovered[0]["lastError"]
+            .as_str()
+            .unwrap()
+            .contains("阻止自动重复执行"));
+        assert!(recovered[0]["nextRunAt"].as_u64().unwrap() > expires_at);
+        assert!(recovered[0].get(HOST_RUNTIME_KEY).is_none());
         let _ = fs::remove_file(path);
     }
 

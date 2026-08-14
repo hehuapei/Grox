@@ -25,21 +25,22 @@ struct BrowserSessionExtensions {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OpenAgentSessionRequest {
-    cwd: String,
-    generation: u64,
-    session_id: Option<String>,
-    preferred_model: Option<String>,
-    reasoning_effort: Option<String>,
-    permission_mode: String,
-    computer_use_enabled: bool,
-    browser_use_enabled: bool,
+    pub(crate) cwd: String,
+    pub(crate) generation: u64,
+    pub(crate) session_id: Option<String>,
+    pub(crate) preferred_model: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
+    pub(crate) permission_mode: String,
+    pub(crate) computer_use_enabled: bool,
+    pub(crate) browser_use_enabled: bool,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct OpenAgentSessionResult {
-    response: serde_json::Value,
-    warnings: Vec<AcpHostError>,
+    pub(crate) response: serde_json::Value,
+    pub(crate) warnings: Vec<AcpHostError>,
+    pub(crate) effective_permission_mode: String,
 }
 
 #[derive(Default)]
@@ -364,6 +365,17 @@ pub(crate) async fn open_agent_session(
 ) -> Result<OpenAgentSessionResult, AcpHostError> {
     ensure_main_acp_owner(window.label())
         .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    open_agent_session_inner(&app, state.inner(), leases.inner(), request).await
+}
+
+/// 供 Host 内部工作流复用的会话事务。调用者不需要也不能伪造 WebView 所有权；
+/// 运行时代次、工作区、权限和能力租约仍由这一处统一校验。
+pub(crate) async fn open_agent_session_inner(
+    app: &tauri::AppHandle,
+    state: &AcpState,
+    leases: &McpLeaseStore,
+    request: OpenAgentSessionRequest,
+) -> Result<OpenAgentSessionResult, AcpHostError> {
     {
         let process = state.process.lock().await;
         if !process
@@ -400,8 +412,7 @@ pub(crate) async fn open_agent_session(
         .transpose()?;
     let reasoning_effort = checked_reasoning_effort(request.reasoning_effort.clone())
         .map_err(|error| AcpHostError::protocol("ACP_INVALID_REASONING_EFFORT", error))?;
-    let host_permission_mode =
-        host_prefs::load_prefs(&host_prefs_dir_for_app(&app)).permission_mode;
+    let host_permission_mode = host_prefs::load_prefs(&host_prefs_dir_for_app(app)).permission_mode;
     let (permission_mode, bypass_rejected) =
         effective_session_permission_mode(&request.permission_mode, &host_permission_mode)?;
     let (system_prompt_path, _, _) = config_path("system-prompt", &cwd).map_err(|error| {
@@ -434,8 +445,7 @@ pub(crate) async fn open_agent_session(
             "Host 未确认 Bypass/YOLO，本会话已使用默认审批模式",
         ));
     }
-    let mut attempt =
-        prepare_session_extensions(leases.inner(), &request, permission_mode, &mut warnings)?;
+    let mut attempt = prepare_session_extensions(leases, &request, permission_mode, &mut warnings)?;
     let callback_open = match state.client_callbacks.begin_session_open(
         request.generation,
         session_id.as_deref(),
@@ -443,7 +453,7 @@ pub(crate) async fn open_agent_session(
     ) {
         Ok(lease) => lease,
         Err(error) => {
-            discard_session_extension_attempt(leases.inner(), &mut attempt);
+            discard_session_extension_attempt(leases, &mut attempt);
             return Err(AcpHostError::operation(
                 "SESSION_CALLBACK_BINDING_BUSY",
                 error,
@@ -462,8 +472,8 @@ pub(crate) async fn open_agent_session(
     };
     let send = |attempt: &SessionExtensionAttempt| {
         request_acp_json(
-            state.inner(),
-            leases.inner(),
+            state,
+            leases,
             method,
             session_open_params(
                 &cwd,
@@ -486,7 +496,7 @@ pub(crate) async fn open_agent_session(
     let response = match send(&attempt).await {
         Ok(response) => response,
         Err(error) if error.code == "ACP_RPC_INVALID_PARAMS" && had_extensions => {
-            discard_session_extension_attempt(leases.inner(), &mut attempt);
+            discard_session_extension_attempt(leases, &mut attempt);
             warnings.push(AcpHostError::protocol(
                 "ACP_SESSION_EXTENSIONS_UNSUPPORTED",
                 "当前 Grok Build 不接受桌面扩展参数，本会话已不挂载 Computer/Browser Use",
@@ -501,7 +511,7 @@ pub(crate) async fn open_agent_session(
         }
         Err(error) => {
             state.client_callbacks.abort_session_open(&callback_open);
-            discard_session_extension_attempt(leases.inner(), &mut attempt);
+            discard_session_extension_attempt(leases, &mut attempt);
             return Err(error);
         }
     };
@@ -522,7 +532,7 @@ pub(crate) async fn open_agent_session(
         Ok(session_id) => session_id,
         Err(error) => {
             state.client_callbacks.abort_session_open(&callback_open);
-            discard_session_extension_attempt(leases.inner(), &mut attempt);
+            discard_session_extension_attempt(leases, &mut attempt);
             return Err(error);
         }
     };
@@ -531,7 +541,7 @@ pub(crate) async fn open_agent_session(
         .commit_session_open(&callback_open, &bound_session_id)
     {
         state.client_callbacks.abort_session_open(&callback_open);
-        discard_session_extension_attempt(leases.inner(), &mut attempt);
+        discard_session_extension_attempt(leases, &mut attempt);
         return Err(AcpHostError::protocol(
             "SESSION_CALLBACK_BINDING_INVALID",
             error,
@@ -539,8 +549,12 @@ pub(crate) async fn open_agent_session(
     }
     let binding = std::mem::take(&mut attempt.leases);
     let previous = leases.bind_session(bound_session_id, binding.clone());
-    shutdown_replaced_session_resources(leases.inner(), previous, &binding);
-    Ok(OpenAgentSessionResult { response, warnings })
+    shutdown_replaced_session_resources(leases, previous, &binding);
+    Ok(OpenAgentSessionResult {
+        response,
+        warnings,
+        effective_permission_mode: permission_mode.to_string(),
+    })
 }
 
 #[tauri::command]

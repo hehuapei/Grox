@@ -515,11 +515,11 @@ export interface RuntimeOccupancy {
   pendingLifecycle: number;
 }
 
-export interface AutomationDispatch {
-  token: string;
+export interface AutomationSessionStarted {
+  automationId: string;
   source: "scheduled" | "run_now";
   claimedAt: number;
-  leaseExpiresAt: number;
+  sessionId: string;
   automation: {
     id: string;
     title: string;
@@ -538,6 +538,7 @@ export interface AutomationDispatch {
     lastSessionId?: string;
     lastError?: string;
   };
+  warnings: GroxError[];
 }
 
 export interface AutomationRunnerStatus {
@@ -547,18 +548,16 @@ export interface AutomationRunnerStatus {
 }
 
 export interface AutomationSessionSettled {
-  sessionId: string;
+  automationId: string;
+  source: "scheduled" | "run_now";
+  claimedAt: number;
+  sessionId?: string | null;
   model?: string | null;
   mode?: AgentMode | null;
   requestedEffort?: Effort | null;
   effectiveEffort?: Effort | null;
   usage?: Record<string, unknown> | null;
-  error?: GroxError | null;
-}
-
-export interface AutomationSessionResult {
-  automation?: AutomationDispatch["automation"] | null;
-  effectiveEffort: Effort;
+  automation?: AutomationSessionStarted["automation"] | null;
   error?: GroxError | null;
 }
 
@@ -568,7 +567,8 @@ export type BridgeEvent =
   | { type: "runtime_state"; state: RuntimeConnectionState }
   | { type: "runtime_occupancy"; occupancy: RuntimeOccupancy }
   | { type: "prompt_queue_changed"; sessionId: string; itemId: string; queue: unknown[]; reason: "claimed" | "consumed" | "recovered" }
-  | { type: "automation_dispatch"; dispatch: AutomationDispatch }
+  | { type: "automation_session_started"; started: AutomationSessionStarted }
+  | { type: "automation_session_settled"; settled: AutomationSessionSettled }
   | { type: "automation_runner_tick"; status: AutomationRunnerStatus }
   | { type: "model_state"; state: ModelState }
   | { type: "mode_state"; sessionId: string; mode: AgentMode }

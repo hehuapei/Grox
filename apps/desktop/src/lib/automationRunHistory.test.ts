@@ -17,6 +17,10 @@ const run = (outcome: "starting" | "started" = "starting") => ({
 });
 
 describe("automationRunHistory", () => {
+  it("保留 Host 已结算的 completed 终态", () => {
+    expect(parseAutomationRunHistory([{ ...run("started"), outcome: "completed" }])[0]?.outcome).toBe("completed");
+  });
+
   it("把崩溃窗口里的启动记录标成未知而不是伪成功或自动重放", () => {
     expect(recoverInterruptedAutomationRuns([run()], 2 * 60_000 + 2)[0]).toMatchObject({ outcome: "unknown" });
   });

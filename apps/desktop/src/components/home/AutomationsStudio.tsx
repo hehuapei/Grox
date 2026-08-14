@@ -237,6 +237,7 @@ function runOutcomeVisual(outcome: AutomationRunOutcome, zh: boolean) {
   const values: Record<AutomationRunOutcome, { label: string; className: string }> = {
     starting: { label: zh ? "启动中" : "Starting", className: "border-acc/25 bg-acc/5 text-acc" },
     started: { label: zh ? "已启动" : "Started", className: "border-green/25 bg-green/5 text-green" },
+    completed: { label: zh ? "已完成" : "Completed", className: "border-green/25 bg-green/5 text-green" },
     skipped: { label: zh ? "已跳过" : "Skipped", className: "border-gold/25 bg-gold/5 text-gold" },
     error: { label: zh ? "错误" : "Error", className: "border-red/25 bg-red/5 text-red" },
     unknown: { label: zh ? "结果未知" : "Unknown", className: "border-line3 bg-high text-dim" },

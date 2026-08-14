@@ -104,13 +104,13 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - 成功消费或用户停止会在 Host 进程内留下 queue id tombstone；结算前已进入前端 Promise 链的旧 patch 会在原生锁内剔除这些 id，不能在结算后把已执行提示复活。应用重启后旧前端链已不存在，永久删除仍由 SessionStorage tombstone 跨操作兜底。
 - `automation_store::AutomationStore` 按 automation id 在 Host 锁内合并更新/删除，不同任务的启停、编辑和运行结果不再通过整包数组互相覆盖；
 - 自动化 DTO、时间、频率、权限模式、可选运行结果和重复 id 均由 Host 校验，失败 patch 不修改原文件。
-- `automation_runner::AutomationRunner` 在应用进程内每 30 秒检查到期任务，只在 ACP 已初始化且 SessionCoordinator 无活动回合/生命周期操作时派发；WebView 不再持有调度定时器或到期判断；
-- 认领、两分钟租约、30 秒 Host 续租、排程推进、一次性任务停用和安全失败退避都在 AutomationStore 的同一文件事务内完成；建会话前失败会五分钟退避，已经创建会话后的模糊失败会消费本次排程，避免自动复制可能已写入 Agent 的工作；同一时刻跨任务也只允许一个后台派发；
-- `_hostRuntime` 是 Host 保留字段：普通 UI patch 不能伪造或擦除认领，过期租约可以在页面崩溃后恢复，旧 token 不能结算新认领；删除任务仍然优先，不会被晚到结算复活；
+- `automation_runner::AutomationRunner` 在应用进程内每 30 秒检查到期任务，只在 ACP 已初始化且 SessionCoordinator 无活动回合/生命周期操作时认领并启动 Host 后台任务；WebView 不再持有调度定时器、到期判断或执行回调；
+- 认领、两分钟租约、30 秒 Host 续租、排程推进、一次性任务停用和安全失败退避都在 AutomationStore 的同一文件事务内完成；建会话前失败会五分钟退避，已经创建会话后的模糊失败会消费本次排程，避免自动复制可能已写入 Agent 的工作；同一时刻跨任务也只允许一个后台运行；
+- `_hostRuntime` 是 Host 保留字段：普通 UI patch 不能伪造或擦除认领，旧 token 不能结算新认领；`session/new` 成功后 Host 会先把真实 session id 持久绑定到租约再发送 prompt，进程若在最终结算前退出，过期恢复会标记结果未知并消费该次排程，而不是重复创建会话；删除任务仍然优先，不会被晚到结算复活；
 - `session/new` 与 `session/load` 已由 Host 原子完成：读取系统提示、验证工作区/模型/权限、创建 Computer/Browser 租约、取得 lifecycle permit、执行兼容重试并把资源绑定到真实 session id；WebView 只登记返回的会话和投影流事件；
 - Computer/Browser lease id 不再保存在 WebView Map；会话关闭/删除、功能关闭、运行时替换、进程异常退出和主窗口销毁都由 Host 释放资源，TTL/容量淘汰也同步停止 MCP server 并清除会话绑定；
-- Bypass/YOLO 建会话必须与 `host_prefs` 的 Host 授权一致，前端参数只能降权或表达能力意图，不能扩大权限；可选 Browser 降级与扩展参数兼容回退通过结构化 warning 呈现，不再静默失去能力；
-- 自动化在页面登记 Host 创建的会话后，只把 automation id、claim token 和 session id 移交给 Host；Host 从磁盘重读权威配置，并在同一个 turn permit 内完成 `session/set_model`、`session/set_mode`、`session/prompt`、推理强度兼容降级、长回合续租和最终结算；
+- Bypass/YOLO 建会话必须与 `host_prefs` 的 Host 授权一致，前端参数只能降权或表达能力意图，不能扩大权限；自动化 prompt 继续使用 Host 实际裁决后的权限模式，不能在建会话被降权后用原始配置重新扩大授权；Computer 与 Browser 开关都持久化为 Host 偏好，可选 Browser 降级与扩展参数兼容回退通过结构化 warning 呈现；
+- 自动化从认领开始完全由 Host 执行：从磁盘重读权威配置，复用同一个 `open_agent_session` 事务完成 `session/new`、callback/MCP 绑定和会话注册，再在同一个 SessionCoordinator 中完成 `session/set_model`、`session/set_mode`、`session/prompt`、推理强度兼容降级、长回合续租和最终结算；WebView 只接收不含 claim token 的 started/settled 投影；
 - `session/prompt` 的 RPC 成败现在直接决定自动化结果，不再经过会吞掉异常的 UI `bridge.prompt()`；终态和用量由 Host 事件投影到会话，前端不能把协议失败结算成成功；
 - `foreground_turn::ForegroundTurnRegistry` 是普通前台回合的 Host 状态源：按 session + generation 记录当前请求、准备/提示/取消阶段、活动时间、开放工具和权限/问题门禁；进程替换时与请求表、许可一起清空；
 - `execute_foreground_turn` 在一个自动释放的 turn permit 内完成模型/模式绑定、Host-attested 权限元数据、`session/prompt` 和 invalid-effort 降级；前台与自动化复用 `turn_runtime` 的协议规则，不再各自维护一套 fallback；
@@ -125,7 +125,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - `session/new` 尚未返回真实 id 时，唯一 lifecycle opening 临时绑定本次 cwd，并只允许观察到的一个 session id；成功后原子提交正式绑定，失败、close/delete、进程替换和主窗口退出都会清除；
 - 未绑定会话、跨代次、重复 rpc id、越界路径和超限响应都由 Host 明确拒绝，不再用 `AcpBridge.workspace` 猜 cwd；原先暴露给 WebView 的 `acp_read_*` / `acp_write_*` commands 已移除；
 - `clientCapabilities.terminal` 继续为 false。官方 ACP 要求只有完整实现 create/output/wait/kill/release 后才能宣告；本切片没有用半成品 shell 执行器扩大 Agent 权限；
-- 自动化只定向派发给 `main` WebView；供应商、认证或全局配置切换会先暂停 runner，并取得 Host lifecycle permit 后才替换进程，因此能够等待 Host 后台回合而不是只观察 `activePromptSessions`；
+- 自动化执行不再定向派发给 `main` WebView；供应商、认证或全局配置切换会先暂停 runner，并取得 Host lifecycle permit 后才替换进程，因此能够等待 Host 后台回合而不是只观察 `activePromptSessions`；
 - 运行时切换已删除前端 `promptDrainWaiters` 第二门控，只等待 SessionCoordinator 的 lifecycle permit；`activePromptSessions` 仅保留 UI 中断标记与权限提示延迟，不再裁决进程替换；
 - Host 返回 `AUTOMATION_RUNTIME_BUSY`、`AUTOMATION_CLAIM_STALE`、`AUTOMATION_INVALID_RESULT` 和 `AUTOMATION_STORAGE_FAILED` 等分域错误，前端不再把所有失败折叠成“启动失败”。
 - `session_storage::SessionStorageState` 改为按会话写/删除租约：同一会话串行、不同会话并行，删除先标 tombstone 再等待现有 writer，避免全局文件锁拖慢多会话；
@@ -133,9 +133,9 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - 旧版裸 Session 只保留只读迁移入口，损坏的现有 journal 不会被新快照静默覆盖。
 
 本切片没有把完整 SessionManager 伪装成已经迁移：连接初始化、非交互认证、建会话/恢复、
-自动化协议回合、普通前台回合、持久化提示队列和权限/计划/提问交互生命周期已属于 Host。
+自动化完整生命周期、普通前台回合、持久化提示队列和权限/计划/提问交互生命周期已属于 Host。
 标准文件 client callback 与其会话工作区绑定也已属于 Host。用户显式触发的 OAuth 回调、
-自动化启动时的页面会话登记以及尚未宣告的 terminal client callback 仍待迁移；
+尚未宣告的 terminal client callback 与其它仍分散的 Host 服务待迁移；
 在这些职责迁完之前不会另起一个简化 CLI 进程冒充后台运行时。
 
 ## 完整后端对照结论
@@ -149,7 +149,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 多会话 | 单进程共享、生命周期门控在前端 | 每应用会话进程、后台 busy 不被抢占 | 先迁权威，再用容量策略决定进程池 |
 | 持久化 | 前端组装完整 JSON，Host 原子写 | store + 锁 + journal 对账 | Host 提供语义操作和锁内 RMW |
 | 队列 | Store/localStorage 主导 | Host 运行时可观察 busy/退出 | 队列状态与发送事务绑定 |
-| 自动化 | Host 已拥有时钟、建会话、能力租约、模型/模式、Prompt 与结算；页面仍承担会话登记屏障 | runner 复用 SessionManager | 前台与后台已共用 SessionCoordinator/turn_runtime；继续删除页面登记屏障 |
+| 自动化 | Host 已拥有认领、建会话、运行时注册、能力租约、模型/模式、Prompt、崩溃去重与结算；页面只做 started/settled 投影 | runner 复用 SessionManager | 前台与后台共用 SessionCoordinator/turn_runtime，页面登记屏障已删除 |
 | 工作树 | 命令安全性已有，生命周期仍偏 UI | worktree 与 session metadata 绑定 | 引入 Host 所有权记录和清理策略 |
 | 权限/提问 | Host 已按 session + generation 持有反向 RPC，WebView 只用 block id 投影；持久 allow cache 尚未统一 | 每会话策略、allow cache、Host resolve | 交互生命周期已迁移，下一步统一权限策略与审计 |
 | 媒体 | 工具图已落盘，预览/生成分散 | token loopback + path scope | 统一 MediaService 与会话授权 |
@@ -160,7 +160,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 
 ## Consequences
 
-- WebView 刷新不再决定任务是否已被消费，也不会丢失仍在 Host 等待的权限/提问；未结算自动化会在租约过期后由 Host 恢复。当前共享 ACP 进程仍随主窗口退出，这是明确限制。
+- WebView 刷新不再决定任务是否创建、执行或结算，也不会丢失仍在 Host 等待的权限/提问；已创建会话但未结算的自动化在租约过期后会标记结果未知并禁止自动重放。当前共享 ACP 进程仍随主窗口退出，这是明确限制。
 - 迁移期间仍保留一个共享 CLI 进程；这是真实限制，不伪装成进程池。
 - `AcpBridge` 会逐步缩小为投影器，Zustand 只保存 UI 需要的快照。
 - Host 模块会增加，但每次拆分必须伴随职责迁移、测试或不变量，禁止只为了缩短文件。

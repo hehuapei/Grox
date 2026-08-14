@@ -43,8 +43,6 @@ import type {
   RuntimeNotice,
   RuntimeConnectionState,
   RuntimeOccupancy,
-  AutomationDispatch,
-  AutomationSessionResult,
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
 import {
@@ -109,7 +107,6 @@ import {
   patchAutomationRun,
   persistAutomationRunHistory,
   prependAutomationRun,
-  redactAutomationDetail,
 } from "../lib/automationRunHistory";
 import type { AutomationRunRecord } from "../lib/automationRunHistory";
 import { nextViewNavigation, shouldCommitViewNavigation } from "../lib/viewNavigation";
@@ -716,7 +713,6 @@ function providerDefaultModel(profile?: ProviderProfileSummary) {
 /* StrictMode mounts effects twice in dev — subscribe once, ever. */
 let bridgeSubscribed = false;
 let workspaceWatchTimer: number | undefined;
-let automationRunnerBusy = false;
 let workspaceWatchTick = 0;
 let pendingLaunch: { text: string; attachments: PromptAttachment[] } | undefined;
 let providerRestoreGeneration = 0;
@@ -926,178 +922,6 @@ export const useDesktop = create<DesktopState>((set, get) => {
       sessionComposers,
       ...(state.activeId === sessionId ? { model } : {}),
     });
-  };
-
-  const executeAutomation = async (dispatch: AutomationDispatch) => {
-    const automation = dispatch.automation as Automation;
-    if (automationRunnerBusy) {
-      const detail = "桌面执行器尚未结算上一个 Host 派发。";
-      await invoke("complete_automation_dispatch", {
-        id: automation.id,
-        token: dispatch.token,
-        error: detail,
-      }).catch((cause) => publishRuntimeError(cause, {
-        domain: "operation",
-        code: "AUTOMATION_CLAIM_STALE",
-        message: "自动化派发冲突且认领未能结算",
-        recoverable: true,
-        action: "等待当前自动化结束；Host 会在租约过期后恢复任务",
-      }));
-      return;
-    }
-
-    const runId = newAutomationRunId();
-    saveAutomationHistory(prependAutomationRun(get().automationRunHistory, {
-      id: runId,
-      automationId: automation.id,
-      title: automation.title,
-      at: dispatch.claimedAt,
-      outcome: "starting",
-      source: dispatch.source,
-    }));
-    automationRunnerBusy = true;
-    set({ automationRunningId: automation.id });
-
-    let sessionId: string | undefined;
-    let executionError: unknown;
-    let hostOwnsExecution = false;
-    let renewalFailureReported = false;
-    const renewLease = () => {
-      void invoke<number>("renew_automation_dispatch", {
-        id: automation.id,
-        token: dispatch.token,
-      }).catch((cause) => {
-        if (renewalFailureReported) return;
-        renewalFailureReported = true;
-        publishRuntimeError(cause, {
-          domain: "operation",
-          code: "AUTOMATION_LEASE_RENEW_FAILED",
-          message: `已安排任务“${automation.title}”仍在运行，但 Host 租约续期失败`,
-          recoverable: true,
-          action: "任务结果仍会保留；若随后出现认领失效，请检查应用数据目录",
-        });
-      });
-    };
-    let heartbeat: number | undefined = window.setInterval(renewLease, 30_000);
-
-    const stopCreationHeartbeat = () => {
-      if (heartbeat === undefined) return;
-      window.clearInterval(heartbeat);
-      heartbeat = undefined;
-    };
-
-    try {
-      sessionId = await bridge.newBackgroundSession(automation.cwd);
-      saveAutomationHistory(patchAutomationRun(get().automationRunHistory, runId, { sessionId }));
-      const created = get().sessions[sessionId];
-      if (created) {
-        const updated: Session = {
-          ...created,
-          title: automation.title,
-          status: "running",
-          updatedAt: Date.now(),
-          blocks: [{ type: "user", id: uid(), text: automation.prompt, ts: Date.now() }],
-        };
-        const sessionIndex = get().sessionIndex.map((item) => item.id === sessionId ? {
-          ...item,
-          title: automation.title,
-          lastStatus: "running" as const,
-          updatedAt: updated.updatedAt,
-        } : item);
-        const sessionComposers = {
-          ...get().sessionComposers,
-          [sessionId]: {
-            text: "",
-            attachments: [],
-            model: automation.model,
-            effort: automation.effort,
-            mode: automation.mode,
-            permissionMode: automation.permissionMode,
-          },
-        };
-        persistSessionCatalog(sessionIndex);
-        persistSessionComposers(sessionComposers);
-        set({
-          sessions: { ...get().sessions, [sessionId]: updated },
-          sessionIndex,
-          sessionComposers,
-        });
-        void bridge.renameSession(sessionId, automation.title).catch((cause) => {
-          publishRuntimeError(cause, {
-            domain: "operation",
-            code: "AUTOMATION_RENAME_FAILED",
-            message: "自动化会话已启动，但标题同步失败",
-            recoverable: true,
-            action: "可以在会话侧栏中手动重命名",
-          });
-        });
-      }
-      saveAutomationHistory(patchAutomationRun(get().automationRunHistory, runId, {
-        outcome: "started",
-        detail: "Host 已认领任务，提示已交给当前 Agent 运行时。",
-      }));
-      void notifyDesktop("已安排任务已启动", automation.title);
-      // Host 已原子完成 session/new、系统提示与 Computer/Browser 租约绑定；
-      // 页面登记完会话后，模型/模式、prompt、续租和结算继续由 Host 裁决。
-      stopCreationHeartbeat();
-      hostOwnsExecution = true;
-      const result = await invoke<AutomationSessionResult>("execute_automation_session", {
-        id: automation.id,
-        token: dispatch.token,
-        sessionId,
-      });
-      if (result.automation) {
-        set({ automations: adoptNativeAutomation(result.automation as Automation) });
-      }
-      if (result.error) {
-        executionError = result.error;
-        saveAutomationHistory(patchAutomationRun(get().automationRunHistory, runId, {
-          outcome: "error",
-          detail: result.error.message,
-        }));
-      }
-    } catch (cause) {
-      executionError = cause;
-      saveAutomationHistory(patchAutomationRun(get().automationRunHistory, runId, {
-        outcome: "error",
-        detail: redactAutomationDetail(cause),
-      }));
-    }
-
-    if (!hostOwnsExecution) {
-      try {
-        const updated = await invoke<Automation>("complete_automation_dispatch", {
-          id: automation.id,
-          token: dispatch.token,
-          sessionId,
-          ...(executionError ? { error: redactAutomationDetail(executionError) } : {}),
-        });
-        set({ automations: adoptNativeAutomation(updated) });
-      } catch (cause) {
-        publishRuntimeError(cause, {
-          domain: "environment",
-          code: "AUTOMATION_COMPLETE_FAILED",
-          message: `已安排任务“${automation.title}”的 Host 结算失败`,
-          recoverable: true,
-          action: "任务会话仍会保留；Host 将按租约状态决定是否恢复排程",
-        });
-      }
-    }
-    stopCreationHeartbeat();
-    automationRunnerBusy = false;
-    set({ automationRunningId: null });
-
-    if (executionError) {
-      publishRuntimeError(executionError, {
-        domain: "environment",
-        code: "AUTOMATION_START_FAILED",
-        message: `已安排任务“${automation.title}”执行失败`,
-        recoverable: true,
-        action: dispatch.source === "scheduled"
-          ? "检查项目路径、CLI 与认证；Host 会在退避期后恢复排程"
-          : "检查项目路径、CLI 与认证后再次运行",
-      });
-    }
   };
 
   const clearContinuationSettle = (sessionId: string) => {
@@ -1342,9 +1166,87 @@ export const useDesktop = create<DesktopState>((set, get) => {
         });
         break;
       }
-      case "automation_dispatch":
-        void executeAutomation(e.dispatch);
+      case "automation_session_started": {
+        const automation = e.started.automation as Automation;
+        const sessionComposers = {
+          ...get().sessionComposers,
+          [e.started.sessionId]: {
+            text: "",
+            attachments: [],
+            model: automation.model,
+            effort: automation.effort,
+            mode: automation.mode,
+            permissionMode: automation.permissionMode,
+          },
+        };
+        persistSessionComposers(sessionComposers);
+        const existingRun = get().automationRunHistory.find((row) => (
+          row.automationId === automation.id
+          && row.sessionId === e.started.sessionId
+        ));
+        if (!existingRun) {
+          saveAutomationHistory(prependAutomationRun(get().automationRunHistory, {
+            id: newAutomationRunId(e.started.claimedAt),
+            automationId: automation.id,
+            title: automation.title,
+            at: e.started.claimedAt,
+            outcome: "started",
+            source: e.started.source,
+            sessionId: e.started.sessionId,
+            detail: "Host 已创建并注册会话，自动化回合正在运行。",
+          }));
+        }
+        set({
+          automationRunningId: automation.id,
+          sessionComposers,
+        });
+        void notifyDesktop("已安排任务已启动", automation.title);
         break;
+      }
+      case "automation_session_settled": {
+        const settled = e.settled;
+        const updated = settled.automation as Automation | null | undefined;
+        if (updated) {
+          set({ automations: adoptNativeAutomation(updated) });
+        }
+        if (settled.error) {
+          const detail = formatGroxError(settled.error);
+          if (settled.sessionId) {
+            saveAutomationHistory(failLatestAutomationSessionRun(
+              get().automationRunHistory,
+              settled.sessionId,
+              detail,
+            ));
+          } else {
+            const automation = updated
+              ?? get().automations.find((item) => item.id === settled.automationId);
+            saveAutomationHistory(prependAutomationRun(get().automationRunHistory, {
+              id: newAutomationRunId(settled.claimedAt),
+              automationId: settled.automationId,
+              title: automation?.title ?? settled.automationId,
+              at: settled.claimedAt,
+              outcome: "error",
+              source: settled.source,
+              detail,
+            }));
+          }
+        } else if (settled.sessionId) {
+          const run = get().automationRunHistory.find((row) => (
+            row.sessionId === settled.sessionId
+            && ["starting", "started"].includes(row.outcome)
+          ));
+          if (run) {
+            saveAutomationHistory(patchAutomationRun(get().automationRunHistory, run.id, {
+              outcome: "completed",
+              detail: "Host 已完成回合并持久化自动化结算。",
+            }));
+          }
+        }
+        if (get().automationRunningId === settled.automationId) {
+          set({ automationRunningId: null });
+        }
+        break;
+      }
       case "automation_runner_tick":
         set({ automationLastTickAt: e.status.checkedAt ?? null });
         break;
@@ -1920,10 +1822,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
         void (async () => {
           try {
             const feCu = localStorage.getItem("grox.computerUseEnabled") !== "0";
-            void invoke("host_prefs_migrate_computer_use", { feEnabled: feCu }).catch(() => {});
+            const feBrowser = localStorage.getItem("grox.browserUseEnabled") !== "0";
+            await invoke("host_prefs_migrate_computer_use", { feEnabled: feCu }).catch(() => null);
+            await invoke("host_prefs_migrate_browser_use", { feEnabled: feBrowser }).catch(() => null);
 
             const [hostPrefs, envOn, env, promptQueueLoad, automationLoad] = await Promise.all([
-              invoke<{ computerUseEnabled?: boolean }>("host_prefs_get").catch(() => null),
+              invoke<{ computerUseEnabled?: boolean; browserUseEnabled?: boolean }>("host_prefs_get").catch(() => null),
               invoke<boolean>("computer_use_env_enabled").catch(() => false),
               invoke<{ appVersion?: string }>("desktop_environment").catch(() => null),
               loadPromptQueues().then(
@@ -1938,6 +1842,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
             if (hostPrefs && typeof hostPrefs.computerUseEnabled === "boolean") {
               setComputerUseHostPrefsEnabled(hostPrefs.computerUseEnabled);
             }
+            if (hostPrefs && typeof hostPrefs.browserUseEnabled === "boolean") {
+              bridge.setBrowserUseEnabled(hostPrefs.browserUseEnabled);
+            }
             setComputerUseHostEnvEnabled(Boolean(envOn));
             if (env?.appVersion && consumeShellUpgradeRescan(env.appVersion)) {
               upgradeForceOfflineRescan = true;
@@ -1945,6 +1852,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
             }
             set((state) => ({
               computerUseEnabled: isComputerUseOperatorEnabled(),
+              ...(hostPrefs && typeof hostPrefs.browserUseEnabled === "boolean"
+                ? { browserUseEnabled: hostPrefs.browserUseEnabled }
+                : {}),
               ...(promptQueueLoad.value
                 ? { promptQueues: mergeHydratedPromptQueues(promptQueueLoad.value, state.promptQueues) }
                 : {}),
@@ -2854,9 +2764,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async runAutomation(id) {
+      set({ automationRunningId: id });
       try {
         await invoke("run_automation_now", { id });
       } catch (cause) {
+        if (get().automationRunningId === id) set({ automationRunningId: null });
         const automation = get().automations.find((item) => item.id === id);
         const error = toGroxError(cause, {
           domain: "operation",
@@ -3583,6 +3495,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
     setBrowserUseEnabled(enabled) {
       bridge.setBrowserUseEnabled(enabled);
+      void invoke("host_prefs_set_browser_use", { enabled }).catch(() => {});
       set({ browserUseEnabled: enabled });
     },
     setDraft(text) {

@@ -14,12 +14,15 @@ use serde::{Deserialize, Serialize};
 
 const PREFS_FILE: &str = "host_prefs.json";
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostPrefs {
     /// Operator enabled Computer Use (desktop control) in Settings.
     #[serde(default)]
     pub computer_use_enabled: bool,
+    /// Browser MCP 与自动化均读取 Host 偏好，页面重载不能改变后台会话能力。
+    #[serde(default)]
+    pub browser_use_enabled: bool,
     /// Permission mode: default | auto | bypass (host-attested for bypass).
     #[serde(default = "default_permission_mode")]
     pub permission_mode: String,
@@ -34,6 +37,23 @@ pub struct HostPrefs {
     /// silently re-opens the host gate on every boot (review P1).
     #[serde(default)]
     pub computer_use_fe_migrated: bool,
+    /// 一次性把旧版 localStorage Browser Use 选择迁入 Host。
+    #[serde(default)]
+    pub browser_use_fe_migrated: bool,
+}
+
+impl Default for HostPrefs {
+    fn default() -> Self {
+        Self {
+            computer_use_enabled: false,
+            browser_use_enabled: false,
+            permission_mode: default_permission_mode(),
+            prompt_idle_minutes: None,
+            prompt_absolute_hours: None,
+            computer_use_fe_migrated: false,
+            browser_use_fe_migrated: false,
+        }
+    }
 }
 
 fn default_permission_mode() -> String {
@@ -94,7 +114,10 @@ pub fn save_prefs(app_data: &Path, prefs: &HostPrefs) -> Result<(), String> {
 /// Silent one-shot migration: FE had CU on, host never set (0.2.20).
 /// After the first migration attempt, `computer_use_fe_migrated` stays true so
 /// later boots cannot re-open the host gate from localStorage alone.
-pub fn migrate_computer_use_from_fe(app_data: &Path, fe_enabled: bool) -> Result<HostPrefs, String> {
+pub fn migrate_computer_use_from_fe(
+    app_data: &Path,
+    fe_enabled: bool,
+) -> Result<HostPrefs, String> {
     let mut prefs = load_prefs(app_data);
     if prefs.computer_use_fe_migrated {
         return Ok(prefs);
@@ -103,6 +126,17 @@ pub fn migrate_computer_use_from_fe(app_data: &Path, fe_enabled: bool) -> Result
         prefs.computer_use_enabled = true;
     }
     prefs.computer_use_fe_migrated = true;
+    save_prefs(app_data, &prefs)?;
+    Ok(prefs)
+}
+
+pub fn migrate_browser_use_from_fe(app_data: &Path, fe_enabled: bool) -> Result<HostPrefs, String> {
+    let mut prefs = load_prefs(app_data);
+    if prefs.browser_use_fe_migrated {
+        return Ok(prefs);
+    }
+    prefs.browser_use_enabled = fe_enabled;
+    prefs.browser_use_fe_migrated = true;
     save_prefs(app_data, &prefs)?;
     Ok(prefs)
 }
@@ -191,6 +225,24 @@ mod tests {
         let again = migrate_computer_use_from_fe(&dir, true).unwrap();
         assert!(!again.computer_use_enabled);
         assert!(again.computer_use_fe_migrated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_migration_preserves_the_frontend_choice_once() {
+        let _test = isolate_process_state();
+        let dir = temp_dir();
+        let _ = fs::remove_dir_all(&dir);
+
+        let migrated = migrate_browser_use_from_fe(&dir, true).unwrap();
+        assert!(migrated.browser_use_enabled);
+        assert!(migrated.browser_use_fe_migrated);
+
+        let mut disabled = migrated;
+        disabled.browser_use_enabled = false;
+        save_prefs(&dir, &disabled).unwrap();
+        let unchanged = migrate_browser_use_from_fe(&dir, true).unwrap();
+        assert!(!unchanged.browser_use_enabled);
         let _ = fs::remove_dir_all(&dir);
     }
 }
