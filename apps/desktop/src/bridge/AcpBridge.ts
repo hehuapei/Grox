@@ -159,14 +159,6 @@ interface SessionGatePermit {
   generation: number;
 }
 
-interface AcpReadFilePayload {
-  content: string;
-  contentBase64?: string;
-  size: number;
-  lineCount?: number;
-  type: string;
-}
-
 function storedEffort(): Effort {
   const value = localStorage.getItem("grok.effort");
   return EFFORTS.find((effort) => effort === value) ?? "high";
@@ -984,7 +976,6 @@ export class AcpBridge implements GrokBridge {
   /** 客户端操作 id 只用于把“发送前 Stop”归属到同一 Host 回合。 */
   private foregroundTurnIds = new Map<string, string>();
   private stoppingSessions = new Set<string>();
-  private promptDrainWaiters = new Set<() => void>();
   private knownSessions = new Set<string>();
   private loadPromises = new Map<string, Promise<void>>();
   /** toolCallIds still pending/running/awaiting_permission for UI projection. */
@@ -1014,7 +1005,6 @@ export class AcpBridge implements GrokBridge {
   private browserUseEnabled = localStorage.getItem("grox.browserUseEnabled") !== "0";
   private workspace = "";
   private workspaceSelectionGeneration = 0;
-  private sessionWorkspaces = new Map<string, string>();
   private activeComputerSessions = new Set<string>();
   private activeComputerToolCalls = new Set<string>();
   private workflowChildTraces = new Map<string, { sessionId: string; runId: string; trace: WorkflowAgentTrace }>();
@@ -1381,7 +1371,8 @@ export class AcpBridge implements GrokBridge {
     const previousGeneration = this.acpGeneration;
     await invoke("agent_runtime_pause");
     try {
-      await this.waitForActivePrompts();
+      // SessionCoordinator 的 lifecycle permit 会等待 session/new|load 和
+      // 全部活动 turn；不再用 WebView 集合复制一次运行时 drain 事实。
       return await this.withLifecycleGate(async () => {
         const result = await change();
         await this.restartAgent();
@@ -1395,18 +1386,9 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
-  private async waitForActivePrompts(): Promise<void> {
-    if (this.activePromptSessions.size === 0) return;
-    await new Promise<void>((resolve) => {
-      this.promptDrainWaiters.add(resolve);
-    });
-  }
-
   private markPromptFinished(sessionId: string) {
     this.activePromptSessions.delete(sessionId);
     if (this.activePromptSessions.size !== 0) return;
-    for (const resolve of this.promptDrainWaiters) resolve();
-    this.promptDrainWaiters.clear();
     if (this.pendingPermissionModeSync) {
       const mode = this.pendingPermissionModeSync;
       this.pendingPermissionModeSync = null;
@@ -1556,7 +1538,18 @@ export class AcpBridge implements GrokBridge {
       || message.method === ACP_METHODS.fsRead
       || message.method === "fs/write_text_file"
     ) {
-      void this.handleFileSystemRequest(message);
+      this.emit({
+        type: "runtime_notice",
+        notice: runtimeNoticeFromError({
+          domain: "protocol",
+          code: "CLIENT_CALLBACK_HOST_BYPASSED",
+          message: "收到未由 Host 处理的文件回调",
+          recoverable: true,
+          fatal: false,
+          holdQueue: true,
+          action: "重新连接 Agent；当前页面不会猜测回调所属工作区",
+        }),
+      });
       return;
     }
     if (
@@ -1583,69 +1576,6 @@ export class AcpBridge implements GrokBridge {
       id: message.id,
       error: { code: -32601, message: `Unsupported client method: ${message.method}` },
     });
-  }
-
-  private async handleFileSystemRequest(message: JsonRpcMessage) {
-    const params = record(message.params) ?? {};
-    // Grok's ACP adapters have used both `path` and the TUI-facing
-    // `file_path` spelling over time. Accept the aliases here while keeping
-    // the native command's canonical path boundary unchanged.
-    const path = string(params.path)
-      ?? string(params.filePath)
-      ?? string(params.file_path)
-      ?? string(params.target_file);
-    const sessionId = string(params.sessionId);
-    const explicitLine = number(params.line) ?? number(params.startLine) ?? number(params.start_line);
-    const offset = number(params.offset);
-    // Grok Build's read_file schema uses a one-based line offset. ACP's
-    // standard text callback also uses one-based line numbers, so keep one
-    // interpretation here instead of silently shifting a requested image or
-    // skill document by one line.
-    const line = explicitLine ?? (offset === undefined ? undefined : Math.max(1, Math.floor(offset)));
-    const limit = number(params.limit) ?? number(params.maxLines);
-    const cwd = (sessionId ? this.sessionWorkspaces.get(sessionId) ?? this.catalogue.get(sessionId)?.cwd : undefined) ?? this.workspace;
-    if (!path) {
-      await this.sendRaw({
-        jsonrpc: "2.0",
-        id: message.id,
-        error: { code: -32602, message: "文件路径不能为空" },
-      });
-      return;
-    }
-    try {
-      if (message.method === ACP_METHODS.fsRead) {
-        const payload = await invoke<AcpReadFilePayload>("acp_read_file", {
-          cwd,
-          path,
-          line,
-          limit,
-        });
-        await this.sendRaw({ jsonrpc: "2.0", id: message.id, result: payload });
-        return;
-      }
-      if (message.method === "fs/read_text_file") {
-        const content = await invoke<string>("acp_read_text_file", {
-          cwd,
-          path,
-          line,
-          limit,
-        });
-        await this.sendRaw({ jsonrpc: "2.0", id: message.id, result: { content } });
-        return;
-      }
-      const content = string(params.content);
-      if (content === undefined) {
-        throw new Error("写入内容必须是文本");
-      }
-      await invoke("acp_write_text_file", { cwd, path, content });
-      await this.sendRaw({ jsonrpc: "2.0", id: message.id, result: {} });
-    } catch (cause) {
-      await this.sendRaw({
-        jsonrpc: "2.0",
-        id: message.id,
-        error: { code: -32000, message: cause instanceof Error ? cause.message : String(cause) },
-      });
-    }
   }
 
   private onNotification(method: string, paramsValue: unknown) {
@@ -2819,7 +2749,6 @@ export class AcpBridge implements GrokBridge {
     const sessions = [...collected.values()].sort((a, b) => b.updatedAt - a.updatedAt);
     for (const meta of sessions) {
       this.catalogue.set(meta.id, meta);
-      this.sessionWorkspaces.set(meta.id, meta.cwd);
     }
     return sessions;
   }
@@ -2896,7 +2825,6 @@ export class AcpBridge implements GrokBridge {
       effort: reasoningEffort,
       mode: "agent",
     });
-    this.sessionWorkspaces.set(sessionId, cwd);
     this.catalogue.set(sessionId, meta);
     this.cursors.set(sessionId, { toolBlocks: new Map() });
     this.usage.set(sessionId, { ...EMPTY_USAGE });
@@ -2958,7 +2886,6 @@ export class AcpBridge implements GrokBridge {
     }
 
     this.emit({ type: "status", sessionId: id, status: "connecting" });
-    this.sessionWorkspaces.set(id, meta.cwd);
     this.cursors.set(id, { toolBlocks: new Map() });
     this.replaying.set(id, emptySession(meta));
     try {
@@ -3246,8 +3173,6 @@ export class AcpBridge implements GrokBridge {
       // to lift the rewind isolation gate.
       this.forgetRewoundSession(sessionId);
       this.knownSessions.add(sessionId);
-      const sessionCwd = this.catalogue.get(sessionId)?.cwd;
-      if (sessionCwd) this.sessionWorkspaces.set(sessionId, sessionCwd);
       this.closeUser(sessionId);
       this.openToolCalls.delete(sessionId);
       this.emit({ type: "status", sessionId, status: "running" });
@@ -3516,7 +3441,6 @@ export class AcpBridge implements GrokBridge {
     }
     this.knownSessions.delete(id);
     this.forgetToolImagePersistence(id);
-    this.sessionWorkspaces.delete(id);
     this.cursors.delete(id);
     this.usage.delete(id);
   }
@@ -3526,7 +3450,6 @@ export class AcpBridge implements GrokBridge {
     await invoke("close_agent_session", { sessionId: id, generation: this.acpGeneration });
     this.knownSessions.delete(id);
     this.forgetToolImagePersistence(id);
-    this.sessionWorkspaces.delete(id);
     this.cursors.delete(id);
     this.usage.delete(id);
   }

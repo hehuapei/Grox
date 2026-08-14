@@ -53,6 +53,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 9. 协议、用户操作、环境错误在 Host 边界具有稳定代码，前端只负责本地化呈现。
 10. 共享单进程存在期间，进程级事故必须列出全部受影响会话，不能只更新当前页面。
 11. Agent 发起的交互请求只接受 Host 保存的 session + rpc id + generation；WebView 不得回传或猜测 wire id。
+12. Client callback 只能使用 Host 在 session/new|load 时绑定的工作区；未知会话不得回退到当前页面目录。
 
 ### v0.3.2 内的迁移顺序
 
@@ -65,9 +66,10 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 3 | Native repositories | PromptQueueStore、AutomationStore、SessionJournalStore 已迁移；草稿持久化边界继续收口 |
 | 4 | Unified turn execution | Host 自动化与普通前台回合均拥有许可、模型/模式绑定、Prompt、watchdog、取消和 effort 降级；流内容继续由前端投影 |
 | 5 | Interaction service | Host 持有权限、计划审批、ask-user 的 rpc id、代次、回复和 Stop 清算；已落地 |
-| 6 | Host services | worktree、权限策略、媒体、密钥统一使用会话/项目身份和路径授权 |
-| 7 | Command facade | 将 `main.rs` 按领域迁出，Tauri command 只校验 DTO 并调用服务 |
-| 8 | Error/diagnostics | 稳定错误码、运行时快照、审计事件和支持包覆盖所有上述服务 |
+| 6 | Client callback service | Host 持有 FS callback 的 session/cwd/rpc/generation；标准 FS 已落地，terminal 仍保持未宣告 |
+| 7 | Host services | worktree、权限策略、媒体、密钥统一使用会话/项目身份和路径授权 |
+| 8 | Command facade | 将 `main.rs` 按领域迁出，Tauri command 只校验 DTO 并调用服务 |
+| 9 | Error/diagnostics | 稳定错误码、运行时快照、审计事件和支持包覆盖所有上述服务 |
 
 顺序不能倒置：在 Host 尚未拥有会话状态前直接增加进程池，只会把当前分裂状态复制
 到多个进程；在 repository 尚未拥有事务前运行后台自动化，会放大队列和 journal 竞态。
@@ -79,7 +81,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - 普通请求超时与长回合 watchdog 都由 Host 处理；WebView 不再持有 prompt RPC id 或调用任意请求取消命令；
 - 进程替换、自然退出、停止、CLI 更新和主窗口退出都会清算请求；
 - Host 为退出、通道替换、超时、停滞、取消和协议校验返回稳定错误代码，前端不再用字符串正则覆盖这些分类；
-- 环境摘要和支持包分别记录 Host 悬挂请求与待用户交互门控数；
+- 环境摘要和支持包记录 Host 悬挂请求、待用户交互门控、Client callback 与已绑定工作区会话数；
 - WebView 只解释已经归属的响应，未知广播响应仍呈现为协议错误。
 - `agent_runtime_connect` 在 Host 连接锁内完成 CLI 检测、进程替换、`initialize`、非交互认证和 ready 提交；WebView 不再用 `acp_spawn`、`initialize` 和 `runtime_ready` 三次调用拼出连接事实；
 - 初始化失败或进程在握手中退出会清算该代请求、能力租约和半连接子进程；运行时快照区分 starting、initializing、authenticating、ready、paused 与 offline，不再把“有 PID”等同于“可派发”；
@@ -119,7 +121,12 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - `resolve_interaction` 不接受 WebView 回传 rpc id 或 optionId，而是用 Host 保存的协议材料构造回复；跨会话、过期、重复点击、未知选项和伪造问题键都有稳定错误，stdin 写入结果不确定时不会自动重发批准；
 - Stop 与绝对 watchdog 会先由 Host 回复当前会话的全部反向 RPC 为 cancelled，再发送 `session/cancel`；符合 ACP 对 pending permission 的取消要求，也避免 Agent 永久卡在 ask-user/plan gate；
 - `interaction_status` 允许主 WebView 重载后重新投影仍存活的门控；进程代次切换、自然退出和 CLI 更新会在 Host 清空旧请求，新页面不能把旧卡片回复到新进程；
+- `client_callbacks::ClientCallbackRegistry` 截获标准 `fs/read_text_file`、`fs/write_text_file` 和 Grok Build 的 `x.ai/fs/read_file`：Host 按 generation 保存 rpc id 与 session→canonical cwd，WebView 不再接收或回复文件 RPC；
+- `session/new` 尚未返回真实 id 时，唯一 lifecycle opening 临时绑定本次 cwd，并只允许观察到的一个 session id；成功后原子提交正式绑定，失败、close/delete、进程替换和主窗口退出都会清除；
+- 未绑定会话、跨代次、重复 rpc id、越界路径和超限响应都由 Host 明确拒绝，不再用 `AcpBridge.workspace` 猜 cwd；原先暴露给 WebView 的 `acp_read_*` / `acp_write_*` commands 已移除；
+- `clientCapabilities.terminal` 继续为 false。官方 ACP 要求只有完整实现 create/output/wait/kill/release 后才能宣告；本切片没有用半成品 shell 执行器扩大 Agent 权限；
 - 自动化只定向派发给 `main` WebView；供应商、认证或全局配置切换会先暂停 runner，并取得 Host lifecycle permit 后才替换进程，因此能够等待 Host 后台回合而不是只观察 `activePromptSessions`；
+- 运行时切换已删除前端 `promptDrainWaiters` 第二门控，只等待 SessionCoordinator 的 lifecycle permit；`activePromptSessions` 仅保留 UI 中断标记与权限提示延迟，不再裁决进程替换；
 - Host 返回 `AUTOMATION_RUNTIME_BUSY`、`AUTOMATION_CLAIM_STALE`、`AUTOMATION_INVALID_RESULT` 和 `AUTOMATION_STORAGE_FAILED` 等分域错误，前端不再把所有失败折叠成“启动失败”。
 - `session_storage::SessionStorageState` 改为按会话写/删除租约：同一会话串行、不同会话并行，删除先标 tombstone 再等待现有 writer，避免全局文件锁拖慢多会话；
 - `session_journal_store::SessionJournalStore` 校验现有和提交快照，前端以磁盘 savedAt 为基线生成单调逻辑版本；旧窗口的等版本/低版本写入会明确冲突并停止续写，不能覆盖新 journal；
@@ -127,7 +134,8 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 
 本切片没有把完整 SessionManager 伪装成已经迁移：连接初始化、非交互认证、建会话/恢复、
 自动化协议回合、普通前台回合、持久化提示队列和权限/计划/提问交互生命周期已属于 Host。
-用户显式触发的 OAuth 回调、前台会话登记屏障以及部分文件/终端 client callback 仍在 Bridge；
+标准文件 client callback 与其会话工作区绑定也已属于 Host。用户显式触发的 OAuth 回调、
+自动化启动时的页面会话登记以及尚未宣告的 terminal client callback 仍待迁移；
 在这些职责迁完之前不会另起一个简化 CLI 进程冒充后台运行时。
 
 ## 完整后端对照结论
@@ -136,6 +144,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | --- | --- | --- | --- |
 | 组合根 | 9k+ 行 `main.rs` 同时承担命令与业务 | `lib.rs` 组合状态，commands 为薄门面 | 随职责迁移拆模块，不做纯文件搬家 |
 | ACP | Rust 透传 stdio，Bridge 关联请求 | `AcpClient` 在 Host 维护 pending/退出 | 先完成 Native ACP transport |
+| Client callback | Bridge 用当前页面 catalogue 猜 FS cwd；terminal 未宣告 | 未实现能力就不宣告，避免 Agent 挂起 | FS 由 Host 会话绑定应答；terminal 完整实现前保持 false |
 | 会话 | Bridge + Store 共同裁决 | Host SessionManager + FSM + snapshots | 建立单一 SessionCoordinator |
 | 多会话 | 单进程共享、生命周期门控在前端 | 每应用会话进程、后台 busy 不被抢占 | 先迁权威，再用容量策略决定进程池 |
 | 持久化 | 前端组装完整 JSON，Host 原子写 | store + 锁 + journal 对账 | Host 提供语义操作和锁内 RMW |
@@ -155,4 +164,4 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - 迁移期间仍保留一个共享 CLI 进程；这是真实限制，不伪装成进程池。
 - `AcpBridge` 会逐步缩小为投影器，Zustand 只保存 UI 需要的快照。
 - Host 模块会增加，但每次拆分必须伴随职责迁移、测试或不变量，禁止只为了缩短文件。
-- v0.3.2 完成标准不是“看起来像 grok-app”，而是上述十一条不变量可由 Host 测试证明。
+- v0.3.2 完成标准不是“看起来像 grok-app”，而是上述十二条不变量可由 Host 测试证明。

@@ -11,6 +11,7 @@ mod agent_runtime;
 mod automation_runner;
 mod automation_store;
 mod browser_mcp;
+mod client_callbacks;
 mod computer_mcp;
 mod foreground_turn;
 mod git_confirm;
@@ -46,6 +47,7 @@ use agent_runtime::AgentRuntimeConnection;
 use automation_runner::{storage_error as automation_storage_error, AutomationRunner};
 use automation_store::{AutomationCompletion, AutomationStore};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use client_callbacks::{ClientCallbackInbound, ClientCallbackRegistry};
 use git_confirm::GitConfirmStore;
 use foreground_turn::{
     cancel_foreground_turn, execute_foreground_turn, foreground_turn_status,
@@ -147,6 +149,7 @@ struct AcpState {
     sessions: Arc<SessionCoordinator>,
     foreground_turns: Arc<ForegroundTurnRegistry>,
     interactions: Arc<InteractionRegistry>,
+    client_callbacks: Arc<ClientCallbackRegistry>,
 }
 
 impl AcpState {
@@ -348,6 +351,8 @@ struct AgentRuntimeStatus {
     pid: Option<u32>,
     pending_requests: usize,
     pending_interactions: usize,
+    pending_client_callbacks: usize,
+    bound_client_sessions: usize,
 }
 
 #[derive(Serialize)]
@@ -382,6 +387,8 @@ async fn agent_runtime_status(
         pid,
         pending_requests: state.requests.len().await,
         pending_interactions: state.interactions.snapshots().len(),
+        pending_client_callbacks: state.client_callbacks.pending_len(),
+        bound_client_sessions: state.client_callbacks.bound_len(),
     })
 }
 
@@ -2999,7 +3006,6 @@ fn configured_grok_command(_app: &tauri::AppHandle) -> GrokRuntimeInfo {
     runtime_info(executable.to_string(), "missing", None, true)
 }
 
-#[tauri::command]
 fn acp_read_text_file(
     cwd: String,
     path: String,
@@ -3065,11 +3071,10 @@ fn build_acp_read_file(bytes: Vec<u8>, line: Option<u32>, limit: Option<u32>) ->
     }
 }
 
-/// Read the TUI-compatible, binary-safe file response.  Unlike
-/// `acp_read_text_file`, this command deliberately never calls
+/// Build the TUI-compatible, binary-safe Host callback response. Unlike
+/// `acp_read_text_file`, this helper deliberately never calls
 /// `read_to_string` for an image: PNG/JPEG/etc. are returned as base64 bytes
 /// so the model can receive them as a multimodal tool result.
-#[tauri::command]
 fn acp_read_file(
     cwd: String,
     path: String,
@@ -3138,7 +3143,6 @@ fn read_prompt_image_paths(cwd: String, paths: Vec<String>) -> Result<Vec<Prompt
     Ok(images)
 }
 
-#[tauri::command]
 fn acp_write_text_file(cwd: String, path: String, content: String) -> Result<(), String> {
     if content.len() as u64 > MAX_ACP_TEXT_BYTES {
         return Err("单个文本文件不能超过 16 MB".into());
@@ -3295,6 +3299,8 @@ async fn export_session_support_bundle(
         "nextGeneration": state.next_generation.load(Ordering::Relaxed),
         "pendingRequests": state.requests.len().await,
         "pendingInteractions": state.interactions.snapshots().len(),
+        "pendingClientCallbacks": state.client_callbacks.pending_len(),
+        "boundClientSessions": state.client_callbacks.bound_len(),
         "sessionOccupancy": state.sessions.snapshot(),
         "automationRunner": automation_runner.status(state.inner()).await,
         "cli": {
@@ -3453,6 +3459,7 @@ async fn install_official_grok_cli(
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
     state.foreground_turns.reset(generation);
     state.interactions.reset(generation);
+    state.client_callbacks.reset(generation).await;
     state.sessions.reset(generation);
     state
         .requests
@@ -7571,8 +7578,65 @@ async fn discard_failed_runtime(
         let next_generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
         state.foreground_turns.reset(next_generation);
         state.interactions.reset(next_generation);
+        state.client_callbacks.reset(next_generation).await;
         state.sessions.reset(next_generation);
         terminate_process(process).await;
+    }
+}
+
+async fn handle_client_callback_line(
+    app: &tauri::AppHandle,
+    state: &AcpState,
+    generation: u64,
+    line: &str,
+) -> bool {
+    // Process reset takes the same lock, so an old Agent cannot keep mutating
+    // files while its generation is being replaced.
+    let _operation_guard = state.client_callbacks.lock_operations().await;
+    match state.client_callbacks.observe_inbound(generation, line) {
+        ClientCallbackInbound::NotCallback => false,
+        ClientCallbackInbound::Request(lease) => {
+            let response = state.client_callbacks.render_response(&lease);
+            state
+                .foreground_turns
+                .observe_outbound(generation, &response);
+            let write_result = write_acp_line(state, &response, generation).await;
+            state.client_callbacks.settle(&lease);
+            if let Err(error) = write_result {
+                let (session_id, method) = ClientCallbackRegistry::describe(&lease);
+                let _ = app.emit(
+                    "acp-stderr",
+                    format!("Client callback 回复失败（{method}，session={session_id}）：{error}"),
+                );
+            }
+            true
+        }
+        ClientCallbackInbound::AutoReply(response) => {
+            state
+                .foreground_turns
+                .observe_outbound(generation, &response);
+            if let Err(error) = write_acp_line(state, &response, generation).await {
+                let _ = app.emit(
+                    "acp-stderr",
+                    format!("Client callback 自动拒绝回复失败：{error}"),
+                );
+            }
+            true
+        }
+        ClientCallbackInbound::Duplicate => {
+            let _ = app.emit(
+                "acp-stderr",
+                "Agent 复用了仍在处理的 Client callback rpc id；已拒绝覆盖原请求",
+            );
+            true
+        }
+        ClientCallbackInbound::Invalid => {
+            let _ = app.emit(
+                "acp-stderr",
+                "Agent 发送了没有合法 rpc id 的 Client callback；无法安全回复",
+            );
+            true
+        }
     }
 }
 
@@ -7595,6 +7659,7 @@ async fn spawn_acp_process(
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
     state.foreground_turns.reset(generation);
     state.interactions.reset(generation);
+    state.client_callbacks.reset(generation).await;
     state.sessions.reset(generation);
     state
         .requests
@@ -7741,6 +7806,16 @@ async fn spawn_acp_process(
                                 )
                                 .await;
                         }
+                        if handle_client_callback_line(
+                            &stdout_app,
+                            stdout_state.as_ref(),
+                            generation,
+                            &line,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
                         match stdout_state.interactions.observe_inbound(generation, &line) {
                             InteractionInbound::NotInteraction => {
                                 let _ = stdout_app.emit("acp-event", line);
@@ -7808,6 +7883,7 @@ async fn spawn_acp_process(
                 .unwrap_or_else(|current| current);
             stdout_state.foreground_turns.reset(next_generation);
             stdout_state.interactions.reset(next_generation);
+            stdout_state.client_callbacks.reset(next_generation).await;
             stdout_state.sessions.reset(next_generation);
             drop(process.stdin);
             let code = process
@@ -7906,13 +7982,6 @@ fn acp_method_allowed(method: &str) -> bool {
             | "session/update"
             | "initialize"
             | "authenticate"
-            | "terminal/create"
-            | "terminal/output"
-            | "terminal/release"
-            | "terminal/wait_for_exit"
-            | "terminal/kill"
-            | "fs/read_text_file"
-            | "fs/write_text_file"
             | "x.ai/interject"
             | "x.ai/session/list"
             | "x.ai/session/delete"
@@ -8355,6 +8424,7 @@ async fn acp_kill(
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
     state.foreground_turns.reset(generation);
     state.interactions.reset(generation);
+    state.client_callbacks.reset(generation).await;
     state.sessions.reset(generation);
     state
         .requests
@@ -8947,10 +9017,7 @@ fn main() {
             git_push,
             read_preview_file,
             start_file_preview,
-            acp_read_text_file,
-            acp_read_file,
             read_prompt_image_paths,
-            acp_write_text_file,
             open_in_explorer,
             open_in_app,
             notify_desktop,
@@ -9014,6 +9081,7 @@ fn main() {
                     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
                     state.foreground_turns.reset(generation);
                     state.interactions.reset(generation);
+                    state.client_callbacks.reset(generation).await;
                     state.sessions.reset(generation);
                     state
                         .requests
@@ -10307,7 +10375,10 @@ UNRELATED=value
         assert!(!acp_method_allowed("_session/prompt"));
         assert!(!acp_method_allowed("session/unknown"));
         assert!(!acp_method_allowed("terminal/unknown"));
+        assert!(!acp_method_allowed("terminal/create"));
         assert!(!acp_method_allowed("fs/unknown"));
+        assert!(!acp_method_allowed("fs/read_text_file"));
+        assert!(!acp_method_allowed("fs/write_text_file"));
         assert!(acp_method_allowed("x.ai/future_extension"));
         assert!(acp_method_allowed("_x.ai/future_extension"));
         assert!(!acp_method_allowed("session/../../evil"));

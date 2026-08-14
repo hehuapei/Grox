@@ -12,6 +12,8 @@ interface HostInteraction {
 interface InteractionInternals {
   projectHostInteraction(interaction: HostInteraction): void;
   reconcileHostInteractions(interactions: HostInteraction[]): void;
+  onLine(line: string): void;
+  sendRaw(message: unknown): Promise<void>;
 }
 
 function bridgeHarness() {
@@ -86,5 +88,24 @@ describe("AcpBridge Host interaction projection", () => {
         response: { outcome: "cancelled" },
       },
     ]);
+  });
+
+  it("never answers a file callback after it bypasses Host ownership", () => {
+    const { events, internal } = bridgeHarness();
+    let replied = false;
+    internal.sendRaw = async () => { replied = true; };
+    internal.onLine(JSON.stringify({
+      jsonrpc: "2.0",
+      id: 11,
+      method: "_x.ai/fs/read_file",
+      params: { sessionId: "session-a", path: "/tmp/a.txt" },
+    }));
+
+    const notice = events.find(
+      (event): event is Extract<BridgeEvent, { type: "runtime_notice" }> =>
+        event.type === "runtime_notice",
+    );
+    expect(notice?.notice.id).toBe("error-protocol-CLIENT_CALLBACK_HOST_BYPASSED");
+    expect(replied).toBe(false);
   });
 });

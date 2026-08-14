@@ -436,6 +436,20 @@ pub(crate) async fn open_agent_session(
     }
     let mut attempt =
         prepare_session_extensions(leases.inner(), &request, permission_mode, &mut warnings)?;
+    let callback_open = match state.client_callbacks.begin_session_open(
+        request.generation,
+        session_id.as_deref(),
+        &cwd,
+    ) {
+        Ok(lease) => lease,
+        Err(error) => {
+            discard_session_extension_attempt(leases.inner(), &mut attempt);
+            return Err(AcpHostError::operation(
+                "SESSION_CALLBACK_BINDING_BUSY",
+                error,
+            ));
+        }
+    };
     let method = if session_id.is_some() {
         "session/load"
     } else {
@@ -477,9 +491,16 @@ pub(crate) async fn open_agent_session(
                 "ACP_SESSION_EXTENSIONS_UNSUPPORTED",
                 "当前 Grok Build 不接受桌面扩展参数，本会话已不挂载 Computer/Browser Use",
             ));
-            send(&attempt).await?
+            match send(&attempt).await {
+                Ok(response) => response,
+                Err(error) => {
+                    state.client_callbacks.abort_session_open(&callback_open);
+                    return Err(error);
+                }
+            }
         }
         Err(error) => {
+            state.client_callbacks.abort_session_open(&callback_open);
             discard_session_extension_attempt(leases.inner(), &mut attempt);
             return Err(error);
         }
@@ -500,10 +521,22 @@ pub(crate) async fn open_agent_session(
     let bound_session_id = match bound_session_id {
         Ok(session_id) => session_id,
         Err(error) => {
+            state.client_callbacks.abort_session_open(&callback_open);
             discard_session_extension_attempt(leases.inner(), &mut attempt);
             return Err(error);
         }
     };
+    if let Err(error) = state
+        .client_callbacks
+        .commit_session_open(&callback_open, &bound_session_id)
+    {
+        state.client_callbacks.abort_session_open(&callback_open);
+        discard_session_extension_attempt(leases.inner(), &mut attempt);
+        return Err(AcpHostError::protocol(
+            "SESSION_CALLBACK_BINDING_INVALID",
+            error,
+        ));
+    }
     let binding = std::mem::take(&mut attempt.leases);
     let previous = leases.bind_session(bound_session_id, binding.clone());
     shutdown_replaced_session_resources(leases.inner(), previous, &binding);
@@ -548,6 +581,7 @@ pub(crate) async fn close_agent_session(
         Err(error) => return Err(error),
     }
     shutdown_session_resources(leases.inner(), &session_id);
+    state.client_callbacks.unbind_session(&session_id);
     Ok(())
 }
 
@@ -587,6 +621,7 @@ pub(crate) async fn delete_agent_session(
     )
     .await?;
     shutdown_session_resources(leases.inner(), &session_id);
+    state.client_callbacks.unbind_session(&session_id);
     Ok(())
 }
 

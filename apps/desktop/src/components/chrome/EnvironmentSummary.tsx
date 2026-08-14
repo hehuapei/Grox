@@ -48,6 +48,8 @@ interface AgentRuntimeStatus {
   pid?: number;
   pendingRequests: number;
   pendingInteractions: number;
+  pendingClientCallbacks: number;
+  boundClientSessions: number;
 }
 
 interface SummarySource {
@@ -156,7 +158,7 @@ export function EnvironmentSummary() {
         });
         setWorktrees([]);
         setJournalStatus({ count: 12, totalBytes: 1_480_000, latestSavedAt: Date.now(), migrationPending: 0, unreadableCount: 0 });
-        setRuntimeStatus({ topology: "shared_process", processCapacity: 1, running: true, ready: true, phase: "ready", generation: 1, pid: 12345, pendingRequests: 0, pendingInteractions: 0 });
+        setRuntimeStatus({ topology: "shared_process", processCapacity: 1, running: true, ready: true, phase: "ready", generation: 1, pid: 12345, pendingRequests: 0, pendingInteractions: 0, pendingClientCallbacks: 0, boundClientSessions: 0 });
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -360,6 +362,12 @@ export function EnvironmentSummary() {
                         : "",
                       runtimeStatus.pendingInteractions > 0
                         ? `${runtimeStatus.pendingInteractions} ${zh ? "个交互门控等待用户" : "operator gates pending"}`
+                        : "",
+                      runtimeStatus.pendingClientCallbacks > 0
+                        ? `${runtimeStatus.pendingClientCallbacks} ${zh ? "个 Client 回调处理中" : "client callbacks pending"}`
+                        : "",
+                      runtimeStatus.boundClientSessions > 0
+                        ? `${runtimeStatus.boundClientSessions} ${zh ? "个会话已绑定工作区" : "sessions bound to workspaces"}`
                         : "",
                       activeTurns > 0 ? `${activeTurns} ${zh ? "个活动回合" : "active turns"}` : "",
                       runtimeOccupancy.lifecycleActive ? (zh ? "会话同步占用中" : "Session sync active") : "",
