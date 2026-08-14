@@ -62,7 +62,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 1 | Native ACP transport | Host 关联请求/响应并负责超时、取消、退出清算；已落地 |
 | 2 | SessionCoordinator | Host 签发/校验 lifecycle 与 turn 许可并发布占用快照；已落地 |
 | 3 | Native repositories | PromptQueueStore、AutomationStore、SessionJournalStore 已迁移；草稿持久化边界继续收口 |
-| 4 | Background execution | 自动化、恢复、后台多会话通过 SessionCoordinator 执行；再评估按会话进程池 |
+| 4 | Background execution | Host 自动化时钟、租约、门禁和结算已落地；ACP 建会话/发提示继续沿同一 SessionCoordinator 下沉 |
 | 5 | Host services | worktree、权限、媒体、密钥统一使用会话/项目身份和路径授权 |
 | 6 | Command facade | 将 `main.rs` 按领域迁出，Tauri command 只校验 DTO 并调用服务 |
 | 7 | Error/diagnostics | 稳定错误码、运行时快照、审计事件和支持包覆盖所有上述服务 |
@@ -90,14 +90,21 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - 删除会话/项目会在同一 tombstone 锁序内删除提示队列，晚到 upsert 会被 Host 拒绝，不能让已删除会话复活。
 - `automation_store::AutomationStore` 按 automation id 在 Host 锁内合并更新/删除，不同任务的启停、编辑和运行结果不再通过整包数组互相覆盖；
 - 自动化 DTO、时间、频率、权限模式、可选运行结果和重复 id 均由 Host 校验，失败 patch 不修改原文件。
+- `automation_runner::AutomationRunner` 在应用进程内每 30 秒检查到期任务，只在 ACP 已初始化且 SessionCoordinator 无活动回合/生命周期操作时派发；WebView 不再持有调度定时器或到期判断；
+- 认领、两分钟租约、30 秒续租、排程推进、一次性任务停用和安全失败退避都在 AutomationStore 的同一文件事务内完成；建会话前失败会五分钟退避，已经创建会话后的模糊失败会消费本次排程，避免自动复制可能已写入 Agent 的工作；同一时刻跨任务也只允许一个后台派发；
+- `_hostRuntime` 是 Host 保留字段：普通 UI patch 不能伪造或擦除认领，过期租约可以在页面崩溃后恢复，旧 token 不能结算新认领；删除任务仍然优先，不会被晚到结算复活；
+- 自动化只定向派发给 `main` WebView；供应商、认证或全局配置切换会先暂停 runner，直到新 ACP 代次完成初始化，避免任务进入正在替换的连接；
+- Host 返回 `AUTOMATION_RUNTIME_BUSY`、`AUTOMATION_CLAIM_STALE`、`AUTOMATION_INVALID_RESULT` 和 `AUTOMATION_STORAGE_FAILED` 等分域错误，前端不再把所有失败折叠成“启动失败”。
 - `session_storage::SessionStorageState` 改为按会话写/删除租约：同一会话串行、不同会话并行，删除先标 tombstone 再等待现有 writer，避免全局文件锁拖慢多会话；
 - `session_journal_store::SessionJournalStore` 校验现有和提交快照，前端以磁盘 savedAt 为基线生成单调逻辑版本；旧窗口的等版本/低版本写入会明确冲突并停止续写，不能覆盖新 journal；
 - 旧版裸 Session 只保留只读迁移入口，损坏的现有 journal 不会被新快照静默覆盖。
 
-本切片没有把供应商切换的“发送意图等待”、队列调度策略和自动化调度伪装成已经迁移：
-它们仍在 Bridge/Store，后续必须通过同一个 SessionCoordinator 的维护操作与后台执行入口
-迁入 Host，才能删除 `activePromptSessions` 等剩余前端运行时权威。提示队列持久化事务
-已经迁入 Host，但何时 claim、发送和恢复仍属于 Background execution 切片。
+本切片没有把完整 SessionManager 伪装成已经迁移：自动化的时钟、claim、续租、退避、
+排程推进和运行时门禁已经属于 Host，但 `session/new`、模型/模式绑定与 `session/prompt`
+的协议编排仍由 `AcpBridge` 执行，并通过 Host SessionCoordinator 取得许可。供应商切换的
+发送意图等待、提示队列何时 claim/发送/恢复也仍在 Bridge/Store。后续必须把这些协议
+编排和队列调度迁入同一个 Host 会话服务，才能删除 `activePromptSessions` 与 WebView
+执行器；在此之前不会另起一个简化 CLI 进程冒充后台运行时。
 
 ## 完整后端对照结论
 
@@ -109,7 +116,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 多会话 | 单进程共享、生命周期门控在前端 | 每应用会话进程、后台 busy 不被抢占 | 先迁权威，再用容量策略决定进程池 |
 | 持久化 | 前端组装完整 JSON，Host 原子写 | store + 锁 + journal 对账 | Host 提供语义操作和锁内 RMW |
 | 队列 | Store/localStorage 主导 | Host 运行时可观察 busy/退出 | 队列状态与发送事务绑定 |
-| 自动化 | 前端调度，依赖 WebView 存活 | runner 复用 SessionManager | 后台 runner 共用 SessionCoordinator |
+| 自动化 | Host 已拥有时钟/租约/结算，协议编排仍在 Bridge | runner 复用 SessionManager | 先完成 Host lease runner，再把建会话/发提示下沉到同一会话服务 |
 | 工作树 | 命令安全性已有，生命周期仍偏 UI | worktree 与 session metadata 绑定 | 引入 Host 所有权记录和清理策略 |
 | 权限 | Host 有部分产品门禁，交互在 Bridge | 每会话策略、allow cache、Host resolve | 权限请求按 session + rpc id 建模 |
 | 媒体 | 工具图已落盘，预览/生成分散 | token loopback + path scope | 统一 MediaService 与会话授权 |
@@ -120,7 +127,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 
 ## Consequences
 
-- WebView 刷新不再是清理后台请求的必要条件，后续可以安全支持后台会话和自动化。
+- WebView 刷新不再决定任务是否已被消费；未结算自动化会在租约过期后由 Host 恢复。当前共享 ACP 进程仍随主窗口退出，这是明确限制。
 - 迁移期间仍保留一个共享 CLI 进程；这是真实限制，不伪装成进程池。
 - `AcpBridge` 会逐步缩小为投影器，Zustand 只保存 UI 需要的快照。
 - Host 模块会增加，但每次拆分必须伴随职责迁移、测试或不变量，禁止只为了缩短文件。

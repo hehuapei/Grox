@@ -1,8 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
-  advanceAutomation,
   diffAutomations,
-  dueAutomations,
   nextAutomationRun,
   parseAutomations,
   type Automation,
@@ -28,14 +26,6 @@ describe("automations", () => {
     expect(() => parseAutomations("not-json")).toThrow("不是有效 JSON");
     expect(() => parseAutomations("{}")).toThrow("必须是 JSON 数组");
     expect(() => parseAutomations(JSON.stringify([base, { id: "broken" }]))).toThrow("包含无效任务");
-  });
-
-  it("只返回已启用且到期的任务", () => {
-    expect(dueAutomations([base, { ...base, id: "off", enabled: false }], 2).map((item) => item.id)).toEqual(["a"]);
-  });
-
-  it("一次性任务执行后停用", () => {
-    expect(advanceAutomation({ ...base, frequency: "once" }, 10)).toMatchObject({ enabled: false, lastRunAt: 10 });
   });
 
   it("工作日不会排到周末", () => {

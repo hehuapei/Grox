@@ -515,11 +515,44 @@ export interface RuntimeOccupancy {
   pendingLifecycle: number;
 }
 
+export interface AutomationDispatch {
+  token: string;
+  source: "scheduled" | "run_now";
+  claimedAt: number;
+  leaseExpiresAt: number;
+  automation: {
+    id: string;
+    title: string;
+    prompt: string;
+    cwd: string;
+    model: string;
+    effort: Effort;
+    mode: AgentMode;
+    permissionMode: PermissionMode;
+    frequency: "once" | "daily" | "weekdays" | "weekly";
+    time: string;
+    weekday?: number;
+    enabled: boolean;
+    nextRunAt: number;
+    lastRunAt?: number;
+    lastSessionId?: string;
+    lastError?: string;
+  };
+}
+
+export interface AutomationRunnerStatus {
+  checkedAt: number | null;
+  runtimeReady: boolean;
+  runtimeBusy: boolean;
+}
+
 /** Events a bridge pushes into the store. Wire-level naming kept close to ACP. */
 export type BridgeEvent =
   | { type: "auth_state"; state: AuthState }
   | { type: "runtime_state"; state: RuntimeConnectionState }
   | { type: "runtime_occupancy"; occupancy: RuntimeOccupancy }
+  | { type: "automation_dispatch"; dispatch: AutomationDispatch }
+  | { type: "automation_runner_tick"; status: AutomationRunnerStatus }
   | { type: "model_state"; state: ModelState }
   | { type: "mode_state"; sessionId: string; mode: AgentMode }
   | { type: "available_commands"; sessionId: string; commands: SlashCommand[] }

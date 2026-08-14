@@ -8,6 +8,7 @@
 
 mod acp_host;
 mod automation_store;
+mod automation_runner;
 mod browser_mcp;
 mod computer_mcp;
 mod git_confirm;
@@ -36,7 +37,8 @@ use std::{
 };
 
 use acp_host::{AcpHostError, AcpRequestBroker};
-use automation_store::AutomationStore;
+use automation_store::{AutomationCompletion, AutomationStore};
+use automation_runner::{storage_error as automation_storage_error, AutomationRunner};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use git_confirm::GitConfirmStore;
 use mcp_leases::McpLeaseStore;
@@ -1939,6 +1941,143 @@ fn patch_automations(
     automations.patch(&path, upserts, deletes, AUTOMATIONS_MAX_BYTES)
 }
 
+fn automation_claim_error(message: String) -> AcpHostError {
+    if message.contains("token 无效")
+        || message.contains("无效会话 ID")
+        || message.contains("错误详情不能超过")
+    {
+        AcpHostError::protocol("AUTOMATION_INVALID_RESULT", message)
+    } else if message.contains("认领")
+        || message.contains("正在执行")
+        || message.contains("不存在")
+        || message.contains("id 无效")
+    {
+        AcpHostError::operation("AUTOMATION_CLAIM_STALE", message)
+    } else {
+        automation_storage_error(message)
+    }
+}
+
+#[tauri::command]
+async fn automation_runner_runtime_ready(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    runner: tauri::State<'_, AutomationRunner>,
+    generation: u64,
+) -> Result<(), AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    runner.mark_runtime_ready(state.inner(), generation).await
+}
+
+#[tauri::command]
+fn automation_runner_runtime_pause(
+    window: tauri::WebviewWindow,
+    runner: tauri::State<'_, AutomationRunner>,
+) -> Result<(), AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    runner.mark_runtime_unready();
+    Ok(())
+}
+
+#[tauri::command]
+async fn automation_runner_status(
+    state: tauri::State<'_, Arc<AcpState>>,
+    runner: tauri::State<'_, AutomationRunner>,
+) -> Result<automation_runner::AutomationRunnerStatus, AcpHostError> {
+    Ok(runner.status(state.inner()).await)
+}
+
+#[tauri::command]
+async fn run_automation_now(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    runner: tauri::State<'_, AutomationRunner>,
+    automations: tauri::State<'_, AutomationStore>,
+    id: String,
+) -> Result<(), AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    runner.ensure_dispatchable(state.inner()).await?;
+    let now_ms = automation_runner::unix_time_ms();
+    let path = automations_path(&app).map_err(automation_storage_error)?;
+    let dispatch = automations
+        .claim_now(&path, &id, now_ms, AUTOMATIONS_MAX_BYTES)
+        .map_err(automation_claim_error)?;
+    if let Err(error) = runner.emit_dispatch(&app, dispatch.clone()) {
+        if let Err(settle_error) = automations.complete_claim(
+            &path,
+            &id,
+            &dispatch.token,
+            AutomationCompletion {
+                session_id: None,
+                error: Some(&error.message),
+                completed_at: now_ms,
+            },
+            AUTOMATIONS_MAX_BYTES,
+        ) {
+            return Err(automation_storage_error(format!(
+                "{}；派发失败后的租约结算也失败：{settle_error}",
+                error.message
+            )));
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+fn renew_automation_dispatch(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    automations: tauri::State<'_, AutomationStore>,
+    id: String,
+    token: String,
+) -> Result<u64, AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    let path = automations_path(&app).map_err(automation_storage_error)?;
+    automations
+        .renew_claim(
+            &path,
+            &id,
+            &token,
+            automation_runner::unix_time_ms(),
+            AUTOMATIONS_MAX_BYTES,
+        )
+        .map_err(automation_claim_error)
+}
+
+#[tauri::command]
+fn complete_automation_dispatch(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    automations: tauri::State<'_, AutomationStore>,
+    id: String,
+    token: String,
+    session_id: Option<String>,
+    error: Option<String>,
+) -> Result<serde_json::Value, AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    let path = automations_path(&app).map_err(automation_storage_error)?;
+    automations
+        .complete_claim(
+            &path,
+            &id,
+            &token,
+            AutomationCompletion {
+                session_id: session_id.as_deref(),
+                error: error.as_deref(),
+                completed_at: automation_runner::unix_time_ms(),
+            },
+            AUTOMATIONS_MAX_BYTES,
+        )
+        .map_err(automation_claim_error)
+}
+
 #[tauri::command]
 fn delete_session_data(
     app: tauri::AppHandle,
@@ -2910,6 +3049,7 @@ fn selected_session_journal_diagnostic(app: &tauri::AppHandle, id: &str) -> serd
 async fn export_session_support_bundle(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AcpState>>,
+    automation_runner: tauri::State<'_, AutomationRunner>,
     session_id: String,
     client_snapshot: String,
 ) -> Result<SessionSupportExport, String> {
@@ -2943,6 +3083,7 @@ async fn export_session_support_bundle(
         "nextGeneration": state.next_generation.load(Ordering::Relaxed),
         "pendingRequests": state.requests.len().await,
         "sessionOccupancy": state.sessions.snapshot(),
+        "automationRunner": automation_runner.status(state.inner()).await,
         "cli": {
             "path": support_path(&runtime_info.path),
             "source": runtime_info.source,
@@ -7193,11 +7334,13 @@ async fn acp_spawn(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<AcpState>>,
+    automation_runner: tauri::State<'_, AutomationRunner>,
     cwd: String,
     computer_use_enabled: Option<bool>,
     reasoning_effort: Option<String>,
 ) -> Result<u64, String> {
     ensure_main_acp_owner(window.label())?;
+    automation_runner.mark_runtime_unready();
     let cwd = checked_workspace(&cwd)?;
 
     // Invalidate the previous readers before terminating their process. On a
@@ -7353,6 +7496,9 @@ async fn acp_spawn(
             }
         };
         if let Some(mut process) = process {
+            stdout_app
+                .state::<AutomationRunner>()
+                .mark_generation_unready(generation);
             let next_generation = stdout_state
                 .next_generation
                 .compare_exchange(
@@ -7707,8 +7853,10 @@ async fn acp_kill(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<AcpState>>,
+    automation_runner: tauri::State<'_, AutomationRunner>,
 ) -> Result<(), String> {
     ensure_main_acp_owner(window.label())?;
+    automation_runner.mark_runtime_unready();
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
     state.sessions.reset(generation);
     state
@@ -8217,12 +8365,14 @@ fn main() {
         .manage(SessionStorageState::default())
         .manage(PromptQueueStore::default())
         .manage(AutomationStore::default())
+        .manage(AutomationRunner::default())
         .setup(|app| {
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?;
             if let Some(window) = app.get_webview_window("main") {
                 window.set_icon(icon)?;
             }
             register_computer_emergency_shortcut(app.handle().clone());
+            app.state::<AutomationRunner>().start(app.handle().clone());
             let coordinator = app.state::<Arc<AcpState>>().sessions.clone();
             let mut occupancy = coordinator.subscribe();
             let occupancy_app = app.handle().clone();
@@ -8270,6 +8420,12 @@ fn main() {
             patch_prompt_queues,
             read_automations,
             patch_automations,
+            automation_runner_runtime_ready,
+            automation_runner_runtime_pause,
+            automation_runner_status,
+            run_automation_now,
+            renew_automation_dispatch,
+            complete_automation_dispatch,
             delete_session_data,
             delete_project_session_data,
             scrub_session_journal_orphans,
@@ -8345,6 +8501,7 @@ fn main() {
         ])
         .on_window_event(|window, event| {
             if matches!(event, tauri::WindowEvent::Destroyed) && window.label() == "main" {
+                window.state::<AutomationRunner>().mark_runtime_unready();
                 let state = window.state::<Arc<AcpState>>().inner().clone();
                 let preview_state = window.state::<Arc<PreviewState>>().inner().clone();
                 tauri::async_runtime::spawn(async move {

@@ -43,6 +43,9 @@ import type {
   RewindPoint,
   RewindResult,
   RuntimeOccupancy,
+  AutomationDispatch,
+  AutomationRunnerStatus,
+  GroxError,
   SlashCommand,
   WorkflowAgentTrace,
   WorkflowTraceEntry,
@@ -905,6 +908,8 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
     case "runtime_notice":
     case "runtime_state":
     case "runtime_occupancy":
+    case "automation_dispatch":
+    case "automation_runner_tick":
       return session;
     case "session_meta":
       return { ...session, ...event.patch };
@@ -1253,6 +1258,15 @@ export class AcpBridge implements GrokBridge {
       await listen<RuntimeOccupancy>("session-runtime-occupancy", ({ payload }) => {
         this.emit({ type: "runtime_occupancy", occupancy: payload });
       }),
+      await listen<AutomationDispatch>("automation-dispatch", ({ payload }) => {
+        this.emit({ type: "automation_dispatch", dispatch: payload });
+      }),
+      await listen<AutomationRunnerStatus>("automation-runner-tick", ({ payload }) => {
+        this.emit({ type: "automation_runner_tick", status: payload });
+      }),
+      await listen<GroxError>("automation-runner-error", ({ payload }) => {
+        this.emit({ type: "runtime_notice", notice: runtimeNoticeFromError(payload) });
+      }),
       await listen("computer-emergency-shortcut", () => {
         for (const sessionId of this.activeComputerSessions) {
           void this.emergencyStopComputer(sessionId);
@@ -1262,6 +1276,10 @@ export class AcpBridge implements GrokBridge {
     this.emit({
       type: "runtime_occupancy",
       occupancy: await invoke<RuntimeOccupancy>("session_runtime_status"),
+    });
+    this.emit({
+      type: "automation_runner_tick",
+      status: await invoke<AutomationRunnerStatus>("automation_runner_status"),
     });
 
     try {
@@ -1315,6 +1333,8 @@ export class AcpBridge implements GrokBridge {
     this.captureModelState(response);
     this.captureRuntimeCommands(response);
     await this.configureAuthentication(response);
+    // Host 只在 ACP 初始化及认证配置完成后派发任务，租约不会消耗在半连接状态。
+    await invoke("automation_runner_runtime_ready", { generation: this.acpGeneration });
     // v1 source snapshots make startup structurally non-blocking: initialize
     // may expose a cached/bundled catalog before the authenticated fetch ends.
     // Refresh in the background so desktop readiness never waits on network.
@@ -1365,6 +1385,26 @@ export class AcpBridge implements GrokBridge {
       this.emit({ type: "runtime_state", state: "ready" });
     } catch (error) {
       this.emit({ type: "runtime_state", state: "offline" });
+      throw error;
+    }
+  }
+
+  /**
+   * 配置写入与 ACP 子进程替换是一个运行时切换事务。先暂停 Host 派发；
+   * 写入失败时只在旧代次仍存活的情况下恢复调度。
+   */
+  private async reconfigureRuntime<T>(change: () => Promise<T>): Promise<T> {
+    const previousGeneration = this.acpGeneration;
+    await invoke("automation_runner_runtime_pause");
+    try {
+      await this.waitForActivePrompts();
+      const result = await change();
+      await this.restartAgent();
+      return result;
+    } catch (error) {
+      await invoke("automation_runner_runtime_ready", { generation: previousGeneration }).catch((resumeError) => {
+        this.diagnostics.push(`自动化调度未能恢复：${errorText(resumeError)}`);
+      });
       throw error;
     }
   }
@@ -2824,9 +2864,7 @@ export class AcpBridge implements GrokBridge {
     // previously selected API gateway can keep owning the next ACP child.
     const provider = await this.getProviderStatus();
     if (provider.kind !== "oauth") {
-      await this.waitForActivePrompts();
-      await invoke("configure_provider", { request: { kind: "oauth" } });
-      await this.restartAgent();
+      await this.reconfigureRuntime(() => invoke("configure_provider", { request: { kind: "oauth" } }));
     }
     if (!this.authMethodId) throw new Error("Grok Agent 没有可用的交互认证方式");
     if (this.authState.inProgress) return;
@@ -2861,10 +2899,10 @@ export class AcpBridge implements GrokBridge {
   }
 
   async logout(): Promise<void> {
-    await this.waitForActivePrompts();
-    await this.callExtension("x.ai/auth/logout", {});
-    await invoke("configure_provider", { request: { kind: "oauth" } });
-    await this.restartAgent();
+    await this.reconfigureRuntime(async () => {
+      await this.callExtension("x.ai/auth/logout", {});
+      await invoke("configure_provider", { request: { kind: "oauth" } });
+    });
   }
 
   async getAccountInfo(): Promise<AccountInfo> {
@@ -2920,9 +2958,7 @@ export class AcpBridge implements GrokBridge {
   async configureProvider(config: ProviderConfig): Promise<void> {
     // Keep the old child and its environment intact for the current turn.
     // The configuration file is intentionally not touched until it finishes.
-    await this.waitForActivePrompts();
-    await invoke("configure_provider", { request: config });
-    await this.restartAgent();
+    await this.reconfigureRuntime(() => invoke("configure_provider", { request: config }));
     if (config.kind === "oauth" && this.authState.required) await this.authenticate();
   }
 
@@ -2946,9 +2982,7 @@ export class AcpBridge implements GrokBridge {
     // Profile activation also writes the endpoint and per-model transport.
     // Do it only after the prior turn has finished so it cannot change the
     // provider or model underneath an in-flight request.
-    await this.waitForActivePrompts();
-    await invoke("activate_provider_profile", { id });
-    await this.restartAgent();
+    await this.reconfigureRuntime(() => invoke("activate_provider_profile", { id }));
   }
 
   async setSessionMode(sessionId: string, mode: AgentMode): Promise<void> {
@@ -2962,9 +2996,11 @@ export class AcpBridge implements GrokBridge {
 
   async deleteProviderProfile(id: string): Promise<void> {
     const active = (await this.listProviderProfiles()).activeId === id;
-    if (active) await this.waitForActivePrompts();
-    await invoke("delete_provider_profile", { id });
-    if (active) await this.restartAgent();
+    if (active) {
+      await this.reconfigureRuntime(() => invoke("delete_provider_profile", { id }));
+    } else {
+      await invoke("delete_provider_profile", { id });
+    }
   }
 
   async readConfigDocuments(cwd: string): Promise<ConfigDocument[]> {
@@ -2972,17 +3008,11 @@ export class AcpBridge implements GrokBridge {
   }
 
   async writeConfigDocument(document: ConfigDocument): Promise<ConfigDocument> {
-    const saved = await invoke<ConfigDocument>("write_config_document", {
+    const write = () => invoke<ConfigDocument>("write_config_document", {
       request: { id: document.id, cwd: this.workspace, content: document.content },
     });
+    const saved = document.id === "config" ? await this.reconfigureRuntime(write) : await write();
     if (document.id === "system-prompt") this.sessionMetaCache.delete(this.workspace);
-    if (document.id === "config") {
-      // Grok reads its global config at agent startup. Restart only after an
-      // active prompt settles, then the settings UI reloads the idle session
-      // so a successful save has an observable effect immediately.
-      await this.waitForActivePrompts();
-      await this.restartAgent();
-    }
     return saved;
   }
 

@@ -71,8 +71,8 @@ export function AutomationsStudio() {
           </div>
           <div className={`mt-1 rounded-full border px-3 py-1.5 font-mono text-[9px] ${lastTickAt && Date.now() - lastTickAt < 90_000 ? "border-green/25 bg-green/5 text-green" : "border-line2 bg-high/55 text-dim"}`}>
             {lastTickAt
-              ? `${zh ? "窗口调度上次检查" : "Window scheduler checked"} ${new Date(lastTickAt).toLocaleTimeString()}`
-              : (zh ? "等待窗口调度首次检查" : "Waiting for first window scheduler check")}
+              ? `${zh ? "Host 调度上次检查" : "Host scheduler checked"} ${new Date(lastTickAt).toLocaleTimeString()}`
+              : (zh ? "等待 Host 调度首次检查" : "Waiting for first Host scheduler check")}
           </div>
         </div>
         <p className="mt-2 max-w-2xl text-[12px] leading-relaxed text-mute">

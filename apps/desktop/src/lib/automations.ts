@@ -57,23 +57,6 @@ export function nextAutomationRun(
   return next.getTime();
 }
 
-export function advanceAutomation(automation: Automation, now = Date.now()): Automation {
-  if (automation.frequency === "once") {
-    return { ...automation, enabled: false, lastRunAt: now };
-  }
-  return {
-    ...automation,
-    lastRunAt: now,
-    nextRunAt: nextAutomationRun(automation.frequency, automation.time, now + 1_000, automation.weekday),
-  };
-}
-
-export function dueAutomations(automations: readonly Automation[], now = Date.now()): Automation[] {
-  return automations
-    .filter((automation) => automation.enabled && automation.nextRunAt <= now)
-    .sort((a, b) => a.nextRunAt - b.nextRunAt);
-}
-
 export function parseAutomations(raw: string | null | undefined): Automation[] {
   if (!raw?.trim()) return [];
   let values: unknown;
@@ -170,4 +153,17 @@ export async function persistAutomations(automations: readonly Automation[]): Pr
     nativeCommittedAutomations = target;
   });
   await nativeWriteChain;
+}
+
+/** 接受 Host 结算后的权威单行快照，防止后续 UI patch 写回旧排程。 */
+export function adoptNativeAutomation(automation: Automation): Automation[] {
+  const replace = (values: readonly Automation[]) => {
+    const exists = values.some((item) => item.id === automation.id);
+    return exists
+      ? values.map((item) => item.id === automation.id ? { ...automation } : { ...item })
+      : [...snapshotAutomations(values), { ...automation }];
+  };
+  nativeCommittedAutomations = replace(nativeCommittedAutomations);
+  nativeDesiredAutomations = replace(nativeDesiredAutomations);
+  return snapshotAutomations(nativeDesiredAutomations);
 }

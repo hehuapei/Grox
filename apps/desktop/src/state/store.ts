@@ -43,6 +43,7 @@ import type {
   RuntimeNotice,
   RuntimeConnectionState,
   RuntimeOccupancy,
+  AutomationDispatch,
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
 import {
@@ -95,8 +96,7 @@ import type { ErrorFallback } from "../lib/errorModel";
 import { commitComposerSubmission } from "../lib/composerSubmission";
 import type { ComposerSubmission } from "../lib/composerSubmission";
 import {
-  advanceAutomation,
-  dueAutomations,
+  adoptNativeAutomation,
   loadAutomations,
   persistAutomations,
 } from "../lib/automations";
@@ -715,7 +715,6 @@ function providerDefaultModel(profile?: ProviderProfileSummary) {
 /* StrictMode mounts effects twice in dev — subscribe once, ever. */
 let bridgeSubscribed = false;
 let workspaceWatchTimer: number | undefined;
-let automationTimer: number | undefined;
 let automationRunnerBusy = false;
 let workspaceWatchTick = 0;
 let pendingLaunch: { text: string; attachments: PromptAttachment[] } | undefined;
@@ -949,37 +948,21 @@ export const useDesktop = create<DesktopState>((set, get) => {
     });
   };
 
-  const executeAutomation = async (id: string, manual = false) => {
-    if (automationRunnerBusy) return;
-    const state = get();
-    const automation = state.automations.find((item) => item.id === id);
-    if (!automation || (!automation.enabled && !manual)) return;
-    const runtimeBusy = Object.values(state.sessions).some((session) => (
-      !isSessionTerminal(session.status)
-    ));
-    // 自动化不能抢占正在流式、门禁、恢复或停止中的会话。
-    if (runtimeBusy || state.providerSwitching || state.runtimeConnection !== "ready") {
-      if (manual) {
-        const detail = "已有会话、门禁、恢复或运行时连接正在占用执行通道。";
-        saveAutomationHistory(prependAutomationRun(get().automationRunHistory, {
-          id: newAutomationRunId(),
-          automationId: automation.id,
-          title: automation.title,
-          at: Date.now(),
-          outcome: "skipped",
-          source: "run_now",
-          detail,
-        }));
-        const error = toGroxError("已有会话或运行时正在忙碌", {
-          domain: "operation",
-          code: "AUTOMATION_RUNTIME_BUSY",
-          message: "现在不能启动已安排任务",
-          recoverable: true,
-          action: "等待当前回合、门禁、恢复或供应商切换结束后重试",
-        });
-        const notice = runtimeNoticeFromError(error);
-        set((latest) => ({ runtimeNotices: [...latest.runtimeNotices.filter((item) => item.id !== notice.id), notice] }));
-      }
+  const executeAutomation = async (dispatch: AutomationDispatch) => {
+    const automation = dispatch.automation as Automation;
+    if (automationRunnerBusy) {
+      const detail = "桌面执行器尚未结算上一个 Host 派发。";
+      await invoke("complete_automation_dispatch", {
+        id: automation.id,
+        token: dispatch.token,
+        error: detail,
+      }).catch((cause) => publishRuntimeError(cause, {
+        domain: "operation",
+        code: "AUTOMATION_CLAIM_STALE",
+        message: "自动化派发冲突且认领未能结算",
+        recoverable: true,
+        action: "等待当前自动化结束；Host 会在租约过期后恢复任务",
+      }));
       return;
     }
 
@@ -988,23 +971,36 @@ export const useDesktop = create<DesktopState>((set, get) => {
       id: runId,
       automationId: automation.id,
       title: automation.title,
-      at: Date.now(),
+      at: dispatch.claimedAt,
       outcome: "starting",
-      source: manual ? "run_now" : "scheduled",
+      source: dispatch.source,
     }));
     automationRunnerBusy = true;
-    set({ automationRunningId: id });
-    // “立即运行”是独立尝试，不消费一次性任务、也不改写下一次排程；
-    // 只有定时触发需要先推进排程来获得崩溃后的至多一次语义。
-    const claimed = manual
-      ? { ...automation, lastRunAt: Date.now() }
-      : advanceAutomation(automation);
-    let automations = state.automations.map((item) => item.id === id ? claimed : item);
-    set({ automations });
+    set({ automationRunningId: automation.id });
+
+    let sessionId: string | undefined;
+    let executionError: unknown;
+    let renewalFailureReported = false;
+    const renewLease = () => {
+      void invoke<number>("renew_automation_dispatch", {
+        id: automation.id,
+        token: dispatch.token,
+      }).catch((cause) => {
+        if (renewalFailureReported) return;
+        renewalFailureReported = true;
+        publishRuntimeError(cause, {
+          domain: "operation",
+          code: "AUTOMATION_LEASE_RENEW_FAILED",
+          message: `已安排任务“${automation.title}”仍在运行，但 Host 租约续期失败`,
+          recoverable: true,
+          action: "任务结果仍会保留；若随后出现认领失效，请检查应用数据目录",
+        });
+      });
+    };
+    const heartbeat = window.setInterval(renewLease, 30_000);
+
     try {
-      // 先原子认领再创建会话；认领落盘失败时绝不能继续执行，否则崩溃后会重复触发。
-      await persistAutomations(automations);
-      const sessionId = await bridge.newBackgroundSession(automation.cwd);
+      sessionId = await bridge.newBackgroundSession(automation.cwd);
       saveAutomationHistory(patchAutomationRun(get().automationRunHistory, runId, { sessionId }));
       const created = get().sessions[sessionId];
       if (created) {
@@ -1049,58 +1045,58 @@ export const useDesktop = create<DesktopState>((set, get) => {
           });
         });
       }
-      automations = get().automations.map((item) => item.id === id ? {
-        ...item,
-        lastSessionId: sessionId,
-        lastError: undefined,
-      } : item);
-      set({ automations });
-      await persistAutomations(automations);
       saveAutomationHistory(patchAutomationRun(get().automationRunHistory, runId, {
         outcome: "started",
-        detail: "提示已交给当前应用进程中的 Agent 运行时。",
+        detail: "Host 已认领任务，提示已交给当前 Agent 运行时。",
       }));
-      void bridge.prompt(sessionId, automation.prompt, {
+      void notifyDesktop("已安排任务已启动", automation.title);
+      await bridge.prompt(sessionId, automation.prompt, {
         model: automation.model,
         effort: automation.effort,
         mode: automation.mode,
         permissionMode: automation.permissionMode,
-      }).catch((cause) => {
-        saveAutomationHistory(patchAutomationRun(get().automationRunHistory, runId, {
-          outcome: "error",
-          detail: redactAutomationDetail(cause),
-        }));
       });
-      void notifyDesktop("已安排任务已启动", automation.title);
     } catch (cause) {
-      const message = cause instanceof Error ? cause.message : String(cause);
+      executionError = cause;
       saveAutomationHistory(patchAutomationRun(get().automationRunHistory, runId, {
         outcome: "error",
         detail: redactAutomationDetail(cause),
       }));
-      automations = get().automations.map((item) => item.id === id ? { ...item, lastError: message } : item);
-      set({ automations });
-      await persistAutomations(automations).catch(() => {});
-      const error = toGroxError(cause, {
-        domain: "environment",
-        code: "AUTOMATION_START_FAILED",
-        message: `已安排任务“${automation.title}”启动失败`,
-        recoverable: true,
-        action: "检查项目路径、CLI 与认证；任务不会在同一分钟反复重试",
+    }
+
+    try {
+      const updated = await invoke<Automation>("complete_automation_dispatch", {
+        id: automation.id,
+        token: dispatch.token,
+        sessionId,
+        ...(executionError ? { error: redactAutomationDetail(executionError) } : {}),
       });
-      const notice = runtimeNoticeFromError(error);
-      set((latest) => ({ runtimeNotices: [...latest.runtimeNotices.filter((item) => item.id !== notice.id), notice] }));
+      set({ automations: adoptNativeAutomation(updated) });
+    } catch (cause) {
+      publishRuntimeError(cause, {
+        domain: "environment",
+        code: "AUTOMATION_COMPLETE_FAILED",
+        message: `已安排任务“${automation.title}”的 Host 结算失败`,
+        recoverable: true,
+        action: "任务会话仍会保留；Host 将按租约状态决定是否恢复排程",
+      });
     } finally {
+      window.clearInterval(heartbeat);
       automationRunnerBusy = false;
       set({ automationRunningId: null });
     }
-  };
 
-  const runDueAutomation = () => {
-    set({ automationLastTickAt: Date.now() });
-    if (automationRunnerBusy) return;
-    const due = dueAutomations(get().automations)[0];
-    if (due) void executeAutomation(due.id);
+    if (executionError) {
+      publishRuntimeError(executionError, {
+        domain: "environment",
+        code: "AUTOMATION_START_FAILED",
+        message: `已安排任务“${automation.title}”执行失败`,
+        recoverable: true,
+        action: dispatch.source === "scheduled"
+          ? "检查项目路径、CLI 与认证；Host 会在退避期后恢复排程"
+          : "检查项目路径、CLI 与认证后再次运行",
+      });
+    }
   };
 
   const clearContinuationSettle = (sessionId: string) => {
@@ -1282,6 +1278,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
         break;
       case "runtime_occupancy":
         set({ runtimeOccupancy: e.occupancy });
+        break;
+      case "automation_dispatch":
+        void executeAutomation(e.dispatch);
+        break;
+      case "automation_runner_tick":
+        set({ automationLastTickAt: e.status.checkedAt ?? null });
         break;
       case "model_state":
         {
@@ -1898,10 +1900,6 @@ export const useDesktop = create<DesktopState>((set, get) => {
                 action: "请检查应用数据目录的文件权限或磁盘状态",
               }));
               set((state) => ({ runtimeNotices: [...state.runtimeNotices.filter((item) => item.id !== notice.id), notice] }));
-            }
-            if (automationTimer === undefined) {
-              automationTimer = window.setInterval(runDueAutomation, 30_000);
-              window.setTimeout(runDueAutomation, 2_000);
             }
           } catch {
             // Host prefs are non-fatal.
@@ -2793,7 +2791,33 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async runAutomation(id) {
-      await executeAutomation(id, true);
+      try {
+        await invoke("run_automation_now", { id });
+      } catch (cause) {
+        const automation = get().automations.find((item) => item.id === id);
+        const error = toGroxError(cause, {
+          domain: "operation",
+          code: "AUTOMATION_RUN_NOW_FAILED",
+          message: automation ? `现在不能运行“${automation.title}”` : "自动化任务不存在",
+          recoverable: true,
+          action: "等待当前会话或自动化结束，并确认 Agent 运行时已连接",
+        });
+        if (automation) {
+          saveAutomationHistory(prependAutomationRun(get().automationRunHistory, {
+            id: newAutomationRunId(),
+            automationId: automation.id,
+            title: automation.title,
+            at: Date.now(),
+            outcome: error.domain === "operation" ? "skipped" : "error",
+            source: "run_now",
+            detail: error.message,
+          }));
+        }
+        const notice = runtimeNoticeFromError(error);
+        set((state) => ({
+          runtimeNotices: [...state.runtimeNotices.filter((item) => item.id !== notice.id), notice],
+        }));
+      }
     },
 
     clearAutomationRunHistory() {
