@@ -47,6 +47,7 @@ interface AgentRuntimeStatus {
   generation?: number;
   pid?: number;
   pendingRequests: number;
+  pendingInteractions: number;
 }
 
 interface SummarySource {
@@ -155,7 +156,7 @@ export function EnvironmentSummary() {
         });
         setWorktrees([]);
         setJournalStatus({ count: 12, totalBytes: 1_480_000, latestSavedAt: Date.now(), migrationPending: 0, unreadableCount: 0 });
-        setRuntimeStatus({ topology: "shared_process", processCapacity: 1, running: true, ready: true, phase: "ready", generation: 1, pid: 12345, pendingRequests: 0 });
+        setRuntimeStatus({ topology: "shared_process", processCapacity: 1, running: true, ready: true, phase: "ready", generation: 1, pid: 12345, pendingRequests: 0, pendingInteractions: 0 });
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -356,6 +357,9 @@ export function EnvironmentSummary() {
                       runtimeStatus.generation ? `${zh ? "代次" : "Generation"} ${runtimeStatus.generation}` : "",
                       runtimeStatus.pendingRequests > 0
                         ? `${runtimeStatus.pendingRequests} ${zh ? "个 Host 请求等待响应" : "Host requests pending"}`
+                        : "",
+                      runtimeStatus.pendingInteractions > 0
+                        ? `${runtimeStatus.pendingInteractions} ${zh ? "个交互门控等待用户" : "operator gates pending"}`
                         : "",
                       activeTurns > 0 ? `${activeTurns} ${zh ? "个活动回合" : "active turns"}` : "",
                       runtimeOccupancy.lifecycleActive ? (zh ? "会话同步占用中" : "Session sync active") : "",

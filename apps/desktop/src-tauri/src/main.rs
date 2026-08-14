@@ -15,6 +15,7 @@ mod computer_mcp;
 mod foreground_turn;
 mod git_confirm;
 mod host_prefs;
+mod interaction_service;
 mod mcp_leases;
 mod path_sandbox;
 #[cfg(windows)]
@@ -50,6 +51,7 @@ use foreground_turn::{
     cancel_foreground_turn, execute_foreground_turn, foreground_turn_status,
     ForegroundTurnRegistry,
 };
+use interaction_service::{InteractionInbound, InteractionProjection, InteractionRegistry};
 use mcp_leases::McpLeaseStore;
 use path_sandbox::{
     checked_workspace, checked_workspace_file, checked_workspace_target, is_workspace_file,
@@ -144,6 +146,7 @@ struct AcpState {
     requests: AcpRequestBroker,
     sessions: Arc<SessionCoordinator>,
     foreground_turns: Arc<ForegroundTurnRegistry>,
+    interactions: Arc<InteractionRegistry>,
 }
 
 impl AcpState {
@@ -344,6 +347,7 @@ struct AgentRuntimeStatus {
     generation: Option<u64>,
     pid: Option<u32>,
     pending_requests: usize,
+    pending_interactions: usize,
 }
 
 #[derive(Serialize)]
@@ -377,6 +381,7 @@ async fn agent_runtime_status(
         generation,
         pid,
         pending_requests: state.requests.len().await,
+        pending_interactions: state.interactions.snapshots().len(),
     })
 }
 
@@ -3289,6 +3294,7 @@ async fn export_session_support_bundle(
         "process": process.unwrap_or_else(|| serde_json::json!({ "running": false })),
         "nextGeneration": state.next_generation.load(Ordering::Relaxed),
         "pendingRequests": state.requests.len().await,
+        "pendingInteractions": state.interactions.snapshots().len(),
         "sessionOccupancy": state.sessions.snapshot(),
         "automationRunner": automation_runner.status(state.inner()).await,
         "cli": {
@@ -3446,6 +3452,7 @@ async fn install_official_grok_cli(
     // starts the freshly installed binary again.
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
     state.foreground_turns.reset(generation);
+    state.interactions.reset(generation);
     state.sessions.reset(generation);
     state
         .requests
@@ -7563,6 +7570,7 @@ async fn discard_failed_runtime(
     if let Some(process) = process {
         let next_generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
         state.foreground_turns.reset(next_generation);
+        state.interactions.reset(next_generation);
         state.sessions.reset(next_generation);
         terminate_process(process).await;
     }
@@ -7586,6 +7594,7 @@ async fn spawn_acp_process(
     // connection.
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
     state.foreground_turns.reset(generation);
+    state.interactions.reset(generation);
     state.sessions.reset(generation);
     state
         .requests
@@ -7732,7 +7741,37 @@ async fn spawn_acp_process(
                                 )
                                 .await;
                         }
-                        let _ = stdout_app.emit("acp-event", line);
+                        match stdout_state.interactions.observe_inbound(generation, &line) {
+                            InteractionInbound::NotInteraction => {
+                                let _ = stdout_app.emit("acp-event", line);
+                            }
+                            InteractionInbound::Opened(interaction) => {
+                                // 反向 RPC 只投影给主窗口；rpc id 和 wire option
+                                // 留在 Host，辅助窗口不能窃取或回复门控。
+                                if let Some(window) = stdout_app.get_webview_window("main") {
+                                    let _ = window.emit("interaction-opened", interaction);
+                                }
+                            }
+                            InteractionInbound::AutoReply(response) => {
+                                stdout_state
+                                    .foreground_turns
+                                    .observe_outbound(generation, &response);
+                                if let Err(error) =
+                                    write_acp_line(stdout_state.as_ref(), &response, generation).await
+                                {
+                                    let _ = stdout_app.emit(
+                                        "acp-stderr",
+                                        format!("自动取消无效交互请求失败：{error}"),
+                                    );
+                                }
+                            }
+                            InteractionInbound::Duplicate => {
+                                let _ = stdout_app.emit(
+                                    "acp-stderr",
+                                    "Agent 在同一进程代次复用了仍待回复的交互 rpc id；已拒绝覆盖原门控",
+                                );
+                            }
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -7768,6 +7807,7 @@ async fn spawn_acp_process(
                 .map(|_| generation + 1)
                 .unwrap_or_else(|current| current);
             stdout_state.foreground_turns.reset(next_generation);
+            stdout_state.interactions.reset(next_generation);
             stdout_state.sessions.reset(next_generation);
             drop(process.stdin);
             let code = process
@@ -7973,6 +8013,77 @@ async fn acp_send(
     }
     state.foreground_turns.observe_outbound(generation, &line);
     write_acp_line(state.inner(), &line, generation).await
+}
+
+/// 返回当前 Host 代次仍待用户处理的交互门控。WebView 重载后用它恢复
+/// 界面投影，但拿不到 rpc id，因此旧页面状态不能伪造协议回复。
+#[tauri::command]
+fn interaction_status(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+) -> Result<Vec<InteractionProjection>, AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    Ok(state.interactions.snapshots())
+}
+
+/// 原子领取并回复一个 Host 持有的交互门控。调用方只能提供不透明 block id
+/// 和用户决定；session、rpc id、wire option 与代次都从 Host 状态取回。
+#[tauri::command]
+async fn resolve_interaction(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    leases: tauri::State<'_, Arc<McpLeaseStore>>,
+    session_id: String,
+    block_id: String,
+    decision: serde_json::Value,
+) -> Result<(), AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    let _write_guard = state.interactions.lock_writes().await;
+    let lease = state
+        .interactions
+        .claim_resolution(&session_id, &block_id, &decision)?;
+    let line = match prepare_acp_line(lease.line.clone(), leases.inner()) {
+        Ok(line) => line,
+        Err(error) => {
+            state.interactions.release_claim(&lease);
+            return Err(AcpHostError::protocol(
+                "INTERACTION_RESPONSE_INVALID",
+                error,
+            ));
+        }
+    };
+    state
+        .foreground_turns
+        .observe_outbound(lease.generation, &line);
+    if let Err(error) = write_acp_line(state.inner(), &line, lease.generation).await {
+        // stdin 写失败后无法证明回复是否到达，绝不自动重发批准决定。
+        state.interactions.settle(&lease);
+        let _ = window.emit(
+            "interaction-closed",
+            serde_json::json!({
+                "sessionId": lease.session_id,
+                "blockId": lease.block_id,
+                "kind": lease.kind,
+                "reason": "write_failed",
+            }),
+        );
+        return Err(AcpHostError::environment(
+            "INTERACTION_RESPONSE_FAILED",
+            error,
+            false,
+            true,
+            "重新连接 Agent；等待它发出新的权限或提问请求",
+        ));
+    }
+    if !state.interactions.settle(&lease) {
+        return Err(AcpHostError::operation(
+            "INTERACTION_EXPIRED",
+            "交互请求在回复期间已失效",
+        ));
+    }
+    Ok(())
 }
 
 /// 发送 ACP 请求并在原生 Host 内等待其响应。响应不再广播给所有 WebView。
@@ -8243,6 +8354,7 @@ async fn acp_kill(
     state.set_runtime_phase(RuntimePhase::Stopped);
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
     state.foreground_turns.reset(generation);
+    state.interactions.reset(generation);
     state.sessions.reset(generation);
     state
         .requests
@@ -8884,6 +8996,8 @@ fn main() {
             agent_runtime_connect,
             execute_foreground_turn,
             cancel_foreground_turn,
+            interaction_status,
+            resolve_interaction,
             acp_request,
             acp_send,
             acp_kill,
@@ -8899,6 +9013,7 @@ fn main() {
                 tauri::async_runtime::spawn(async move {
                     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
                     state.foreground_turns.reset(generation);
+                    state.interactions.reset(generation);
                     state.sessions.reset(generation);
                     state
                         .requests

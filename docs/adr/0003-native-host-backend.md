@@ -7,7 +7,7 @@
 
 ## Context
 
-Grox 的 Rust 进程已经负责启动 CLI、文件和 Git 操作，但 ACP JSON-RPC 请求关联、
+Grox 的 Rust 进程已经负责启动 CLI、文件和 Git 操作，但迁移前 ACP JSON-RPC 请求关联、
 会话门控、流式回合、重连、提示队列和多数恢复决策仍在 `AcpBridge`/Zustand 内。
 这不是单纯的 `main.rs` 过长问题，而是权威被拆成了三份：
 
@@ -52,6 +52,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 8. 路径、权限和密钥由 Host 验证；前端开关只能表达意图，不能扩大授权。
 9. 协议、用户操作、环境错误在 Host 边界具有稳定代码，前端只负责本地化呈现。
 10. 共享单进程存在期间，进程级事故必须列出全部受影响会话，不能只更新当前页面。
+11. Agent 发起的交互请求只接受 Host 保存的 session + rpc id + generation；WebView 不得回传或猜测 wire id。
 
 ### v0.3.2 内的迁移顺序
 
@@ -63,9 +64,10 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 2 | SessionCoordinator | Host 签发/校验 lifecycle 与 turn 许可并发布占用快照；已落地 |
 | 3 | Native repositories | PromptQueueStore、AutomationStore、SessionJournalStore 已迁移；草稿持久化边界继续收口 |
 | 4 | Unified turn execution | Host 自动化与普通前台回合均拥有许可、模型/模式绑定、Prompt、watchdog、取消和 effort 降级；流内容继续由前端投影 |
-| 5 | Host services | worktree、权限、媒体、密钥统一使用会话/项目身份和路径授权 |
-| 6 | Command facade | 将 `main.rs` 按领域迁出，Tauri command 只校验 DTO 并调用服务 |
-| 7 | Error/diagnostics | 稳定错误码、运行时快照、审计事件和支持包覆盖所有上述服务 |
+| 5 | Interaction service | Host 持有权限、计划审批、ask-user 的 rpc id、代次、回复和 Stop 清算；已落地 |
+| 6 | Host services | worktree、权限策略、媒体、密钥统一使用会话/项目身份和路径授权 |
+| 7 | Command facade | 将 `main.rs` 按领域迁出，Tauri command 只校验 DTO 并调用服务 |
+| 8 | Error/diagnostics | 稳定错误码、运行时快照、审计事件和支持包覆盖所有上述服务 |
 
 顺序不能倒置：在 Host 尚未拥有会话状态前直接增加进程池，只会把当前分裂状态复制
 到多个进程；在 repository 尚未拥有事务前运行后台自动化，会放大队列和 journal 竞态。
@@ -77,7 +79,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - 普通请求超时与长回合 watchdog 都由 Host 处理；WebView 不再持有 prompt RPC id 或调用任意请求取消命令；
 - 进程替换、自然退出、停止、CLI 更新和主窗口退出都会清算请求；
 - Host 为退出、通道替换、超时、停滞、取消和协议校验返回稳定错误代码，前端不再用字符串正则覆盖这些分类；
-- 环境摘要和支持包记录 Host 悬挂请求数；
+- 环境摘要和支持包分别记录 Host 悬挂请求与待用户交互门控数；
 - WebView 只解释已经归属的响应，未知广播响应仍呈现为协议错误。
 - `agent_runtime_connect` 在 Host 连接锁内完成 CLI 检测、进程替换、`initialize`、非交互认证和 ready 提交；WebView 不再用 `acp_spawn`、`initialize` 和 `runtime_ready` 三次调用拼出连接事实；
 - 初始化失败或进程在握手中退出会清算该代请求、能力租约和半连接子进程；运行时快照区分 starting、initializing、authenticating、ready、paused 与 offline，不再把“有 PID”等同于“可派发”；
@@ -113,6 +115,10 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - `cancel_foreground_turn` 先定向拒绝当前 Host 请求，使 prompt future 与 turn permit 立即释放，再尽力写 `session/cancel`；发送前 Stop 的 IPC 竞态由短期取消墓碑消费，不会在用户停止后反向启动回合；
 - Host 从入站 ACP 更新维护 stream 活动、开放工具和 operator gate。学习 grok-app 的停滞策略：普通 5 分钟静默只发一次可见提示，不自动误杀长工具；Host 配置的绝对上限仍会清算僵尸回合；
 - `session/prompt` RPC 结果仍是回合终态权威；`turn_completed` / `prompt_complete` 只更新用量或触发协议恢复，不能提前释放下一条队列；
+- `interaction_service::InteractionRegistry` 截获 `session/request_permission`、`x.ai/exit_plan_mode` 和 `x.ai/ask_user_question`：按 generation 保存 rpc id、session、原始 options/questions 和回复中状态，只向主窗口发布不含 rpc id/wire option 的不透明 block id；
+- `resolve_interaction` 不接受 WebView 回传 rpc id 或 optionId，而是用 Host 保存的协议材料构造回复；跨会话、过期、重复点击、未知选项和伪造问题键都有稳定错误，stdin 写入结果不确定时不会自动重发批准；
+- Stop 与绝对 watchdog 会先由 Host 回复当前会话的全部反向 RPC 为 cancelled，再发送 `session/cancel`；符合 ACP 对 pending permission 的取消要求，也避免 Agent 永久卡在 ask-user/plan gate；
+- `interaction_status` 允许主 WebView 重载后重新投影仍存活的门控；进程代次切换、自然退出和 CLI 更新会在 Host 清空旧请求，新页面不能把旧卡片回复到新进程；
 - 自动化只定向派发给 `main` WebView；供应商、认证或全局配置切换会先暂停 runner，并取得 Host lifecycle permit 后才替换进程，因此能够等待 Host 后台回合而不是只观察 `activePromptSessions`；
 - Host 返回 `AUTOMATION_RUNTIME_BUSY`、`AUTOMATION_CLAIM_STALE`、`AUTOMATION_INVALID_RESULT` 和 `AUTOMATION_STORAGE_FAILED` 等分域错误，前端不再把所有失败折叠成“启动失败”。
 - `session_storage::SessionStorageState` 改为按会话写/删除租约：同一会话串行、不同会话并行，删除先标 tombstone 再等待现有 writer，避免全局文件锁拖慢多会话；
@@ -120,10 +126,9 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - 旧版裸 Session 只保留只读迁移入口，损坏的现有 journal 不会被新快照静默覆盖。
 
 本切片没有把完整 SessionManager 伪装成已经迁移：连接初始化、非交互认证、建会话/恢复、
-自动化协议回合、普通前台回合和持久化提示队列的 claim/dispatch/settle/recover 已属于 Host，
-但用户触发的交互 OAuth、权限/问题回复与失效清算仍在 Bridge。后续必须把这些交互请求
-迁入同一个 Host 会话服务，才能删除 `activePromptSessions` 等剩余 WebView 运行时状态；在此
-之前不会另起一个简化 CLI 进程冒充后台运行时。
+自动化协议回合、普通前台回合、持久化提示队列和权限/计划/提问交互生命周期已属于 Host。
+用户显式触发的 OAuth 回调、前台会话登记屏障以及部分文件/终端 client callback 仍在 Bridge；
+在这些职责迁完之前不会另起一个简化 CLI 进程冒充后台运行时。
 
 ## 完整后端对照结论
 
@@ -137,7 +142,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 队列 | Store/localStorage 主导 | Host 运行时可观察 busy/退出 | 队列状态与发送事务绑定 |
 | 自动化 | Host 已拥有时钟、建会话、能力租约、模型/模式、Prompt 与结算；页面仍承担会话登记屏障 | runner 复用 SessionManager | 前台与后台已共用 SessionCoordinator/turn_runtime；继续删除页面登记屏障 |
 | 工作树 | 命令安全性已有，生命周期仍偏 UI | worktree 与 session metadata 绑定 | 引入 Host 所有权记录和清理策略 |
-| 权限 | Host 有部分产品门禁，交互在 Bridge | 每会话策略、allow cache、Host resolve | 权限请求按 session + rpc id 建模 |
+| 权限/提问 | Host 已按 session + generation 持有反向 RPC，WebView 只用 block id 投影；持久 allow cache 尚未统一 | 每会话策略、allow cache、Host resolve | 交互生命周期已迁移，下一步统一权限策略与审计 |
 | 媒体 | 工具图已落盘，预览/生成分散 | token loopback + path scope | 统一 MediaService 与会话授权 |
 | 密钥 | 配置合并/脱敏，但无统一 secret backend | OS keychain + 受限文件后备 | 单独 SecretStore，诊断永不带值 |
 | 错误 | Rust 多为字符串，前端再推断域 | 稳定 AgentErrorCode | HostError DTO 取代正则推断 |
@@ -146,8 +151,8 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 
 ## Consequences
 
-- WebView 刷新不再决定任务是否已被消费；未结算自动化会在租约过期后由 Host 恢复。当前共享 ACP 进程仍随主窗口退出，这是明确限制。
+- WebView 刷新不再决定任务是否已被消费，也不会丢失仍在 Host 等待的权限/提问；未结算自动化会在租约过期后由 Host 恢复。当前共享 ACP 进程仍随主窗口退出，这是明确限制。
 - 迁移期间仍保留一个共享 CLI 进程；这是真实限制，不伪装成进程池。
 - `AcpBridge` 会逐步缩小为投影器，Zustand 只保存 UI 需要的快照。
 - Host 模块会增加，但每次拆分必须伴随职责迁移、测试或不变量，禁止只为了缩短文件。
-- v0.3.2 完成标准不是“看起来像 grok-app”，而是上述十条不变量可由 Host 测试证明。
+- v0.3.2 完成标准不是“看起来像 grok-app”，而是上述十一条不变量可由 Host 测试证明。

@@ -14,7 +14,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{Emitter, WebviewWindow};
+use tauri::{Emitter, Manager, WebviewWindow};
 
 use crate::{
     acp_host::AcpHostError,
@@ -583,6 +583,12 @@ async fn execute_prepared_foreground_turn(
     let turn = state
         .foreground_turns
         .begin(session_id.to_string(), turn_id, generation)?;
+    {
+        let _write_guard = state.interactions.lock_writes().await;
+        state
+            .interactions
+            .begin_session_turn(session_id, generation);
+    }
     let gate_token = permit.token();
 
     let mut effective_effort = bind_model(
@@ -1014,6 +1020,7 @@ async fn prompt_once(
                             .reject(request_id, generation, failure.clone())
                             .await;
                     }
+                    cancel_pending_interactions(app, state, leases, session_id, generation).await?;
                     let _ =
                         send_cancel_notification(state, leases, session_id, generation, "watchdog")
                             .await;
@@ -1066,8 +1073,16 @@ pub(crate) async fn cancel_foreground_turn(
     if let Some(request_id) = target.request_id {
         state.requests.reject(request_id, generation, failure).await;
     }
+    let cancelled_interactions = cancel_pending_interactions(
+        window.app_handle(),
+        state.inner(),
+        leases.inner(),
+        &session_id,
+        generation,
+    )
+    .await?;
     // 先清算 Host 请求与 FSM，再做可能受阻的 stdin 写入。
-    if target.active {
+    if target.active || cancelled_interactions > 0 {
         send_cancel_notification(
             state.inner(),
             leases.inner(),
@@ -1077,7 +1092,7 @@ pub(crate) async fn cancel_foreground_turn(
         )
         .await?;
     }
-    Ok(target.active)
+    Ok(target.active || cancelled_interactions > 0)
 }
 
 #[tauri::command]
@@ -1085,6 +1100,60 @@ pub(crate) fn foreground_turn_status(
     state: tauri::State<'_, Arc<AcpState>>,
 ) -> Vec<ForegroundTurnSnapshot> {
     state.foreground_turns.snapshots()
+}
+
+async fn cancel_pending_interactions(
+    app: &tauri::AppHandle,
+    state: &AcpState,
+    leases: &McpLeaseStore,
+    session_id: &str,
+    generation: u64,
+) -> Result<usize, AcpHostError> {
+    let _write_guard = state.interactions.lock_writes().await;
+    let pending = state
+        .interactions
+        .claim_session_cancellations(session_id, generation);
+    for lease in &pending {
+        let line = match prepare_acp_line(lease.line.clone(), leases) {
+            Ok(line) => line,
+            Err(error) => {
+                for claimed in &pending {
+                    state.interactions.settle(claimed);
+                }
+                return Err(AcpHostError::protocol("INTERACTION_CANCEL_INVALID", error));
+            }
+        };
+        state
+            .foreground_turns
+            .observe_outbound(lease.generation, &line);
+        if let Err(error) = write_acp_line(state, &line, lease.generation).await {
+            // 写入失败后每个反向 RPC 的送达情况都不确定；全部终结，避免
+            // 重连后把旧批准或回答写进新的 Agent 进程。
+            for claimed in &pending {
+                state.interactions.settle(claimed);
+            }
+            return Err(AcpHostError::environment(
+                "INTERACTION_CANCEL_FAILED",
+                error,
+                false,
+                true,
+                "重新连接 Agent；旧交互请求已失效",
+            ));
+        }
+        state.interactions.settle(lease);
+        if let Some(window) = app.get_webview_window("main") {
+            let _ = window.emit(
+                "interaction-closed",
+                json!({
+                    "sessionId": &lease.session_id,
+                    "blockId": &lease.block_id,
+                    "kind": lease.kind,
+                    "reason": "cancelled",
+                }),
+            );
+        }
+    }
+    Ok(pending.len())
 }
 
 async fn send_cancel_notification(
@@ -1280,10 +1349,11 @@ fn invalid_effort_from_update(update: &Value) -> Option<String> {
 }
 
 fn rpc_id_key(value: &Value) -> String {
-    value
-        .as_str()
-        .map(str::to_string)
-        .unwrap_or_else(|| value.to_string())
+    match value {
+        Value::String(value) => format!("s:{value}"),
+        Value::Number(value) => format!("n:{value}"),
+        _ => format!("other:{value}"),
+    }
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -1375,6 +1445,25 @@ mod tests {
         let snapshot = registry.snapshots().pop().unwrap();
         assert_eq!(snapshot.open_tools, 0);
         assert_eq!(snapshot.open_gates, 0);
+    }
+
+    #[test]
+    fn string_and_numeric_reverse_rpc_ids_do_not_share_a_gate_slot() {
+        let registry = Arc::new(ForegroundTurnRegistry::default());
+        registry.reset(4);
+        let turn = registry.begin("s1".into(), "turn-1".into(), 4).unwrap();
+        turn.mark_prompt_started().unwrap();
+        registry.observe_inbound(
+            4,
+            r#"{"jsonrpc":"2.0","id":9,"method":"session/request_permission","params":{"sessionId":"s1"}}"#,
+        );
+        registry.observe_inbound(
+            4,
+            r#"{"jsonrpc":"2.0","id":"9","method":"x.ai/ask_user_question","params":{"sessionId":"s1"}}"#,
+        );
+        assert_eq!(registry.snapshots()[0].open_gates, 2);
+        registry.observe_outbound(4, r#"{"jsonrpc":"2.0","id":9,"result":{}}"#);
+        assert_eq!(registry.snapshots()[0].open_gates, 1);
     }
 
     #[test]

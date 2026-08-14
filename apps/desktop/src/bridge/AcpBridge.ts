@@ -118,6 +118,20 @@ interface PromptQueueChanged {
   queue: unknown[];
   reason: "claimed" | "consumed" | "recovered";
 }
+
+interface HostInteractionProjection {
+  blockId: string;
+  sessionId: string;
+  kind: "permission" | "plan" | "question";
+  params: unknown;
+}
+
+interface HostInteractionClosed {
+  blockId: string;
+  sessionId: string;
+  kind: HostInteractionProjection["kind"];
+  reason: "resolved" | "cancelled" | "write_failed";
+}
 type RpcId = string | number;
 
 interface JsonRpcMessage extends JsonObject {
@@ -168,15 +182,6 @@ interface ContentCursor {
   userOpen?: boolean;
   planId?: string;
   toolBlocks: Map<string, string>;
-}
-
-interface PendingInteraction {
-  rpcId: RpcId;
-  sessionId: string;
-  blockId: string;
-  kind: "permission" | "plan" | "question";
-  optionIds: Partial<Record<PermissionOption, string>>;
-  questions?: QuestionItem[];
 }
 
 function isMethodUnavailable(error: unknown): boolean {
@@ -958,7 +963,9 @@ export class AcpBridge implements GrokBridge {
   readonly kind = "acp" as const;
 
   private listeners = new Set<(event: BridgeEvent) => void>();
-  private interactions = new Map<string, PendingInteraction>();
+  /** Host 门控的 UI 投影；不包含 rpc id 或 wire option。 */
+  private hostInteractions = new Map<string, HostInteractionProjection>();
+  private resolvingInteractions = new Set<string>();
   private cursors = new Map<string, ContentCursor>();
   private catalogue = new Map<string, SessionMeta>();
   private replaying = new Map<string, Session>();
@@ -1195,6 +1202,12 @@ export class AcpBridge implements GrokBridge {
 
     this.unlisten.push(
       await listen<string>("acp-event", ({ payload }) => this.onLine(payload)),
+      await listen<HostInteractionProjection>("interaction-opened", ({ payload }) => {
+        this.projectHostInteraction(payload);
+      }),
+      await listen<HostInteractionClosed>("interaction-closed", ({ payload }) => {
+        this.closeHostInteraction(payload);
+      }),
       await listen<string>("acp-stderr", ({ payload }) => {
         this.diagnostics.push(payload);
         this.diagnostics = this.diagnostics.slice(-20);
@@ -1312,6 +1325,7 @@ export class AcpBridge implements GrokBridge {
       reasoningEffort: storedEffort(),
     });
     this.acpGeneration = connection.generation;
+    await this.syncHostInteractions();
     this.captureModelState(connection.initialize);
     this.captureRuntimeCommands(connection.initialize);
     this.authMethodId = connection.auth.methodId;
@@ -1337,7 +1351,6 @@ export class AcpBridge implements GrokBridge {
     this.emit({ type: "runtime_state", state: "starting" });
     this.flushStreamAppends();
     this.flushToolPatches();
-    this.interactions.clear();
     this.cursors.clear();
     this.openToolCalls.clear();
     this.sessionOptions.clear();
@@ -1402,7 +1415,10 @@ export class AcpBridge implements GrokBridge {
   }
 
   private onExit(payload: ExitPayload) {
-    if (payload.reason === "killed") return;
+    if (payload.reason === "killed") {
+      this.reconcileHostInteractions([]);
+      return;
+    }
     this.flushStreamAppends();
     this.flushToolPatches();
     const diagnostic = this.diagnostics
@@ -1426,24 +1442,7 @@ export class AcpBridge implements GrokBridge {
     for (const sessionId of affected) {
       this.emit({ type: "status", sessionId, status: "disconnected" });
     }
-    for (const interaction of this.interactions.values()) {
-      if (interaction.kind === "question") {
-        this.emit({
-          type: "question_resolved",
-          sessionId: interaction.sessionId,
-          blockId: interaction.blockId,
-          response: { outcome: "cancelled" },
-        });
-      } else {
-        this.emit({
-          type: "permission_resolved",
-          sessionId: interaction.sessionId,
-          blockId: interaction.blockId,
-          option: "deny",
-        });
-      }
-    }
-    this.interactions.clear();
+    this.reconcileHostInteractions([]);
     this.knownSessions.clear();
     this.loadPromises.clear();
     this.cursors.clear();
@@ -1560,16 +1559,23 @@ export class AcpBridge implements GrokBridge {
       void this.handleFileSystemRequest(message);
       return;
     }
-    if (message.method === ACP_METHODS.requestPermission) {
-      this.handlePermission(message.id!, message.params);
-      return;
-    }
-    if (message.method === "x.ai/exit_plan_mode") {
-      this.handlePlanApproval(message.id!, message.params);
-      return;
-    }
-    if (message.method === "x.ai/ask_user_question") {
-      this.handleQuestion(message.id!, message.params);
+    if (
+      message.method === ACP_METHODS.requestPermission
+      || message.method === "x.ai/exit_plan_mode"
+      || message.method === "x.ai/ask_user_question"
+    ) {
+      this.emit({
+        type: "runtime_notice",
+        notice: runtimeNoticeFromError({
+          domain: "protocol",
+          code: "INTERACTION_HOST_BYPASSED",
+          message: "收到未由 Host 登记的交互请求",
+          recoverable: true,
+          fatal: false,
+          holdQueue: true,
+          action: "重新连接 Agent；不要在当前页面重复批准",
+        }),
+      });
       return;
     }
     void this.sendRaw({
@@ -2209,7 +2215,7 @@ export class AcpBridge implements GrokBridge {
   }
 
   private sessionGateStatus(sessionId: string): SessionStatus | null {
-    for (const interaction of this.interactions.values()) {
+    for (const interaction of this.hostInteractions.values()) {
       if (interaction.sessionId !== sessionId) continue;
       return interaction.kind === "question" ? "awaiting_input" : "awaiting_permission";
     }
@@ -2231,61 +2237,99 @@ export class AcpBridge implements GrokBridge {
     this.emit({ type: "usage", sessionId, usage: next });
   }
 
-  private handlePermission(rpcId: RpcId, paramsValue: unknown) {
-    const params = record(paramsValue) ?? {};
-    const tool = record(params.toolCall) ?? {};
-    const sessionId = string(params.sessionId);
-    if (!sessionId) {
-      void this.sendRaw({
-        jsonrpc: "2.0",
-        id: rpcId,
-        result: { outcome: { outcome: "cancelled" } },
-      });
-      return;
+  private async syncHostInteractions(): Promise<void> {
+    const interactions = await invoke<HostInteractionProjection[]>("interaction_status");
+    this.reconcileHostInteractions(interactions);
+  }
+
+  private reconcileHostInteractions(interactions: HostInteractionProjection[]): void {
+    const currentIds = new Set(interactions.map((interaction) => interaction.blockId));
+    for (const interaction of [...this.hostInteractions.values()]) {
+      if (!currentIds.has(interaction.blockId)) {
+        this.closeHostInteraction({ ...interaction, reason: "cancelled" });
+      }
     }
+    for (const interaction of interactions) this.projectHostInteraction(interaction);
+  }
+
+  private projectHostInteraction(interaction: HostInteractionProjection): void {
+    if (
+      !interaction.blockId
+      || !interaction.sessionId
+      || this.hostInteractions.has(interaction.blockId)
+    ) return;
+    this.hostInteractions.set(interaction.blockId, interaction);
+    this.emitHostInteraction(interaction);
+  }
+
+  private emitHostInteraction(interaction: HostInteractionProjection): void {
+    switch (interaction.kind) {
+      case "permission":
+        this.handlePermission(interaction);
+        break;
+      case "plan":
+        this.handlePlanApproval(interaction);
+        break;
+      case "question":
+        this.handleQuestion(interaction);
+        break;
+    }
+  }
+
+  private closeHostInteraction(interaction: HostInteractionClosed): void {
+    const pending = this.hostInteractions.get(interaction.blockId);
+    if (!pending || pending.sessionId !== interaction.sessionId) return;
+    this.hostInteractions.delete(interaction.blockId);
+    this.resolvingInteractions.delete(interaction.blockId);
+    if (pending.kind === "question") {
+      this.emit({
+        type: "question_resolved",
+        sessionId: pending.sessionId,
+        blockId: pending.blockId,
+        response: { outcome: "cancelled" },
+      });
+    } else {
+      this.emit({
+        type: "permission_resolved",
+        sessionId: pending.sessionId,
+        blockId: pending.blockId,
+        option: "deny",
+      });
+    }
+  }
+
+  private handlePermission(interaction: HostInteractionProjection) {
+    const params = record(interaction.params) ?? {};
+    const tool = record(params.toolCall) ?? {};
+    const { sessionId, blockId } = interaction;
     const toolCallId = string(tool.toolCallId) ?? string(params.toolCallId) ?? uid();
-    const blockId = `permission-${toolCallId}`;
-    const optionIds: PendingInteraction["optionIds"] = {};
+    const optionKinds = new Set<PermissionOption>();
     for (const rawOption of array(params.options)) {
       const option = record(rawOption) ?? {};
-      const optionId = string(option.optionId);
-      if (!optionId) continue;
-      switch ((string(option.kind) ?? string(option.name) ?? "").toLowerCase()) {
+      const optionKind = (string(option.kind) ?? string(option.name) ?? "").toLowerCase();
+      switch (optionKind) {
         case "allow_once":
-          optionIds.allow_once = optionId;
+          optionKinds.add("allow_once");
           break;
         case "allow_always":
-          optionIds.allow_always = optionId;
+          optionKinds.add("allow_always");
           break;
         case "reject_once":
         case "reject_always":
         case "deny":
-          optionIds.deny ??= optionId;
-          break;
-        default:
-          // Unknown kind from a newer/mismatched agent build: fall back to
-          // the option id so the card never collapses to a deny-only choice.
-          if (/allow/.test(optionId)) optionIds.allow_once ??= optionId;
-          else if (/reject|deny/.test(optionId)) optionIds.deny ??= optionId;
+          optionKinds.add("deny");
           break;
       }
     }
     const options = (["allow_once", "allow_always", "deny"] as PermissionOption[]).filter(
-      (option) => optionIds[option] !== undefined || option === "deny",
+      (option) => optionKinds.has(option) || option === "deny",
     );
-    this.interactions.set(blockId, {
-      rpcId,
-      sessionId,
-      blockId,
-      kind: "permission",
-      optionIds,
-    });
     this.emit({
       type: "permission_request",
       sessionId,
       blockId,
       req: {
-        id: String(rpcId),
+        id: blockId,
         toolCallId,
         title: string(tool.title) ?? "Tool approval",
         description: string(tool.kind) ?? "Grok requests permission to continue.",
@@ -2296,28 +2340,16 @@ export class AcpBridge implements GrokBridge {
     });
   }
 
-  private handlePlanApproval(rpcId: RpcId, paramsValue: unknown) {
-    const params = record(paramsValue) ?? {};
-    const sessionId = string(params.sessionId);
-    if (!sessionId) {
-      void this.sendRaw({ jsonrpc: "2.0", id: rpcId, result: { outcome: "abandoned" } });
-      return;
-    }
+  private handlePlanApproval(interaction: HostInteractionProjection) {
+    const params = record(interaction.params) ?? {};
+    const { sessionId, blockId } = interaction;
     const toolCallId = string(params.toolCallId) ?? uid();
-    const blockId = `plan-approval-${toolCallId}`;
-    this.interactions.set(blockId, {
-      rpcId,
-      sessionId,
-      blockId,
-      kind: "plan",
-      optionIds: {},
-    });
     this.emit({
       type: "permission_request",
       sessionId,
       blockId,
       req: {
-        id: String(rpcId),
+        id: blockId,
         toolCallId,
         title: "Approve execution plan",
         description: "Grok has finished planning and is waiting to enter agent mode.",
@@ -2328,9 +2360,9 @@ export class AcpBridge implements GrokBridge {
     });
   }
 
-  private handleQuestion(rpcId: RpcId, paramsValue: unknown) {
-    const params = record(paramsValue) ?? {};
-    const sessionId = string(params.sessionId);
+  private handleQuestion(interaction: HostInteractionProjection) {
+    const params = record(interaction.params) ?? {};
+    const { sessionId, blockId } = interaction;
     const toolCallId = string(params.toolCallId) ?? uid();
     const questions: QuestionItem[] = [];
     for (const value of array(params.questions)) {
@@ -2356,26 +2388,13 @@ export class AcpBridge implements GrokBridge {
       });
     }
 
-    if (!sessionId || questions.length === 0) {
-      void this.sendRaw({ jsonrpc: "2.0", id: rpcId, result: { outcome: "cancelled" } });
-      return;
-    }
-
-    const blockId = `question-${toolCallId}`;
-    this.interactions.set(blockId, {
-      rpcId,
-      sessionId,
-      blockId,
-      kind: "question",
-      optionIds: {},
-      questions,
-    });
+    if (questions.length === 0) return;
     this.emit({
       type: "question_request",
       sessionId,
       blockId,
       req: {
-        id: String(rpcId),
+        id: blockId,
         toolCallId,
         questions,
         mode: string(params.mode) === "plan" ? "plan" : "default",
@@ -2982,6 +3001,14 @@ export class AcpBridge implements GrokBridge {
       // (resume after shell upgrade / effort change must not reuse dead options).
       this.sessionOptions.delete(id);
       this.emit({ type: "session_ready", session: finalized, background });
+      const visibleBlocks = new Set(finalized.blocks.map((block) => block.id));
+      for (const interaction of this.hostInteractions.values()) {
+        if (interaction.sessionId === id && !visibleBlocks.has(interaction.blockId)) {
+          // interaction_status 可能早于 session/load 完成；会话实体就绪后
+          // 重新投影卡片，但仍不恢复或暴露任何 rpc id。
+          this.emitHostInteraction(interaction);
+        }
+      }
       this.emit({ type: "available_commands", sessionId: id, commands: this.runtimeCommands });
       // Restored workflow actors emit a current snapshot, but older CLI
       // versions may have written the detailed updates only to JSONL. Read
@@ -3321,21 +3348,17 @@ export class AcpBridge implements GrokBridge {
   cancel(sessionId: string, userInitiated = true): void {
     if (userInitiated) this.stoppingSessions.add(sessionId);
     this.emit({ type: "status", sessionId, status: "stopping" });
-    for (const [blockId, interaction] of this.interactions) {
-      if (interaction.sessionId !== sessionId) continue;
-      this.interactions.delete(blockId);
-      const result =
-        interaction.kind === "permission"
-          ? { outcome: { outcome: "cancelled" } }
-          : { outcome: "cancelled" };
-      void this.sendRaw({ jsonrpc: "2.0", id: interaction.rpcId, result });
-    }
     void invoke<boolean>("cancel_foreground_turn", {
       sessionId,
       turnId: this.foregroundTurnIds.get(sessionId),
       generation: this.acpGeneration,
       reason: userInitiated ? "用户已停止当前回合" : "Host watchdog 已停止当前回合",
       kind: userInitiated ? "user" : "watchdog",
+    }).then(() => {
+      void this.syncHostInteractions().catch((error) => {
+        this.diagnostics.push(`交互门控快照刷新失败：${errorText(error)}`);
+        this.diagnostics = this.diagnostics.slice(-20);
+      });
     }).catch((error) => {
       const code = string(record(error)?.code);
       if (code === "ACP_CHANNEL_REPLACED" || code === "ACP_RUNTIME_NOT_READY") return;
@@ -3403,23 +3426,25 @@ export class AcpBridge implements GrokBridge {
   }
 
   respondPermission(sessionId: string, blockId: string, option: PermissionOption, feedback?: string): void {
-    const pending = this.interactions.get(blockId);
-    if (!pending || pending.sessionId !== sessionId) return;
-    this.interactions.delete(blockId);
-
-    let result: unknown;
-    if (pending.kind === "plan") {
-      result = {
-        outcome: option === "deny" ? "cancelled" : "approved",
-        ...(option === "deny" && feedback?.trim() ? { feedback: feedback.trim() } : {}),
-      };
-    } else {
-      const optionId = pending.optionIds[option];
-      result = optionId
-        ? { outcome: { outcome: "selected", optionId } }
-        : { outcome: { outcome: "cancelled" } };
-    }
-    void this.sendRaw({ jsonrpc: "2.0", id: pending.rpcId, result }).catch((error) => {
+    const pending = this.hostInteractions.get(blockId);
+    if (
+      !pending
+      || pending.sessionId !== sessionId
+      || pending.kind === "question"
+      || this.resolvingInteractions.has(blockId)
+    ) return;
+    this.resolvingInteractions.add(blockId);
+    void invoke("resolve_interaction", {
+      sessionId,
+      blockId,
+      decision: { option, ...(feedback?.trim() ? { feedback: feedback.trim() } : {}) },
+    }).then(() => {
+      if (this.hostInteractions.get(blockId)?.sessionId !== sessionId) return;
+      this.hostInteractions.delete(blockId);
+      this.resolvingInteractions.delete(blockId);
+      this.emit({ type: "permission_resolved", sessionId, blockId, option });
+    }).catch((error) => {
+      this.resolvingInteractions.delete(blockId);
       this.emitError(sessionId, error, {
         domain: "operation",
         code: "PERMISSION_RESPONSE_FAILED",
@@ -3430,37 +3455,28 @@ export class AcpBridge implements GrokBridge {
         action: "重新打开会话；失效的批准不会发送到其它会话",
       });
     });
-    this.emit({ type: "permission_resolved", sessionId, blockId, option });
   }
 
   respondQuestion(sessionId: string, blockId: string, response: QuestionResponse): void {
-    const pending = this.interactions.get(blockId);
-    if (!pending || pending.sessionId !== sessionId || pending.kind !== "question") return;
-    this.interactions.delete(blockId);
-
-    let result: unknown;
-    if (response.outcome === "accepted") {
-      const annotations: Record<string, { preview?: string; notes?: string }> = {};
-      for (const question of pending.questions ?? []) {
-        const selected = response.answers[question.question] ?? [];
-        const preview = question.multiSelect
-          ? undefined
-          : question.options.find((option) => option.label === selected[0])?.preview;
-        const notes = response.notes[question.question]?.trim() || undefined;
-        if (preview || notes) annotations[question.question] = { preview, notes };
-      }
-      result = {
-        outcome: "accepted",
-        answers: response.answers,
-        ...(Object.keys(annotations).length > 0 ? { annotations } : {}),
-      };
-    } else if (response.outcome === "cancelled") {
-      result = { outcome: "cancelled" };
-    } else {
-      result = { outcome: response.outcome, partial_answers: response.partialAnswers };
-    }
-
-    void this.sendRaw({ jsonrpc: "2.0", id: pending.rpcId, result }).catch((error) => {
+    const pending = this.hostInteractions.get(blockId);
+    if (
+      !pending
+      || pending.sessionId !== sessionId
+      || pending.kind !== "question"
+      || this.resolvingInteractions.has(blockId)
+    ) return;
+    this.resolvingInteractions.add(blockId);
+    void invoke("resolve_interaction", {
+      sessionId,
+      blockId,
+      decision: response,
+    }).then(() => {
+      if (this.hostInteractions.get(blockId)?.sessionId !== sessionId) return;
+      this.hostInteractions.delete(blockId);
+      this.resolvingInteractions.delete(blockId);
+      this.emit({ type: "question_resolved", sessionId, blockId, response });
+    }).catch((error) => {
+      this.resolvingInteractions.delete(blockId);
       this.emitError(sessionId, error, {
         domain: "operation",
         code: "QUESTION_RESPONSE_FAILED",
@@ -3471,7 +3487,6 @@ export class AcpBridge implements GrokBridge {
         action: "重新打开会话；回答不会发送到其它会话",
       });
     });
-    this.emit({ type: "question_resolved", sessionId, blockId, response });
   }
 
   async renameSession(id: string, title: string): Promise<void> {
