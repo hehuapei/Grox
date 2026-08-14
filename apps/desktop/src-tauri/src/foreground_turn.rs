@@ -20,13 +20,17 @@ use crate::{
     acp_host::AcpHostError,
     ensure_main_acp_owner, host_prefs,
     mcp_leases::McpLeaseStore,
-    prepare_acp_line, request_acp_json_tracked,
+    prepare_acp_line,
+    prompt_queue_store::{
+        PromptQueueClaim, PromptQueueClaimError, PromptQueueSettlement, PromptQueueStore,
+    },
+    request_acp_json_tracked,
     turn_runtime::{
         bind_mode, bind_model, effort_fallback_chain, invalid_reasoning_effort_message,
         is_invalid_reasoning_effort, normalize_effort, normalize_mode,
         prompt_result_invalid_effort, AcpRequestTracker,
     },
-    write_acp_line, AcpState, UPSTREAM_CLI_CLIENT_NAME,
+    write_acp_line, AcpState, PROMPT_QUEUES_MAX_BYTES, UPSTREAM_CLI_CLIENT_NAME,
 };
 
 const WATCHDOG_POLL_MS: u64 = 15_000;
@@ -44,6 +48,7 @@ pub(crate) struct ForegroundTurnRequest {
     model: String,
     effort: String,
     mode: String,
+    queue_item_id: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,6 +79,23 @@ pub(crate) struct ForegroundTurnSnapshot {
 struct ForegroundTurnStalled {
     session_id: String,
     silent_for_ms: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PromptQueueChanged {
+    session_id: String,
+    item_id: String,
+    queue: Vec<Value>,
+    reason: &'static str,
+}
+
+struct PreparedForegroundTurn {
+    prompt: Value,
+    model: String,
+    requested_effort: String,
+    mode: &'static str,
+    permission_mode: Option<String>,
 }
 
 struct ActiveTurn {
@@ -457,55 +479,142 @@ pub(crate) async fn execute_foreground_turn(
     window: WebviewWindow,
     state: tauri::State<'_, Arc<AcpState>>,
     leases: tauri::State<'_, Arc<McpLeaseStore>>,
+    queues: tauri::State<'_, PromptQueueStore>,
     request: ForegroundTurnRequest,
 ) -> Result<ForegroundTurnResult, AcpHostError> {
     ensure_main_acp_owner(window.label())
         .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
     let session_id = checked_short_string(&request.session_id, "sessionId", 512)?;
     let turn_id = checked_short_string(&request.turn_id, "turnId", 128)?;
-    let model = checked_short_string(&request.model, "model", 512)?;
-    let requested_effort = normalize_effort(&request.effort)
-        .ok_or_else(|| AcpHostError::operation("SESSION_EFFORT_INVALID", "推理强度无效"))?
-        .to_string();
-    let mode = normalize_mode(&request.mode)
-        .ok_or_else(|| AcpHostError::operation("SESSION_MODE_INVALID", "会话模式无效"))?;
-    let prompt = prepare_prompt_content(request.prompt)?;
     ensure_ready_generation(state.inner(), request.generation).await?;
 
-    let permit = state
-        .sessions
-        .acquire_turn(session_id.clone(), request.generation)
-        .await?;
-    let turn = state
-        .foreground_turns
-        .begin(session_id.clone(), turn_id, request.generation)?;
-    let gate_token = permit.token();
-
-    let mut effective_effort = bind_model(
+    let queue_path = request
+        .queue_item_id
+        .as_ref()
+        .map(|_| crate::prompt_queues_path(&app))
+        .transpose()
+        .map_err(prompt_queue_storage_error)?;
+    let queue_claim = match (request.queue_item_id.as_deref(), queue_path.as_ref()) {
+        (Some(item_id), Some(path)) => {
+            let item_id = checked_short_string(item_id, "queueItemId", 512)?;
+            let claim = queues
+                .claim(
+                    path,
+                    &session_id,
+                    &item_id,
+                    request.generation,
+                    PROMPT_QUEUES_MAX_BYTES,
+                )
+                .map_err(prompt_queue_claim_error)?;
+            emit_prompt_queue_changed(&window, &claim, claim.queue.clone(), "claimed");
+            Some(claim)
+        }
+        _ => None,
+    };
+    let prepared = match queue_claim.as_ref() {
+        Some(claim) => prepare_queued_turn(&claim.entry),
+        None => prepare_requested_turn(
+            request.prompt,
+            &request.model,
+            &request.effort,
+            &request.mode,
+        ),
+    };
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            if let (Some(path), Some(claim)) = (queue_path.as_ref(), queue_claim.as_ref()) {
+                if let Ok(queue) = queues.settle(
+                    path,
+                    claim,
+                    PromptQueueSettlement::Retry,
+                    PROMPT_QUEUES_MAX_BYTES,
+                ) {
+                    emit_prompt_queue_changed(&window, claim, queue, "recovered");
+                }
+            }
+            return Err(error);
+        }
+    };
+    let result = execute_prepared_foreground_turn(
+        &app,
         state.inner(),
         leases.inner(),
         &session_id,
-        &model,
-        &requested_effort,
+        turn_id,
         request.generation,
+        prepared,
+    )
+    .await;
+
+    if let (Some(path), Some(claim)) = (queue_path.as_ref(), queue_claim.as_ref()) {
+        let settlement = queue_settlement_for_result(&result);
+        let queue = queues
+            .settle(path, claim, settlement, PROMPT_QUEUES_MAX_BYTES)
+            .map_err(prompt_queue_settlement_error)?;
+        emit_prompt_queue_changed(
+            &window,
+            claim,
+            queue,
+            if settlement == PromptQueueSettlement::Consumed {
+                "consumed"
+            } else {
+                "recovered"
+            },
+        );
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn execute_prepared_foreground_turn(
+    app: &tauri::AppHandle,
+    state: &AcpState,
+    leases: &McpLeaseStore,
+    session_id: &str,
+    turn_id: String,
+    generation: u64,
+    prepared: PreparedForegroundTurn,
+) -> Result<ForegroundTurnResult, AcpHostError> {
+    let permit = state
+        .sessions
+        .acquire_turn(session_id.to_string(), generation)
+        .await?;
+    let turn = state
+        .foreground_turns
+        .begin(session_id.to_string(), turn_id, generation)?;
+    let gate_token = permit.token();
+
+    let mut effective_effort = bind_model(
+        state,
+        leases,
+        session_id,
+        &prepared.model,
+        &prepared.requested_effort,
+        generation,
         gate_token,
         Some(&turn),
     )
     .await?;
     bind_mode(
-        state.inner(),
-        leases.inner(),
-        &session_id,
-        mode,
-        request.generation,
+        state,
+        leases,
+        session_id,
+        prepared.mode,
+        generation,
         gate_token,
         Some(&turn),
     )
     .await?;
 
-    let prefs = host_prefs::load_prefs(&crate::host_prefs_dir_for_app(&app));
-    let permission_mode =
+    let prefs = host_prefs::load_prefs(&crate::host_prefs_dir_for_app(app));
+    let host_permission_mode =
         host_prefs::normalize_permission_mode(&prefs.permission_mode).unwrap_or("auto");
+    let permission_mode = prepared
+        .permission_mode
+        .as_deref()
+        .map(|requested| restrict_permission_mode(host_permission_mode, requested))
+        .unwrap_or(host_permission_mode);
     let absolute_hours = prefs
         .prompt_absolute_hours
         .map(u64::from)
@@ -516,15 +625,15 @@ pub(crate) async fn execute_foreground_turn(
     let mut attempted = BTreeSet::new();
     attempted.insert(effective_effort.clone());
     let mut response = prompt_once(
-        &app,
-        state.inner(),
-        leases.inner(),
+        app,
+        state,
+        leases,
         &turn,
-        &session_id,
-        prompt.clone(),
+        session_id,
+        prepared.prompt.clone(),
         &effective_effort,
         permission_mode,
-        request.generation,
+        generation,
         gate_token,
         absolute_ms,
     )
@@ -546,14 +655,14 @@ pub(crate) async fn execute_foreground_turn(
                 "当前模型或 API 拒绝了推理强度",
             )
         }));
-        for candidate in effort_fallback_chain(&requested_effort) {
+        for candidate in effort_fallback_chain(&prepared.requested_effort) {
             let bound = bind_model(
-                state.inner(),
-                leases.inner(),
-                &session_id,
-                &model,
+                state,
+                leases,
+                session_id,
+                &prepared.model,
                 candidate,
-                request.generation,
+                generation,
                 gate_token,
                 Some(&turn),
             )
@@ -563,15 +672,15 @@ pub(crate) async fn execute_foreground_turn(
             }
             effective_effort = bound;
             match prompt_once(
-                &app,
-                state.inner(),
-                leases.inner(),
+                app,
+                state,
+                leases,
                 &turn,
-                &session_id,
-                prompt.clone(),
+                session_id,
+                prepared.prompt.clone(),
                 &effective_effort,
                 permission_mode,
-                request.generation,
+                generation,
                 gate_token,
                 absolute_ms,
             )
@@ -598,9 +707,238 @@ pub(crate) async fn execute_foreground_turn(
     turn.ensure_active()?;
     Ok(ForegroundTurnResult {
         response,
-        requested_effort,
+        requested_effort: prepared.requested_effort,
         effective_effort,
     })
+}
+
+fn prepare_requested_turn(
+    prompt: Value,
+    model: &str,
+    effort: &str,
+    mode: &str,
+) -> Result<PreparedForegroundTurn, AcpHostError> {
+    Ok(PreparedForegroundTurn {
+        prompt: prepare_prompt_content(prompt)?,
+        model: checked_short_string(model, "model", 512)?,
+        requested_effort: normalize_effort(effort)
+            .ok_or_else(|| AcpHostError::operation("SESSION_EFFORT_INVALID", "推理强度无效"))?
+            .to_string(),
+        mode: normalize_mode(mode)
+            .ok_or_else(|| AcpHostError::operation("SESSION_MODE_INVALID", "会话模式无效"))?,
+        permission_mode: None,
+    })
+}
+
+fn prepare_queued_turn(entry: &Value) -> Result<PreparedForegroundTurn, AcpHostError> {
+    let entry = entry.as_object().ok_or_else(prompt_queue_invalid)?;
+    let model = queue_string(entry, "model")?;
+    let effort = queue_string(entry, "effort")?;
+    let mode = queue_string(entry, "mode")?;
+    let permission_mode = queue_string(entry, "permissionMode")?;
+    if !matches!(permission_mode, "default" | "auto" | "bypass") {
+        return Err(prompt_queue_invalid());
+    }
+    Ok(PreparedForegroundTurn {
+        prompt: prepare_prompt_content(queue_prompt_content(entry)?)?,
+        model: checked_short_string(model, "model", 512)?,
+        requested_effort: normalize_effort(effort)
+            .ok_or_else(prompt_queue_invalid)?
+            .to_string(),
+        mode: normalize_mode(mode).ok_or_else(prompt_queue_invalid)?,
+        permission_mode: Some(permission_mode.to_string()),
+    })
+}
+
+fn queue_prompt_content(entry: &serde_json::Map<String, Value>) -> Result<Value, AcpHostError> {
+    let text = entry
+        .get("text")
+        .and_then(Value::as_str)
+        .ok_or_else(prompt_queue_invalid)?;
+    let attachments = entry
+        .get("attachments")
+        .and_then(Value::as_array)
+        .ok_or_else(prompt_queue_invalid)?;
+    let mut blocks = vec![json!({ "type": "text", "text": text })];
+    for attachment in attachments {
+        let attachment = attachment.as_object().ok_or_else(prompt_queue_invalid)?;
+        let kind = queue_string(attachment, "kind")?;
+        let mime = queue_string(attachment, "mime")?;
+        let name = queue_string(attachment, "name")?;
+        let safe_name = name
+            .chars()
+            .map(|ch| {
+                if matches!(ch, '\\' | '/' | '#' | '?') {
+                    '_'
+                } else {
+                    ch
+                }
+            })
+            .collect::<String>();
+        let uri = format!(
+            "file://{}",
+            if safe_name.is_empty() {
+                "attachment"
+            } else {
+                &safe_name
+            }
+        );
+        match kind {
+            "image" => {
+                if let Some(data) = attachment.get("data").and_then(Value::as_str) {
+                    blocks.push(json!({
+                        "type": "image",
+                        "data": data,
+                        "mimeType": mime,
+                        "uri": uri,
+                    }));
+                }
+            }
+            "text" => {
+                if let Some(text) = attachment.get("text").and_then(Value::as_str) {
+                    blocks.push(json!({
+                        "type": "resource",
+                        "resource": { "uri": uri, "mimeType": mime, "text": text },
+                    }));
+                }
+            }
+            "binary" => {
+                if let Some(data) = attachment.get("data").and_then(Value::as_str) {
+                    blocks.push(json!({
+                        "type": "resource",
+                        "resource": { "uri": uri, "mimeType": mime, "blob": data },
+                    }));
+                }
+            }
+            _ => return Err(prompt_queue_invalid()),
+        }
+    }
+    Ok(Value::Array(blocks))
+}
+
+fn queue_string<'a>(
+    entry: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<&'a str, AcpHostError> {
+    entry
+        .get(key)
+        .and_then(Value::as_str)
+        .ok_or_else(prompt_queue_invalid)
+}
+
+fn restrict_permission_mode(host: &str, requested: &str) -> &'static str {
+    let level = |mode| match mode {
+        "bypass" => 2,
+        "auto" => 1,
+        _ => 0,
+    };
+    match level(host).min(level(requested)) {
+        2 => "bypass",
+        1 => "auto",
+        _ => "default",
+    }
+}
+
+fn emit_prompt_queue_changed(
+    window: &WebviewWindow,
+    claim: &PromptQueueClaim,
+    queue: Vec<Value>,
+    reason: &'static str,
+) {
+    let _ = window.emit(
+        "prompt-queue-changed",
+        PromptQueueChanged {
+            session_id: claim.session_id.clone(),
+            item_id: claim.item_id.clone(),
+            queue,
+            reason,
+        },
+    );
+}
+
+fn prompt_queue_invalid() -> AcpHostError {
+    AcpHostError::environment(
+        "PROMPT_QUEUE_INVALID",
+        "Host 无法读取已领取的提示队列条目",
+        false,
+        true,
+        "检查队列内容和附件后，确认并继续",
+    )
+}
+
+fn prompt_queue_storage_error(message: String) -> AcpHostError {
+    AcpHostError::environment(
+        "PROMPT_QUEUE_STORAGE_FAILED",
+        message,
+        false,
+        true,
+        "检查应用数据目录的磁盘空间和文件权限",
+    )
+}
+
+fn prompt_queue_claim_error(error: PromptQueueClaimError) -> AcpHostError {
+    match error {
+        PromptQueueClaimError::Busy => AcpHostError {
+            domain: "operation",
+            code: "PROMPT_QUEUE_CLAIM_BUSY",
+            message: "该会话已有 Host 正在派发的队列提示".into(),
+            recoverable: true,
+            fatal: false,
+            hold_queue: true,
+            action: Some("等待当前回合结束；若运行时已退出，请确认最后一轮后恢复队列"),
+        },
+        PromptQueueClaimError::Stale => AcpHostError {
+            domain: "operation",
+            code: "PROMPT_QUEUE_CLAIM_STALE",
+            message: "队列顺序已变化，Host 拒绝发送过期条目".into(),
+            recoverable: true,
+            fatal: false,
+            hold_queue: true,
+            action: Some("核对最新队列后，确认并继续"),
+        },
+        PromptQueueClaimError::Invalid(message) => AcpHostError::environment(
+            "PROMPT_QUEUE_INVALID",
+            message,
+            false,
+            true,
+            "检查队列内容和附件后，确认并继续",
+        ),
+        PromptQueueClaimError::Storage(message) => prompt_queue_storage_error(message),
+    }
+}
+
+fn prompt_queue_settlement_error(error: PromptQueueClaimError) -> AcpHostError {
+    let detail = match error {
+        PromptQueueClaimError::Busy => "队列认领仍被占用".into(),
+        PromptQueueClaimError::Stale => "队列认领已失效".into(),
+        PromptQueueClaimError::Invalid(message) | PromptQueueClaimError::Storage(message) => {
+            message
+        }
+    };
+    AcpHostError::environment(
+        "PROMPT_QUEUE_SETTLE_FAILED",
+        format!("回合已经结束，但提示队列未能结算：{detail}"),
+        true,
+        true,
+        "不要直接重发；先检查最后一轮和应用数据目录，再清理或恢复队列",
+    )
+}
+
+fn queue_settlement_for_result(
+    result: &Result<ForegroundTurnResult, AcpHostError>,
+) -> PromptQueueSettlement {
+    if result.is_ok()
+        || result
+            .as_ref()
+            .err()
+            .is_some_and(|error| error.code == "SESSION_PROMPT_CANCELLED")
+    {
+        PromptQueueSettlement::Consumed
+    } else {
+        // 通道替换、供应商切换、协议失败和环境退出都无法证明 Agent 未执行，
+        // 因此保留原条目并由前端的 holdQueue 门禁等待人工确认。
+        PromptQueueSettlement::Retry
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1080,5 +1418,75 @@ mod tests {
             r#"/workflow grox-deep-research {"query":"evidence"}"#
         );
         assert_eq!(prompt[1]["data"], "abc");
+    }
+
+    #[test]
+    fn queued_turn_is_built_from_the_persisted_entry() {
+        let prepared = prepare_queued_turn(&json!({
+            "id": "q1",
+            "text": "queued truth",
+            "attachments": [
+                {
+                    "id": "a1",
+                    "kind": "text",
+                    "name": "a/b.txt",
+                    "mime": "text/plain",
+                    "size": 4,
+                    "text": "body"
+                }
+            ],
+            "model": "grok-build",
+            "effort": "high",
+            "mode": "plan",
+            "permissionMode": "bypass",
+            "createdAt": 1
+        }))
+        .unwrap();
+
+        assert_eq!(prepared.prompt[0]["text"], "queued truth");
+        assert_eq!(prepared.prompt[1]["resource"]["uri"], "file://a_b.txt");
+        assert_eq!(prepared.model, "grok-build");
+        assert_eq!(prepared.mode, "plan");
+        assert_eq!(prepared.permission_mode.as_deref(), Some("bypass"));
+    }
+
+    #[test]
+    fn queued_permission_can_only_reduce_current_host_authority() {
+        assert_eq!(restrict_permission_mode("default", "bypass"), "default");
+        assert_eq!(restrict_permission_mode("auto", "bypass"), "auto");
+        assert_eq!(restrict_permission_mode("bypass", "default"), "default");
+        assert_eq!(restrict_permission_mode("bypass", "auto"), "auto");
+        assert_eq!(restrict_permission_mode("bypass", "bypass"), "bypass");
+    }
+
+    #[test]
+    fn queue_consumes_only_success_or_explicit_user_cancel() {
+        let success = Ok(ForegroundTurnResult {
+            response: json!({}),
+            requested_effort: "high".into(),
+            effective_effort: "high".into(),
+        });
+        assert_eq!(
+            queue_settlement_for_result(&success),
+            PromptQueueSettlement::Consumed
+        );
+        let cancelled = Err(AcpHostError::operation(
+            "SESSION_PROMPT_CANCELLED",
+            "用户停止",
+        ));
+        assert_eq!(
+            queue_settlement_for_result(&cancelled),
+            PromptQueueSettlement::Consumed
+        );
+        let provider_switch = Err(channel_replaced());
+        assert_eq!(
+            queue_settlement_for_result(&provider_switch),
+            PromptQueueSettlement::Retry
+        );
+        let protocol = Err(AcpHostError::protocol("ACP_RESPONSE_INVALID", "bad"));
+        assert_eq!(
+            queue_settlement_for_result(&protocol),
+            PromptQueueSettlement::Retry
+        );
     }
 }

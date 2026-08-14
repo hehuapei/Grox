@@ -452,20 +452,21 @@ export function Composer() {
                     <input
                       value={item.text}
                       onChange={(event) => activeId && updateQueuedPrompt(activeId, item.id, event.target.value)}
+                      disabled={item.state === "sending"}
                       placeholder={item.attachments.length > 0 ? (language === "zh-CN" ? "图片消息" : "Image prompt") : undefined}
                       className="min-w-0 flex-1 bg-transparent text-[10.5px] text-fg2 outline-none placeholder:text-faint"
                     />
-                    <button disabled={index === 0} onClick={() => activeId && moveQueuedPrompt(activeId, item.id, -1)} className="text-faint enabled:hover:text-fg disabled:opacity-25" title={language === "zh-CN" ? "上移" : "Move up"}><Icon name="arrowUp" size={9} /></button>
-                    <button disabled={index === queue.length - 1} onClick={() => activeId && moveQueuedPrompt(activeId, item.id, 1)} className="rotate-180 text-faint enabled:hover:text-fg disabled:opacity-25" title={language === "zh-CN" ? "下移" : "Move down"}><Icon name="arrowUp" size={9} /></button>
-                    <button onClick={() => activeId && removeQueuedPrompt(activeId, item.id)} className="text-faint hover:text-red" title={language === "zh-CN" ? "移出队列" : "Remove from queue"}>
+                    <button disabled={item.state === "sending" || queue[index - 1]?.state === "sending" || index === 0} onClick={() => activeId && moveQueuedPrompt(activeId, item.id, -1)} className="text-faint enabled:hover:text-fg disabled:opacity-25" title={language === "zh-CN" ? "上移" : "Move up"}><Icon name="arrowUp" size={9} /></button>
+                    <button disabled={item.state === "sending" || queue[index + 1]?.state === "sending" || index === queue.length - 1} onClick={() => activeId && moveQueuedPrompt(activeId, item.id, 1)} className="rotate-180 text-faint enabled:hover:text-fg disabled:opacity-25" title={language === "zh-CN" ? "下移" : "Move down"}><Icon name="arrowUp" size={9} /></button>
+                    <button disabled={item.state === "sending"} onClick={() => activeId && removeQueuedPrompt(activeId, item.id)} className="text-faint enabled:hover:text-red disabled:opacity-25" title={language === "zh-CN" ? "移出队列" : "Remove from queue"}>
                       <Icon name="x" size={9} />
                     </button>
                     </div>
                     {item.attachments.length > 0 && <div className="mt-1 flex flex-wrap gap-1">{item.attachments.map((attachment, attachmentIndex) => (
                       <span key={attachment.id} className="flex items-center gap-1 rounded-[3px] border border-line px-1.5 py-0.5 font-mono text-[8.5px] text-mute">
                         <span className="max-w-28 truncate">{attachment.name}</span>
-                        <button disabled={attachmentIndex === 0} onClick={() => activeId && moveQueuedAttachment(activeId, item.id, attachment.id, -1)} className="disabled:opacity-20" aria-label="上移附件">↑</button>
-                        <button disabled={attachmentIndex === item.attachments.length - 1} onClick={() => activeId && moveQueuedAttachment(activeId, item.id, attachment.id, 1)} className="disabled:opacity-20" aria-label="下移附件">↓</button>
+                        <button disabled={item.state === "sending" || attachmentIndex === 0} onClick={() => activeId && moveQueuedAttachment(activeId, item.id, attachment.id, -1)} className="disabled:opacity-20" aria-label="上移附件">↑</button>
+                        <button disabled={item.state === "sending" || attachmentIndex === item.attachments.length - 1} onClick={() => activeId && moveQueuedAttachment(activeId, item.id, attachment.id, 1)} className="disabled:opacity-20" aria-label="下移附件">↓</button>
                       </span>
                     ))}</div>}
                   </div>

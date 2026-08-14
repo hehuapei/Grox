@@ -80,6 +80,11 @@ function queuedPrompt(value: unknown): PersistedQueuedPrompt | null {
   };
 }
 
+export function parsePromptQueueSnapshot(value: unknown): PersistedQueuedPrompt[] {
+  if (!Array.isArray(value)) return [];
+  return value.map(queuedPrompt).filter((row): row is PersistedQueuedPrompt => Boolean(row));
+}
+
 /** 坏行按条丢弃；坏顶层拒绝，避免一个损坏附件清空所有会话队列。 */
 export function parsePromptQueues(raw: string | null | undefined): PersistedPromptQueues {
   if (!raw?.trim()) return {};
@@ -93,7 +98,7 @@ export function parsePromptQueues(raw: string | null | undefined): PersistedProm
   return Object.fromEntries(
     Object.entries(value).flatMap(([sessionId, rows]) => {
       if (!sessionId || !Array.isArray(rows)) return [];
-      const valid = rows.map(queuedPrompt).filter((row): row is PersistedQueuedPrompt => Boolean(row));
+      const valid = parsePromptQueueSnapshot(rows);
       return valid.length > 0 ? [[sessionId, valid] as const] : [];
     }),
   );

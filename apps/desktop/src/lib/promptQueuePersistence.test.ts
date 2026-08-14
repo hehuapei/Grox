@@ -3,6 +3,7 @@ import {
   diffPromptQueues,
   loadPromptQueuesFromBrowser,
   mergeHydratedPromptQueues,
+  parsePromptQueueSnapshot,
   parsePromptQueues,
 } from "./promptQueuePersistence";
 
@@ -29,6 +30,13 @@ describe("promptQueuePersistence", () => {
       b: "not-an-array",
     }));
     expect(parsed).toEqual({ a: [row("ok")] });
+  });
+
+  it("Host 队列事件只投影有效公开字段", () => {
+    expect(parsePromptQueueSnapshot([
+      { ...row("sending"), state: "sending", _hostRuntime: { token: "must-not-matter" } },
+      { ...row("bad"), mode: "invalid" },
+    ])).toEqual([{ ...row("sending"), state: "sending" }]);
   });
 
   it("启动读盘到达较晚时保留当前进程新入队项", () => {

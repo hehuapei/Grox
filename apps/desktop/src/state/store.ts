@@ -80,7 +80,6 @@ import {
   shouldForceOfflineRescan,
 } from "../lib/sessionOpenPolicy";
 import {
-  filterQueueGhostsByLiveText,
   nextLocalDrainIndex,
   moveQueueEntry,
   rehomeHeldQueueForRecovery,
@@ -89,6 +88,7 @@ import {
   loadPromptQueues,
   loadPromptQueuesFromBrowser,
   mergeHydratedPromptQueues,
+  parsePromptQueueSnapshot,
   persistPromptQueues,
 } from "../lib/promptQueuePersistence";
 import type { PersistedQueuedPrompt } from "../lib/promptQueuePersistence";
@@ -348,7 +348,7 @@ interface DesktopState {
    * asynchronously prepares path-based image attachments, so switching tasks
    * during that read cannot redirect or erase the original draft.
    */
-  sendPrompt(text: string, attachments?: PromptAttachment[], targetSessionId?: string, modeOverride?: AgentMode, submission?: ComposerSubmission): boolean;
+  sendPrompt(text: string, attachments?: PromptAttachment[], targetSessionId?: string, modeOverride?: AgentMode, submission?: ComposerSubmission, queueItemId?: string): boolean;
   interjectPrompt(text: string, attachments?: PromptAttachment[], targetSessionId?: string, submission?: ComposerSubmission): Promise<boolean>;
   removeQueuedPrompt(sessionId: string, queueId: string): void;
   updateQueuedPrompt(sessionId: string, queueId: string, text: string): void;
@@ -858,18 +858,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
   const drainPromptQueue = (sessionId: string) => {
     const state = get();
     const session = state.sessions[sessionId];
-    let queue = state.promptQueues[sessionId] ?? [];
-    // Ghost filter: drop rows whose text already matches last primary user.
-    const lastUser = [...session?.blocks ?? []].reverse().find(
-      (b) => b.type === "user" && !("interjected" in b && b.interjected),
-    );
-    const liveText = lastUser && lastUser.type === "user" ? lastUser.text : null;
-    queue = filterQueueGhostsByLiveText(queue, liveText);
-    if (queue.length !== (state.promptQueues[sessionId] ?? []).length) {
-      const promptQueues = { ...state.promptQueues, [sessionId]: queue };
-      set({ promptQueues });
-      savePromptQueues(promptQueues);
-    }
+    const queue = state.promptQueues[sessionId] ?? [];
     if (!session || !shouldDrainLocalQueue({
       status: session.status,
       providerSwitching: state.providerSwitching,
@@ -890,7 +879,6 @@ export const useDesktop = create<DesktopState>((set, get) => {
     );
     if (drainAt < 0) return;
     const next = queue[drainAt];
-    const rest = [...queue.slice(0, drainAt), ...queue.slice(drainAt + 1)];
     const currentComposer = state.sessionComposers[sessionId] ?? {
       text: "", attachments: [], model: state.model, effort: state.effort,
       mode: state.mode, permissionMode: state.permissionMode,
@@ -906,19 +894,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
       },
     };
     persistSessionComposers(sessionComposers);
-    const promptQueues = { ...state.promptQueues, [sessionId]: rest };
-    set({
-      promptQueues,
-      sessionComposers,
-    });
-    savePromptQueues(promptQueues);
-    const accepted = get().sendPrompt(next.text, next.attachments, sessionId, next.mode);
-    if (!accepted) {
-      const current = get().promptQueues[sessionId] ?? [];
-      const restoredQueues = { ...get().promptQueues, [sessionId]: [next, ...current] };
-      set({ promptQueues: restoredQueues });
-      savePromptQueues(restoredQueues);
-    }
+    set({ sessionComposers });
+    // 队列行不能在 RPC 被 Host 接受前消失。execute_foreground_turn 会在
+    // 原生事务内领取该 id，并用权威磁盘内容派发、消费或异常回队。
+    get().sendPrompt(next.text, next.attachments, sessionId, next.mode, undefined, next.id);
   };
 
   const applyQueuedModel = (sessionId: string) => {
@@ -1301,6 +1280,68 @@ export const useDesktop = create<DesktopState>((set, get) => {
       case "runtime_occupancy":
         set({ runtimeOccupancy: e.occupancy });
         break;
+      case "prompt_queue_changed": {
+        const queue = parsePromptQueueSnapshot(e.queue);
+        if (queue.length !== e.queue.length) {
+          publishRuntimeError(new Error("Host 返回了无效提示队列快照"), {
+            domain: "protocol",
+            code: "PROMPT_QUEUE_SNAPSHOT_INVALID",
+            message: "提示队列快照无法投影",
+            recoverable: true,
+            action: "保留当前队列并导出诊断；不要重复发送",
+          });
+          break;
+        }
+        set((state) => {
+          const promptQueues = { ...state.promptQueues, [e.sessionId]: queue };
+          if (e.reason !== "claimed") return { promptQueues };
+          const claimed = queue.find((item) => item.id === e.itemId);
+          const session = state.sessions[e.sessionId];
+          if (!claimed || !session) return { promptQueues };
+          let blockIndex = -1;
+          for (let index = session.blocks.length - 1; index >= 0; index -= 1) {
+            const block = session.blocks[index];
+            if (block.type === "user" && !block.interjected) {
+              blockIndex = index;
+              break;
+            }
+          }
+          if (blockIndex < 0) return { promptQueues };
+          const blocks = [...session.blocks];
+          const block = blocks[blockIndex];
+          if (block.type !== "user") return { promptQueues };
+          blocks[blockIndex] = {
+            ...block,
+            text: claimed.text,
+            attachments: claimed.attachments.map(({ id, kind, name, mime, size }) => ({
+              id, kind, name, mime, size,
+            })),
+          };
+          const currentComposer = state.sessionComposers[e.sessionId];
+          return {
+            promptQueues,
+            sessions: {
+              ...state.sessions,
+              [e.sessionId]: { ...session, blocks },
+            },
+            ...(currentComposer
+              ? {
+                  sessionComposers: {
+                    ...state.sessionComposers,
+                    [e.sessionId]: {
+                      ...currentComposer,
+                      model: claimed.model,
+                      effort: claimed.effort,
+                      mode: claimed.mode,
+                      permissionMode: claimed.permissionMode,
+                    },
+                  },
+                }
+              : {}),
+          };
+        });
+        break;
+      }
       case "automation_dispatch":
         void executeAutomation(e.dispatch);
         break;
@@ -3098,7 +3139,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
     },
 
-    sendPrompt(text, attachments = [], targetSessionId, modeOverride, submission) {
+    sendPrompt(text, attachments = [], targetSessionId, modeOverride, submission, queueItemId) {
       const { activeId, sessions, model, effort, mode, permissionMode, sessionComposers, providerSwitching, restoringSessionId } = get();
       const sessionId = targetSessionId ?? activeId;
       if (providerSwitching || restoringSessionId === sessionId) return false;
@@ -3140,6 +3181,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
         return true;
       }
       if (!sessionAcceptsNewPrimaryPrompt({ status: session.status, blocks: session.blocks })) {
+        // Host 队列派发只允许领取当前空闲会话；竞态变忙时保留原行，
+        // 不能把同一个 queue id 再复制成一条新提示。
+        if (queueItemId) return false;
         const queue = get().promptQueues[session.id] ?? [];
         const duplicate = queue.some((item) => item.text.trim() === trimmed && trimmed.length > 0);
         if (duplicate) return false;
@@ -3214,13 +3258,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
         ...(activeId === session.id && modeOverride ? { mode: modeOverride } : {}),
       });
 
-      bridge.setPermissionMode(composer.permissionMode);
+      // 队列保存的是入队时的权限意图，不能在数小时后反向扩大当前 Host 授权。
+      // Host 会把该意图与当前 host_prefs 取更严格者。
+      if (!queueItemId) bridge.setPermissionMode(composer.permissionMode);
       void bridge.prompt(session.id, trimmed, {
         model: composer.model,
         effort: composer.effort,
         mode: composer.mode,
         permissionMode: composer.permissionMode,
         attachments,
+        ...(queueItemId ? { queueItemId } : {}),
       });
       return true;
     },
@@ -3282,6 +3329,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     removeQueuedPrompt(sessionId, queueId) {
       const queue = get().promptQueues[sessionId] ?? [];
+      if (queue.some((item) => item.id === queueId && item.state === "sending")) return;
       const promptQueues = { ...get().promptQueues, [sessionId]: queue.filter((item) => item.id !== queueId) };
       set({ promptQueues });
       savePromptQueues(promptQueues);
@@ -3289,6 +3337,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     updateQueuedPrompt(sessionId, queueId, text) {
       const queue = get().promptQueues[sessionId] ?? [];
+      if (queue.some((item) => item.id === queueId && item.state === "sending")) return;
       const promptQueues = {
           ...get().promptQueues,
           [sessionId]: queue.map((item) => item.id === queueId ? { ...item, text } : item),
@@ -3299,7 +3348,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     moveQueuedPrompt(sessionId, queueId, direction) {
       const queue = get().promptQueues[sessionId] ?? [];
+      if (queue.some((item) => item.id === queueId && item.state === "sending")) return;
       const index = queue.findIndex((item) => item.id === queueId);
+      if (queue[index + direction]?.state === "sending") return;
       const promptQueues = { ...get().promptQueues, [sessionId]: moveQueueEntry(queue, index, direction) };
       set({ promptQueues });
       savePromptQueues(promptQueues);
@@ -3307,6 +3358,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     moveQueuedAttachment(sessionId, queueId, attachmentId, direction) {
       const queue = get().promptQueues[sessionId] ?? [];
+      if (queue.some((item) => item.id === queueId && item.state === "sending")) return;
       const promptQueues = {
           ...get().promptQueues,
           [sessionId]: queue.map((item) => {
@@ -3333,7 +3385,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const id = sessionId ?? get().activeId;
       if (!id) return;
       suppressedQueueDrain.delete(id);
-      const promptQueues = { ...get().promptQueues, [id]: [] };
+      const sending = (get().promptQueues[id] ?? []).filter((item) => item.state === "sending");
+      const promptQueues = { ...get().promptQueues, [id]: sending };
       set({
         promptQueues,
         queueDrainParked: nextQueueDrainParked(get().queueDrainParked, id, false),

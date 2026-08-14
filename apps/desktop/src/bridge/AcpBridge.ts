@@ -111,6 +111,13 @@ interface ForegroundTurnStalled {
   sessionId: string;
   silentForMs: number;
 }
+
+interface PromptQueueChanged {
+  sessionId: string;
+  itemId: string;
+  queue: unknown[];
+  reason: "claimed" | "consumed" | "recovered";
+}
 type RpcId = string | number;
 
 interface JsonRpcMessage extends JsonObject {
@@ -852,6 +859,7 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
     case "runtime_notice":
     case "runtime_state":
     case "runtime_occupancy":
+    case "prompt_queue_changed":
     case "automation_dispatch":
     case "automation_runner_tick":
       return session;
@@ -1194,6 +1202,15 @@ export class AcpBridge implements GrokBridge {
       await listen<ExitPayload>("acp-exit", ({ payload }) => this.onExit(payload)),
       await listen<RuntimeOccupancy>("session-runtime-occupancy", ({ payload }) => {
         this.emit({ type: "runtime_occupancy", occupancy: payload });
+      }),
+      await listen<PromptQueueChanged>("prompt-queue-changed", ({ payload }) => {
+        this.emit({
+          type: "prompt_queue_changed",
+          sessionId: payload.sessionId,
+          itemId: payload.itemId,
+          queue: payload.queue,
+          reason: payload.reason,
+        });
       }),
       await listen<AutomationDispatch>("automation-dispatch", ({ payload }) => {
         this.emit({ type: "automation_dispatch", dispatch: payload });
@@ -3217,6 +3234,7 @@ export class AcpBridge implements GrokBridge {
           model: options.model,
           effort: options.effort,
           mode: options.mode,
+          queueItemId: options.queueItemId,
         },
       });
       this.sessionOptions.set(sessionId, {

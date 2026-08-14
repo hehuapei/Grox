@@ -92,6 +92,12 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - 不同会话的并发队列写不会互相覆盖，Host 会校验队列条目/附件契约、容量和重复 id；
 - 旧 localStorage 队列只在原生仓储从未初始化时迁移一次，原生空对象也是初始化标记，避免已删除队列在重启后再次导入；
 - 删除会话/项目会在同一 tombstone 锁序内删除提示队列，晚到 upsert 会被 Host 拒绝，不能让已删除会话复活。
+- 普通前台队列不再由 Store 先删行再调用 `bridge.prompt()`：`execute_foreground_turn` 在同一 Host 命令内按 queue id 原子领取磁盘首项、用权威文本/附件/模型/模式派发，并在 RPC 成功或用户停止后消费；协议、环境或进程代次失败会原位回队并触发人工确认门禁；
+- 提示队列的 `_hostRuntime` 记录 Host 实例、claim token、进程代次和领取时间。WebView 只收到去除保留字段的快照，普通 patch 不能伪造、擦除、编辑或删除活动领取；旧 token 不能结算新领取；新 Host 实例、进程代次变化和旧版无 token 的 `sending` 行会恢复为 `queued`；
+- 队列领取事件会在 Agent 输出前校正前端乐观用户气泡，避免磁盘权威内容与屏幕内容不一致；发送中的行不可编辑/排序/删除，清空操作也保留当前活动领取；
+- 入队时保存的权限模式只是历史意图。派发时 Host 会与当前 `host_prefs` 取更严格者，旧队列不能在用户关闭 bypass 后重新扩大授权；
+- 本地队列以稳定 id 和 Host settlement 判断是否消费，不再根据“文本刚好等于最后一个用户气泡”删除条目；因此异常回队后显式“确认并继续”确实会重发，而不会被文本去重静默吞掉。
+- 成功消费或用户停止会在 Host 进程内留下 queue id tombstone；结算前已进入前端 Promise 链的旧 patch 会在原生锁内剔除这些 id，不能在结算后把已执行提示复活。应用重启后旧前端链已不存在，永久删除仍由 SessionStorage tombstone 跨操作兜底。
 - `automation_store::AutomationStore` 按 automation id 在 Host 锁内合并更新/删除，不同任务的启停、编辑和运行结果不再通过整包数组互相覆盖；
 - 自动化 DTO、时间、频率、权限模式、可选运行结果和重复 id 均由 Host 校验，失败 patch 不修改原文件。
 - `automation_runner::AutomationRunner` 在应用进程内每 30 秒检查到期任务，只在 ACP 已初始化且 SessionCoordinator 无活动回合/生命周期操作时派发；WebView 不再持有调度定时器或到期判断；
@@ -114,10 +120,10 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - 旧版裸 Session 只保留只读迁移入口，损坏的现有 journal 不会被新快照静默覆盖。
 
 本切片没有把完整 SessionManager 伪装成已经迁移：连接初始化、非交互认证、建会话/恢复、
-自动化协议回合和普通前台回合事务已属于 Host，但用户触发的交互 OAuth、权限/问题的
-回复与失效清算，以及提示队列何时 claim/发送/恢复仍在 Bridge/Store。后续必须把这些路径
-迁入同一个 Host 会话服务，才能删除 `activePromptSessions` 与 WebView 队列执行器；在此之前
-不会另起一个简化 CLI 进程冒充后台运行时。
+自动化协议回合、普通前台回合和持久化提示队列的 claim/dispatch/settle/recover 已属于 Host，
+但用户触发的交互 OAuth、权限/问题回复与失效清算仍在 Bridge。后续必须把这些交互请求
+迁入同一个 Host 会话服务，才能删除 `activePromptSessions` 等剩余 WebView 运行时状态；在此
+之前不会另起一个简化 CLI 进程冒充后台运行时。
 
 ## 完整后端对照结论
 

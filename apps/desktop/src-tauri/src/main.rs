@@ -2065,11 +2065,16 @@ fn patch_prompt_queues(
     deletes: Vec<String>,
 ) -> Result<(), String> {
     let upsert_ids = upserts.keys().cloned().collect::<Vec<_>>();
-    for id in upsert_ids.iter().chain(deletes.iter()) {
+    let patch_ids = upsert_ids
+        .iter()
+        .chain(deletes.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    for id in &patch_ids {
         safe_session_storage_id(id)?;
     }
     // 与删除命令采用相同锁序：先 tombstone，再队列事务，防止延迟 patch 复活。
-    let _write = storage.begin_write_ids(&upsert_ids)?;
+    let _write = storage.begin_write_ids(&patch_ids)?;
     let path = prompt_queues_path(&app)?;
     queues.patch(&path, upserts, deletes, PROMPT_QUEUES_MAX_BYTES)
 }

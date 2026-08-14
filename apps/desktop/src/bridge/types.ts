@@ -567,6 +567,7 @@ export type BridgeEvent =
   | { type: "auth_state"; state: AuthState }
   | { type: "runtime_state"; state: RuntimeConnectionState }
   | { type: "runtime_occupancy"; occupancy: RuntimeOccupancy }
+  | { type: "prompt_queue_changed"; sessionId: string; itemId: string; queue: unknown[]; reason: "claimed" | "consumed" | "recovered" }
   | { type: "automation_dispatch"; dispatch: AutomationDispatch }
   | { type: "automation_runner_tick"; status: AutomationRunnerStatus }
   | { type: "model_state"; state: ModelState }
@@ -605,4 +606,6 @@ export interface PromptOptions {
   /** 随这一轮发送，避免共享 ACP 进程中的权限模式串到其它会话。 */
   permissionMode?: PermissionMode;
   attachments?: PromptAttachment[];
+  /** Host 原子领取并派发的持久化队列条目；普通发送不设置。 */
+  queueItemId?: string;
 }
