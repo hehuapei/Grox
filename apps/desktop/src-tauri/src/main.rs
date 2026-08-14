@@ -105,6 +105,39 @@ struct AgentProcess {
 }
 
 #[derive(Default)]
+struct SessionStorageState {
+    deleted: std::sync::Mutex<BTreeSet<String>>,
+}
+
+impl SessionStorageState {
+    fn lock_writable(
+        &self,
+        id: &str,
+    ) -> Result<std::sync::MutexGuard<'_, BTreeSet<String>>, String> {
+        let deleted = self
+            .deleted
+            .lock()
+            .map_err(|_| "会话存储门禁已损坏".to_string())?;
+        if deleted.contains(id) {
+            return Err("会话已删除，拒绝再次写入本地存储".into());
+        }
+        Ok(deleted)
+    }
+
+    fn lock_deleted(
+        &self,
+        id: &str,
+    ) -> Result<std::sync::MutexGuard<'_, BTreeSet<String>>, String> {
+        let mut deleted = self
+            .deleted
+            .lock()
+            .map_err(|_| "会话存储门禁已损坏".to_string())?;
+        deleted.insert(id.to_string());
+        Ok(deleted)
+    }
+}
+
+#[derive(Default)]
 struct AcpState {
     process: Mutex<Option<AgentProcess>>,
     next_generation: AtomicU64,
@@ -1525,6 +1558,8 @@ fn scrub_atomic_write_orphans(dir: &Path, max_age: std::time::Duration) -> u32 {
 
 const SESSION_JOURNAL_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const PROMPT_QUEUES_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const TOOL_IMAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const TOOL_IMAGES_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 fn safe_session_storage_id(id: &str) -> Result<&str, String> {
     if id.is_empty()
@@ -1558,6 +1593,120 @@ fn session_journal_path(app: &tauri::AppHandle, id: &str) -> Result<PathBuf, Str
     Ok(session_journal_dir(app, id)?.join("journal.json"))
 }
 
+#[derive(Deserialize)]
+struct ToolImagePayload {
+    mime: String,
+    data: String,
+}
+
+#[derive(Serialize)]
+struct ToolImageReference {
+    mime: String,
+    path: String,
+}
+
+fn checked_tool_image(image: ToolImagePayload) -> Result<(String, Vec<u8>, String), String> {
+    if image.data.len() > TOOL_IMAGE_MAX_BYTES.saturating_mul(4) / 3 + 4 {
+        return Err("单张工具图片不能超过 8 MB".into());
+    }
+    let bytes = BASE64
+        .decode(image.data.as_bytes())
+        .map_err(|error| format!("工具图片不是有效 Base64：{error}"))?;
+    if bytes.len() > TOOL_IMAGE_MAX_BYTES {
+        return Err("单张工具图片不能超过 8 MB".into());
+    }
+    let detected = prompt_image_mime(&bytes)
+        .ok_or("工具图片只支持 PNG、JPEG、GIF、WebP 或 BMP")?;
+    let declared_mime = image.mime.trim().to_ascii_lowercase();
+    let declared = match declared_mime.as_str() {
+        "image/jpg" => "image/jpeg",
+        value => value,
+    };
+    if declared != detected {
+        return Err(format!(
+            "工具图片声明类型 {declared} 与实际类型 {detected} 不一致"
+        ));
+    }
+    let extension = match detected {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        _ => return Err("不支持的工具图片类型".into()),
+    };
+    use sha2::{Digest as _, Sha256};
+    let name = format!("{:x}.{extension}", Sha256::digest(&bytes));
+    Ok((detected.to_string(), bytes, name))
+}
+
+fn write_tool_image(path: &Path, bytes: &[u8]) -> Result<(), String> {
+    if path.is_file() {
+        let existing = fs::read(path).map_err(|error| format!("无法校验工具图片：{error}"))?;
+        if existing == bytes {
+            return Ok(());
+        }
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "工具图片路径缺少父目录".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("无法创建工具图片目录：{error}"))?;
+    let nonce = CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(".tool-media-{}-{nonce}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .map_err(|error| format!("无法创建工具图片临时文件：{error}"))?;
+    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temp);
+        return Err(format!("无法写入工具图片：{error}"));
+    }
+    drop(file);
+    if let Err(error) = replace_file_atomic(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    restrict_private_file(path)
+}
+
+#[tauri::command]
+fn persist_session_tool_images(
+    app: tauri::AppHandle,
+    storage: tauri::State<'_, SessionStorageState>,
+    session_id: String,
+    images: Vec<ToolImagePayload>,
+) -> Result<Vec<ToolImageReference>, String> {
+    safe_session_storage_id(&session_id)?;
+    let deleted = storage.lock_writable(&session_id)?;
+    if images.len() > 16 {
+        return Err("单次最多保存 16 张工具图片".into());
+    }
+    let media_dir = session_journal_dir(&app, &session_id)?.join("media");
+    let mut total = 0usize;
+    let mut references = Vec::with_capacity(images.len());
+    for image in images {
+        let (mime, bytes, name) = checked_tool_image(image)?;
+        total = total.saturating_add(bytes.len());
+        if total > TOOL_IMAGES_MAX_BYTES {
+            return Err("单次工具图片总大小不能超过 16 MB".into());
+        }
+        let path = media_dir.join(name);
+        write_tool_image(&path, &bytes)?;
+        app.asset_protocol_scope()
+            .allow_file(&path)
+            .map_err(|error| format!("无法授权工具图片预览：{error}"))?;
+        references.push(ToolImageReference {
+            mime,
+            path: path_for_webview(&path),
+        });
+    }
+    drop(deleted);
+    Ok(references)
+}
+
 fn validate_session_journal(content: &str, id: &str) -> Result<(), String> {
     let value: serde_json::Value = serde_json::from_str(content)
         .map_err(|error| format!("应用会话 journal 必须是 JSON：{error}"))?;
@@ -1586,6 +1735,12 @@ fn validate_session_journal(content: &str, id: &str) -> Result<(), String> {
 
 #[tauri::command]
 fn read_session_journal(app: tauri::AppHandle, id: String) -> Result<Option<String>, String> {
+    let media_dir = session_journal_dir(&app, &id)?.join("media");
+    if media_dir.is_dir() {
+        app.asset_protocol_scope()
+            .allow_directory(&media_dir, false)
+            .map_err(|error| format!("无法授权会话工具图片预览：{error}"))?;
+    }
     let path = session_journal_path(&app, &id)?;
     let source = if path.is_file() {
         path
@@ -1602,11 +1757,17 @@ fn read_session_journal(app: tauri::AppHandle, id: String) -> Result<Option<Stri
 }
 
 #[tauri::command]
-fn write_session_journal(app: tauri::AppHandle, id: String, content: String) -> Result<(), String> {
+fn write_session_journal(
+    app: tauri::AppHandle,
+    storage: tauri::State<'_, SessionStorageState>,
+    id: String,
+    content: String,
+) -> Result<(), String> {
     if content.len() as u64 > SESSION_JOURNAL_MAX_BYTES {
         return Err("应用会话 journal 不能超过 16 MB".into());
     }
     safe_session_storage_id(&id)?;
+    let deleted = storage.lock_writable(&id)?;
     validate_session_journal(&content, &id)?;
     let path = session_journal_path(&app, &id)?;
     atomic_write_bounded(&path, &content, SESSION_JOURNAL_MAX_BYTES)?;
@@ -1619,30 +1780,31 @@ fn write_session_journal(app: tauri::AppHandle, id: String, content: String) -> 
             eprintln!("grox: 新版 journal 已写入，但无法清理旧版会话缓存：{error}");
         }
     }
+    drop(deleted);
     Ok(())
 }
 
-#[tauri::command]
-fn delete_session_journal(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    let path = session_journal_path(&app, &id)?;
-    if path.is_file() {
-        fs::remove_file(&path).map_err(|error| format!("无法删除应用会话 journal：{error}"))?;
+fn delete_session_journal_files(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
+    let dir = session_journal_dir(app, id)?;
+    if dir.is_dir() {
+        fs::remove_dir_all(&dir).map_err(|error| format!("无法删除应用会话目录：{error}"))?;
     }
-    let dir = session_journal_dir(&app, &id)?;
-    if dir.is_dir()
-        && dir
-            .read_dir()
-            .map_err(|error| format!("无法检查应用会话目录：{error}"))?
-            .next()
-            .is_none()
-    {
-        fs::remove_dir(&dir).map_err(|error| format!("无法删除空应用会话目录：{error}"))?;
-    }
-    let legacy = legacy_session_cache_path(&app, &id)?;
+    let legacy = legacy_session_cache_path(app, id)?;
     if legacy.is_file() {
         fs::remove_file(&legacy).map_err(|error| format!("无法删除旧版会话缓存：{error}"))?;
     }
     Ok(())
+}
+
+#[tauri::command]
+fn delete_session_journal(
+    app: tauri::AppHandle,
+    storage: tauri::State<'_, SessionStorageState>,
+    id: String,
+) -> Result<(), String> {
+    safe_session_storage_id(&id)?;
+    let _deleted = storage.lock_deleted(&id)?;
+    delete_session_journal_files(&app, &id)
 }
 
 #[derive(Serialize)]
@@ -1788,12 +1950,17 @@ fn write_automations(app: tauri::AppHandle, content: String) -> Result<(), Strin
 }
 
 #[tauri::command]
-fn delete_session_data(app: tauri::AppHandle, id: String) -> Result<bool, String> {
+fn delete_session_data(
+    app: tauri::AppHandle,
+    storage: tauri::State<'_, SessionStorageState>,
+    id: String,
+) -> Result<bool, String> {
     if !valid_session_id(&id) {
         return Err("无效会话 ID".into());
     }
+    let _deleted = storage.lock_deleted(&id)?;
     let history = grok_home().and_then(|home| delete_session_history_data(&home, &id));
-    let journal = delete_session_journal(app, id);
+    let journal = delete_session_journal_files(&app, &id);
     match (history, journal) {
         (Ok(removed), Ok(())) => Ok(removed),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
@@ -1804,10 +1971,15 @@ fn delete_session_data(app: tauri::AppHandle, id: String) -> Result<bool, String
 }
 
 #[tauri::command]
-fn delete_project_session_data(app: tauri::AppHandle, cwd: String) -> Result<Vec<String>, String> {
+fn delete_project_session_data(
+    app: tauri::AppHandle,
+    storage: tauri::State<'_, SessionStorageState>,
+    cwd: String,
+) -> Result<Vec<String>, String> {
     let ids = delete_project_session_history_data(&grok_home()?, &cwd)?;
     for id in &ids {
-        delete_session_journal(app.clone(), id.clone())?;
+        let _deleted = storage.lock_deleted(id)?;
+        delete_session_journal_files(&app, id)?;
     }
     Ok(ids)
 }
@@ -3802,6 +3974,56 @@ fn confirm_destructive_git_action(title: &str, description: &str) -> Result<(), 
 /// real permission path — `--always-approve` is intentional only for these tools.
 const MEDIA_GENERATION_TOOLS: &str = "image_gen,video_gen,image_to_video,reference_to_video";
 
+#[derive(Debug)]
+struct ListedWorktree {
+    path: PathBuf,
+    branch: Option<String>,
+}
+
+fn parse_worktree_list(porcelain: &str) -> Vec<ListedWorktree> {
+    let mut entries = Vec::new();
+    let mut current: Option<ListedWorktree> = None;
+    for line in porcelain.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            current = Some(ListedWorktree {
+                path: PathBuf::from(path),
+                branch: None,
+            });
+        } else if let Some(branch) = line.strip_prefix("branch ") {
+            if let Some(entry) = current.as_mut() {
+                entry.branch = Some(branch.to_string());
+            }
+        }
+    }
+    if let Some(entry) = current {
+        entries.push(entry);
+    }
+    entries
+}
+
+fn is_legacy_grox_worktree(primary: &Path, target: &Path, branch: Option<&str>) -> bool {
+    let Some(primary_name) = primary.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if primary.parent() != target.parent() {
+        return false;
+    }
+    let Some(target_name) = target.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let base = format!("{primary_name}-worktree");
+    let valid_name = target_name == base
+        || target_name
+            .strip_prefix(&format!("{base}-"))
+            .is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            });
+    valid_name && branch.is_some_and(|name| name.starts_with("refs/heads/grox/worktree-"))
+}
+
 fn checked_removable_worktree(root: &Path, requested: &str) -> Result<PathBuf, String> {
     let requested = requested.trim();
     if requested.is_empty() {
@@ -3810,34 +4032,32 @@ fn checked_removable_worktree(root: &Path, requested: &str) -> Result<PathBuf, S
     let canonical = PathBuf::from(requested)
         .canonicalize()
         .map_err(|error| format!("无法解析 Worktree 路径：{error}"))?;
-    let primary = root
+    let current = root
         .canonicalize()
         .map_err(|error| format!("无法解析仓库根目录：{error}"))?;
+    if canonical == current {
+        return Err("不能移除当前正在使用的工作树".into());
+    }
+    let listed = git_text(root, &["worktree", "list", "--porcelain"])?;
+    let entries = parse_worktree_list(&listed);
+    let primary = entries
+        .first()
+        .and_then(|entry| entry.path.canonicalize().ok())
+        .ok_or_else(|| "无法确定仓库主工作树".to_string())?;
     if canonical == primary {
         return Err("不能移除仓库主工作树".into());
     }
+    let entry = entries
+        .iter()
+        .find(|entry| entry.path.canonicalize().ok().as_ref() == Some(&canonical))
+        .ok_or_else(|| "只能移除当前仓库已登记的 worktree".to_string())?;
     let managed_ok = grok_home()?
         .join("worktrees")
         .canonicalize()
         .ok()
         .is_some_and(|managed| canonical.starts_with(&managed));
-    let listed = git_text(root, &["worktree", "list", "--porcelain"])?;
-    let mut known = false;
-    for line in listed.lines() {
-        if let Some(path) = line.strip_prefix("worktree ") {
-            let Ok(entry) = PathBuf::from(path).canonicalize() else {
-                continue;
-            };
-            if entry == canonical {
-                known = true;
-                break;
-            }
-        }
-    }
-    if !known {
-        return Err("只能移除当前仓库已登记的 worktree".into());
-    }
-    if !managed_ok {
+    let legacy_ok = is_legacy_grox_worktree(&primary, &canonical, entry.branch.as_deref());
+    if !managed_ok && !legacy_ok {
         return Err("只能移除 Grox 管理目录下的 worktree".into());
     }
     Ok(canonical)
@@ -5227,9 +5447,7 @@ fn open_file_with_application(cwd: String, path: String, application: String) ->
     }
 }
 
-/// Create a sibling Git worktree for the Codex-style “permanent worktree”
-/// actions. The target is never inside the current project, and an available
-/// suffix is chosen instead of overwriting an existing directory.
+/// 永久工作树与手动工作树共用同一管理目录和删除边界。
 #[tauri::command]
 fn create_permanent_worktree(cwd: String) -> Result<String, String> {
     let requested = checked_workspace(&cwd)?;
@@ -5238,28 +5456,33 @@ fn create_permanent_worktree(cwd: String) -> Result<String, String> {
     let root = PathBuf::from(top_level)
         .canonicalize()
         .map_err(|error| format!("无法解析 Git 仓库根目录：{error}"))?;
-    let parent = root
-        .parent()
-        .ok_or_else(|| "无法确定工作树所在目录".to_string())?;
-    let base = root
+    let listed = git_text(&root, &["worktree", "list", "--porcelain"])?;
+    let primary = parse_worktree_list(&listed)
+        .into_iter()
+        .next()
+        .map(|entry| entry.path)
+        .unwrap_or_else(|| root.clone());
+    let project = primary
         .file_name()
         .and_then(|name| name.to_str())
         .filter(|name| !name.is_empty())
         .unwrap_or("grox-project");
-    let mut target = parent.join(format!("{base}-worktree"));
-    let mut suffix = 2u32;
-    while target.exists() {
-        target = parent.join(format!("{base}-worktree-{suffix}"));
-        suffix = suffix.saturating_add(1);
-        if suffix > 10_000 {
-            return Err("可用的工作树目录过多".into());
-        }
-    }
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let branch = format!("grox/worktree-{timestamp}");
+    let nonce = CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let unique = format!("{timestamp}-{nonce}");
+    let target = grok_home()?
+        .join("worktrees")
+        .join(project)
+        .join(format!("permanent-{unique}"));
+    let parent = target
+        .parent()
+        .ok_or_else(|| "无法确定工作树管理目录".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("无法创建 worktree 目录：{error}"))?;
+    let branch = format!("grox/worktree-{unique}");
     let mut command = std::process::Command::new("git");
     command
         .current_dir(&root)
@@ -6934,17 +7157,27 @@ fn checked_reasoning_effort(effort: Option<String>) -> Result<Option<String>, St
     }
 }
 
+fn ensure_main_acp_owner(window_label: &str) -> Result<(), String> {
+    if window_label == "main" {
+        Ok(())
+    } else {
+        Err("当前窗口不是 ACP 运行时所有者，请回到主窗口继续会话".into())
+    }
+}
+
 /// Start a fresh ACP child and stream each stdout JSON-RPC line to the webview.
 /// A repeated call intentionally replaces the old child so a webview reload
 /// cannot initialize the same agent process twice.
 #[tauri::command]
 async fn acp_spawn(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<AcpState>>,
     cwd: String,
     computer_use_enabled: Option<bool>,
     reasoning_effort: Option<String>,
 ) -> Result<u64, String> {
+    ensure_main_acp_owner(window.label())?;
     let cwd = checked_workspace(&cwd)?;
 
     // Invalidate the previous readers before terminating their process. On a
@@ -7189,11 +7422,13 @@ fn acp_method_allowed(method: &str) -> bool {
 
 #[tauri::command]
 async fn acp_send(
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<AcpState>>,
     leases: tauri::State<'_, Arc<McpLeaseStore>>,
     line: String,
     generation: u64,
 ) -> Result<(), String> {
+    ensure_main_acp_owner(window.label())?;
     if line.contains('\n') || line.contains('\r') {
         return Err("ACP 消息必须是单行 JSON".into());
     }
@@ -7245,8 +7480,10 @@ async fn acp_send(
 #[tauri::command]
 async fn acp_kill(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<AcpState>>,
 ) -> Result<(), String> {
+    ensure_main_acp_owner(window.label())?;
     state.next_generation.fetch_add(1, Ordering::Relaxed);
     if let Some(process) = state.process.lock().await.take() {
         terminate_process(process).await;
@@ -7744,6 +7981,7 @@ fn main() {
         .manage(Arc::new(FilePreviewState::default()))
         .manage(Arc::new(McpLeaseStore::default()))
         .manage(Arc::new(GitConfirmStore::default()))
+        .manage(SessionStorageState::default())
         .setup(|app| {
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?;
             if let Some(window) = app.get_webview_window("main") {
@@ -7777,6 +8015,7 @@ fn main() {
             search_session_history,
             read_session_journal,
             write_session_journal,
+            persist_session_tool_images,
             delete_session_journal,
             session_journal_status,
             read_prompt_queues,
@@ -7855,7 +8094,7 @@ fn main() {
             acp_kill,
         ])
         .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::Destroyed) {
+            if matches!(event, tauri::WindowEvent::Destroyed) && window.label() == "main" {
                 let state = window.state::<Arc<AcpState>>().inner().clone();
                 let preview_state = window.state::<Arc<PreviewState>>().inner().clone();
                 tauri::async_runtime::spawn(async move {
@@ -8006,6 +8245,32 @@ mod tests {
         assert!(safe_session_storage_id("../session").is_err());
         assert!(safe_session_storage_id("会话").is_err());
         assert!(safe_session_storage_id(&"x".repeat(81)).is_err());
+    }
+
+    #[test]
+    fn tool_image_storage_uses_detected_mime_and_content_hash() {
+        let png = b"\x89PNG\r\n\x1a\nminimal";
+        let checked = checked_tool_image(ToolImagePayload {
+            mime: "image/png".into(),
+            data: BASE64.encode(png),
+        })
+        .unwrap();
+        assert_eq!(checked.0, "image/png");
+        assert!(checked.2.ends_with(".png"));
+        assert!(checked_tool_image(ToolImagePayload {
+            mime: "image/jpeg".into(),
+            data: BASE64.encode(png),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn deleted_session_storage_rejects_late_writes() {
+        let storage = SessionStorageState::default();
+        drop(storage.lock_writable("session-1").unwrap());
+        drop(storage.lock_deleted("session-1").unwrap());
+        assert!(storage.lock_writable("session-1").is_err());
+        assert!(storage.lock_writable("session-2").is_ok());
     }
 
     #[test]
@@ -8259,6 +8524,55 @@ mod tests {
             Some("max".into())
         );
         assert!(checked_reasoning_effort(Some("ultra".into())).is_err());
+    }
+
+    #[test]
+    fn only_main_window_can_own_acp_runtime() {
+        assert!(ensure_main_acp_owner("main").is_ok());
+        assert!(ensure_main_acp_owner("session-secondary").is_err());
+    }
+
+    #[test]
+    fn legacy_grox_worktrees_require_sibling_name_and_owned_branch() {
+        let primary = Path::new("/repo/project");
+        assert!(is_legacy_grox_worktree(
+            primary,
+            Path::new("/repo/project-worktree"),
+            Some("refs/heads/grox/worktree-123")
+        ));
+        assert!(is_legacy_grox_worktree(
+            primary,
+            Path::new("/repo/project-worktree-2"),
+            Some("refs/heads/grox/worktree-456")
+        ));
+        assert!(!is_legacy_grox_worktree(
+            primary,
+            Path::new("/repo/project-backup"),
+            Some("refs/heads/grox/worktree-123")
+        ));
+        assert!(!is_legacy_grox_worktree(
+            primary,
+            Path::new("/repo/project-worktree"),
+            Some("refs/heads/feature/user-owned")
+        ));
+    }
+
+    #[test]
+    fn parses_worktree_branch_ownership_from_porcelain() {
+        let entries = parse_worktree_list(concat!(
+            "worktree /repo/project\n",
+            "HEAD abc\n",
+            "branch refs/heads/main\n\n",
+            "worktree /repo/project-worktree\n",
+            "HEAD def\n",
+            "branch refs/heads/grox/worktree-123\n",
+        ));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].path, PathBuf::from("/repo/project-worktree"));
+        assert_eq!(
+            entries[1].branch.as_deref(),
+            Some("refs/heads/grox/worktree-123")
+        );
     }
 
     #[test]

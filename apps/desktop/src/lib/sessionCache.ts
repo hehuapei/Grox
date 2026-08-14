@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { Session, SessionBlock } from "../bridge/types";
+import type { Session, SessionBlock, ToolImage } from "../bridge/types";
 import { isSessionTerminal } from "../bridge/types";
 
 const MAX_JOURNAL_BLOCKS = 600;
@@ -34,6 +34,11 @@ const truncate = (value: string | undefined, limit: number) => {
   return `${value.slice(0, limit)}\n…[缓存已截断]`;
 };
 
+export function durableToolImages(images: ToolImage[] | undefined): ToolImage[] | undefined {
+  const durable = images?.flatMap((image) => image.path ? [{ mime: image.mime, path: image.path }] : []);
+  return durable && durable.length > 0 ? durable : undefined;
+}
+
 function freezeBlock(block: SessionBlock): SessionBlock {
   if (block.type === "assistant") return { ...block, streaming: false, text: truncate(block.text, MAX_BODY_TEXT) ?? "" };
   if (block.type === "thinking") return { ...block, live: false, text: truncate(block.text, MAX_BODY_TEXT) ?? "" };
@@ -45,7 +50,7 @@ function freezeBlock(block: SessionBlock): SessionBlock {
       status: block.call.status === "running" || block.call.status === "pending" ? "done" : block.call.status,
       input: truncate(block.call.input, MAX_TOOL_TEXT),
       output: truncate(block.call.output, MAX_TOOL_TEXT),
-      images: undefined,
+      images: durableToolImages(block.call.images),
       terminal: block.call.terminal ? { ...block.call.terminal, lines: block.call.terminal.lines.slice(-80) } : undefined,
     },
   };

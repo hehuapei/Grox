@@ -74,6 +74,14 @@ export interface TerminalIO {
   exitCode?: number;
 }
 
+export interface ToolImage {
+  mime: string;
+  /** 仅存在于当前运行内；journal 不保存大体积 base64。 */
+  data?: string;
+  /** Host 管理的内容寻址文件，可在重启后恢复。 */
+  path?: string;
+}
+
 export interface ToolCall {
   id: string;
   kind: ToolKind;
@@ -92,7 +100,7 @@ export interface ToolCall {
   diff?: DiffHunk[];
   terminal?: TerminalIO;
   locations?: string[];
-  images?: { mime: string; data: string }[];
+  images?: ToolImage[];
 }
 
 export type PlanStepStatus = "pending" | "in_progress" | "completed";

@@ -468,7 +468,6 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
   const removeFromSidebar = useDesktop((state) => state.removeSessionFromSidebar);
   const continueInNewChat = useDesktop((state) => state.continueSessionInNewChat);
   const continueInWorktree = useDesktop((state) => state.continueSessionInNewWorktree);
-  const openInNewWindow = useDesktop((state) => state.openSessionInNewWindow);
   const copySessionValue = useDesktop((state) => state.copySessionValue);
   const [editing, setEditing] = useState(false);
   const [menu, setMenu] = useState(false);
@@ -533,8 +532,6 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
           <MenuDivider />
           <MenuButton icon="arrowRight" label={language === "zh-CN" ? "在新聊天中继续" : "Continue in new chat"} onClick={() => void continueInNewChat(meta.id)} />
           <MenuButton icon="branch" label={language === "zh-CN" ? "在新工作树中继续" : "Continue in new worktree"} onClick={() => void continueInWorktree(meta.id)} />
-          <MenuDivider />
-          <MenuButton icon="external" label={language === "zh-CN" ? "在新窗口中打开" : "Open in new window"} onClick={() => void openInNewWindow(meta.id)} />
           <MenuDivider />
           <MenuButton
             icon="trash"

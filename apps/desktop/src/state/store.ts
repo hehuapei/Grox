@@ -92,6 +92,8 @@ import {
 import type { PersistedQueuedPrompt } from "../lib/promptQueuePersistence";
 import { formatGroxError, runtimeNoticeFromError, toGroxError } from "../lib/errorModel";
 import type { ErrorFallback } from "../lib/errorModel";
+import { commitComposerSubmission } from "../lib/composerSubmission";
+import type { ComposerSubmission } from "../lib/composerSubmission";
 import {
   advanceAutomation,
   dueAutomations,
@@ -312,7 +314,6 @@ interface DesktopState {
   copySessionValue(id: string, value: "cwd" | "id" | "link"): Promise<void>;
   continueSessionInNewChat(id: string): Promise<void>;
   continueSessionInNewWorktree(id: string): Promise<void>;
-  openSessionInNewWindow(id: string): Promise<void>;
   /** `restoreProject`: explicit add (folder picker) may undismiss a removed project. */
   setWorkspace(cwd: string, options?: { restoreProject?: boolean; navigation?: ViewNavigationIntent }): Promise<void>;
   authenticate(): Promise<void>;
@@ -346,8 +347,8 @@ interface DesktopState {
    * asynchronously prepares path-based image attachments, so switching tasks
    * during that read cannot redirect or erase the original draft.
    */
-  sendPrompt(text: string, attachments?: PromptAttachment[], targetSessionId?: string, modeOverride?: AgentMode): boolean;
-  interjectPrompt(text: string, attachments?: PromptAttachment[], targetSessionId?: string): Promise<boolean>;
+  sendPrompt(text: string, attachments?: PromptAttachment[], targetSessionId?: string, modeOverride?: AgentMode, submission?: ComposerSubmission): boolean;
+  interjectPrompt(text: string, attachments?: PromptAttachment[], targetSessionId?: string, submission?: ComposerSubmission): Promise<boolean>;
   removeQueuedPrompt(sessionId: string, queueId: string): void;
   updateQueuedPrompt(sessionId: string, queueId: string, text: string): void;
   moveQueuedPrompt(sessionId: string, queueId: string, direction: -1 | 1): void;
@@ -3046,38 +3047,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
     },
 
-    async openSessionInNewWindow(id) {
-      const meta = get().sessionIndex.find((entry) => entry.id === id);
-      if (!meta) return;
-      try {
-        const url = new URL(window.location.href);
-        url.search = "";
-        url.hash = "";
-        url.searchParams.set("open", id);
-        if ("__TAURI_INTERNALS__" in window) {
-          const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
-          const label = `session-${id.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 28)}-${Date.now()}`;
-          const child = new WebviewWindow(label, {
-            url: url.toString(),
-            title: meta.title,
-            width: 1180,
-            height: 780,
-            minWidth: 860,
-            minHeight: 560,
-            resizable: true,
-          });
-          child.once("tauri://error", (event) => {
-            set({ startupError: String(event.payload ?? "无法打开新窗口") });
-          });
-        } else {
-          window.open(url.toString(), "_blank", "noopener,noreferrer");
-        }
-      } catch (error) {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
-      }
-    },
-
-    sendPrompt(text, attachments = [], targetSessionId, modeOverride) {
+    sendPrompt(text, attachments = [], targetSessionId, modeOverride, submission) {
       const { activeId, sessions, model, effort, mode, permissionMode, sessionComposers, providerSwitching, restoringSessionId } = get();
       const sessionId = targetSessionId ?? activeId;
       if (providerSwitching || restoringSessionId === sessionId) return false;
@@ -3096,11 +3066,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const trimmed = text.trim();
       if (!trimmed && attachments.length === 0) return false;
       const cwd = session.cwd || get().workspace;
-      // Real sessions: text is durable via CLI. Draft first-send must keep the
-      // crash buffer (text + attachments) until session_ready.
-      if (!shouldRetainDraftBufferUntilSessionReady(session.id)) {
+      // 只有编辑器提交能消费其 crash buffer；队列、自动化和 Inspector 的
+      // 内部发送不得顺手删除用户尚未发送的附件草稿。
+      if (!shouldRetainDraftBufferUntilSessionReady(session.id) && submission) {
         clearDraftBuffer(cwd);
-      } else {
+      } else if (shouldRetainDraftBufferUntilSessionReady(session.id)) {
         saveDraftBuffer(cwd, trimmed, attachments);
       }
 
@@ -3124,7 +3094,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         if (duplicate) return false;
         const nextComposers = {
           ...sessionComposers,
-          [session.id]: { ...composer, text: "", attachments: [] },
+          [session.id]: commitComposerSubmission(composer, submission),
         };
         const queued: QueuedPrompt = {
           id: uid(),
@@ -3162,7 +3132,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
       const nextComposers = {
         ...sessionComposers,
-        [session.id]: { ...composer, text: "", attachments: [] },
+        [session.id]: commitComposerSubmission(composer, submission),
       };
       persistSessionComposers(nextComposers);
       set({
@@ -3204,13 +3174,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
       return true;
     },
 
-    async interjectPrompt(text, attachments = [], targetSessionId) {
+    async interjectPrompt(text, attachments = [], targetSessionId, submission) {
       const state = get();
       const sessionId = targetSessionId ?? state.activeId;
       if (!sessionId) return false;
       const session = state.sessions[sessionId];
       if (!session || state.providerSwitching || state.restoringSessionId === sessionId) return false;
-      if (session.status !== "running") return get().sendPrompt(text, attachments, sessionId);
+      if (session.status !== "running") return get().sendPrompt(text, attachments, sessionId, undefined, submission);
       const composer = state.sessionComposers[sessionId] ?? {
         text: "",
         attachments: [],
@@ -3227,9 +3197,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
           attachments,
         });
         if (accepted) {
+          const latestComposers = get().sessionComposers;
           const nextComposers = {
-            ...get().sessionComposers,
-            [sessionId]: { ...composer, text: "", attachments: [] },
+            ...latestComposers,
+            [sessionId]: commitComposerSubmission(latestComposers[sessionId] ?? composer, submission),
           };
           persistSessionComposers(nextComposers);
           set({ sessionComposers: nextComposers });
@@ -3244,9 +3215,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         const promptQueues = { ...get().promptQueues, [sessionId]: [queued, ...queue] };
         set({ promptQueues });
         savePromptQueues(promptQueues);
+        const latestComposers = get().sessionComposers;
         const nextComposers = {
-          ...get().sessionComposers,
-          [sessionId]: { ...composer, text: "", attachments: [] },
+          ...latestComposers,
+          [sessionId]: commitComposerSubmission(latestComposers[sessionId] ?? composer, submission),
         };
         persistSessionComposers(nextComposers);
         set({ sessionComposers: nextComposers });

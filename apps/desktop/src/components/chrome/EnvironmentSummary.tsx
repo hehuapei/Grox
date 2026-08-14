@@ -4,6 +4,7 @@ import { useDesktop } from "../../state/store";
 import { MAX_ATTACHMENTS, prepareAttachment, validateAttachmentSet } from "../../lib/attachments";
 import { baseName } from "../../lib/format";
 import { useI18n } from "../../lib/i18n";
+import { worktreeRemovalBlocker } from "../../lib/worktreeOwnership";
 import { Icon } from "../fx/Icon";
 import { ChipSelect } from "../common/ChipSelect";
 
@@ -457,6 +458,21 @@ export function EnvironmentSummary() {
                             disabled={busy !== null}
                             onClick={() => {
                               void runAction("worktree", async () => {
+                                const state = useDesktop.getState();
+                                const blocker = worktreeRemovalBlocker(
+                                  item.path,
+                                  state.workspace,
+                                  state.sessionIndex.map((entry) => entry.cwd),
+                                  state.automations.map((automation) => automation.cwd),
+                                );
+                                if (blocker?.kind === "current_workspace") {
+                                  throw new Error(zh ? "不能删除当前正在使用的工作树" : "The current worktree cannot be removed");
+                                }
+                                if (blocker?.kind === "references") {
+                                  throw new Error(zh
+                                    ? `该工作树仍被 ${blocker.sessions} 个会话和 ${blocker.automations} 个自动化引用，请先迁移或删除这些记录`
+                                    : `This worktree is still referenced by ${blocker.sessions} session(s) and ${blocker.automations} automation(s)`);
+                                }
                                 if (!inTauri()) return zh ? "Worktree 已移除" : "Worktree removed";
                                 // Native shell confirms via OS dialog inside prepare_git_worktree_remove.
                                 const confirmToken = await invoke<string>("prepare_git_worktree_remove", {

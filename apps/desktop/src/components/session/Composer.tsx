@@ -219,7 +219,9 @@ export function Composer() {
   };
 
   const send = async () => {
-    const t = text.trim();
+    const submittedText = text;
+    const submittedAttachmentIds = attachments.map((attachment) => attachment.id);
+    const t = submittedText.trim();
     if ((!t && attachments.length === 0) || creating || restoring || readingFiles) return;
     // Path attachments are resolved asynchronously. Pin this turn to the
     // session that owned the composer when Enter was pressed; otherwise a
@@ -242,9 +244,15 @@ export function Composer() {
       let accepted: boolean;
       if (modeCommand?.[2]) {
         const nextMode = modeCommand[1].toLowerCase() as "plan" | "agent" | "ask";
-        accepted = sendPrompt(modeCommand[2].trim(), turnAttachments, targetSessionId, nextMode);
+        accepted = sendPrompt(modeCommand[2].trim(), turnAttachments, targetSessionId, nextMode, {
+          text: submittedText,
+          attachmentIds: submittedAttachmentIds,
+        });
       } else {
-        accepted = sendPrompt(t, turnAttachments, targetSessionId);
+        accepted = sendPrompt(t, turnAttachments, targetSessionId, undefined, {
+          text: submittedText,
+          attachmentIds: submittedAttachmentIds,
+        });
       }
       // sendPrompt clears the targeted session's persisted draft itself. If
       // the provider started switching while we were reading, leave this
@@ -258,13 +266,18 @@ export function Composer() {
   };
 
   const interject = async () => {
-    const t = text.trim();
+    const submittedText = text;
+    const submittedAttachmentIds = attachments.map((attachment) => attachment.id);
+    const t = submittedText.trim();
     if ((!t && attachments.length === 0) || creating || restoring || readingFiles || !activeId) return;
     setReadingFiles(true);
     setAttachmentError("");
     try {
       const turnAttachments = await attachExplicitPromptImages(workspace, t, attachments);
-      await interjectPrompt(t, turnAttachments, activeId);
+      await interjectPrompt(t, turnAttachments, activeId, {
+        text: submittedText,
+        attachmentIds: submittedAttachmentIds,
+      });
     } catch (cause) {
       setAttachmentError(cause instanceof Error ? cause.message : String(cause));
     } finally {

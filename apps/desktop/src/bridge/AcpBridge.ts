@@ -602,8 +602,8 @@ function extractDiffs(value: unknown): DiffHunk[] | undefined {
   return diffs.length > 0 ? diffs : undefined;
 }
 
-function extractImages(value: unknown): ToolCall["images"] {
-  const images: NonNullable<ToolCall["images"]> = [];
+function extractImages(value: unknown): Array<{ mime: string; data: string }> | undefined {
+  const images: Array<{ mime: string; data: string }> = [];
   const seen = new Set<string>();
   walkJson(value, (object) => {
     const type = string(object.type);
@@ -1054,6 +1054,8 @@ export class AcpBridge implements GrokBridge {
   private streamFlushTimer: number | undefined;
   private toolPatches = new Map<string, Extract<BridgeEvent, { type: "tool_patch" }>>();
   private toolFlushTimer: number | undefined;
+  private toolImagePersistGeneration = new Map<string, number>();
+  private toolImagePersistFailures = new Set<string>();
   private diagnostics: string[] = [];
   private requestId = 0;
   /** 与原生 ACP 子进程绑定，防止旧异步请求写入新子进程。 */
@@ -1198,6 +1200,50 @@ export class AcpBridge implements GrokBridge {
     }
     if (this.toolPatches.size > 0) {
       this.toolFlushTimer = window.setTimeout(() => this.flushToolPatches(), TOOL_FLUSH_MS);
+    }
+  }
+
+  private persistToolImages(
+    sessionId: string,
+    blockId: string,
+    images: Array<{ mime: string; data: string }> | undefined,
+  ) {
+    if (!images || images.length === 0) return;
+    const key = `${sessionId}:${blockId}`;
+    const generation = (this.toolImagePersistGeneration.get(key) ?? 0) + 1;
+    this.toolImagePersistGeneration.set(key, generation);
+    void invoke<ToolCall["images"]>("persist_session_tool_images", { sessionId, images }).then((references) => {
+      if (this.toolImagePersistGeneration.get(key) !== generation || !references?.length) return;
+      // 先提交可能仍在节流队列中的 base64 patch，再用持久引用替换它。
+      this.flushToolPatches(sessionId);
+      this.emit({ type: "tool_patch", sessionId, blockId, call: { images: references } });
+      this.toolImagePersistFailures.delete(key);
+    }).catch((error) => {
+      this.diagnostics.push(`工具图片持久化失败：${errorText(error)}`);
+      this.diagnostics = this.diagnostics.slice(-20);
+      if (this.toolImagePersistFailures.has(key)) return;
+      this.toolImagePersistFailures.add(key);
+      this.emit({
+        type: "runtime_notice",
+        notice: runtimeNoticeFromError(toGroxError(error, {
+          domain: "environment",
+          code: "TOOL_MEDIA_PERSIST_FAILED",
+          message: "工具图片未能写入会话存储，重启后可能无法恢复",
+          recoverable: true,
+          fatal: false,
+          holdQueue: false,
+          action: "请检查应用配置目录的磁盘空间和写入权限",
+        })),
+      });
+    });
+  }
+
+  private forgetToolImagePersistence(sessionId: string) {
+    for (const key of this.toolImagePersistGeneration.keys()) {
+      if (key.startsWith(`${sessionId}:`)) this.toolImagePersistGeneration.delete(key);
+    }
+    for (const key of this.toolImagePersistFailures) {
+      if (key.startsWith(`${sessionId}:`)) this.toolImagePersistFailures.delete(key);
     }
   }
 
@@ -2002,6 +2048,7 @@ export class AcpBridge implements GrokBridge {
     const content = array(update.content);
     const canonicalKind = toolCanonicalKind(update);
     const kind = mapToolKind(canonicalKind ?? update.kind, update.title);
+    const images = extractImages([content, update.rawOutput]);
     const call: ToolCall = {
       id: toolCallId,
       kind,
@@ -2014,7 +2061,7 @@ export class AcpBridge implements GrokBridge {
       input: jsonText(update.rawInput),
       output: toolOutputText(update.rawOutput, content),
       diff: extractDiffs([content, update.rawInput, update.rawOutput]),
-      images: extractImages([content, update.rawOutput]),
+      images,
       terminal: extractTerminal(
         kind,
         update.title,
@@ -2034,6 +2081,7 @@ export class AcpBridge implements GrokBridge {
       sessionId,
       block: { type: "tool", id: blockId, call, ts: Date.now() },
     });
+    this.persistToolImages(sessionId, blockId, images);
   }
 
   private patchTool(sessionId: string, update: JsonObject) {
@@ -2075,6 +2123,9 @@ export class AcpBridge implements GrokBridge {
       }
     }
     const locations = extractLocations(update.locations, update.rawInput, update.rawOutput, content);
+    const images = content.length > 0 || update.rawOutput !== undefined
+      ? extractImages([content, update.rawOutput])
+      : undefined;
     this.queueToolPatch({
       type: "tool_patch",
       sessionId,
@@ -2091,11 +2142,12 @@ export class AcpBridge implements GrokBridge {
         ...(content.length > 0 || update.rawInput !== undefined || update.rawOutput !== undefined
           ? { diff: extractDiffs([content, update.rawInput, update.rawOutput]) }
           : {}),
-        ...(content.length > 0 || update.rawOutput !== undefined ? { images: extractImages([content, update.rawOutput]) } : {}),
+        ...(images ? { images } : {}),
         ...(terminal ? { terminal } : {}),
         ...(locations ? { locations } : {}),
       },
     });
+    this.persistToolImages(sessionId, blockId, images);
   }
 
   private handleXaiUpdate(sessionId: string, updateValue: unknown) {
@@ -3891,6 +3943,7 @@ export class AcpBridge implements GrokBridge {
       if (key.startsWith(`${id}:`)) this.activeComputerToolCalls.delete(key);
     }
     this.knownSessions.delete(id);
+    this.forgetToolImagePersistence(id);
     this.sessionWorkspaces.delete(id);
     this.cursors.delete(id);
     this.usage.delete(id);
@@ -3906,6 +3959,7 @@ export class AcpBridge implements GrokBridge {
       await this.request("x.ai/session/close", { sessionId: id });
     }
     this.knownSessions.delete(id);
+    this.forgetToolImagePersistence(id);
     this.sessionWorkspaces.delete(id);
     this.cursors.delete(id);
     this.usage.delete(id);

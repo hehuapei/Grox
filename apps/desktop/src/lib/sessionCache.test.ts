@@ -44,6 +44,29 @@ describe("compactSession", () => {
     expect(parseSessionJournal(JSON.stringify(snapshot), "session-1")).toEqual(snapshot);
   });
 
+  it("journal 只保存 Host 管理的工具图片引用", () => {
+    const result = compactSession(session([{
+      type: "tool",
+      id: "tool-image",
+      ts: 1,
+      call: {
+        id: "call-image",
+        kind: "computer",
+        title: "screenshot",
+        status: "done",
+        startedAt: 1,
+        images: [
+          { mime: "image/png", data: "inline-only" },
+          { mime: "image/png", data: "live-copy", path: "/managed/session/media/hash.png" },
+        ],
+      },
+    }]));
+    const block = result.blocks[0];
+    expect(block.type).toBe("tool");
+    if (block.type !== "tool") return;
+    expect(block.call.images).toEqual([{ mime: "image/png", path: "/managed/session/media/hash.png" }]);
+  });
+
   it("读取旧版裸 Session 时迁移为 settled journal", () => {
     const migrated = parseSessionJournal(JSON.stringify(session([], "idle")), "session-1");
     expect(migrated).toMatchObject({ version: 1, appSessionId: "session-1", turnState: "settled" });
