@@ -6,6 +6,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod acp_host;
 mod browser_mcp;
 mod computer_mcp;
 mod git_confirm;
@@ -29,6 +30,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use acp_host::{AcpHostError, AcpRequestBroker};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use git_confirm::GitConfirmStore;
 use mcp_leases::McpLeaseStore;
@@ -141,6 +143,7 @@ impl SessionStorageState {
 struct AcpState {
     process: Mutex<Option<AgentProcess>>,
     next_generation: AtomicU64,
+    requests: AcpRequestBroker,
 }
 
 struct PreviewProcess {
@@ -174,6 +177,7 @@ struct AgentRuntimeStatus {
     running: bool,
     generation: Option<u64>,
     pid: Option<u32>,
+    pending_requests: usize,
 }
 
 #[derive(Serialize)]
@@ -188,13 +192,21 @@ struct DesktopEnvironment {
 async fn agent_runtime_status(
     state: tauri::State<'_, Arc<AcpState>>,
 ) -> Result<AgentRuntimeStatus, String> {
-    let process = state.process.lock().await;
+    let (running, generation, pid) = {
+        let process = state.process.lock().await;
+        (
+            process.is_some(),
+            process.as_ref().map(|process| process.generation),
+            process.as_ref().and_then(|process| process.child.id()),
+        )
+    };
     Ok(AgentRuntimeStatus {
         topology: "shared_process",
         process_capacity: 1,
-        running: process.is_some(),
-        generation: process.as_ref().map(|process| process.generation),
-        pid: process.as_ref().and_then(|process| process.child.id()),
+        running,
+        generation,
+        pid,
+        pending_requests: state.requests.len().await,
     })
 }
 
@@ -2935,6 +2947,7 @@ async fn export_session_support_bundle(
         "sessionCapacity": "shared_unbounded",
         "process": process.unwrap_or_else(|| serde_json::json!({ "running": false })),
         "nextGeneration": state.next_generation.load(Ordering::Relaxed),
+        "pendingRequests": state.requests.len().await,
         "cli": {
             "path": support_path(&runtime_info.path),
             "source": runtime_info.source,
@@ -3088,6 +3101,17 @@ async fn install_official_grok_cli(
     // Windows cannot replace a running executable. Stop the official CLI
     // child before invoking its official updater; the webview reload below
     // starts the freshly installed binary again.
+    state.next_generation.fetch_add(1, Ordering::Relaxed);
+    state
+        .requests
+        .reject_all(AcpHostError::environment(
+            "ACP_CLI_UPDATING",
+            "Grok CLI 正在更新，当前 ACP 请求已停止",
+            true,
+            true,
+            "更新结束后重新连接 Agent，并检查最后一轮结果",
+        ))
+        .await;
     if let Some(process) = state.process.lock().await.take() {
         terminate_process(process).await;
     }
@@ -7185,6 +7209,16 @@ async fn acp_spawn(
     // or stderr lines after `kill`; those lines must not reach the new ACP
     // connection.
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    state
+        .requests
+        .reject_all(AcpHostError::environment(
+            "ACP_CHANNEL_REPLACED",
+            "ACP 通道已切换，请在新通道上重试",
+            true,
+            true,
+            "Agent 重连后检查最后一轮结果，再决定是否重新发送",
+        ))
+        .await;
 
     if let Some(old) = state.process.lock().await.take() {
         terminate_process(old).await;
@@ -7292,6 +7326,13 @@ async fn acp_spawn(
                         break;
                     }
                     if !line.trim().is_empty() {
+                        if stdout_state
+                            .requests
+                            .resolve_response(generation, &line)
+                            .await
+                        {
+                            continue;
+                        }
                         let _ = stdout_app.emit("acp-event", line);
                     }
                 }
@@ -7322,6 +7363,23 @@ async fn acp_spawn(
                 .await
                 .ok()
                 .and_then(|status| status.code());
+            let exit_message = match code {
+                Some(code) => format!("Grok Agent 已退出（代码 {code}）"),
+                None => "Grok Agent 已退出".to_string(),
+            };
+            stdout_state
+                .requests
+                .reject_generation(
+                    generation,
+                    AcpHostError::environment(
+                        "ACP_PROCESS_EXITED",
+                        exit_message,
+                        true,
+                        true,
+                        "Agent 重连后检查最后一轮结果，再决定是否重新发送",
+                    ),
+                )
+                .await;
             let _ = stdout_app.emit(
                 "acp-exit",
                 AcpExitPayload {
@@ -7420,19 +7478,11 @@ fn acp_method_allowed(method: &str) -> bool {
     ) || m.starts_with("x.ai/")
 }
 
-#[tauri::command]
-async fn acp_send(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, Arc<AcpState>>,
-    leases: tauri::State<'_, Arc<McpLeaseStore>>,
-    line: String,
-    generation: u64,
-) -> Result<(), String> {
-    ensure_main_acp_owner(window.label())?;
+fn prepare_acp_line(line: String, leases: &McpLeaseStore) -> Result<String, String> {
     if line.contains('\n') || line.contains('\r') {
         return Err("ACP 消息必须是单行 JSON".into());
     }
-    // Bound stdin payload size (multimodal base64 still fits under 8 MiB).
+    // 多模态 base64 需要较大上限，但不能允许 WebView 无界占用 Host 内存。
     const MAX_ACP_LINE_BYTES: usize = 8 * 1024 * 1024;
     if line.len() > MAX_ACP_LINE_BYTES {
         return Err(format!(
@@ -7441,18 +7491,31 @@ async fn acp_send(
             MAX_ACP_LINE_BYTES
         ));
     }
-    // Method allowlist before lease inject / stdin write.
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-        if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
-            if !acp_method_allowed(method) {
-                return Err(format!("不允许的 ACP 方法：{method}"));
-            }
+    let message = serde_json::from_str::<serde_json::Value>(&line)
+        .map_err(|error| format!("ACP 消息不是合法 JSON：{error}"))?;
+    if !message.is_object() {
+        return Err("ACP 消息必须是 JSON 对象".into());
+    }
+    if message.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+        return Err("ACP 消息必须声明 jsonrpc 2.0".into());
+    }
+    if let Some(method) = message.get("method").and_then(serde_json::Value::as_str) {
+        if !acp_method_allowed(method) {
+            return Err(format!("不允许的 ACP 方法：{method}"));
         }
     }
-    let line = mcp_leases::inject_mcp_servers(&line, leases.inner())?;
+    let line = mcp_leases::inject_mcp_servers(&line, leases)?;
     if line.contains('\n') || line.contains('\r') {
         return Err("ACP 消息必须是单行 JSON".into());
     }
+    Ok(line)
+}
+
+async fn write_acp_line(
+    state: &AcpState,
+    line: &str,
+    generation: u64,
+) -> Result<(), String> {
     let mut guard = state.process.lock().await;
     let process = guard
         .as_mut()
@@ -7478,6 +7541,153 @@ async fn acp_send(
 }
 
 #[tauri::command]
+async fn acp_send(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    leases: tauri::State<'_, Arc<McpLeaseStore>>,
+    line: String,
+    generation: u64,
+) -> Result<(), String> {
+    ensure_main_acp_owner(window.label())?;
+    let line = prepare_acp_line(line, leases.inner())?;
+    let message = serde_json::from_str::<serde_json::Value>(&line)
+        .map_err(|error| format!("ACP 消息不是合法 JSON：{error}"))?;
+    if message.get("id").is_some() && message.get("method").is_some() {
+        return Err("ACP 请求必须通过原生请求通道发送".into());
+    }
+    write_acp_line(state.inner(), &line, generation).await
+}
+
+/// 发送 ACP 请求并在原生 Host 内等待其响应。响应不再广播给所有 WebView。
+#[tauri::command]
+async fn acp_request(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    leases: tauri::State<'_, Arc<McpLeaseStore>>,
+    line: String,
+    request_id: u64,
+    generation: u64,
+    timeout_ms: u64,
+) -> Result<String, AcpHostError> {
+    ensure_main_acp_owner(window.label()).map_err(|error| {
+        AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error)
+    })?;
+    let line = prepare_acp_line(line, leases.inner())
+        .map_err(|error| AcpHostError::protocol("ACP_INVALID_REQUEST", error))?;
+    let message = serde_json::from_str::<serde_json::Value>(&line)
+        .map_err(|error| AcpHostError::protocol("ACP_INVALID_REQUEST", format!("ACP 消息不是合法 JSON：{error}")))?;
+    let wire_id = message
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| AcpHostError::protocol("ACP_INVALID_REQUEST", "ACP 请求缺少数字 id"))?;
+    if wire_id != request_id {
+        return Err(AcpHostError::protocol(
+            "ACP_REQUEST_ID_MISMATCH",
+            "ACP 请求 id 与 Host 参数不一致",
+        ));
+    }
+    let method = message
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AcpHostError::protocol("ACP_INVALID_REQUEST", "ACP 请求缺少 method"))?
+        .to_string();
+    let receiver = state
+        .requests
+        .register(request_id, generation, method.clone())
+        .await?;
+    if let Err(error) = write_acp_line(state.inner(), &line, generation).await {
+        let failure = AcpHostError::environment(
+            "ACP_WRITE_FAILED",
+            error,
+            true,
+            true,
+            "检查 Grok Build CLI 是否仍在运行，然后重新连接",
+        );
+        state
+            .requests
+            .reject(request_id, generation, failure.clone())
+            .await;
+        return Err(failure);
+    }
+
+    let response = if timeout_ms == 0 {
+        receiver.await.map_err(|_| {
+            AcpHostError::environment(
+                "ACP_REQUEST_CHANNEL_CLOSED",
+                "ACP 请求通道已关闭",
+                true,
+                true,
+                "重新连接 Agent 后重试",
+            )
+        })?
+    } else {
+        // 普通 RPC 最多允许等待一天；长回合使用 0 并由会话 watchdog 明确取消。
+        let timeout = Duration::from_millis(timeout_ms.min(24 * 60 * 60 * 1_000));
+        match tokio::time::timeout(timeout, receiver).await {
+            Ok(result) => result.map_err(|_| {
+                AcpHostError::environment(
+                    "ACP_REQUEST_CHANNEL_CLOSED",
+                    "ACP 请求通道已关闭",
+                    true,
+                    true,
+                    "重新连接 Agent 后重试",
+                )
+            })?,
+            Err(_) => {
+                let failure = AcpHostError::environment(
+                    "ACP_REQUEST_TIMEOUT",
+                    format!("Grok Agent 请求超时：{method}"),
+                    true,
+                    true,
+                    "检查网络和 Grok Build CLI 状态后重试",
+                );
+                state
+                    .requests
+                    .reject(request_id, generation, failure.clone())
+                    .await;
+                return Err(failure);
+            }
+        }
+    };
+    response
+}
+
+/// 会话 watchdog/协议恢复只取消一个 Host 请求，不影响同进程内其他会话。
+#[tauri::command]
+async fn acp_cancel_request(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    request_id: u64,
+    generation: u64,
+    reason: String,
+    kind: String,
+) -> Result<bool, String> {
+    ensure_main_acp_owner(window.label())?;
+    let reason = reason.trim();
+    if reason.is_empty() || reason.chars().count() > 1_000 {
+        return Err("ACP 取消原因无效".into());
+    }
+    let failure = match kind.as_str() {
+        "watchdog" => AcpHostError::environment(
+            "ACP_REQUEST_STALLED",
+            reason,
+            true,
+            true,
+            "检查网络、模型或供应商配置，并确认最后一轮结果后重试",
+        ),
+        "protocol_recovery" => {
+            AcpHostError::protocol("ACP_REQUEST_ABORTED_FOR_RECOVERY", reason)
+        }
+        "user" => AcpHostError::operation("ACP_REQUEST_CANCELLED", reason),
+        _ => return Err("ACP 取消类型无效".into()),
+    };
+    Ok(state
+        .requests
+        .reject(request_id, generation, failure)
+        .await)
+}
+
+#[tauri::command]
 async fn acp_kill(
     app: tauri::AppHandle,
     window: tauri::WebviewWindow,
@@ -7485,6 +7695,13 @@ async fn acp_kill(
 ) -> Result<(), String> {
     ensure_main_acp_owner(window.label())?;
     state.next_generation.fetch_add(1, Ordering::Relaxed);
+    state
+        .requests
+        .reject_all(AcpHostError::operation(
+            "ACP_REQUEST_CANCELLED",
+            "Grok Agent 已停止",
+        ))
+        .await;
     if let Some(process) = state.process.lock().await.take() {
         terminate_process(process).await;
         let _ = app.emit(
@@ -8090,6 +8307,8 @@ fn main() {
             save_media_reference,
             generate_media,
             acp_spawn,
+            acp_request,
+            acp_cancel_request,
             acp_send,
             acp_kill,
         ])
@@ -8098,6 +8317,17 @@ fn main() {
                 let state = window.state::<Arc<AcpState>>().inner().clone();
                 let preview_state = window.state::<Arc<PreviewState>>().inner().clone();
                 tauri::async_runtime::spawn(async move {
+                    state.next_generation.fetch_add(1, Ordering::Relaxed);
+                    state
+                        .requests
+                        .reject_all(AcpHostError::environment(
+                            "ACP_HOST_CLOSED",
+                            "主窗口已关闭，ACP 请求已停止",
+                            true,
+                            true,
+                            "重新打开 Grox 后检查最后一轮结果",
+                        ))
+                        .await;
                     if let Some(process) = state.process.lock().await.take() {
                         terminate_process(process).await;
                     }
@@ -9322,6 +9552,26 @@ UNRELATED=value
         assert!(acp_method_allowed("x.ai/future_extension"));
         assert!(acp_method_allowed("_x.ai/future_extension"));
         assert!(!acp_method_allowed("session/../../evil"));
+    }
+
+    #[test]
+    fn acp_line_gate_requires_json_rpc_and_rejects_privileged_methods() {
+        let leases = McpLeaseStore::default();
+        assert!(prepare_acp_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{}}"#.into(),
+            &leases,
+        )
+        .is_ok());
+        assert!(prepare_acp_line(
+            r#"{"id":1,"method":"session/prompt","params":{}}"#.into(),
+            &leases,
+        )
+        .is_err());
+        assert!(prepare_acp_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"shell/exec","params":{}}"#.into(),
+            &leases,
+        )
+        .is_err());
     }
 
     #[test]

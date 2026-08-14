@@ -1,5 +1,8 @@
 # ADR-0001：会话回合由 session/prompt RPC 结果裁决
 
+> 2026-08-14：第 4、6、7 条关于 Bridge/窗口拥有运行时的决定已由
+> [ADR-0003](./0003-native-host-backend.md) 取代；`session/prompt` 仍是回合终态裁决依据。
+
 - 状态：Accepted
 - 日期：2026-08-13
 

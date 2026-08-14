@@ -31,4 +31,25 @@ describe("errorModel", () => {
     expect(error.domain).toBe("environment");
     expect(error.holdQueue).toBe(true);
   });
+
+  it("保留原生 Host 提供的稳定错误代码和恢复动作", () => {
+    const error = toGroxError({
+      domain: "environment",
+      code: "ACP_PROCESS_EXITED",
+      message: "Grok Agent 已退出",
+      recoverable: true,
+      fatal: true,
+      holdQueue: true,
+      action: "重连后检查最后一轮结果",
+    }, { domain: "protocol", code: "SESSION_PROMPT_FAILED" });
+    expect(error).toEqual({
+      domain: "environment",
+      code: "ACP_PROCESS_EXITED",
+      message: "Grok Agent 已退出",
+      recoverable: true,
+      fatal: true,
+      holdQueue: true,
+      action: "重连后检查最后一轮结果",
+    });
+  });
 });

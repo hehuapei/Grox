@@ -56,7 +56,6 @@ import {
 } from "../lib/promptTurnTimeout";
 import {
   formatGroxError,
-  groxFailure,
   runtimeNoticeFromError,
   toGroxError,
 } from "../lib/errorModel";
@@ -64,6 +63,7 @@ import type { ErrorFallback } from "../lib/errorModel";
 import { sessionFromDiskPreview, type SessionDiskPreview } from "../lib/sessionDiskPreview";
 import { mapToolKind } from "../lib/toolKind";
 import { SharedAcpLifecycleGate } from "../lib/sharedAcpLifecycleGate";
+import { AcpRpcError, decodeAcpResponse } from "./acpRpc";
 
 export const ACP_METHODS = {
   initialize: "initialize",
@@ -125,13 +125,6 @@ interface AcpReadFilePayload {
   type: string;
 }
 
-interface PendingRequest {
-  resolve(value: unknown): void;
-  reject(error: Error): void;
-  method: string;
-  timeoutId?: number;
-}
-
 function storedEffort(): Effort {
   const value = localStorage.getItem("grok.effort");
   return EFFORTS.find((effort) => effort === value) ?? "high";
@@ -156,18 +149,6 @@ interface PendingInteraction {
   kind: "permission" | "plan" | "question";
   optionIds: Partial<Record<PermissionOption, string>>;
   questions?: QuestionItem[];
-}
-
-class AcpRpcError extends Error {
-  constructor(
-    readonly method: string,
-    readonly code: number | undefined,
-    message: string,
-    readonly data?: unknown,
-  ) {
-    super(`${message} · ${method}`);
-    this.name = "AcpRpcError";
-  }
 }
 
 function isInvalidParamsError(error: unknown): boolean {
@@ -1015,7 +996,6 @@ export class AcpBridge implements GrokBridge {
   readonly kind = "acp" as const;
 
   private listeners = new Set<(event: BridgeEvent) => void>();
-  private pending = new Map<RpcId, PendingRequest>();
   private interactions = new Map<string, PendingInteraction>();
   private cursors = new Map<string, ContentCursor>();
   private catalogue = new Map<string, SessionMeta>();
@@ -1354,12 +1334,6 @@ export class AcpBridge implements GrokBridge {
     this.emit({ type: "runtime_state", state: "starting" });
     this.flushStreamAppends();
     this.flushToolPatches();
-    const error = new Error("模型服务已切换，请重新发送尚未完成的请求");
-    for (const request of this.pending.values()) {
-      if (request.timeoutId !== undefined) window.clearTimeout(request.timeoutId);
-      request.reject(error);
-    }
-    this.pending.clear();
     this.interactions.clear();
     this.cursors.clear();
     this.openToolCalls.clear();
@@ -1498,20 +1472,6 @@ export class AcpBridge implements GrokBridge {
       }
     }
     this.interactions.clear();
-    const exitFailure = groxFailure({
-      domain: "environment",
-      code: "ACP_PROCESS_EXITED",
-      message,
-      recoverable: true,
-      fatal: true,
-      holdQueue: true,
-      action: "Agent 重连后检查最后一轮结果，再决定是否重新发送",
-    });
-    for (const request of this.pending.values()) {
-      if (request.timeoutId !== undefined) window.clearTimeout(request.timeoutId);
-      request.reject(exitFailure);
-    }
-    this.pending.clear();
     this.knownSessions.clear();
     this.loadPromises.clear();
     this.cursors.clear();
@@ -1596,53 +1556,19 @@ export class AcpBridge implements GrokBridge {
     }
 
     if (message.id !== undefined && !message.method) {
-      const pending = this.pending.get(message.id);
-      if (!pending) {
-        this.emit({
-          type: "runtime_notice",
-          notice: runtimeNoticeFromError({
-            domain: "protocol",
-            code: "ACP_ORPHAN_RESPONSE",
-            message: "收到无法归属到当前请求的 ACP 响应",
-            recoverable: true,
-            fatal: false,
-            holdQueue: false,
-            action: "若会话状态异常，请重新打开该会话",
-          }),
-        });
-        return;
-      }
-      this.pending.delete(message.id);
-      if (pending.timeoutId !== undefined) window.clearTimeout(pending.timeoutId);
-      if (message.error !== undefined) {
-        const error = record(message.error);
-        pending.reject(
-          new AcpRpcError(
-            pending.method,
-            number(error?.code),
-            string(error?.message) ?? `ACP 请求失败：${pending.method}`,
-            error?.data,
-          ),
-        );
-      } else {
-        const extension = pending.method.startsWith("x.ai/")
-          ? record(message.result)
-          : undefined;
-        if (extension && "error" in extension && extension.error != null) {
-          pending.reject(
-            new AcpRpcError(
-              pending.method,
-              number(record(extension.error)?.code),
-              errorText(extension.error),
-              extension.error,
-            ),
-          );
-        } else if (extension && "result" in extension) {
-          pending.resolve(extension.result);
-        } else {
-          pending.resolve(message.result);
-        }
-      }
+      // 正常响应已由原生 Host 定向交付；广播到这里的一定没有请求归属。
+      this.emit({
+        type: "runtime_notice",
+        notice: runtimeNoticeFromError({
+          domain: "protocol",
+          code: "ACP_ORPHAN_RESPONSE",
+          message: "收到无法归属到当前请求的 ACP 响应",
+          recoverable: true,
+          fatal: false,
+          holdQueue: false,
+          action: "若会话状态异常，请重新打开该会话",
+        }),
+      });
       return;
     }
 
@@ -2362,12 +2288,8 @@ export class AcpBridge implements GrokBridge {
 
     const rpcId = this.promptRpcBySession.get(sessionId);
     if (rpcId === undefined) return;
-    const pending = this.pending.get(rpcId);
-    if (!pending || pending.method !== ACP_METHODS.sessionPrompt) return;
-    this.pending.delete(rpcId);
     this.promptRpcBySession.delete(sessionId);
-    if (pending.timeoutId !== undefined) window.clearTimeout(pending.timeoutId);
-    pending.reject(new Error(message || "Invalid reasoning effort"));
+    void this.cancelRpcRequest(rpcId, message || "Invalid reasoning effort", "protocol_recovery");
   }
 
   /** If session/prompt resolves with an error body instead of rejecting. */
@@ -2560,27 +2482,36 @@ export class AcpBridge implements GrokBridge {
     await invoke("acp_send", { line: JSON.stringify(message), generation: this.acpGeneration });
   }
 
-  private requestRaw(method: string, params: unknown, timeoutMs = 30_000, onPending?: (id: RpcId) => void): Promise<unknown> {
+  private async requestRaw(method: string, params: unknown, timeoutMs = 30_000, onPending?: (id: RpcId) => void): Promise<unknown> {
     const id = ++this.requestId;
     onPending?.(id);
-    return new Promise((resolve, reject) => {
-      const timeoutId = timeoutMs > 0
-        ? window.setTimeout(() => {
-            const pending = this.pending.get(id);
-            if (!pending) return;
-            this.pending.delete(id);
-            pending.reject(new Error(`Grok Agent 请求超时：${method}`));
-          }, timeoutMs)
-        : undefined;
-      this.pending.set(id, { resolve, reject, method, timeoutId });
-      void this.sendRaw({ jsonrpc: "2.0", id, method: wireMethod(method), params }).catch((cause) => {
-        const pending = this.pending.get(id);
-        if (!pending) return;
-        this.pending.delete(id);
-        if (pending.timeoutId !== undefined) window.clearTimeout(pending.timeoutId);
-        reject(cause instanceof Error ? cause : new Error(String(cause)));
-      });
+    const response = await invoke<string>("acp_request", {
+      line: JSON.stringify({ jsonrpc: "2.0", id, method: wireMethod(method), params }),
+      requestId: id,
+      generation: this.acpGeneration,
+      timeoutMs,
     });
+    return decodeAcpResponse(response, id, method);
+  }
+
+  private async cancelRpcRequest(
+    id: RpcId,
+    reason: string,
+    kind: "watchdog" | "protocol_recovery" | "user",
+  ): Promise<boolean> {
+    if (typeof id !== "number") return false;
+    try {
+      return await invoke<boolean>("acp_cancel_request", {
+        requestId: id,
+        generation: this.acpGeneration,
+        reason,
+        kind,
+      });
+    } catch (error) {
+      this.diagnostics.push(`取消 ACP 请求失败：${errorText(error)}`);
+      this.diagnostics = this.diagnostics.slice(-20);
+      return false;
+    }
   }
 
   private async request(method: string, params: unknown, timeoutMs = 30_000): Promise<unknown> {
@@ -3617,17 +3548,12 @@ export class AcpBridge implements GrokBridge {
             hasOpenGate: this.sessionHasOpenGate(sessionId),
           });
           if (reason === "ok") return;
-          const pending = this.pending.get(promptRpcId);
-          if (!pending) return;
-          this.pending.delete(promptRpcId);
+          if (this.promptRpcBySession.get(sessionId) !== promptRpcId) return;
           this.promptRpcBySession.delete(sessionId);
-          pending.reject(
-            new Error(
-              reason === "absolute"
-                ? promptTurnTimeoutMessage("absolute")
-                : "Grok Agent 长时间没有任何响应：上游服务可能无返回。请检查网络、模型或供应商配置后重试。",
-            ),
-          );
+          const timeoutMessage = reason === "absolute"
+            ? promptTurnTimeoutMessage("absolute")
+            : "Grok Agent 长时间没有任何响应：上游服务可能无返回。请检查网络、模型或供应商配置后重试。";
+          void this.cancelRpcRequest(promptRpcId, timeoutMessage, "watchdog");
           this.cancel(sessionId, false);
         }, 15_000);
         try {

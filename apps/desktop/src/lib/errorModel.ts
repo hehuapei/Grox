@@ -28,6 +28,37 @@ function errorText(cause: unknown): string {
   }
 }
 
+function structuredHostError(cause: unknown): GroxError | undefined {
+  let value = cause;
+  if (typeof value === "string" && value.trim().startsWith("{")) {
+    try {
+      value = JSON.parse(value);
+    } catch {
+      return undefined;
+    }
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const row = value as Record<string, unknown>;
+  const domain = row.domain;
+  if (domain !== "protocol" && domain !== "operation" && domain !== "environment") return undefined;
+  if (
+    typeof row.code !== "string"
+    || typeof row.message !== "string"
+    || typeof row.recoverable !== "boolean"
+    || typeof row.fatal !== "boolean"
+    || typeof row.holdQueue !== "boolean"
+  ) return undefined;
+  return {
+    domain,
+    code: row.code,
+    message: row.message,
+    recoverable: row.recoverable,
+    fatal: row.fatal,
+    holdQueue: row.holdQueue,
+    ...(typeof row.action === "string" ? { action: row.action } : {}),
+  };
+}
+
 function inferredDomain(cause: unknown, fallback: GroxErrorDomain): GroxErrorDomain {
   if (cause instanceof Error && cause.name === "AcpRpcError") return "protocol";
   const message = errorText(cause).toLowerCase();
@@ -39,6 +70,8 @@ function inferredDomain(cause: unknown, fallback: GroxErrorDomain): GroxErrorDom
 
 export function toGroxError(cause: unknown, fallback: ErrorFallback): GroxError {
   if (cause instanceof GroxFailure) return cause.error;
+  const hostError = structuredHostError(cause);
+  if (hostError) return hostError;
   const detail = errorText(cause);
   const domain = inferredDomain(cause, fallback.domain);
   return {
