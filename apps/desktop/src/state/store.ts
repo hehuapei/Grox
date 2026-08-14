@@ -42,6 +42,7 @@ import type {
   WorkflowRun,
   RuntimeNotice,
   RuntimeConnectionState,
+  RuntimeOccupancy,
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
 import {
@@ -222,6 +223,7 @@ interface DesktopState {
   startupError: string | null;
   runtimeNotices: RuntimeNotice[];
   runtimeConnection: RuntimeConnectionState;
+  runtimeOccupancy: RuntimeOccupancy;
   auth: AuthState;
   bridgeKind: "mock" | "acp";
   workspace: string;
@@ -1272,6 +1274,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
       case "runtime_state":
         set({ runtimeConnection: e.state });
         break;
+      case "runtime_occupancy":
+        set({ runtimeOccupancy: e.occupancy });
+        break;
       case "model_state":
         {
           const currentState = get();
@@ -1735,6 +1740,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     startupError: null,
     runtimeNotices: [],
     runtimeConnection: bridge.kind === "mock" ? "ready" : "starting",
+    runtimeOccupancy: { activeTurnSessionIds: [], lifecycleActive: false, pendingLifecycle: 0 },
     auth: { required: false, inProgress: false },
     bridgeKind: bridge.kind,
     workspace: DEMO_CWD,

@@ -63,6 +63,7 @@ import {
 import type { ErrorFallback } from "../lib/errorModel";
 import { sessionFromDiskPreview, type SessionDiskPreview } from "../lib/sessionDiskPreview";
 import { mapToolKind } from "../lib/toolKind";
+import { SharedAcpLifecycleGate } from "../lib/sharedAcpLifecycleGate";
 
 export const ACP_METHODS = {
   initialize: "initialize",
@@ -917,6 +918,7 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
     case "workflow_trace_update":
     case "runtime_notice":
     case "runtime_state":
+    case "runtime_occupancy":
       return session;
     case "session_meta":
       return { ...session, ...event.patch };
@@ -1033,6 +1035,9 @@ export class AcpBridge implements GrokBridge {
   private promptRpcBySession = new Map<string, RpcId>();
   private sessionSetModelUnsupported = false;
   private activePromptSessions = new Set<string>();
+  private readonly lifecycleGate = new SharedAcpLifecycleGate((occupancy) => {
+    this.emit({ type: "runtime_occupancy", occupancy });
+  });
   private stoppingSessions = new Set<string>();
   private promptDrainWaiters = new Set<() => void>();
   private knownSessions = new Set<string>();
@@ -3022,37 +3027,38 @@ export class AcpBridge implements GrokBridge {
     let computer = await this.resolveComputerExtensions();
     let responseValue: unknown;
     try {
-      try {
-        responseValue = await this.request(ACP_METHODS.sessionNew, {
-          cwd,
-          // Bearer tokens are injected natively from lease ids — never from the WebView.
-          mcpServers: [],
-          _meta: {
-            ...metaRequest,
-            ...(preferredModel ? { modelId: preferredModel } : {}),
-            reasoningEffort,
-            ...(computer.pluginDirs.length ? { pluginDirs: computer.pluginDirs } : {}),
-            ...(computer.computerLeaseId ? { groxComputerLeaseId: computer.computerLeaseId } : {}),
-            ...(computer.browserLeaseId ? { groxBrowserLeaseId: computer.browserLeaseId } : {}),
-          },
-        });
-      } catch (error) {
-        // Older Grok CLIs reject the v0.2.3 Computer Use session extensions
-        // instead of ignoring unknown fields. Keep core ACP usable by retrying
-        // with the standard session/new shape.
-        if (!isInvalidParamsError(error)) throw error;
-        await this.discardLeaseAttempt(computer);
-        computer = { pluginDirs: [], computerLeaseId: "", browserLeaseId: "" };
-        responseValue = await this.request(ACP_METHODS.sessionNew, {
-          cwd,
-          mcpServers: [],
-          _meta: {
-            ...metaRequest,
-            ...(preferredModel ? { modelId: preferredModel } : {}),
-            reasoningEffort,
-          },
-        });
-      }
+      responseValue = await this.lifecycleGate.runLifecycle(async () => {
+        try {
+          return await this.request(ACP_METHODS.sessionNew, {
+            cwd,
+            // Bearer tokens are injected natively from lease ids — never from the WebView.
+            mcpServers: [],
+            _meta: {
+              ...metaRequest,
+              ...(preferredModel ? { modelId: preferredModel } : {}),
+              reasoningEffort,
+              ...(computer.pluginDirs.length ? { pluginDirs: computer.pluginDirs } : {}),
+              ...(computer.computerLeaseId ? { groxComputerLeaseId: computer.computerLeaseId } : {}),
+              ...(computer.browserLeaseId ? { groxBrowserLeaseId: computer.browserLeaseId } : {}),
+            },
+          });
+        } catch (error) {
+          // Keep the compatibility retry in the same exclusive window: a
+          // prompt must not slip between the rejected and canonical request.
+          if (!isInvalidParamsError(error)) throw error;
+          await this.discardLeaseAttempt(computer);
+          computer = { pluginDirs: [], computerLeaseId: "", browserLeaseId: "" };
+          return this.request(ACP_METHODS.sessionNew, {
+            cwd,
+            mcpServers: [],
+            _meta: {
+              ...metaRequest,
+              ...(preferredModel ? { modelId: preferredModel } : {}),
+              reasoningEffort,
+            },
+          });
+        }
+      });
     } catch (error) {
       await this.discardLeaseAttempt(computer);
       throw error;
@@ -3160,66 +3166,68 @@ export class AcpBridge implements GrokBridge {
     try {
       const metaRequest = await this.sessionMeta(meta.cwd);
       computer = await this.resolveComputerExtensions();
-      let response: unknown;
-      try {
-        response = await this.request(ACP_METHODS.sessionLoad, {
-          sessionId: id,
-          cwd: meta.cwd,
-          mcpServers: [],
-          _meta: {
-            ...metaRequest,
-            ...(computer.pluginDirs.length ? { pluginDirs: computer.pluginDirs } : {}),
-            ...(computer.computerLeaseId ? { groxComputerLeaseId: computer.computerLeaseId } : {}),
-            ...(computer.browserLeaseId ? { groxBrowserLeaseId: computer.browserLeaseId } : {}),
-          },
-        }, 2 * 60_000);
-      } catch (error) {
-        if (!isInvalidParamsError(error)) throw error;
-        await this.discardLeaseAttempt(computer);
-        computer = { pluginDirs: [], computerLeaseId: "", browserLeaseId: "" };
-        response = await this.request(ACP_METHODS.sessionLoad, {
-          sessionId: id,
-          cwd: meta.cwd,
-          mcpServers: [],
-          _meta: metaRequest,
-        }, 2 * 60_000);
-      }
-      const previousLease = this.computerLeases.get(id);
-      if (previousLease && previousLease !== computer.computerLeaseId) {
-        await invoke("computer_shutdown_lease", { leaseId: previousLease }).catch(() => {});
-        await invoke("computer_clear_emergency_stop", { leaseId: previousLease }).catch(() => {});
-      }
-      if (computer.computerLeaseId) this.computerLeases.set(id, computer.computerLeaseId);
-      else this.computerLeases.delete(id);
-      claimPendingBrowserLease(this.browserLeases, id, computer.browserLeaseId);
-      this.flushStreamAppends(id);
-      this.flushToolPatches(id);
-      this.captureModelState(response);
-      this.captureRuntimeCommands(response);
-      await this.refreshSessionInfo(id);
-      if (this.pendingCanonicalReplays.delete(id) || this.rewoundSessions.has(id)) {
-        await this.replayAfterLatestRewind(id, meta.cwd, meta);
-      }
-      const replayed = this.replaying.get(id) ?? emptySession(meta);
-      const finalized: Session = {
-        ...replayed,
-        usage: this.usage.get(id) ?? replayed.usage,
-        status: this.sessionGateStatus(id) ?? "idle",
-        blocks: replayed.blocks.map((block) =>
-          block.type === "assistant"
-            ? { ...block, streaming: false }
-            : block.type === "thinking"
-              ? { ...block, live: false }
-              : block,
-        ),
-      };
-      this.replaying.delete(id);
-      this.knownSessions.add(id);
-      // Drop sticky model/effort so the next prompt re-binds via set_model
-      // (resume after shell upgrade / effort change must not reuse dead options).
-      this.sessionOptions.delete(id);
-      this.emit({ type: "session_ready", session: finalized, background });
-      this.emit({ type: "available_commands", sessionId: id, commands: this.runtimeCommands });
+      await this.lifecycleGate.runLifecycle(async () => {
+        let response: unknown;
+        try {
+          response = await this.request(ACP_METHODS.sessionLoad, {
+            sessionId: id,
+            cwd: meta.cwd,
+            mcpServers: [],
+            _meta: {
+              ...metaRequest,
+              ...(computer.pluginDirs.length ? { pluginDirs: computer.pluginDirs } : {}),
+              ...(computer.computerLeaseId ? { groxComputerLeaseId: computer.computerLeaseId } : {}),
+              ...(computer.browserLeaseId ? { groxBrowserLeaseId: computer.browserLeaseId } : {}),
+            },
+          }, 2 * 60_000);
+        } catch (error) {
+          if (!isInvalidParamsError(error)) throw error;
+          await this.discardLeaseAttempt(computer);
+          computer = { pluginDirs: [], computerLeaseId: "", browserLeaseId: "" };
+          response = await this.request(ACP_METHODS.sessionLoad, {
+            sessionId: id,
+            cwd: meta.cwd,
+            mcpServers: [],
+            _meta: metaRequest,
+          }, 2 * 60_000);
+        }
+        const previousLease = this.computerLeases.get(id);
+        if (previousLease && previousLease !== computer.computerLeaseId) {
+          await invoke("computer_shutdown_lease", { leaseId: previousLease }).catch(() => {});
+          await invoke("computer_clear_emergency_stop", { leaseId: previousLease }).catch(() => {});
+        }
+        if (computer.computerLeaseId) this.computerLeases.set(id, computer.computerLeaseId);
+        else this.computerLeases.delete(id);
+        claimPendingBrowserLease(this.browserLeases, id, computer.browserLeaseId);
+        this.flushStreamAppends(id);
+        this.flushToolPatches(id);
+        this.captureModelState(response);
+        this.captureRuntimeCommands(response);
+        await this.refreshSessionInfo(id);
+        if (this.pendingCanonicalReplays.delete(id) || this.rewoundSessions.has(id)) {
+          await this.replayAfterLatestRewind(id, meta.cwd, meta);
+        }
+        const replayed = this.replaying.get(id) ?? emptySession(meta);
+        const finalized: Session = {
+          ...replayed,
+          usage: this.usage.get(id) ?? replayed.usage,
+          status: this.sessionGateStatus(id) ?? "idle",
+          blocks: replayed.blocks.map((block) =>
+            block.type === "assistant"
+              ? { ...block, streaming: false }
+              : block.type === "thinking"
+                ? { ...block, live: false }
+                : block,
+          ),
+        };
+        this.replaying.delete(id);
+        this.knownSessions.add(id);
+        // Drop sticky model/effort so the next prompt re-binds via set_model
+        // (resume after shell upgrade / effort change must not reuse dead options).
+        this.sessionOptions.delete(id);
+        this.emit({ type: "session_ready", session: finalized, background });
+        this.emit({ type: "available_commands", sessionId: id, commands: this.runtimeCommands });
+      });
       // Restored workflow actors emit a current snapshot, but older CLI
       // versions may have written the detailed updates only to JSONL. Read
       // those public envelopes in the background so opening an old session
@@ -3482,11 +3490,14 @@ export class AcpBridge implements GrokBridge {
     // race: provider activation must see this request immediately.
     this.activePromptSessions.add(sessionId);
     let terminalStatus: SessionStatus = "idle";
+    let turnEntered = false;
     try {
       await this.ensureReady();
       if (!this.knownSessions.has(sessionId)) {
         await this.loadSession(sessionId, { background: true });
       }
+      await this.lifecycleGate.enterTurn(sessionId);
+      turnEntered = true;
       // A new user prompt begins the new branch. It is the only event allowed
       // to lift the rewind isolation gate.
       this.forgetRewoundSession(sessionId);
@@ -3655,6 +3666,7 @@ export class AcpBridge implements GrokBridge {
     } finally {
       this.promptRpcBySession.delete(sessionId);
       this.finishTurn(sessionId, undefined, terminalStatus);
+      if (turnEntered) this.lifecycleGate.leaveTurn(sessionId);
       this.stoppingSessions.delete(sessionId);
       this.markPromptFinished(sessionId);
     }

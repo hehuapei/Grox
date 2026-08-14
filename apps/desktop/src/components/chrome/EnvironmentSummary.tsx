@@ -89,6 +89,7 @@ export function EnvironmentSummary() {
   const rootRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const workspace = useDesktop((state) => state.workspace);
+  const runtimeOccupancy = useDesktop((state) => state.runtimeOccupancy);
   const activeId = useDesktop((state) => state.activeId);
   const session = useDesktop((state) => (state.activeId ? state.sessions[state.activeId] : null));
   const composer = useDesktop((state) => (state.activeId ? state.sessionComposers[state.activeId] : null));
@@ -257,6 +258,16 @@ export function EnvironmentSummary() {
       && summary?.branch
       && summary.branch !== (summary.defaultBranch ?? "main"),
   );
+  const activeTurns = runtimeOccupancy.activeTurnSessionIds.length;
+  const runtimeOccupancyLabel = runtimeOccupancy.lifecycleActive
+    ? (runtimeOccupancy.pendingLifecycle > 0
+      ? `${zh ? "同步中" : "syncing"} +${runtimeOccupancy.pendingLifecycle}`
+      : (zh ? "同步中" : "syncing"))
+    : runtimeOccupancy.pendingLifecycle > 0
+      ? `${runtimeOccupancy.pendingLifecycle} ${zh ? "待同步" : "queued"}`
+      : activeTurns > 0
+        ? `${activeTurns} ${zh ? "活跃" : "active"}`
+        : "";
 
   return (
     <div ref={rootRef} className="relative">
@@ -329,11 +340,19 @@ export function EnvironmentSummary() {
                       runtimeStatus.running ? (zh ? "进程运行中" : "Process running") : (zh ? "按需启动" : "Starts on demand"),
                       runtimeStatus.pid ? `PID ${runtimeStatus.pid}` : "",
                       runtimeStatus.generation ? `${zh ? "代次" : "Generation"} ${runtimeStatus.generation}` : "",
+                      activeTurns > 0 ? `${activeTurns} ${zh ? "个活动回合" : "active turns"}` : "",
+                      runtimeOccupancy.lifecycleActive ? (zh ? "会话同步占用中" : "Session sync active") : "",
+                      runtimeOccupancy.pendingLifecycle > 0
+                        ? `${runtimeOccupancy.pendingLifecycle} ${zh ? "个会话同步排队" : "session syncs queued"}`
+                        : "",
                     ].filter(Boolean).join(" · ")
                   : undefined}
               >
                 {runtimeStatus
-                  ? `${zh ? "共享运行时" : "Shared runtime"} · ${runtimeStatus.processCapacity} ${zh ? "进程" : "process"}`
+                  ? [
+                      `${zh ? "共享" : "Shared"} · ${runtimeStatus.processCapacity} ${zh ? "进程" : "process"}`,
+                      runtimeOccupancyLabel,
+                    ].filter(Boolean).join(" · ")
                   : "—"}
               </span>
             </SummaryRow>

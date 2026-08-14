@@ -500,10 +500,18 @@ export const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type Effort = (typeof EFFORTS)[number];
 export type PermissionMode = "default" | "auto" | "bypass";
 
+/** 共享 ACP 进程的实时协议占用；不是物理进程池容量。 */
+export interface RuntimeOccupancy {
+  activeTurnSessionIds: string[];
+  lifecycleActive: boolean;
+  pendingLifecycle: number;
+}
+
 /** Events a bridge pushes into the store. Wire-level naming kept close to ACP. */
 export type BridgeEvent =
   | { type: "auth_state"; state: AuthState }
   | { type: "runtime_state"; state: RuntimeConnectionState }
+  | { type: "runtime_occupancy"; occupancy: RuntimeOccupancy }
   | { type: "model_state"; state: ModelState }
   | { type: "mode_state"; sessionId: string; mode: AgentMode }
   | { type: "available_commands"; sessionId: string; commands: SlashCommand[] }
