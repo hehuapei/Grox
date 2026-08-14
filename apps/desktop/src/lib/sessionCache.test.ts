@@ -4,6 +4,7 @@ import {
   clearDraftBuffer,
   compactSession,
   loadDraftBuffer,
+  nextSessionJournalSavedAt,
   parseSessionJournal,
   saveDraftBuffer,
   sessionJournalSnapshot,
@@ -42,6 +43,11 @@ describe("compactSession", () => {
     expect(snapshot).toMatchObject({ version: 1, appSessionId: "session-1", agentSessionId: "session-1", savedAt: 42, turnState: "active" });
     expect(snapshot.session.status).toBe("idle");
     expect(parseSessionJournal(JSON.stringify(snapshot), "session-1")).toEqual(snapshot);
+  });
+
+  it("journal 版本在系统时间回拨后仍单调递增", () => {
+    expect(nextSessionJournalSavedAt(100, 50)).toBe(101);
+    expect(nextSessionJournalSavedAt(100, 200)).toBe(200);
   });
 
   it("journal 只保存 Host 管理的工具图片引用", () => {

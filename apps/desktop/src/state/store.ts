@@ -814,12 +814,17 @@ export const useDesktop = create<DesktopState>((set, get) => {
   };
 
   setSessionJournalFailureHandler((sessionId, cause) => {
+    const conflict = String(cause).includes("journal 写入冲突");
     publishRuntimeError(cause, {
-      domain: "environment",
-      code: "SESSION_JOURNAL_WRITE_FAILED",
-      message: `会话 ${sessionId} 的应用 journal 未能写入磁盘`,
+      domain: conflict ? "operation" : "environment",
+      code: conflict ? "SESSION_JOURNAL_CONFLICT" : "SESSION_JOURNAL_WRITE_FAILED",
+      message: conflict
+        ? `会话 ${sessionId} 已在另一个窗口写入更新快照`
+        : `会话 ${sessionId} 的应用 journal 未能写入磁盘`,
       recoverable: true,
-      action: "当前窗口仍保留内容；请检查应用数据目录的可用空间和写入权限",
+      action: conflict
+        ? "重新打开该会话以合并最新 journal；当前窗口不会继续覆盖磁盘"
+        : "当前窗口仍保留内容；请检查应用数据目录的可用空间和写入权限",
     });
   });
 

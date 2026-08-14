@@ -61,7 +61,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | --- | --- | --- |
 | 1 | Native ACP transport | Host 关联请求/响应并负责超时、取消、退出清算；已落地 |
 | 2 | SessionCoordinator | Host 签发/校验 lifecycle 与 turn 许可并发布占用快照；已落地 |
-| 3 | Native repositories | PromptQueueStore、AutomationStore 已迁移；journal、草稿继续改为带锁语义事务 |
+| 3 | Native repositories | PromptQueueStore、AutomationStore、SessionJournalStore 已迁移；草稿持久化边界继续收口 |
 | 4 | Background execution | 自动化、恢复、后台多会话通过 SessionCoordinator 执行；再评估按会话进程池 |
 | 5 | Host services | worktree、权限、媒体、密钥统一使用会话/项目身份和路径授权 |
 | 6 | Command facade | 将 `main.rs` 按领域迁出，Tauri command 只校验 DTO 并调用服务 |
@@ -90,6 +90,9 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - 删除会话/项目会在同一 tombstone 锁序内删除提示队列，晚到 upsert 会被 Host 拒绝，不能让已删除会话复活。
 - `automation_store::AutomationStore` 按 automation id 在 Host 锁内合并更新/删除，不同任务的启停、编辑和运行结果不再通过整包数组互相覆盖；
 - 自动化 DTO、时间、频率、权限模式、可选运行结果和重复 id 均由 Host 校验，失败 patch 不修改原文件。
+- `session_storage::SessionStorageState` 改为按会话写/删除租约：同一会话串行、不同会话并行，删除先标 tombstone 再等待现有 writer，避免全局文件锁拖慢多会话；
+- `session_journal_store::SessionJournalStore` 校验现有和提交快照，前端以磁盘 savedAt 为基线生成单调逻辑版本；旧窗口的等版本/低版本写入会明确冲突并停止续写，不能覆盖新 journal；
+- 旧版裸 Session 只保留只读迁移入口，损坏的现有 journal 不会被新快照静默覆盖。
 
 本切片没有把供应商切换的“发送意图等待”、队列调度策略和自动化调度伪装成已经迁移：
 它们仍在 Bridge/Store，后续必须通过同一个 SessionCoordinator 的维护操作与后台执行入口

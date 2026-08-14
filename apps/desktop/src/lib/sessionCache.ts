@@ -102,6 +102,10 @@ export function sessionJournalSnapshot(session: Session, savedAt = Date.now()): 
   };
 }
 
+export function nextSessionJournalSavedAt(previous: number | undefined, now = Date.now()): number {
+  return Math.max(now, (previous ?? 0) + 1);
+}
+
 export function parseSessionJournal(raw: string, id: string): SessionJournalSnapshot {
   const parsed = JSON.parse(raw) as Partial<SessionJournalSnapshot> & Partial<Session>;
   // v0.3.1/v0.3.2 early builds wrote a bare Session into session-cache.
@@ -140,15 +144,28 @@ export function parseSessionJournal(raw: string, id: string): SessionJournalSnap
 
 export async function loadSessionJournal(id: string): Promise<SessionJournalSnapshot | null> {
   const raw = await invoke<string | null>("read_session_journal", { id });
-  return raw ? parseSessionJournal(raw, id) : null;
+  if (!raw) {
+    journalSavedAt.delete(id);
+    journalWriteConflicts.delete(id);
+    return null;
+  }
+  const snapshot = parseSessionJournal(raw, id);
+  journalSavedAt.set(id, snapshot.savedAt);
+  journalWriteConflicts.delete(id);
+  return snapshot;
 }
 
 const timers = new Map<string, number>();
+/** Per-session logical clock seeded from disk; survives wall-clock rollback. */
+const journalSavedAt = new Map<string, number>();
+/** A stale writer must reload before it can write this session again. */
+const journalWriteConflicts = new Set<string>();
 /** Latest payload per id waiting for disk (survives debounce cancellation). */
 const pendingPayloads = new Map<string, string>();
 const inFlight = new Map<string, Promise<void>>();
 
 function writePayload(id: string, content: string): Promise<void> {
+  if (journalWriteConflicts.has(id)) return Promise.resolve();
   pendingPayloads.set(id, content);
   const prior = inFlight.get(id) ?? Promise.resolve();
   const next = prior
@@ -166,6 +183,7 @@ function writePayload(id: string, content: string): Promise<void> {
       await invoke("write_session_journal", { id, content: toWrite });
     })
     .catch((cause) => {
+      if (String(cause).includes("journal 写入冲突")) journalWriteConflicts.add(id);
       journalFailureHandler?.(id, cause);
     })
     .finally(() => {
@@ -173,6 +191,12 @@ function writePayload(id: string, content: string): Promise<void> {
     });
   inFlight.set(id, next);
   return next;
+}
+
+function nextSessionJournalSnapshot(session: Session): SessionJournalSnapshot {
+  const savedAt = nextSessionJournalSavedAt(journalSavedAt.get(session.id));
+  journalSavedAt.set(session.id, savedAt);
+  return sessionJournalSnapshot(session, savedAt);
 }
 
 /**
@@ -183,7 +207,7 @@ export function scheduleSaveSessionJournal(session: Session): void {
   if (!session.id || session.blocks.length === 0) return;
   if (session.id.startsWith("draft-") || session.id.startsWith("pending-")) return;
 
-  const content = JSON.stringify(sessionJournalSnapshot(session));
+  const content = JSON.stringify(nextSessionJournalSnapshot(session));
   const delay = isSessionTerminal(session.status) ? TERMINAL_SAVE_DEBOUNCE_MS : LIVE_SAVE_DEBOUNCE_MS;
 
   const previous = timers.get(session.id);
@@ -208,7 +232,7 @@ export function flushSessionJournal(session: Session): void {
   const previous = timers.get(session.id);
   if (previous !== undefined) window.clearTimeout(previous);
   timers.delete(session.id);
-  void writePayload(session.id, JSON.stringify(sessionJournalSnapshot(session)));
+  void writePayload(session.id, JSON.stringify(nextSessionJournalSnapshot(session)));
 }
 
 /**
@@ -223,7 +247,7 @@ export function flushAllPendingSessionJournals(
     timers.delete(id);
     const session = sessions[id];
     if (session && session.blocks.length > 0) {
-      void writePayload(id, JSON.stringify(sessionJournalSnapshot(session)));
+      void writePayload(id, JSON.stringify(nextSessionJournalSnapshot(session)));
     }
   }
 }
@@ -233,6 +257,8 @@ export function cancelPendingSessionJournal(id: string): void {
   if (timer !== undefined) window.clearTimeout(timer);
   timers.delete(id);
   pendingPayloads.delete(id);
+  journalSavedAt.delete(id);
+  journalWriteConflicts.delete(id);
 }
 
 export async function scrubSessionJournalOrphans(): Promise<number> {

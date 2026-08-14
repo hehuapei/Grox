@@ -17,7 +17,9 @@ mod path_sandbox;
 #[cfg(windows)]
 mod process_job;
 mod prompt_queue_store;
+mod session_journal_store;
 mod session_coordinator;
+mod session_storage;
 mod support_bundle;
 
 use std::{
@@ -45,7 +47,9 @@ use path_sandbox::{
 use percent_encoding::percent_decode_str;
 use prompt_queue_store::PromptQueueStore;
 use serde::{Deserialize, Serialize};
+use session_journal_store::SessionJournalStore;
 use session_coordinator::{SessionCoordinator, SessionRuntimeOccupancy};
+use session_storage::SessionStorageState;
 use tauri::{Emitter, Manager};
 use toml_edit::{value as toml_value, Document, Item, Table, TableLike};
 use tokio::{
@@ -110,53 +114,6 @@ struct AgentProcess {
     /// Windows Job Object so cancel kills nested tool trees (cargo test, shells).
     #[cfg(windows)]
     job: Option<process_job::ProcessJob>,
-}
-
-#[derive(Default)]
-struct SessionStorageState {
-    deleted: std::sync::Mutex<BTreeSet<String>>,
-}
-
-impl SessionStorageState {
-    fn lock_writable(
-        &self,
-        id: &str,
-    ) -> Result<std::sync::MutexGuard<'_, BTreeSet<String>>, String> {
-        let deleted = self
-            .deleted
-            .lock()
-            .map_err(|_| "会话存储门禁已损坏".to_string())?;
-        if deleted.contains(id) {
-            return Err("会话已删除，拒绝再次写入本地存储".into());
-        }
-        Ok(deleted)
-    }
-
-    fn lock_deleted(
-        &self,
-        id: &str,
-    ) -> Result<std::sync::MutexGuard<'_, BTreeSet<String>>, String> {
-        let mut deleted = self
-            .deleted
-            .lock()
-            .map_err(|_| "会话存储门禁已损坏".to_string())?;
-        deleted.insert(id.to_string());
-        Ok(deleted)
-    }
-
-    fn lock_writable_ids(
-        &self,
-        ids: &[String],
-    ) -> Result<std::sync::MutexGuard<'_, BTreeSet<String>>, String> {
-        let deleted = self
-            .deleted
-            .lock()
-            .map_err(|_| "会话存储门禁已损坏".to_string())?;
-        if let Some(id) = ids.iter().find(|id| deleted.contains(*id)) {
-            return Err(format!("会话 {id} 已删除，拒绝再次写入提示队列"));
-        }
-        Ok(deleted)
-    }
 }
 
 #[derive(Default)]
@@ -1754,7 +1711,7 @@ fn persist_session_tool_images(
     images: Vec<ToolImagePayload>,
 ) -> Result<Vec<ToolImageReference>, String> {
     safe_session_storage_id(&session_id)?;
-    let deleted = storage.lock_writable(&session_id)?;
+    let _write = storage.begin_write(&session_id)?;
     if images.len() > 16 {
         return Err("单次最多保存 16 张工具图片".into());
     }
@@ -1777,34 +1734,7 @@ fn persist_session_tool_images(
             path: path_for_webview(&path),
         });
     }
-    drop(deleted);
     Ok(references)
-}
-
-fn validate_session_journal(content: &str, id: &str) -> Result<(), String> {
-    let value: serde_json::Value = serde_json::from_str(content)
-        .map_err(|error| format!("应用会话 journal 必须是 JSON：{error}"))?;
-    let object = value
-        .as_object()
-        .ok_or_else(|| "应用会话 journal 必须是 JSON 对象".to_string())?;
-    if object.get("version").and_then(|value| value.as_u64()) != Some(1)
-        || object.get("appSessionId").and_then(|value| value.as_str()) != Some(id)
-        || object.get("agentSessionId").and_then(|value| value.as_str()).is_none()
-        || object.get("savedAt").and_then(|value| value.as_u64()).is_none()
-        || !matches!(
-            object.get("turnState").and_then(|value| value.as_str()),
-            Some("active" | "settled")
-        )
-        || object
-            .get("session")
-            .and_then(|value| value.as_object())
-            .and_then(|session| session.get("id"))
-            .and_then(|value| value.as_str())
-            != Some(id)
-    {
-        return Err("应用会话 journal 格式无效或会话身份不匹配".into());
-    }
-    Ok(())
 }
 
 #[tauri::command]
@@ -1825,9 +1755,7 @@ fn read_session_journal(app: tauri::AppHandle, id: String) -> Result<Option<Stri
         }
         legacy
     };
-    read_bounded_text(&source, SESSION_JOURNAL_MAX_BYTES)
-        .map(|content| if content.trim().is_empty() { None } else { Some(content) })
-        .map_err(|error| format!("无法读取应用会话 journal：{error}"))
+    SessionJournalStore.read(&source, &id, SESSION_JOURNAL_MAX_BYTES)
 }
 
 #[tauri::command]
@@ -1837,24 +1765,17 @@ fn write_session_journal(
     id: String,
     content: String,
 ) -> Result<(), String> {
-    if content.len() as u64 > SESSION_JOURNAL_MAX_BYTES {
-        return Err("应用会话 journal 不能超过 16 MB".into());
-    }
     safe_session_storage_id(&id)?;
-    let deleted = storage.lock_writable(&id)?;
-    validate_session_journal(&content, &id)?;
+    let _write = storage.begin_write(&id)?;
     let path = session_journal_path(&app, &id)?;
-    atomic_write_bounded(&path, &content, SESSION_JOURNAL_MAX_BYTES)?;
-    restrict_private_file(&path)?;
     let legacy = legacy_session_cache_path(&app, &id)?;
-    if legacy.is_file() {
-        if let Err(error) = fs::remove_file(&legacy) {
-            // The v1 write already succeeded. Keep this non-fatal and expose
-            // the remaining legacy row through session_journal_status.
-            eprintln!("grox: 新版 journal 已写入，但无法清理旧版会话缓存：{error}");
-        }
-    }
-    drop(deleted);
+    SessionJournalStore.write(
+        &path,
+        &legacy,
+        &id,
+        &content,
+        SESSION_JOURNAL_MAX_BYTES,
+    )?;
     Ok(())
 }
 
@@ -1877,7 +1798,7 @@ fn delete_session_journal(
     id: String,
 ) -> Result<(), String> {
     safe_session_storage_id(&id)?;
-    let _deleted = storage.lock_deleted(&id)?;
+    let _delete = storage.begin_delete(&id)?;
     delete_session_journal_files(&app, &id)
 }
 
@@ -1986,7 +1907,7 @@ fn patch_prompt_queues(
         safe_session_storage_id(id)?;
     }
     // 与删除命令采用相同锁序：先 tombstone，再队列事务，防止延迟 patch 复活。
-    let _deleted = storage.lock_writable_ids(&upsert_ids)?;
+    let _write = storage.begin_write_ids(&upsert_ids)?;
     let path = prompt_queues_path(&app)?;
     queues.patch(&path, upserts, deletes, PROMPT_QUEUES_MAX_BYTES)
 }
@@ -2028,7 +1949,7 @@ fn delete_session_data(
     if !valid_session_id(&id) {
         return Err("无效会话 ID".into());
     }
-    let _deleted = storage.lock_deleted(&id)?;
+    let _delete = storage.begin_delete(&id)?;
     let history = grok_home().and_then(|home| delete_session_history_data(&home, &id));
     let journal = delete_session_journal_files(&app, &id);
     let queue = prompt_queues_path(&app).and_then(|path| {
@@ -2060,8 +1981,8 @@ fn delete_project_session_data(
     cwd: String,
 ) -> Result<Vec<String>, String> {
     let ids = delete_project_session_history_data(&grok_home()?, &cwd)?;
+    let _delete = storage.begin_delete_ids(&ids)?;
     for id in &ids {
-        let _deleted = storage.lock_deleted(id)?;
         delete_session_journal_files(&app, id)?;
     }
     let path = prompt_queues_path(&app)?;
@@ -8569,15 +8490,26 @@ mod tests {
             "turnState": "active",
             "session": { "id": "session-1", "blocks": [] }
         });
-        assert!(validate_session_journal(&valid.to_string(), "session-1").is_ok());
+        assert!(
+            session_journal_store::validate_current_journal(&valid.to_string(), "session-1")
+                .is_ok()
+        );
 
         let mut wrong_identity = valid.clone();
         wrong_identity["session"]["id"] = serde_json::json!("session-2");
-        assert!(validate_session_journal(&wrong_identity.to_string(), "session-1").is_err());
+        assert!(session_journal_store::validate_current_journal(
+            &wrong_identity.to_string(),
+            "session-1"
+        )
+        .is_err());
 
         let mut unknown_version = valid;
         unknown_version["version"] = serde_json::json!(2);
-        assert!(validate_session_journal(&unknown_version.to_string(), "session-1").is_err());
+        assert!(session_journal_store::validate_current_journal(
+            &unknown_version.to_string(),
+            "session-1"
+        )
+        .is_err());
     }
 
     #[test]
@@ -8608,13 +8540,13 @@ mod tests {
     #[test]
     fn deleted_session_storage_rejects_late_writes() {
         let storage = SessionStorageState::default();
-        drop(storage.lock_writable("session-1").unwrap());
-        drop(storage.lock_deleted("session-1").unwrap());
-        assert!(storage.lock_writable("session-1").is_err());
+        drop(storage.begin_write("session-1").unwrap());
+        drop(storage.begin_delete("session-1").unwrap());
+        assert!(storage.begin_write("session-1").is_err());
         assert!(storage
-            .lock_writable_ids(&["session-1".into(), "session-2".into()])
+            .begin_write_ids(&["session-1".into(), "session-2".into()])
             .is_err());
-        assert!(storage.lock_writable("session-2").is_ok());
+        assert!(storage.begin_write("session-2").is_ok());
     }
 
     #[test]
