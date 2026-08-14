@@ -67,6 +67,14 @@ pub(crate) struct ClaimedAutomation {
 }
 
 impl AutomationStore {
+    pub(crate) fn any_enabled(&self, path: &Path, max_bytes: u64) -> Result<bool, String> {
+        let _transaction = self.lock_transaction();
+        Ok(self
+            .read_locked(path, max_bytes)?
+            .iter()
+            .any(|automation| automation.get("enabled").and_then(Value::as_bool) == Some(true)))
+    }
+
     pub(crate) fn read(&self, path: &Path, max_bytes: u64) -> Result<Option<String>, String> {
         let _transaction = self.lock_transaction();
         if !path.is_file() {
@@ -886,6 +894,24 @@ mod tests {
             std::process::id(),
             crate::CONFIG_WRITE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ))
+    }
+
+    #[test]
+    fn enabled_snapshot_is_read_under_the_store_transaction() {
+        let path = temp_file("enabled-snapshot");
+        let store = AutomationStore::default();
+        assert!(!store.any_enabled(&path, 1024 * 1024).unwrap());
+        fs::write(
+            &path,
+            serde_json::json!([automation("a", false), automation("b", true)]).to_string(),
+        )
+        .unwrap();
+        assert!(store.any_enabled(&path, 1024 * 1024).unwrap());
+        store
+            .patch(&path, vec![automation("b", false)], vec![], 1024 * 1024)
+            .unwrap();
+        assert!(!store.any_enabled(&path, 1024 * 1024).unwrap());
+        let _ = fs::remove_file(path);
     }
 
     #[test]

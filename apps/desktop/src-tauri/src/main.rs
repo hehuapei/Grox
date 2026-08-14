@@ -27,6 +27,7 @@ mod session_journal_store;
 mod session_runtime;
 mod session_storage;
 mod support_bundle;
+mod tray;
 mod turn_runtime;
 
 use std::{
@@ -36,7 +37,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
         Arc, RwLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -396,6 +397,11 @@ struct PreviewState {
 struct FilePreviewState {
     port: Mutex<Option<u16>>,
     roots: Arc<Mutex<BTreeMap<String, PathBuf>>>,
+}
+
+#[derive(Default)]
+struct AppShutdown {
+    started: AtomicBool,
 }
 
 #[derive(Clone, Serialize)]
@@ -8933,6 +8939,77 @@ async fn rollback_update(app: tauri::AppHandle, version: String) -> Result<(), S
     install_release(&app, &version, release).await
 }
 
+fn main_window_close_keeps_host_alive(app: &tauri::AppHandle) -> bool {
+    let any_enabled_automation = match automations_path(app).and_then(|path| {
+        app.state::<AutomationStore>()
+            .any_enabled(&path, AUTOMATIONS_MAX_BYTES)
+    }) {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            // 读不到权威排程时不能通过关闭窗口冒险杀掉可能存在的任务。
+            eprintln!("grox: 无法判断是否存在已启用自动化，将保留后台进程：{error}");
+            true
+        }
+    };
+    let state = app.state::<Arc<AcpState>>();
+    let occupancy = state.sessions.snapshot();
+    let host_busy = !occupancy.active_turn_session_ids.is_empty()
+        || occupancy.lifecycle_active
+        || occupancy.pending_lifecycle > 0
+        || app.state::<AutomationRunner>().is_dispatching();
+    automation_runner::should_keep_process_alive_on_close(any_enabled_automation, host_busy)
+}
+
+async fn shutdown_host(app: &tauri::AppHandle) {
+    let state = app.state::<Arc<AcpState>>().inner().clone();
+    state.ready_generation.store(0, Ordering::Release);
+    state.paused_generation.store(0, Ordering::Release);
+    state.clear_cached_connection(None);
+    state.set_runtime_phase(RuntimePhase::Stopped);
+    let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    state.foreground_turns.reset(generation);
+    state.interactions.reset(generation);
+    state.client_callbacks.reset(generation).await;
+    state.sessions.reset(generation);
+    state
+        .requests
+        .reject_all(AcpHostError::environment(
+            "ACP_HOST_EXITING",
+            "Grox 正在退出，ACP 请求已停止",
+            true,
+            true,
+            "重新打开 Grox 后检查最后一轮结果",
+        ))
+        .await;
+    shutdown_all_mcp_resources(app.state::<Arc<McpLeaseStore>>().inner());
+    if let Some(process) = state.process.lock().await.take() {
+        terminate_process(process).await;
+    }
+    let preview_state = app.state::<Arc<PreviewState>>();
+    if let Some(mut process) = preview_state.process.lock().await.take() {
+        let _ = process.child.kill().await;
+        let _ = process.child.wait().await;
+    };
+}
+
+pub(crate) fn request_host_exit(app: tauri::AppHandle) {
+    let shutdown = app.state::<AppShutdown>();
+    if shutdown.started.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    tauri::async_runtime::spawn(async move {
+        if tokio::time::timeout(Duration::from_secs(5), shutdown_host(&app))
+            .await
+            .is_err()
+        {
+            // 显式退出不能因为损坏的子进程或 callback 永久卡住；所有 child
+            // 都启用了 kill_on_drop，进程退出仍会完成最后的操作系统级回收。
+            eprintln!("grox: Host 退出清理超过 5 秒，将由进程退出完成最终回收");
+        }
+        app.exit(0);
+    });
+}
+
 fn main() {
     let process_args = std::env::args().collect::<Vec<_>>();
     if process_args
@@ -8976,11 +9053,13 @@ fn main() {
         .manage(PromptQueueStore::default())
         .manage(AutomationStore::default())
         .manage(AutomationRunner::default())
+        .manage(AppShutdown::default())
         .setup(|app| {
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?;
             if let Some(window) = app.get_webview_window("main") {
                 window.set_icon(icon)?;
             }
+            tray::setup(app.handle()).map_err(std::io::Error::other)?;
             register_computer_emergency_shortcut(app.handle().clone());
             app.state::<AutomationRunner>().start(app.handle().clone());
             let coordinator = app.state::<Arc<AcpState>>().sessions.clone();
@@ -9110,43 +9189,34 @@ fn main() {
             acp_kill,
         ])
         .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::Destroyed) && window.label() == "main" {
-                let state = window.state::<Arc<AcpState>>().inner().clone();
-                state.ready_generation.store(0, Ordering::Release);
-                state.paused_generation.store(0, Ordering::Release);
-                state.clear_cached_connection(None);
-                state.set_runtime_phase(RuntimePhase::Stopped);
-                let leases = window.state::<Arc<McpLeaseStore>>().inner().clone();
-                let preview_state = window.state::<Arc<PreviewState>>().inner().clone();
-                tauri::async_runtime::spawn(async move {
-                    let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
-                    state.foreground_turns.reset(generation);
-                    state.interactions.reset(generation);
-                    state.client_callbacks.reset(generation).await;
-                    state.sessions.reset(generation);
-                    state
-                        .requests
-                        .reject_all(AcpHostError::environment(
-                            "ACP_HOST_CLOSED",
-                            "主窗口已关闭，ACP 请求已停止",
-                            true,
-                            true,
-                            "重新打开 Grox 后检查最后一轮结果",
-                        ))
-                        .await;
-                    shutdown_all_mcp_resources(&leases);
-                    if let Some(process) = state.process.lock().await.take() {
-                        terminate_process(process).await;
-                    }
-                    if let Some(mut process) = preview_state.process.lock().await.take() {
-                        let _ = process.child.kill().await;
-                        let _ = process.child.wait().await;
-                    }
-                });
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() != "main" {
+                    return;
+                }
+                api.prevent_close();
+                if main_window_close_keeps_host_alive(window.app_handle()) {
+                    tray::hide_main_window(window.app_handle());
+                } else {
+                    request_host_exit(window.app_handle().clone());
+                }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Grox Desktop");
+        .build(tauri::generate_context!())
+        .expect("error while building Grox Desktop")
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                if !app.state::<AppShutdown>().started.load(Ordering::Acquire) {
+                    api.prevent_exit();
+                    request_host_exit(app.clone());
+                }
+            }
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } if !has_visible_windows => tray::show_main_window(app),
+            _ => {}
+        });
 }
 
 #[cfg(test)]

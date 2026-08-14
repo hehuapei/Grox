@@ -127,6 +127,8 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - 未绑定会话、跨代次、重复 rpc id、越界路径和超限响应都由 Host 明确拒绝，不再用 `AcpBridge.workspace` 猜 cwd；原先暴露给 WebView 的 `acp_read_*` / `acp_write_*` commands 已移除；
 - `clientCapabilities.terminal` 继续为 false。官方 ACP 要求只有完整实现 create/output/wait/kill/release 后才能宣告；本切片没有用半成品 shell 执行器扩大 Agent 权限；
 - 自动化执行不再定向派发给 `main` WebView；供应商、认证或全局配置切换会先暂停 runner，并取得 Host lifecycle permit 后才替换进程，因此能够等待 Host 后台回合而不是只观察 `activePromptSessions`；
+- 主窗口关闭与进程退出已经拆分：存在已启用自动化或 Host 正在执行会话/生命周期事务时，CloseRequested 只隐藏窗口并保留托盘；没有后台责任时关闭才进入真正退出；
+- 托盘恢复窗口不重建 WebView 或 AgentRuntime；托盘“退出”、普通关闭退出、系统退出和更新退出都汇入幂等的 Host shutdown 事务，统一清算请求、门禁、callback、MCP、ACP 和预览子进程；
 - 运行时切换已删除前端 `promptDrainWaiters` 第二门控，只等待 SessionCoordinator 的 lifecycle permit；`activePromptSessions` 仅保留 UI 中断标记与权限提示延迟，不再裁决进程替换；
 - Host 返回 `AUTOMATION_RUNTIME_BUSY`、`AUTOMATION_CLAIM_STALE`、`AUTOMATION_INVALID_RESULT` 和 `AUTOMATION_STORAGE_FAILED` 等分域错误，前端不再把所有失败折叠成“启动失败”。
 - `session_storage::SessionStorageState` 改为按会话写/删除租约：同一会话串行、不同会话并行，删除先标 tombstone 再等待现有 writer，避免全局文件锁拖慢多会话；
@@ -161,7 +163,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 
 ## Consequences
 
-- WebView 刷新不再决定任务是否创建、执行或结算，也不会丢失仍在 Host 等待的权限/提问；已创建会话但未结算的自动化在租约过期后会标记结果未知并禁止自动重放。当前共享 ACP 进程仍随主窗口退出，这是明确限制。
+- WebView 刷新或隐藏不再决定任务是否创建、执行或结算，也不会丢失仍在 Host 等待的权限/提问；已创建会话但未结算的自动化在租约过期后会标记结果未知并禁止自动重放。完全退出 Grox 进程后调度仍会暂停，这是明确限制。
 - 迁移期间仍保留一个共享 CLI 进程；这是真实限制，不伪装成进程池。
 - `AcpBridge` 会逐步缩小为投影器，Zustand 只保存 UI 需要的快照。
 - Host 模块会增加，但每次拆分必须伴随职责迁移、测试或不变量，禁止只为了缩短文件。

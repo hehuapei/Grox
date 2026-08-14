@@ -162,6 +162,10 @@ impl AutomationRunner {
         self.dispatching.store(false, Ordering::Release);
     }
 
+    pub(crate) fn is_dispatching(&self) -> bool {
+        self.dispatching.load(Ordering::Acquire)
+    }
+
     pub(crate) async fn ready_generation(&self, state: &AcpState) -> Result<u64, AcpHostError> {
         let ready_generation = state.ready_generation.load(Ordering::Acquire);
         if ready_generation != 0
@@ -759,6 +763,13 @@ fn runtime_phase_blocks_dispatch(phase: RuntimePhase) -> bool {
     )
 }
 
+pub(crate) fn should_keep_process_alive_on_close(
+    any_enabled_automation: bool,
+    host_busy: bool,
+) -> bool {
+    any_enabled_automation || host_busy
+}
+
 pub(crate) fn unix_time_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -836,5 +847,13 @@ mod tests {
             runner.reserve_dispatch(&state).await.unwrap();
             runner.release_dispatch();
         });
+    }
+
+    #[test]
+    fn close_keeps_host_alive_only_for_background_responsibilities() {
+        assert!(!should_keep_process_alive_on_close(false, false));
+        assert!(should_keep_process_alive_on_close(true, false));
+        assert!(should_keep_process_alive_on_close(false, true));
+        assert!(should_keep_process_alive_on_close(true, true));
     }
 }

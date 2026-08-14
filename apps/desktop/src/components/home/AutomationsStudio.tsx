@@ -77,8 +77,8 @@ export function AutomationsStudio() {
         </div>
         <p className="mt-2 max-w-2xl text-[12px] leading-relaxed text-mute">
           {zh
-            ? "任务在 Grox 进程存活时每 30 秒检查一次；流式会话、权限门禁、恢复和停止期间不会抢跑。完全退出应用后不会假装继续执行。"
-            : "Due tasks are checked every 30 seconds while Grox is running. Busy turns and human gates are never pre-empted; fully quitting pauses schedules."}
+            ? "任务在 Grox 进程存活时每 30 秒检查一次；启用任务后关闭主窗口会转入托盘，流式会话、权限门禁、恢复和停止期间不会抢跑。托盘中明确退出后暂停调度。"
+            : "Due tasks are checked every 30 seconds while Grox is running. Closing the main window keeps enabled schedules in the tray; busy turns and human gates are never pre-empted. Explicitly quitting from the tray pauses scheduling."}
         </p>
         <div className="mt-5 flex items-center gap-1 rounded-[8px] border border-line2 bg-panel/55 p-1">
           {(["tasks", "runs"] as const).map((item) => (
