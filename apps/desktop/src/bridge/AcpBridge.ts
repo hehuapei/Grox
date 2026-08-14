@@ -42,6 +42,7 @@ import type {
   RewindMode,
   RewindPoint,
   RewindResult,
+  RuntimeOccupancy,
   SlashCommand,
   WorkflowAgentTrace,
   WorkflowTraceEntry,
@@ -62,7 +63,6 @@ import {
 import type { ErrorFallback } from "../lib/errorModel";
 import { sessionFromDiskPreview, type SessionDiskPreview } from "../lib/sessionDiskPreview";
 import { mapToolKind } from "../lib/toolKind";
-import { SharedAcpLifecycleGate } from "../lib/sharedAcpLifecycleGate";
 import { AcpRpcError, decodeAcpResponse } from "./acpRpc";
 
 export const ACP_METHODS = {
@@ -115,6 +115,11 @@ interface DesktopEnvironment {
 interface ExitPayload {
   code?: number | null;
   reason: "exited" | "killed";
+}
+
+interface SessionGatePermit {
+  token: number;
+  generation: number;
 }
 
 interface AcpReadFilePayload {
@@ -1015,9 +1020,6 @@ export class AcpBridge implements GrokBridge {
   private promptRpcBySession = new Map<string, RpcId>();
   private sessionSetModelUnsupported = false;
   private activePromptSessions = new Set<string>();
-  private readonly lifecycleGate = new SharedAcpLifecycleGate((occupancy) => {
-    this.emit({ type: "runtime_occupancy", occupancy });
-  });
   private stoppingSessions = new Set<string>();
   private promptDrainWaiters = new Set<() => void>();
   private knownSessions = new Set<string>();
@@ -1248,12 +1250,19 @@ export class AcpBridge implements GrokBridge {
         this.diagnostics = this.diagnostics.slice(-20);
       }),
       await listen<ExitPayload>("acp-exit", ({ payload }) => this.onExit(payload)),
+      await listen<RuntimeOccupancy>("session-runtime-occupancy", ({ payload }) => {
+        this.emit({ type: "runtime_occupancy", occupancy: payload });
+      }),
       await listen("computer-emergency-shortcut", () => {
         for (const sessionId of this.activeComputerSessions) {
           void this.emergencyStopComputer(sessionId);
         }
       }),
     );
+    this.emit({
+      type: "runtime_occupancy",
+      occupancy: await invoke<RuntimeOccupancy>("session_runtime_status"),
+    });
 
     try {
       await this.initializeAgent();
@@ -2482,7 +2491,13 @@ export class AcpBridge implements GrokBridge {
     await invoke("acp_send", { line: JSON.stringify(message), generation: this.acpGeneration });
   }
 
-  private async requestRaw(method: string, params: unknown, timeoutMs = 30_000, onPending?: (id: RpcId) => void): Promise<unknown> {
+  private async requestRaw(
+    method: string,
+    params: unknown,
+    timeoutMs = 30_000,
+    onPending?: (id: RpcId) => void,
+    gateToken?: number,
+  ): Promise<unknown> {
     const id = ++this.requestId;
     onPending?.(id);
     const response = await invoke<string>("acp_request", {
@@ -2490,6 +2505,7 @@ export class AcpBridge implements GrokBridge {
       requestId: id,
       generation: this.acpGeneration,
       timeoutMs,
+      gateToken,
     });
     return decodeAcpResponse(response, id, method);
   }
@@ -2514,9 +2530,52 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
-  private async request(method: string, params: unknown, timeoutMs = 30_000): Promise<unknown> {
+  private async request(
+    method: string,
+    params: unknown,
+    timeoutMs = 30_000,
+    gateToken?: number,
+  ): Promise<unknown> {
     await this.ensureReady();
-    return this.requestRaw(method, params, timeoutMs);
+    return this.requestRaw(method, params, timeoutMs, undefined, gateToken);
+  }
+
+  private async withLifecycleGate<T>(
+    operation: (permit: SessionGatePermit) => Promise<T>,
+  ): Promise<T> {
+    await this.ensureReady();
+    const permit = {
+      generation: this.acpGeneration,
+      token: await invoke<number>("session_gate_enter_lifecycle", {
+        generation: this.acpGeneration,
+      }),
+    };
+    try {
+      return await operation(permit);
+    } finally {
+      await this.releaseSessionGate(permit);
+    }
+  }
+
+  private async enterTurnGate(sessionId: string): Promise<SessionGatePermit> {
+    await this.ensureReady();
+    const generation = this.acpGeneration;
+    return {
+      generation,
+      token: await invoke<number>("session_gate_enter_turn", { sessionId, generation }),
+    };
+  }
+
+  private async releaseSessionGate(permit: SessionGatePermit): Promise<void> {
+    try {
+      await invoke<boolean>("session_gate_release", {
+        token: permit.token,
+        generation: permit.generation,
+      });
+    } catch (error) {
+      this.diagnostics.push(`释放原生会话许可失败：${errorText(error)}`);
+      this.diagnostics = this.diagnostics.slice(-20);
+    }
   }
 
   private async notify(method: string, params: unknown): Promise<void> {
@@ -3010,7 +3069,7 @@ export class AcpBridge implements GrokBridge {
     let computer = await this.resolveComputerExtensions();
     let responseValue: unknown;
     try {
-      responseValue = await this.lifecycleGate.runLifecycle(async () => {
+      responseValue = await this.withLifecycleGate(async (permit) => {
         try {
           return await this.request(ACP_METHODS.sessionNew, {
             cwd,
@@ -3024,7 +3083,7 @@ export class AcpBridge implements GrokBridge {
               ...(computer.computerLeaseId ? { groxComputerLeaseId: computer.computerLeaseId } : {}),
               ...(computer.browserLeaseId ? { groxBrowserLeaseId: computer.browserLeaseId } : {}),
             },
-          });
+          }, 30_000, permit.token);
         } catch (error) {
           // Keep the compatibility retry in the same exclusive window: a
           // prompt must not slip between the rejected and canonical request.
@@ -3039,7 +3098,7 @@ export class AcpBridge implements GrokBridge {
               ...(preferredModel ? { modelId: preferredModel } : {}),
               reasoningEffort,
             },
-          });
+          }, 30_000, permit.token);
         }
       });
     } catch (error) {
@@ -3149,7 +3208,7 @@ export class AcpBridge implements GrokBridge {
     try {
       const metaRequest = await this.sessionMeta(meta.cwd);
       computer = await this.resolveComputerExtensions();
-      await this.lifecycleGate.runLifecycle(async () => {
+      await this.withLifecycleGate(async (permit) => {
         let response: unknown;
         try {
           response = await this.request(ACP_METHODS.sessionLoad, {
@@ -3162,7 +3221,7 @@ export class AcpBridge implements GrokBridge {
               ...(computer.computerLeaseId ? { groxComputerLeaseId: computer.computerLeaseId } : {}),
               ...(computer.browserLeaseId ? { groxBrowserLeaseId: computer.browserLeaseId } : {}),
             },
-          }, 2 * 60_000);
+          }, 2 * 60_000, permit.token);
         } catch (error) {
           if (!isInvalidParamsError(error)) throw error;
           await this.discardLeaseAttempt(computer);
@@ -3172,7 +3231,7 @@ export class AcpBridge implements GrokBridge {
             cwd: meta.cwd,
             mcpServers: [],
             _meta: metaRequest,
-          }, 2 * 60_000);
+          }, 2 * 60_000, permit.token);
         }
         const previousLease = this.computerLeases.get(id);
         if (previousLease && previousLease !== computer.computerLeaseId) {
@@ -3438,6 +3497,7 @@ export class AcpBridge implements GrokBridge {
     sessionId: string,
     modelId: string,
     effort: Effort,
+    gateToken?: number,
   ): Promise<Effort> {
     const preferred = normalizeEffort(effort);
     if (this.sessionSetModelUnsupported) return preferred;
@@ -3449,7 +3509,7 @@ export class AcpBridge implements GrokBridge {
           sessionId,
           modelId,
           _meta: { reasoningEffort: candidate },
-        });
+        }, 30_000, undefined, gateToken);
         return candidate;
       } catch (error) {
         lastError = error;
@@ -3473,14 +3533,14 @@ export class AcpBridge implements GrokBridge {
     // race: provider activation must see this request immediately.
     this.activePromptSessions.add(sessionId);
     let terminalStatus: SessionStatus = "idle";
-    let turnEntered = false;
+    let turnPermit: SessionGatePermit | undefined;
     try {
       await this.ensureReady();
       if (!this.knownSessions.has(sessionId)) {
         await this.loadSession(sessionId, { background: true });
       }
-      await this.lifecycleGate.enterTurn(sessionId);
-      turnEntered = true;
+      turnPermit = await this.enterTurnGate(sessionId);
+      const gateToken = turnPermit.token;
       // A new user prompt begins the new branch. It is the only event allowed
       // to lift the rewind isolation gate.
       this.forgetRewoundSession(sessionId);
@@ -3503,13 +3563,14 @@ export class AcpBridge implements GrokBridge {
           sessionId,
           options.model,
           preferredEffort,
+          gateToken,
         );
       }
       if (!previous || previous.mode !== options.mode) {
         await this.requestRaw(ACP_METHODS.sessionSetMode, {
           sessionId,
           modeId: options.mode === "agent" ? "default" : options.mode,
-        });
+        }, 30_000, undefined, gateToken);
       }
       this.sessionOptions.set(sessionId, {
         model: options.model,
@@ -3530,7 +3591,7 @@ export class AcpBridge implements GrokBridge {
         }, 0, (id) => {
           promptRpcId = id;
           this.promptRpcBySession.set(sessionId, id);
-        });
+        }, gateToken);
         // session/prompt has no fixed RPC timeout (long turns stream for
         // many minutes). A completely silent agent with no open tools/gates
         // is a wedged gateway or dead socket. Open tools (sealed LRC,
@@ -3584,6 +3645,7 @@ export class AcpBridge implements GrokBridge {
               sessionId,
               options.model,
               candidate,
+              gateToken,
             );
             this.sessionOptions.set(sessionId, {
               model: options.model,
@@ -3644,7 +3706,7 @@ export class AcpBridge implements GrokBridge {
     } finally {
       this.promptRpcBySession.delete(sessionId);
       this.finishTurn(sessionId, undefined, terminalStatus);
-      if (turnEntered) this.lifecycleGate.leaveTurn(sessionId);
+      if (turnPermit) await this.releaseSessionGate(turnPermit);
       this.stoppingSessions.delete(sessionId);
       this.markPromptFinished(sessionId);
     }

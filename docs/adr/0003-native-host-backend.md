@@ -60,7 +60,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 顺序 | 后端主干 | 迁移结果 |
 | --- | --- | --- |
 | 1 | Native ACP transport | Host 关联请求/响应并负责超时、取消、退出清算；已落地 |
-| 2 | SessionCoordinator | 把 lifecycle gate、活动回合、门禁、重连和会话快照移入 Rust |
+| 2 | SessionCoordinator | Host 签发/校验 lifecycle 与 turn 许可并发布占用快照；已落地 |
 | 3 | Native repositories | journal、队列、草稿、自动化改为带锁事务；localStorage 只留临时镜像 |
 | 4 | Background execution | 自动化、恢复、后台多会话通过 SessionCoordinator 执行；再评估按会话进程池 |
 | 5 | Host services | worktree、权限、媒体、密钥统一使用会话/项目身份和路径授权 |
@@ -79,6 +79,15 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - Host 为退出、通道替换、超时、停滞、取消和协议校验返回稳定错误代码，前端不再用字符串正则覆盖这些分类；
 - 环境摘要和支持包记录 Host 悬挂请求数；
 - WebView 只解释已经归属的响应，未知广播响应仍呈现为协议错误。
+- `session_coordinator::SessionCoordinator` 在 Host 内维护活动回合、FIFO 生命周期队列和进程代次；
+- `session/new`、`session/load`、`session/prompt` 必须携带 Host 签发且与方法、会话、代次匹配的许可；
+- 生命周期排队会阻止新回合抢占，不同已绑定会话仍可并发运行；等待任务取消、进程自然退出、替换、停止、CLI 更新和主窗口退出都会清除旧许可；
+- 占用快照由 Host 通过事件和查询命令发布，环境摘要与支持包不再依赖 WebView 自报门控状态；
+- 前端 `SharedAcpLifecycleGate` 及其平行测试已删除，兼容重试、回放收尾和模型/模式预绑定仍保持在同一 Host 许可窗口内。
+
+本切片没有把供应商切换的“发送意图等待”、提示队列和自动化调度伪装成已经迁移：
+它们仍在 Bridge/Store，后续必须通过同一个 SessionCoordinator 的维护操作与后台执行入口
+迁入 Host，才能删除 `activePromptSessions` 等剩余前端运行时权威。
 
 ## 完整后端对照结论
 

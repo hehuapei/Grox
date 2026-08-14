@@ -15,6 +15,7 @@ mod mcp_leases;
 mod path_sandbox;
 #[cfg(windows)]
 mod process_job;
+mod session_coordinator;
 mod support_bundle;
 
 use std::{
@@ -40,6 +41,7 @@ use path_sandbox::{
 };
 use percent_encoding::percent_decode_str;
 use serde::{Deserialize, Serialize};
+use session_coordinator::{SessionCoordinator, SessionRuntimeOccupancy};
 use tauri::{Emitter, Manager};
 use toml_edit::{value as toml_value, Document, Item, Table, TableLike};
 use tokio::{
@@ -144,6 +146,7 @@ struct AcpState {
     process: Mutex<Option<AgentProcess>>,
     next_generation: AtomicU64,
     requests: AcpRequestBroker,
+    sessions: Arc<SessionCoordinator>,
 }
 
 struct PreviewProcess {
@@ -208,6 +211,46 @@ async fn agent_runtime_status(
         pid,
         pending_requests: state.requests.len().await,
     })
+}
+
+#[tauri::command]
+fn session_runtime_status(state: tauri::State<'_, Arc<AcpState>>) -> SessionRuntimeOccupancy {
+    state.sessions.snapshot()
+}
+
+#[tauri::command]
+async fn session_gate_enter_turn(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    session_id: String,
+    generation: u64,
+) -> Result<u64, AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    state.sessions.enter_turn(session_id, generation).await
+}
+
+#[tauri::command]
+async fn session_gate_enter_lifecycle(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    generation: u64,
+) -> Result<u64, AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    state.sessions.enter_lifecycle(generation).await
+}
+
+#[tauri::command]
+fn session_gate_release(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    token: u64,
+    generation: u64,
+) -> Result<bool, AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    Ok(state.sessions.release(token, generation))
 }
 
 #[derive(Clone, Serialize)]
@@ -2948,6 +2991,7 @@ async fn export_session_support_bundle(
         "process": process.unwrap_or_else(|| serde_json::json!({ "running": false })),
         "nextGeneration": state.next_generation.load(Ordering::Relaxed),
         "pendingRequests": state.requests.len().await,
+        "sessionOccupancy": state.sessions.snapshot(),
         "cli": {
             "path": support_path(&runtime_info.path),
             "source": runtime_info.source,
@@ -3101,7 +3145,8 @@ async fn install_official_grok_cli(
     // Windows cannot replace a running executable. Stop the official CLI
     // child before invoking its official updater; the webview reload below
     // starts the freshly installed binary again.
-    state.next_generation.fetch_add(1, Ordering::Relaxed);
+    let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    state.sessions.reset(generation);
     state
         .requests
         .reject_all(AcpHostError::environment(
@@ -7209,6 +7254,7 @@ async fn acp_spawn(
     // or stderr lines after `kill`; those lines must not reach the new ACP
     // connection.
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    state.sessions.reset(generation);
     state
         .requests
         .reject_all(AcpHostError::environment(
@@ -7356,6 +7402,17 @@ async fn acp_spawn(
             }
         };
         if let Some(mut process) = process {
+            let next_generation = stdout_state
+                .next_generation
+                .compare_exchange(
+                    generation,
+                    generation + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .map(|_| generation + 1)
+                .unwrap_or_else(|current| current);
+            stdout_state.sessions.reset(next_generation);
             drop(process.stdin);
             let code = process
                 .child
@@ -7568,6 +7625,7 @@ async fn acp_request(
     request_id: u64,
     generation: u64,
     timeout_ms: u64,
+    gate_token: Option<u64>,
 ) -> Result<String, AcpHostError> {
     ensure_main_acp_owner(window.label()).map_err(|error| {
         AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error)
@@ -7591,6 +7649,12 @@ async fn acp_request(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| AcpHostError::protocol("ACP_INVALID_REQUEST", "ACP 请求缺少 method"))?
         .to_string();
+    state.sessions.verify_request(
+        &method,
+        message.get("params").unwrap_or(&serde_json::Value::Null),
+        gate_token,
+        generation,
+    )?;
     let receiver = state
         .requests
         .register(request_id, generation, method.clone())
@@ -7694,7 +7758,8 @@ async fn acp_kill(
     state: tauri::State<'_, Arc<AcpState>>,
 ) -> Result<(), String> {
     ensure_main_acp_owner(window.label())?;
-    state.next_generation.fetch_add(1, Ordering::Relaxed);
+    let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    state.sessions.reset(generation);
     state
         .requests
         .reject_all(AcpHostError::operation(
@@ -8205,6 +8270,15 @@ fn main() {
                 window.set_icon(icon)?;
             }
             register_computer_emergency_shortcut(app.handle().clone());
+            let coordinator = app.state::<Arc<AcpState>>().sessions.clone();
+            let mut occupancy = coordinator.subscribe();
+            let occupancy_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while occupancy.changed().await.is_ok() {
+                    let payload = occupancy.borrow_and_update().clone();
+                    let _ = occupancy_app.emit("session-runtime-occupancy", payload);
+                }
+            });
             // Never block setup (window interactivity) on disk / provisioning.
             // These can take seconds with large session-cache dirs and freeze
             // the first 2–3s of operator input.
@@ -8228,6 +8302,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             desktop_environment,
             agent_runtime_status,
+            session_runtime_status,
+            session_gate_enter_turn,
+            session_gate_enter_lifecycle,
+            session_gate_release,
             preview_session_from_disk,
             search_session_history,
             read_session_journal,
@@ -8317,7 +8395,8 @@ fn main() {
                 let state = window.state::<Arc<AcpState>>().inner().clone();
                 let preview_state = window.state::<Arc<PreviewState>>().inner().clone();
                 tauri::async_runtime::spawn(async move {
-                    state.next_generation.fetch_add(1, Ordering::Relaxed);
+                    let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                    state.sessions.reset(generation);
                     state
                         .requests
                         .reject_all(AcpHostError::environment(
