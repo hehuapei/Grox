@@ -53,8 +53,6 @@ import { readStoredPermissionMode } from "../lib/permissionMode";
 import { cleanApiError, toolCanonicalKind, toolReadOnly, versionMismatchNotice } from "../lib/runtimeNotice";
 import {
   isOpenToolStatus,
-  promptTurnTimeoutMessage,
-  shouldFirePromptStallWatchdog,
 } from "../lib/promptTurnTimeout";
 import {
   formatGroxError,
@@ -101,6 +99,17 @@ interface AgentRuntimeConnection {
   generation: number;
   initialize: unknown;
   auth: AuthState & { methodId?: string };
+}
+
+interface ForegroundTurnResult {
+  response: unknown;
+  requestedEffort: Effort;
+  effectiveEffort: Effort;
+}
+
+interface ForegroundTurnStalled {
+  sessionId: string;
+  silentForMs: number;
 }
 type RpcId = string | number;
 
@@ -163,71 +172,8 @@ interface PendingInteraction {
   questions?: QuestionItem[];
 }
 
-function isInvalidParamsError(error: unknown): boolean {
-  if (error instanceof AcpRpcError && error.code === -32602) return true;
-  return error instanceof Error && /\binvalid params\b/i.test(error.message);
-}
-
-/** API 400 / invalid-argument: Invalid reasoning effort (resume + sticky session). */
-function isInvalidReasoningEffortError(error: unknown): boolean {
-  const message = errorText(error);
-  return (
-    /invalid\s+reasoning\s+effort/i.test(message)
-    || /invalid-argument[^\n]*reasoning\s*effort/i.test(message)
-    || /unknown effort level/i.test(message)
-  );
-}
-
-/** True when a turn/stream update carries the invalid-effort API failure. */
-function isInvalidReasoningEffortMessage(message: string | undefined): boolean {
-  if (!message) return false;
-  return (
-    /invalid\s+reasoning\s+effort/i.test(message)
-    || /invalid-argument[^\n]*reasoning\s*effort/i.test(message)
-    || /unknown effort level/i.test(message)
-  );
-}
-
-/** Coerce UI / composer values onto the catalogue (drops garbage after shell upgrades). */
-function normalizeEffort(value: unknown, fallback: Effort = "high"): Effort {
-  if (typeof value === "string") {
-    const lowered = value.trim().toLowerCase();
-    const hit = EFFORTS.find((effort) => effort === lowered);
-    if (hit) return hit;
-  }
-  return fallback;
-}
-
-/**
- * Prefer requested effort, then Grok-safe ladder only.
- * Do not re-try xhigh/max after a failure (they are the usual rejectors).
- */
-function effortFallbackChain(preferred: Effort): Effort[] {
-  const ordered: Effort[] = [preferred, "high", "medium", "low"];
-  const seen = new Set<Effort>();
-  const out: Effort[] = [];
-  for (const effort of ordered) {
-    if (seen.has(effort)) continue;
-    seen.add(effort);
-    out.push(effort);
-  }
-  return out;
-}
-
 function isMethodUnavailable(error: unknown): boolean {
   return error instanceof AcpRpcError && (error.code === -32601 || error.code === -32602);
-}
-
-/**
- * Upstream's built-in /deep-research exits before Verify/Report when an
- * evidence panel is empty. The native shell provisions a user workflow with
- * the same research contract but no early terminal branch; preserve the
- * familiar command while dispatching to that complete pipeline.
- */
-function completeDeepResearchPrompt(text: string): string {
-  const match = text.trim().match(/^\/deep-research(?:\s+([\s\S]*))?$/i);
-  if (!match) return text;
-  return `/workflow grox-deep-research ${JSON.stringify({ query: match[1]?.trim() ?? "" })}`;
 }
 
 /** Keep Grox's transport-only workflow alias out of the conversation replay. */
@@ -1019,18 +965,14 @@ export class AcpBridge implements GrokBridge {
   private canonicalReplaySessions = new Set<string>();
   private usage = new Map<string, Usage>();
   private sessionOptions = new Map<string, PromptOptions>();
-  /** Active session/prompt JSON-RPC id — stream errors can reject it for effort fallback. */
-  private promptRpcBySession = new Map<string, RpcId>();
-  private sessionSetModelUnsupported = false;
   private activePromptSessions = new Set<string>();
+  /** 客户端操作 id 只用于把“发送前 Stop”归属到同一 Host 回合。 */
+  private foregroundTurnIds = new Map<string, string>();
   private stoppingSessions = new Set<string>();
   private promptDrainWaiters = new Set<() => void>();
   private knownSessions = new Set<string>();
   private loadPromises = new Map<string, Promise<void>>();
-  private lastActivity = new Map<string, number>();
-  /** Wall clock when the current session/prompt was written. */
-  private promptWrittenAt = new Map<string, number>();
-  /** toolCallIds still pending/running/awaiting_permission for the stall watchdog. */
+  /** toolCallIds still pending/running/awaiting_permission for UI projection. */
   private openToolCalls = new Map<string, Set<string>>();
   private unlisten: UnlistenFn[] = [];
   private streamAppends = new Map<string, Extract<BridgeEvent, { type: "assistant_append" | "thinking_append" }>>();
@@ -1262,6 +1204,20 @@ export class AcpBridge implements GrokBridge {
       await listen<GroxError>("automation-runner-error", ({ payload }) => {
         this.emit({ type: "runtime_notice", notice: runtimeNoticeFromError(payload) });
       }),
+      await listen<ForegroundTurnStalled>("foreground-turn-stalled", ({ payload }) => {
+        const minutes = Math.max(1, Math.round(payload.silentForMs / 60_000));
+        this.emit({
+          type: "block_add",
+          sessionId: payload.sessionId,
+          block: {
+            type: "system",
+            id: uid(),
+            text: `Agent 已 ${minutes} 分钟没有新输出；Host 仍在等待，运行中的长工具不会被误杀。你可以继续等待或停止本轮。`,
+            ts: Date.now(),
+            kind: "info",
+          },
+        });
+      }),
       await listen<AutomationSessionSettled>("automation-session-settled", ({ payload }) => {
         if (payload.model && payload.effectiveEffort && payload.mode) {
           this.sessionOptions.set(payload.sessionId, {
@@ -1367,10 +1323,7 @@ export class AcpBridge implements GrokBridge {
     this.interactions.clear();
     this.cursors.clear();
     this.openToolCalls.clear();
-    this.promptWrittenAt.clear();
-    this.lastActivity.clear();
     this.sessionOptions.clear();
-    this.sessionSetModelUnsupported = false;
     this.knownSessions.clear();
     this.workflowChildTraces.clear();
     this.cancelledWorkflowRuns.clear();
@@ -1573,11 +1526,6 @@ export class AcpBridge implements GrokBridge {
       });
       return;
     }
-
-    // Any session-scoped traffic (updates, permission prompts, ...) proves the
-    // agent is still alive; the prompt watchdog keys off this timestamp.
-    const activitySession = string(record(message.params)?.sessionId);
-    if (activitySession) this.lastActivity.set(activitySession, Date.now());
 
     if (message.method && message.id !== undefined) {
       this.onServerRequest(message);
@@ -1958,7 +1906,6 @@ export class AcpBridge implements GrokBridge {
         return;
       }
       case "turn_completed":
-        this.rejectPromptOnInvalidEffortUpdate(sessionId, update);
         if (record(update.usage)) this.emitUsage(sessionId, record(update.usage)!);
         return;
       default:
@@ -2119,7 +2066,6 @@ export class AcpBridge implements GrokBridge {
         break;
       }
       case "turn_completed":
-        this.rejectPromptOnInvalidEffortUpdate(sessionId, update);
         if (record(update.usage)) this.emitUsage(sessionId, record(update.usage)!);
         break;
       case "auto_compact_started":
@@ -2149,9 +2095,6 @@ export class AcpBridge implements GrokBridge {
         break;
       case "retry_state": {
         const retry = record(update.retryState) ?? update;
-        // Agent surfaces API 400 Invalid reasoning effort here while session/prompt
-        // may still be pending — reject so prompt() catch can fall back to high.
-        this.rejectPromptOnInvalidEffortUpdate(sessionId, retry);
         this.emit({
           type: "block_add",
           sessionId,
@@ -2229,7 +2172,6 @@ export class AcpBridge implements GrokBridge {
     this.closeAssistant(sessionId);
     this.flushToolPatches(sessionId);
     this.openToolCalls.delete(sessionId);
-    this.promptWrittenAt.delete(sessionId);
     if (usageValue) this.emitUsage(sessionId, usageValue);
     this.emit({ type: "status", sessionId, status });
   }
@@ -2249,68 +2191,12 @@ export class AcpBridge implements GrokBridge {
     if (open.size === 0) this.openToolCalls.delete(sessionId);
   }
 
-  private sessionHasOpenTools(sessionId: string): boolean {
-    return (this.openToolCalls.get(sessionId)?.size ?? 0) > 0;
-  }
-
-  private sessionHasOpenGate(sessionId: string): boolean {
-    for (const interaction of this.interactions.values()) {
-      if (interaction.sessionId === sessionId) return true;
-    }
-    return false;
-  }
-
   private sessionGateStatus(sessionId: string): SessionStatus | null {
     for (const interaction of this.interactions.values()) {
       if (interaction.sessionId !== sessionId) continue;
       return interaction.kind === "question" ? "awaiting_input" : "awaiting_permission";
     }
     return null;
-  }
-
-  /**
-   * Stream-path Invalid reasoning effort (set_model often accepts max; API 400
-   * arrives as retry_state / turn_completed). Reject the in-flight session/prompt
-   * so prompt() can rebind high→medium→low and continue.
-   */
-  private rejectPromptOnInvalidEffortUpdate(sessionId: string, update: JsonObject): void {
-    const stop = string(update.stop_reason) ?? string(update.stopReason);
-    const message =
-      string(update.agent_result)
-      ?? string(update.message)
-      ?? string(update.error)
-      ?? string(record(update.error)?.message)
-      ?? "";
-    const failed =
-      stop === "error"
-      || string(update.type) === "failed"
-      || string(update.error_type) === "api"
-      || isInvalidReasoningEffortMessage(message);
-    if (!failed || !isInvalidReasoningEffortMessage(message)) return;
-
-    const rpcId = this.promptRpcBySession.get(sessionId);
-    if (rpcId === undefined) return;
-    this.promptRpcBySession.delete(sessionId);
-    void this.cancelRpcRequest(rpcId, message || "Invalid reasoning effort", "protocol_recovery");
-  }
-
-  /** If session/prompt resolves with an error body instead of rejecting. */
-  private throwIfPromptResultInvalidEffort(responseValue: unknown): void {
-    const response = record(responseValue);
-    if (!response) return;
-    const stop = string(response.stop_reason) ?? string(response.stopReason);
-    const message =
-      string(response.agent_result)
-      ?? string(response.message)
-      ?? string(response.error)
-      ?? errorText(response.error)
-      ?? "";
-    if (
-      (stop === "error" || isInvalidReasoningEffortMessage(message))
-      && isInvalidReasoningEffortMessage(message)
-    ) {
-      throw new Error(message || "Invalid reasoning effort");
-    }
   }
 
   private emitUsage(sessionId: string, usageValue: JsonObject) {
@@ -2503,26 +2389,6 @@ export class AcpBridge implements GrokBridge {
     return decodeAcpResponse(response, id, method);
   }
 
-  private async cancelRpcRequest(
-    id: RpcId,
-    reason: string,
-    kind: "watchdog" | "protocol_recovery" | "user",
-  ): Promise<boolean> {
-    if (typeof id !== "number") return false;
-    try {
-      return await invoke<boolean>("acp_cancel_request", {
-        requestId: id,
-        generation: this.acpGeneration,
-        reason,
-        kind,
-      });
-    } catch (error) {
-      this.diagnostics.push(`取消 ACP 请求失败：${errorText(error)}`);
-      this.diagnostics = this.diagnostics.slice(-20);
-      return false;
-    }
-  }
-
   private async request(
     method: string,
     params: unknown,
@@ -2548,15 +2414,6 @@ export class AcpBridge implements GrokBridge {
     } finally {
       await this.releaseSessionGate(permit);
     }
-  }
-
-  private async enterTurnGate(sessionId: string): Promise<SessionGatePermit> {
-    await this.ensureReady();
-    const generation = this.acpGeneration;
-    return {
-      generation,
-      token: await invoke<number>("session_gate_enter_turn", { sessionId, generation }),
-    };
   }
 
   private async releaseSessionGate(permit: SessionGatePermit): Promise<void> {
@@ -2718,14 +2575,6 @@ export class AcpBridge implements GrokBridge {
 
   getBrowserUseEnabled(): boolean {
     return this.browserUseEnabled;
-  }
-
-  private sessionPermissionMeta(mode: PermissionMode = this.permissionMode) {
-    return {
-      clientIdentifier: UPSTREAM_CLI_CLIENT_IDENTIFIER,
-      yoloMode: mode === "bypass",
-      autoMode: mode === "auto",
-    };
   }
 
   async authenticate(): Promise<void> {
@@ -3333,60 +3182,22 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
-  /**
-   * Bind model + reasoning effort on the ACP session.
-   * Effort changes must re-call set_model (resume sticky sessions).
-   * Invalid effort falls through the fallback chain instead of latching
-   * `sessionSetModelUnsupported` forever.
-   */
-  private async applySessionModelAndEffort(
-    sessionId: string,
-    modelId: string,
-    effort: Effort,
-    gateToken?: number,
-  ): Promise<Effort> {
-    const preferred = normalizeEffort(effort);
-    if (this.sessionSetModelUnsupported) return preferred;
-
-    let lastError: unknown;
-    for (const candidate of effortFallbackChain(preferred)) {
-      try {
-        await this.requestRaw(ACP_METHODS.sessionSetModel, {
-          sessionId,
-          modelId,
-          _meta: { reasoningEffort: candidate },
-        }, 30_000, undefined, gateToken);
-        return candidate;
-      } catch (error) {
-        lastError = error;
-        if (isInvalidReasoningEffortError(error)) {
-          continue;
-        }
-        if (isInvalidParamsError(error)) {
-          // True capability miss: do not spam set_model every turn.
-          this.sessionSetModelUnsupported = true;
-          return preferred;
-        }
-        throw error;
-      }
-    }
-    if (lastError) throw lastError;
-    return preferred;
-  }
-
   async prompt(sessionId: string, text: string, options: PromptOptions): Promise<void> {
     // Register before any await. This is the critical Send → provider-switch
     // race: provider activation must see this request immediately.
     this.activePromptSessions.add(sessionId);
+    const turnId = uid();
+    this.foregroundTurnIds.set(sessionId, turnId);
     let terminalStatus: SessionStatus = "idle";
-    let turnPermit: SessionGatePermit | undefined;
     try {
       await this.ensureReady();
       if (!this.knownSessions.has(sessionId)) {
         await this.loadSession(sessionId, { background: true });
       }
-      turnPermit = await this.enterTurnGate(sessionId);
-      const gateToken = turnPermit.token;
+      // Stop 可以发生在首次连接或 session/load 尚未完成时。此时 Agent 还
+      // 没收到 prompt，直接结束客户端提交即可；检查后到 Host begin 之间的
+      // 竞态由 turnId 取消墓碑处理。
+      if (this.stoppingSessions.has(sessionId)) return;
       // A new user prompt begins the new branch. It is the only event allowed
       // to lift the rewind isolation gate.
       this.forgetRewoundSession(sessionId);
@@ -3397,138 +3208,41 @@ export class AcpBridge implements GrokBridge {
       this.openToolCalls.delete(sessionId);
       this.emit({ type: "status", sessionId, status: "running" });
 
-      const preferredEffort = normalizeEffort(options.effort);
-      const previous = this.sessionOptions.get(sessionId);
-      let boundEffort = preferredEffort;
-      if (
-        !previous
-        || previous.model !== options.model
-        || previous.effort !== preferredEffort
-      ) {
-        boundEffort = await this.applySessionModelAndEffort(
+      const result = await invoke<ForegroundTurnResult>("execute_foreground_turn", {
+        request: {
           sessionId,
-          options.model,
-          preferredEffort,
-          gateToken,
-        );
-      }
-      if (!previous || previous.mode !== options.mode) {
-        await this.requestRaw(ACP_METHODS.sessionSetMode, {
-          sessionId,
-          modeId: options.mode === "agent" ? "default" : options.mode,
-        }, 30_000, undefined, gateToken);
-      }
+          turnId,
+          generation: this.acpGeneration,
+          prompt: promptContent(text, options.attachments ?? []),
+          model: options.model,
+          effort: options.effort,
+          mode: options.mode,
+        },
+      });
       this.sessionOptions.set(sessionId, {
         model: options.model,
-        effort: boundEffort,
+        effort: result.effectiveEffort,
         mode: options.mode,
       });
-
-      const dispatchText = completeDeepResearchPrompt(text);
-      const runPromptOnce = async (effort: Effort) => {
-        let promptRpcId: RpcId | undefined;
-        const promptRequest = this.requestRaw(ACP_METHODS.sessionPrompt, {
-          sessionId,
-          prompt: promptContent(dispatchText, options.attachments ?? []),
-          _meta: {
-            reasoningEffort: effort,
-            ...this.sessionPermissionMeta(options.permissionMode),
-          },
-        }, 0, (id) => {
-          promptRpcId = id;
-          this.promptRpcBySession.set(sessionId, id);
-        }, gateToken);
-        // session/prompt has no fixed RPC timeout (long turns stream for
-        // many minutes). A completely silent agent with no open tools/gates
-        // is a wedged gateway or dead socket. Open tools (sealed LRC,
-        // cargo test) emit nothing for 20–40+ minutes and must not cancel.
-        const writtenAt = Date.now();
-        this.promptWrittenAt.set(sessionId, writtenAt);
-        this.lastActivity.set(sessionId, writtenAt);
-        const watchdog = window.setInterval(() => {
-          if (promptRpcId === undefined) return;
-          const now = Date.now();
-          const reason = shouldFirePromptStallWatchdog({
-            silentForMs: now - (this.lastActivity.get(sessionId) ?? 0),
-            elapsedMs: now - (this.promptWrittenAt.get(sessionId) ?? writtenAt),
-            hasOpenTools: this.sessionHasOpenTools(sessionId),
-            hasOpenGate: this.sessionHasOpenGate(sessionId),
-          });
-          if (reason === "ok") return;
-          if (this.promptRpcBySession.get(sessionId) !== promptRpcId) return;
-          this.promptRpcBySession.delete(sessionId);
-          const timeoutMessage = reason === "absolute"
-            ? promptTurnTimeoutMessage("absolute")
-            : "Grok Agent 长时间没有任何响应：上游服务可能无返回。请检查网络、模型或供应商配置后重试。";
-          void this.cancelRpcRequest(promptRpcId, timeoutMessage, "watchdog");
-          this.cancel(sessionId, false);
-        }, 15_000);
+      if (result.effectiveEffort !== result.requestedEffort) {
         try {
-          const result = await promptRequest;
-          this.throwIfPromptResultInvalidEffort(result);
-          return result;
-        } finally {
-          window.clearInterval(watchdog);
-          if (promptRpcId !== undefined && this.promptRpcBySession.get(sessionId) === promptRpcId) {
-            this.promptRpcBySession.delete(sessionId);
-          }
+          localStorage.setItem("grok.effort", result.effectiveEffort);
+        } catch {
+          /* private mode */
         }
-      };
-
-      let responseValue: unknown;
-      let usedEffort = boundEffort;
-      try {
-        responseValue = await runPromptOnce(usedEffort);
-      } catch (error) {
-        if (!isInvalidReasoningEffortError(error)) throw error;
-        // Stream/API rejected max|xhigh — rebind safe ladder and continue same turn.
-        let recovered: unknown;
-        let last: unknown = error;
-        for (const candidate of effortFallbackChain(preferredEffort)) {
-          if (candidate === usedEffort) continue;
-          try {
-            usedEffort = await this.applySessionModelAndEffort(
-              sessionId,
-              options.model,
-              candidate,
-              gateToken,
-            );
-            this.sessionOptions.set(sessionId, {
-              model: options.model,
-              effort: usedEffort,
-              mode: options.mode,
-            });
-            // Persist clamp so UI stops advertising a rejected sticky max for this session.
-            try {
-              localStorage.setItem("grok.effort", usedEffort);
-            } catch {
-              /* private mode */
-            }
-            recovered = await runPromptOnce(usedEffort);
-            last = undefined;
-            if (usedEffort !== preferredEffort) {
-              this.emit({
-                type: "block_add",
-                sessionId,
-                block: {
-                  type: "system",
-                  id: uid(),
-                  text: `推理强度 ${preferredEffort} 不被当前模型/API 接受，已自动改用 ${usedEffort} 继续。`,
-                  ts: Date.now(),
-                  kind: "info",
-                },
-              });
-            }
-            break;
-          } catch (retryError) {
-            last = retryError;
-            if (!isInvalidReasoningEffortError(retryError)) throw retryError;
-          }
-        }
-        if (last) throw last;
-        responseValue = recovered;
+        this.emit({
+          type: "block_add",
+          sessionId,
+          block: {
+            type: "system",
+            id: uid(),
+            text: `推理强度 ${result.requestedEffort} 不被当前模型/API 接受，已自动改用 ${result.effectiveEffort} 继续。`,
+            ts: Date.now(),
+            kind: "info",
+          },
+        });
       }
-      const response = record(responseValue);
+      const response = record(result.response);
       const meta = record(response?._meta);
       const promptUsage = record(meta?.usage);
       if (promptUsage) this.emitUsage(sessionId, promptUsage);
@@ -3536,10 +3250,6 @@ export class AcpBridge implements GrokBridge {
     } catch (error) {
       const cancelled = this.stoppingSessions.has(sessionId);
       terminalStatus = cancelled ? "idle" : "failed";
-      if (isInvalidReasoningEffortError(error)) {
-        // Force next send to re-run set_model + fallback chain.
-        this.sessionOptions.delete(sessionId);
-      }
       if (!cancelled) {
         this.emitError(sessionId, error, {
           domain: "protocol",
@@ -3550,9 +3260,10 @@ export class AcpBridge implements GrokBridge {
         });
       }
     } finally {
-      this.promptRpcBySession.delete(sessionId);
       this.finishTurn(sessionId, undefined, terminalStatus);
-      if (turnPermit) await this.releaseSessionGate(turnPermit);
+      if (this.foregroundTurnIds.get(sessionId) === turnId) {
+        this.foregroundTurnIds.delete(sessionId);
+      }
       this.stoppingSessions.delete(sessionId);
       this.markPromptFinished(sessionId);
     }
@@ -3601,10 +3312,15 @@ export class AcpBridge implements GrokBridge {
           : { outcome: "cancelled" };
       void this.sendRaw({ jsonrpc: "2.0", id: interaction.rpcId, result });
     }
-    void this.notify(ACP_METHODS.sessionCancel, {
+    void invoke<boolean>("cancel_foreground_turn", {
       sessionId,
-      _meta: { trigger: "user", cancelSubagents: true },
+      turnId: this.foregroundTurnIds.get(sessionId),
+      generation: this.acpGeneration,
+      reason: userInitiated ? "用户已停止当前回合" : "Host watchdog 已停止当前回合",
+      kind: userInitiated ? "user" : "watchdog",
     }).catch((error) => {
+      const code = string(record(error)?.code);
+      if (code === "ACP_CHANNEL_REPLACED" || code === "ACP_RUNTIME_NOT_READY") return;
       this.emitError(sessionId, error, {
         domain: "operation",
         code: "SESSION_CANCEL_FAILED",
@@ -3762,8 +3478,6 @@ export class AcpBridge implements GrokBridge {
     this.catalogue.delete(id);
     this.activeComputerSessions.delete(id);
     this.openToolCalls.delete(id);
-    this.promptWrittenAt.delete(id);
-    this.lastActivity.delete(id);
     for (const key of this.activeComputerToolCalls) {
       if (key.startsWith(`${id}:`)) this.activeComputerToolCalls.delete(key);
     }

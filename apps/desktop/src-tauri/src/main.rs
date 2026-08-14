@@ -12,6 +12,7 @@ mod automation_runner;
 mod automation_store;
 mod browser_mcp;
 mod computer_mcp;
+mod foreground_turn;
 mod git_confirm;
 mod host_prefs;
 mod mcp_leases;
@@ -24,6 +25,7 @@ mod session_journal_store;
 mod session_runtime;
 mod session_storage;
 mod support_bundle;
+mod turn_runtime;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -44,6 +46,10 @@ use automation_runner::{storage_error as automation_storage_error, AutomationRun
 use automation_store::{AutomationCompletion, AutomationStore};
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use git_confirm::GitConfirmStore;
+use foreground_turn::{
+    cancel_foreground_turn, execute_foreground_turn, foreground_turn_status,
+    ForegroundTurnRegistry,
+};
 use mcp_leases::McpLeaseStore;
 use path_sandbox::{
     checked_workspace, checked_workspace_file, checked_workspace_target, is_workspace_file,
@@ -137,6 +143,7 @@ struct AcpState {
     runtime_phase: AtomicU8,
     requests: AcpRequestBroker,
     sessions: Arc<SessionCoordinator>,
+    foreground_turns: Arc<ForegroundTurnRegistry>,
 }
 
 impl AcpState {
@@ -376,18 +383,6 @@ async fn agent_runtime_status(
 #[tauri::command]
 fn session_runtime_status(state: tauri::State<'_, Arc<AcpState>>) -> SessionRuntimeOccupancy {
     state.sessions.snapshot()
-}
-
-#[tauri::command]
-async fn session_gate_enter_turn(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, Arc<AcpState>>,
-    session_id: String,
-    generation: u64,
-) -> Result<u64, AcpHostError> {
-    ensure_main_acp_owner(window.label())
-        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
-    state.sessions.enter_turn(session_id, generation).await
 }
 
 #[tauri::command]
@@ -3445,6 +3440,7 @@ async fn install_official_grok_cli(
     // child before invoking its official updater; the webview reload below
     // starts the freshly installed binary again.
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    state.foreground_turns.reset(generation);
     state.sessions.reset(generation);
     state
         .requests
@@ -7561,6 +7557,7 @@ async fn discard_failed_runtime(
     };
     if let Some(process) = process {
         let next_generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        state.foreground_turns.reset(next_generation);
         state.sessions.reset(next_generation);
         terminate_process(process).await;
     }
@@ -7583,6 +7580,7 @@ async fn spawn_acp_process(
     // or stderr lines after `kill`; those lines must not reach the new ACP
     // connection.
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    state.foreground_turns.reset(generation);
     state.sessions.reset(generation);
     state
         .requests
@@ -7713,6 +7711,22 @@ async fn spawn_acp_process(
                         {
                             continue;
                         }
+                        if let Some(abort) = stdout_state
+                            .foreground_turns
+                            .observe_inbound(generation, &line)
+                        {
+                            stdout_state
+                                .requests
+                                .reject(
+                                    abort.request_id,
+                                    abort.generation,
+                                    AcpHostError::protocol(
+                                        "ACP_INVALID_REASONING_EFFORT",
+                                        abort.message,
+                                    ),
+                                )
+                                .await;
+                        }
                         let _ = stdout_app.emit("acp-event", line);
                     }
                 }
@@ -7748,6 +7762,7 @@ async fn spawn_acp_process(
                 )
                 .map(|_| generation + 1)
                 .unwrap_or_else(|current| current);
+            stdout_state.foreground_turns.reset(next_generation);
             stdout_state.sessions.reset(next_generation);
             drop(process.stdin);
             let code = process
@@ -7951,6 +7966,7 @@ async fn acp_send(
     if message.get("id").is_some() && message.get("method").is_some() {
         return Err("ACP 请求必须通过原生请求通道发送".into());
     }
+    state.foreground_turns.observe_outbound(generation, &line);
     write_acp_line(state.inner(), &line, generation).await
 }
 
@@ -8090,7 +8106,49 @@ pub(crate) async fn request_acp_json(
     timeout_ms: u64,
     gate_token: Option<u64>,
 ) -> Result<serde_json::Value, AcpHostError> {
+    request_acp_json_tracked(
+        state,
+        leases,
+        method,
+        params,
+        generation,
+        timeout_ms,
+        gate_token,
+        None,
+    )
+    .await
+}
+
+/// 与普通 Host 请求共用同一 broker；tracker 只记录当前事务可定向取消的 id。
+pub(crate) async fn request_acp_json_tracked(
+    state: &AcpState,
+    leases: &McpLeaseStore,
+    method: &str,
+    params: serde_json::Value,
+    generation: u64,
+    timeout_ms: u64,
+    gate_token: Option<u64>,
+    tracker: Option<&dyn turn_runtime::AcpRequestTracker>,
+) -> Result<serde_json::Value, AcpHostError> {
     let request_id = state.issue_host_request_id();
+    if let Some(tracker) = tracker {
+        tracker.request_started(request_id, method)?;
+    }
+    struct TrackingGuard<'a> {
+        tracker: Option<&'a dyn turn_runtime::AcpRequestTracker>,
+        request_id: u64,
+    }
+    impl Drop for TrackingGuard<'_> {
+        fn drop(&mut self) {
+            if let Some(tracker) = self.tracker {
+                tracker.request_finished(self.request_id);
+            }
+        }
+    }
+    let _tracking = TrackingGuard {
+        tracker,
+        request_id,
+    };
     let line = serde_json::json!({
         "jsonrpc": "2.0",
         "id": request_id,
@@ -8167,36 +8225,6 @@ fn acp_rpc_error(method: &str, error: &serde_json::Value) -> AcpHostError {
     AcpHostError::protocol(stable_code, format!("{detail} · {method}"))
 }
 
-/// 会话 watchdog/协议恢复只取消一个 Host 请求，不影响同进程内其他会话。
-#[tauri::command]
-async fn acp_cancel_request(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, Arc<AcpState>>,
-    request_id: u64,
-    generation: u64,
-    reason: String,
-    kind: String,
-) -> Result<bool, String> {
-    ensure_main_acp_owner(window.label())?;
-    let reason = reason.trim();
-    if reason.is_empty() || reason.chars().count() > 1_000 {
-        return Err("ACP 取消原因无效".into());
-    }
-    let failure = match kind.as_str() {
-        "watchdog" => AcpHostError::environment(
-            "ACP_REQUEST_STALLED",
-            reason,
-            true,
-            true,
-            "检查网络、模型或供应商配置，并确认最后一轮结果后重试",
-        ),
-        "protocol_recovery" => AcpHostError::protocol("ACP_REQUEST_ABORTED_FOR_RECOVERY", reason),
-        "user" => AcpHostError::operation("ACP_REQUEST_CANCELLED", reason),
-        _ => return Err("ACP 取消类型无效".into()),
-    };
-    Ok(state.requests.reject(request_id, generation, failure).await)
-}
-
 #[tauri::command]
 async fn acp_kill(
     app: tauri::AppHandle,
@@ -8209,6 +8237,7 @@ async fn acp_kill(
     state.paused_generation.store(0, Ordering::Release);
     state.set_runtime_phase(RuntimePhase::Stopped);
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    state.foreground_turns.reset(generation);
     state.sessions.reset(generation);
     state
         .requests
@@ -8759,7 +8788,7 @@ fn main() {
             desktop_environment,
             agent_runtime_status,
             session_runtime_status,
-            session_gate_enter_turn,
+            foreground_turn_status,
             session_gate_enter_lifecycle,
             session_gate_release,
             preview_session_from_disk,
@@ -8848,8 +8877,9 @@ fn main() {
             save_media_reference,
             generate_media,
             agent_runtime_connect,
+            execute_foreground_turn,
+            cancel_foreground_turn,
             acp_request,
-            acp_cancel_request,
             acp_send,
             acp_kill,
         ])
@@ -8863,6 +8893,7 @@ fn main() {
                 let preview_state = window.state::<Arc<PreviewState>>().inner().clone();
                 tauri::async_runtime::spawn(async move {
                     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+                    state.foreground_turns.reset(generation);
                     state.sessions.reset(generation);
                     state
                         .requests
