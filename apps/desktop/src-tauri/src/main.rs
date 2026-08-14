@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod acp_host;
+mod automation_store;
 mod browser_mcp;
 mod computer_mcp;
 mod git_confirm;
@@ -33,6 +34,7 @@ use std::{
 };
 
 use acp_host::{AcpHostError, AcpRequestBroker};
+use automation_store::AutomationStore;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use git_confirm::GitConfirmStore;
 use mcp_leases::McpLeaseStore;
@@ -1629,6 +1631,7 @@ fn scrub_atomic_write_orphans(dir: &Path, max_age: std::time::Duration) -> u32 {
 
 const SESSION_JOURNAL_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const PROMPT_QUEUES_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const AUTOMATIONS_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const TOOL_IMAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
 const TOOL_IMAGES_MAX_BYTES: usize = 16 * 1024 * 1024;
 
@@ -1996,29 +1999,23 @@ fn automations_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 }
 
 #[tauri::command]
-fn read_automations(app: tauri::AppHandle) -> Result<Option<String>, String> {
+fn read_automations(
+    app: tauri::AppHandle,
+    automations: tauri::State<'_, AutomationStore>,
+) -> Result<Option<String>, String> {
     let path = automations_path(&app)?;
-    if !path.is_file() {
-        return Ok(None);
-    }
-    read_bounded_text(&path, 4 * 1024 * 1024)
-        .map(|content| if content.trim().is_empty() { None } else { Some(content) })
-        .map_err(|error| format!("无法读取自动化文件：{error}"))
+    automations.read(&path, AUTOMATIONS_MAX_BYTES)
 }
 
 #[tauri::command]
-fn write_automations(app: tauri::AppHandle, content: String) -> Result<(), String> {
-    if content.len() > 4 * 1024 * 1024 {
-        return Err("自动化文件不能超过 4 MB".into());
-    }
-    let value: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|error| format!("自动化文件必须是 JSON：{error}"))?;
-    if !value.is_array() {
-        return Err("自动化文件必须是 JSON 数组".into());
-    }
+fn patch_automations(
+    app: tauri::AppHandle,
+    automations: tauri::State<'_, AutomationStore>,
+    upserts: Vec<serde_json::Value>,
+    deletes: Vec<String>,
+) -> Result<(), String> {
     let path = automations_path(&app)?;
-    atomic_write(&path, &content)?;
-    restrict_private_file(&path)
+    automations.patch(&path, upserts, deletes, AUTOMATIONS_MAX_BYTES)
 }
 
 #[tauri::command]
@@ -8298,6 +8295,7 @@ fn main() {
         .manage(Arc::new(GitConfirmStore::default()))
         .manage(SessionStorageState::default())
         .manage(PromptQueueStore::default())
+        .manage(AutomationStore::default())
         .setup(|app| {
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?;
             if let Some(window) = app.get_webview_window("main") {
@@ -8350,7 +8348,7 @@ fn main() {
             read_prompt_queues,
             patch_prompt_queues,
             read_automations,
-            write_automations,
+            patch_automations,
             delete_session_data,
             delete_project_session_data,
             scrub_session_journal_orphans,

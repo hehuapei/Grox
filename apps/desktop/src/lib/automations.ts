@@ -23,6 +23,9 @@ export interface Automation {
 }
 
 let nativeWriteChain = Promise.resolve();
+let nativeCommittedAutomations: Automation[] = [];
+let nativeDesiredAutomations: Automation[] = [];
+let nativePersistenceStarted = false;
 
 function validTime(value: unknown): value is string {
   return typeof value === "string" && /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value);
@@ -80,7 +83,7 @@ export function parseAutomations(raw: string | null | undefined): Automation[] {
     throw new Error(`自动化文件不是有效 JSON：${error instanceof Error ? error.message : String(error)}`);
   }
   if (!Array.isArray(values)) throw new Error("自动化文件必须是 JSON 数组");
-  return values.filter((value): value is Automation => {
+  const parsed = values.filter((value): value is Automation => {
     if (!value || typeof value !== "object") return false;
     const item = value as Partial<Automation>;
     return typeof item.id === "string"
@@ -96,6 +99,8 @@ export function parseAutomations(raw: string | null | undefined): Automation[] {
       && typeof item.enabled === "boolean"
       && typeof item.nextRunAt === "number";
   });
+  if (parsed.length !== values.length) throw new Error("自动化文件包含无效任务");
+  return parsed;
 }
 
 export async function loadAutomations(): Promise<Automation[]> {
@@ -106,18 +111,63 @@ export async function loadAutomations(): Promise<Automation[]> {
       return [];
     }
   }
-  return parseAutomations(await invoke<string | null>("read_automations"));
+  const persisted = parseAutomations(await invoke<string | null>("read_automations"));
+  nativeCommittedAutomations = snapshotAutomations(persisted);
+  nativeDesiredAutomations = nativePersistenceStarted
+    ? mergeAutomationSnapshots(persisted, nativeDesiredAutomations)
+    : snapshotAutomations(persisted);
+  return snapshotAutomations(nativeDesiredAutomations);
+}
+
+export interface AutomationPatch {
+  upserts: Automation[];
+  deletes: string[];
+}
+
+export function diffAutomations(
+  previous: readonly Automation[],
+  next: readonly Automation[],
+): AutomationPatch {
+  const before = new Map(previous.map((automation) => [automation.id, automation]));
+  const after = new Map(next.map((automation) => [automation.id, automation]));
+  const upserts = next.filter((automation) => (
+    JSON.stringify(before.get(automation.id)) !== JSON.stringify(automation)
+  ));
+  const deletes = [...before.keys()].filter((id) => !after.has(id)).sort();
+  return { upserts, deletes };
+}
+
+function mergeAutomationSnapshots(
+  persisted: readonly Automation[],
+  current: readonly Automation[],
+): Automation[] {
+  const currentById = new Map(current.map((automation) => [automation.id, automation]));
+  const merged = persisted.map((automation) => currentById.get(automation.id) ?? automation);
+  const persistedIds = new Set(persisted.map((automation) => automation.id));
+  merged.push(...current.filter((automation) => !persistedIds.has(automation.id)));
+  return snapshotAutomations(merged);
+}
+
+function snapshotAutomations(automations: readonly Automation[]): Automation[] {
+  return automations.map((automation) => ({ ...automation }));
 }
 
 export async function persistAutomations(automations: readonly Automation[]): Promise<void> {
-  const content = JSON.stringify(automations);
   if (!("__TAURI_INTERNALS__" in window)) {
-    localStorage.setItem("grox.automations.v1", content);
+    localStorage.setItem("grox.automations.v1", JSON.stringify(automations));
     return;
   }
-  // 快速启停或删除时保持提交顺序，较早的慢写不能覆盖最新排程。
-  nativeWriteChain = nativeWriteChain.catch(() => {}).then(() => (
-    invoke("write_automations", { content })
-  ));
+  nativePersistenceStarted = true;
+  nativeDesiredAutomations = snapshotAutomations(automations);
+  nativeWriteChain = nativeWriteChain.catch(() => {}).then(async () => {
+    const target = snapshotAutomations(nativeDesiredAutomations);
+    const patch = diffAutomations(nativeCommittedAutomations, target);
+    if (patch.upserts.length === 0 && patch.deletes.length === 0) return;
+    await invoke("patch_automations", {
+      upserts: patch.upserts,
+      deletes: patch.deletes,
+    });
+    nativeCommittedAutomations = target;
+  });
   await nativeWriteChain;
 }
