@@ -16,6 +16,7 @@ mod client_callbacks;
 mod computer_mcp;
 mod foreground_turn;
 mod git_confirm;
+mod host_error;
 mod host_prefs;
 mod interaction_service;
 mod mcp_leases;
@@ -31,6 +32,7 @@ mod session_coordinator;
 mod session_journal_store;
 mod session_runtime;
 mod session_storage;
+mod secret_store;
 mod support_bundle;
 mod terminal_host;
 mod tray;
@@ -65,6 +67,7 @@ use foreground_turn::{
     cancel_foreground_turn, execute_foreground_turn, foreground_turn_status,
     ForegroundTurnRegistry,
 };
+use host_error::HostError;
 use interaction_service::{InteractionInbound, InteractionProjection, InteractionRegistry};
 use mcp_leases::McpLeaseStore;
 use media_service::{
@@ -87,6 +90,7 @@ use session_runtime::{
     shutdown_all_mcp_resources,
 };
 use session_storage::SessionStorageState;
+use secret_store::{SecretBackendKind, SecretStore, StoredSecret};
 use tauri::{Emitter, Manager};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
@@ -115,6 +119,10 @@ const GROX_DEEP_RESEARCH_WORKFLOW: &str = include_str!("../resources/grox-deep-r
 const UPSTREAM_CLI_CLIENT_NAME: &str = "grok-shell";
 const GROX_MANAGED_PROVIDER_START: &str = "# >>> Grox managed provider";
 const GROX_MANAGED_PROVIDER_END: &str = "# <<< Grox managed provider";
+const GROX_PROVIDER_KIND_KEY: &str = "GROX_PROVIDER_KIND";
+const GROX_PROVIDER_PROFILE_ID_KEY: &str = "GROX_PROVIDER_PROFILE_ID";
+const SECRET_REF_OFFICIAL_PROVIDER: &str = "provider:official";
+const SECRET_REF_DIRECT_COMPATIBLE: &str = "provider:direct-compatible";
 const GROX_PROVIDER_AUTH_OVERRIDES_FILE: &str = "grox-provider-auth-overrides.json";
 const GROX_PROVIDER_BACKEND_OVERRIDES_FILE: &str = "grox-provider-backend-overrides.json";
 // These are the three documented Grok Build custom-endpoint environment
@@ -729,6 +737,7 @@ struct ProviderStatus {
     kind: &'static str,
     has_api_key: bool,
     base_url: Option<String>,
+    secret_backend: SecretBackendKind,
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
@@ -771,7 +780,9 @@ impl ProviderApiBackend {
 struct StoredProviderProfile {
     id: String,
     name: String,
-    api_key: String,
+    /// v0.3.1 及更早版本写在供应商档案里的明文密钥。只读迁移，永不再序列化。
+    #[serde(default, rename = "apiKey", skip_serializing)]
+    legacy_api_key: Option<String>,
     base_url: String,
     #[serde(default)]
     allow_insecure_http: bool,
@@ -852,6 +863,7 @@ struct ProviderProfileSummary {
     name: String,
     api_key: String,
     has_api_key: bool,
+    secret_backend: SecretBackendKind,
     base_url: String,
     allow_insecure_http: bool,
     api_backend: ProviderApiBackend,
@@ -1710,10 +1722,28 @@ fn atomic_orphan_writer_pid(orphan_name: &str) -> Option<u32> {
 }
 
 fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
-    atomic_write_bounded(path, content, MAX_CONFIG_BYTES)
+    atomic_write_bounded_with_privacy(path, content, MAX_CONFIG_BYTES, false)
+}
+
+fn atomic_write_private(path: &Path, content: &str) -> Result<(), String> {
+    atomic_write_bounded_with_privacy(path, content, MAX_CONFIG_BYTES, true)?;
+    #[cfg(not(unix))]
+    restrict_private_file(path)?;
+    Ok(())
 }
 
 fn atomic_write_bounded(path: &Path, content: &str, max_bytes: u64) -> Result<(), String> {
+    atomic_write_bounded_with_privacy(path, content, max_bytes, false)
+}
+
+fn atomic_write_bounded_with_privacy(
+    path: &Path,
+    content: &str,
+    max_bytes: u64,
+    private: bool,
+) -> Result<(), String> {
+    #[cfg(not(unix))]
+    let _ = private;
     if content.len() as u64 > max_bytes {
         return Err(format!("文档不能超过 {} MB", max_bytes / 1024 / 1024));
     }
@@ -1734,9 +1764,14 @@ fn atomic_write_bounded(path: &Path, content: &str, max_bytes: u64) -> Result<()
         nonce,
     ));
     {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(&temp)
             .map_err(|error| format!("无法创建临时配置 {}：{error}", temp.display()))?;
         if let Err(error) = file
@@ -2526,19 +2561,38 @@ fn parse_grox_managed_provider_env(path: &Path) -> BTreeMap<String, String> {
 /// provider explicitly selected in Grox. This prevents an OAuth login from
 /// inheriting API gateway variables from the desktop app, a parent shell, or
 /// unmarked lines in `~/.grok/.env`.
-fn apply_grox_provider_environment(command: &mut Command) {
+fn apply_grox_provider_environment(command: &mut Command) -> Result<(), String> {
     for key in PROVIDER_ENV_KEYS {
         command.env_remove(key);
     }
-    let Ok(home) = grok_home() else {
-        return;
-    };
+    migrate_legacy_provider_secrets()?;
+    let home = grok_home()?;
     let values = parse_grox_managed_provider_env(&home.join(".env"));
-    for key in PROVIDER_ENV_KEYS {
-        if let Some(value) = values.get(key) {
-            command.env(key, value);
+    let kind = values
+        .get(GROX_PROVIDER_KIND_KEY)
+        .map(String::as_str)
+        .unwrap_or("oauth");
+    let secret = match kind {
+        "oauth" => None,
+        "official" => Some(require_provider_secret(SECRET_REF_OFFICIAL_PROVIDER)?),
+        "compatible" => {
+            for key in ["GROK_MODELS_BASE_URL", "GROK_MODELS_LIST_URL"] {
+                let value = values
+                    .get(key)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| format!("兼容服务缺少运行时元数据 {key}"))?;
+                command.env(key, value);
+            }
+            let profiles = read_provider_profiles_file()?;
+            let reference = compatible_secret_reference(&profiles, &values)?;
+            Some(require_provider_secret(&reference)?)
         }
+        _ => return Err(format!("未知的 Host 供应商模式：{kind}")),
+    };
+    if let Some(secret) = secret {
+        command.env("XAI_API_KEY", secret.expose());
     }
+    Ok(())
 }
 
 /// ACP has a text-only filesystem contract. Keep writes in the workspace, but
@@ -6423,9 +6477,10 @@ fn write_config_document(request: WriteConfigDocument) -> Result<ConfigDocument,
         // never silently leave the CLI with an unreadable global config.
         parse_grok_config_document(&content)?;
     }
-    atomic_write(&path, &content)?;
     if matches!(request.id.as_str(), "config" | "system-prompt") {
-        restrict_private_file(&path)?;
+        atomic_write_private(&path, &content)?;
+    } else {
+        atomic_write(&path, &content)?;
     }
     let id: &'static str = match request.id.as_str() {
         "config" => "config",
@@ -6451,41 +6506,119 @@ fn provider_profiles_path() -> Result<PathBuf, String> {
     Ok(grok_home()?.join("grox-providers.json"))
 }
 
+fn provider_secret_store() -> Result<SecretStore, String> {
+    Ok(SecretStore::new(&grok_home()?))
+}
+
+fn provider_profile_secret_ref(id: &str) -> String {
+    format!("provider:{id}")
+}
+
+fn provider_secret_backend(
+    reference: &str,
+    legacy_value: Option<&str>,
+) -> Result<SecretBackendKind, String> {
+    if legacy_value.is_some_and(|value| !value.trim().is_empty()) {
+        Ok(SecretBackendKind::LegacyFile)
+    } else {
+        provider_secret_store()?.backend(reference)
+    }
+}
+
+fn require_provider_secret(reference: &str) -> Result<StoredSecret, String> {
+    let secret = provider_secret_store()?
+        .get(reference)?
+        .ok_or_else(|| "API Key 为空或已从系统凭据库删除".to_string())?;
+    debug_assert_ne!(secret.backend(), SecretBackendKind::Missing);
+    Ok(secret)
+}
+
 fn read_provider_profiles_file() -> Result<ProviderProfilesFile, String> {
     let path = provider_profiles_path()?;
     if !path.exists() {
         return Ok(ProviderProfilesFile::default());
     }
     let content = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
-    match serde_json::from_str(&content) {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            // A corrupt profiles file must not brick every profile command
-            // (it survives app reinstalls because it lives in ~/.grok).
-            // Quarantine it and start from an empty file so the user can
-            // re-save their profiles instead of hitting a dead end.
-            let millis = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let backup = path.with_extension(format!("corrupt-{millis}.bak"));
-            if let Err(rename_error) = fs::rename(&path, &backup) {
-                return Err(format!(
-                    "无法解析供应商档案 {}：{error}；备份失败：{rename_error}",
-                    path.display()
-                ));
-            }
-            Ok(ProviderProfilesFile::default())
-        }
-    }
+    serde_json::from_str(&content).map_err(|error| {
+        // 损坏的持久化数据不是“没有档案”。保留原文件并显式失败，避免一次读取
+        // 错误被写回成空列表，造成不可逆的数据消失。
+        format!(
+            "无法解析供应商档案 {}，已保留原文件且拒绝覆盖：{error}",
+            path.display()
+        )
+    })
 }
 
 fn write_provider_profiles_file(value: &ProviderProfilesFile) -> Result<(), String> {
     let path = provider_profiles_path()?;
     let content = serde_json::to_string_pretty(value)
         .map_err(|error| format!("无法序列化供应商档案：{error}"))?;
-    atomic_write(&path, &content)?;
-    restrict_private_file(&path)
+    atomic_write_private(&path, &content)
+}
+
+/// 把旧版散落在供应商档案和 `.env` 中的明文密钥先写入 SecretStore，再删除
+/// 旧副本。任一后续元数据写入失败都会保留旧明文，因此迁移不会造成凭据丢失。
+fn migrate_legacy_provider_secrets() -> Result<(), String> {
+    let store = provider_secret_store()?;
+    let mut profiles = read_provider_profiles_file()?;
+    let mut profiles_changed = false;
+    for profile in &mut profiles.profiles {
+        let Some(key) = profile
+            .legacy_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        else {
+            profile.legacy_api_key = None;
+            continue;
+        };
+        checked_api_key(key)?;
+        store.set(&provider_profile_secret_ref(&profile.id), key)?;
+        profile.legacy_api_key = None;
+        profiles_changed = true;
+    }
+    if profiles_changed {
+        write_provider_profiles_file(&profiles)?;
+    }
+
+    let env_path = grok_home()?.join(".env");
+    let current = read_bounded_text(&env_path, MAX_CONFIG_BYTES)?;
+    let values = parse_grox_managed_provider_env(&env_path);
+    let Some(key) = values
+        .get("XAI_API_KEY")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    else {
+        return Ok(());
+    };
+    checked_api_key(key)?;
+    let base_url = values
+        .get("GROK_MODELS_BASE_URL")
+        .filter(|value| !value.trim().is_empty());
+    let (reference, kind, profile_id) = if let Some(base_url) = base_url {
+        let active = profiles.active_id.as_deref().and_then(|id| {
+            profiles.profiles.iter().find(|profile| {
+                profile.id == id
+                    && profile.base_url.trim_end_matches('/') == base_url.trim_end_matches('/')
+            })
+        });
+        (
+            active
+                .map(|profile| provider_profile_secret_ref(&profile.id))
+                .unwrap_or_else(|| SECRET_REF_DIRECT_COMPATIBLE.to_string()),
+            "compatible",
+            active.map(|profile| profile.id.as_str()),
+        )
+    } else {
+        (SECRET_REF_OFFICIAL_PROVIDER.to_string(), "official", None)
+    };
+    store.set(&reference, key)?;
+    let replacement = provider_metadata_from_values(kind, &values, profile_id);
+    atomic_write_private(
+        &env_path,
+        &replace_managed_env_block(&current, &replacement),
+    )
 }
 
 fn provider_auth_overrides_path() -> Result<PathBuf, String> {
@@ -6517,8 +6650,7 @@ fn write_provider_auth_overrides(value: &ProviderAuthOverridesFile) -> Result<()
     }
     let content = serde_json::to_string_pretty(value)
         .map_err(|error| format!("无法序列化 Grox 兼容服务认证还原信息：{error}"))?;
-    atomic_write(&path, &content)?;
-    restrict_private_file(&path)
+    atomic_write_private(&path, &content)
 }
 
 fn parse_grok_config_document(content: &str) -> Result<Document, String> {
@@ -6644,8 +6776,7 @@ fn restore_grox_provider_auth_overrides() -> Result<(), String> {
         root.remove("model");
     }
 
-    atomic_write(&path, &document.to_string())?;
-    restrict_private_file(&path)?;
+    atomic_write_private(&path, &document.to_string())?;
     write_provider_auth_overrides(&ProviderAuthOverridesFile::default())
 }
 
@@ -6678,8 +6809,7 @@ fn write_provider_backend_overrides(value: &ProviderBackendOverridesFile) -> Res
     }
     let content = serde_json::to_string_pretty(value)
         .map_err(|error| format!("无法序列化 Grox 兼容服务协议还原信息：{error}"))?;
-    atomic_write(&path, &content)?;
-    restrict_private_file(&path)
+    atomic_write_private(&path, &content)
 }
 
 fn restore_grox_provider_backend_overrides() -> Result<(), String> {
@@ -6756,8 +6886,7 @@ fn restore_grox_provider_backend_overrides() -> Result<(), String> {
     if models.is_empty() {
         root.remove("model");
     }
-    atomic_write(&path, &document.to_string())?;
-    restrict_private_file(&path)?;
+    atomic_write_private(&path, &document.to_string())?;
     write_provider_backend_overrides(&ProviderBackendOverridesFile::default())
 }
 
@@ -6820,9 +6949,11 @@ fn apply_grox_provider_backend_overrides(
             model.remove("model");
         }
     }
-    atomic_write(&path, &document.to_string())?;
-    restrict_private_file(&path)?;
-    write_provider_backend_overrides(&ProviderBackendOverridesFile { models: backups })
+    // Recovery data must become durable before config.toml changes. If the
+    // process exits or the config write fails afterwards, the next restore can
+    // still reconstruct the exact user-owned fields.
+    write_provider_backend_overrides(&ProviderBackendOverridesFile { models: backups })?;
+    atomic_write_private(&path, &document.to_string())
 }
 
 fn canonical_model_id(model: &str, available_models: &[String]) -> String {
@@ -6864,7 +6995,9 @@ fn compatible_profile_backend_model_ids(profile: &StoredProviderProfile) -> Vec<
     models
 }
 
-fn provider_profile_summary(profile: &StoredProviderProfile) -> ProviderProfileSummary {
+fn provider_profile_summary(
+    profile: &StoredProviderProfile,
+) -> Result<ProviderProfileSummary, String> {
     let mut resident_models = profile.resident_models.clone();
     if resident_models.is_empty() {
         if let Some(model) = profile.model.as_ref().filter(|model| !model.is_empty()) {
@@ -6875,19 +7008,24 @@ fn provider_profile_summary(profile: &StoredProviderProfile) -> ProviderProfileS
     // gateway. A case-only mismatch is enough for many gateways to return a
     // misleading 503 "model unavailable" response.
     canonicalize_resident_models(&mut resident_models, &profile.available_models);
-    ProviderProfileSummary {
+    let secret_backend = provider_secret_backend(
+        &provider_profile_secret_ref(&profile.id),
+        profile.legacy_api_key.as_deref(),
+    )?;
+    Ok(ProviderProfileSummary {
         id: profile.id.clone(),
         name: profile.name.clone(),
         // Never return the raw key to the WebView. The renderer only needs a
         // presence bit; updates use empty-key-means-keep semantics.
         api_key: String::new(),
-        has_api_key: !profile.api_key.is_empty(),
+        has_api_key: secret_backend != SecretBackendKind::Missing,
+        secret_backend,
         base_url: profile.base_url.clone(),
         allow_insecure_http: profile.allow_insecure_http,
         api_backend: profile.api_backend,
         available_models: profile.available_models.clone(),
         resident_models,
-    }
+    })
 }
 
 fn compatible_models_url(base_url: &str, allow_insecure_http: bool) -> Result<String, String> {
@@ -6926,40 +7064,112 @@ fn checked_model_ids(models: Vec<String>) -> Result<Vec<String>, String> {
     Ok(result)
 }
 
-fn compatible_provider_env(
-    api_key: &str,
+fn provider_metadata_from_values(
+    kind: &str,
+    values: &BTreeMap<String, String>,
+    profile_id: Option<&str>,
+) -> String {
+    let mut lines = vec![format!("{GROX_PROVIDER_KIND_KEY}={}", env_value(kind))];
+    for key in ["GROK_MODELS_BASE_URL", "GROK_MODELS_LIST_URL"] {
+        if let Some(value) = values.get(key).filter(|value| !value.trim().is_empty()) {
+            lines.push(format!("{key}={}", env_value(value)));
+        }
+    }
+    if let Some(profile_id) = profile_id.or_else(|| {
+        values
+            .get(GROX_PROVIDER_PROFILE_ID_KEY)
+            .map(String::as_str)
+    }) {
+        lines.push(format!(
+            "{GROX_PROVIDER_PROFILE_ID_KEY}={}",
+            env_value(profile_id)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn official_provider_metadata() -> String {
+    format!(
+        "{GROX_PROVIDER_KIND_KEY}={}",
+        env_value("official")
+    )
+}
+
+fn compatible_provider_metadata(
     base_url: &str,
     allow_insecure_http: bool,
+    profile_id: Option<&str>,
 ) -> Result<String, String> {
-    let key = checked_api_key(api_key.trim())?;
-    if key.is_empty() {
-        return Err("API Key 不能为空".into());
-    }
     let base = checked_service_url_with_policy(
         base_url.trim(),
         "服务地址",
         allow_insecure_http,
     )?;
-    let lines = vec![
-        format!("XAI_API_KEY={}", env_value(key)),
+    let mut lines = vec![
+        format!(
+            "{GROX_PROVIDER_KIND_KEY}={}",
+            env_value("compatible")
+        ),
         format!("GROK_MODELS_BASE_URL={}", env_value(&base)),
         format!(
             "GROK_MODELS_LIST_URL={}",
             env_value(&compatible_models_url(&base, allow_insecure_http)?)
         ),
     ];
+    if let Some(profile_id) = profile_id {
+        lines.push(format!(
+            "{GROX_PROVIDER_PROFILE_ID_KEY}={}",
+            env_value(profile_id)
+        ));
+    }
     Ok(lines.join("\n"))
 }
 
-fn active_profile_for_managed_environment(value: &ProviderProfilesFile) -> Option<StoredProviderProfile> {
-    let managed = parse_grox_managed_provider_env(&grok_home().ok()?.join(".env"));
+fn profile_for_managed_provider_values(
+    value: &ProviderProfilesFile,
+    managed: &BTreeMap<String, String>,
+) -> Option<StoredProviderProfile> {
     let base = managed.get("GROK_MODELS_BASE_URL")?.trim_end_matches('/');
-    let id = value.active_id.as_deref()?;
+    // v0.3.2 records the profile reference beside the endpoint metadata, so
+    // process injection never depends on a second mutable `activeId` source.
+    // The file field is read only for a one-release migration window.
+    let id = managed
+        .get(GROX_PROVIDER_PROFILE_ID_KEY)
+        .map(String::as_str)
+        .or_else(|| {
+            // Only marker-less v0.3.1 metadata may consult the legacy field.
+            // A v0.3.2 direct-compatible block intentionally has no profile id.
+            (!managed.contains_key(GROX_PROVIDER_KIND_KEY))
+                .then_some(value.active_id.as_deref())
+                .flatten()
+        })?;
     value
         .profiles
         .iter()
         .find(|profile| profile.id == id && profile.base_url.trim_end_matches('/') == base)
         .cloned()
+}
+
+fn active_profile_for_managed_environment(
+    value: &ProviderProfilesFile,
+) -> Option<StoredProviderProfile> {
+    let managed = parse_grox_managed_provider_env(&grok_home().ok()?.join(".env"));
+    profile_for_managed_provider_values(value, &managed)
+}
+
+fn compatible_secret_reference(
+    profiles: &ProviderProfilesFile,
+    values: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    if let Some(profile) = profile_for_managed_provider_values(profiles, values) {
+        return Ok(provider_profile_secret_ref(&profile.id));
+    }
+    if let Some(id) = values.get(GROX_PROVIDER_PROFILE_ID_KEY) {
+        return Err(format!(
+            "活动供应商档案 {id} 不存在，或服务地址与活动元数据不一致"
+        ));
+    }
+    Ok(SECRET_REF_DIRECT_COMPATIBLE.to_string())
 }
 
 fn synchronize_active_provider_backend() -> Result<(), String> {
@@ -6978,9 +7188,29 @@ fn synchronize_active_provider_backend() -> Result<(), String> {
     }
 }
 
+fn restore_provider_secret(
+    store: &SecretStore,
+    reference: &str,
+    previous: Option<&str>,
+) -> Result<(), String> {
+    match previous {
+        Some(value) => store.set(reference, value).map(|_| ()),
+        None => store.delete(reference),
+    }
+}
+
+fn provider_storage_error(code: &'static str, error: String) -> HostError {
+    HostError::recoverable_environment(
+        code,
+        error,
+        "检查系统凭据库和 ~/.grok 的访问权限后重试",
+    )
+}
+
 #[tauri::command]
-fn list_provider_profiles() -> Result<ProviderProfilesResponse, String> {
-    let value = read_provider_profiles_file()?;
+fn list_provider_profiles() -> Result<ProviderProfilesResponse, HostError> {
+    let value = read_provider_profiles_file()
+        .map_err(|error| provider_storage_error("PROVIDER_PROFILES_READ_FAILED", error))?;
     // A profile is active only when the process environment actually points
     // at it. This avoids a stale persisted id briefly labelling OAuth as an
     // OpenAI-compatible provider while the ACP child is being replaced.
@@ -6991,40 +7221,31 @@ fn list_provider_profiles() -> Result<ProviderProfilesResponse, String> {
             .profiles
             .iter()
             .map(provider_profile_summary)
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?,
     })
 }
 
 #[tauri::command]
-fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfileSummary, String> {
+fn save_provider_profile(
+    request: SaveProviderProfile,
+) -> Result<ProviderProfileSummary, HostError> {
+    migrate_legacy_provider_secrets()
+        .map_err(|error| provider_storage_error("SECRET_MIGRATION_FAILED", error))?;
     let name = request.name.trim();
     if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
-        return Err("供应商名称必须为 1–80 个可见字符".into());
+        return Err(HostError::operation(
+            "PROVIDER_NAME_INVALID",
+            "供应商名称必须为 1–80 个可见字符",
+        ));
     }
-    let mut value = read_provider_profiles_file()?;
+    let mut value = read_provider_profiles_file()
+        .map_err(|error| provider_storage_error("PROVIDER_PROFILES_READ_FAILED", error))?;
     let existing = request
         .id
         .as_deref()
-        .and_then(|id| value.profiles.iter().find(|profile| profile.id == id));
-    let key = request
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .or_else(|| existing.map(|profile| profile.api_key.as_str()))
-        .ok_or("API Key 不能为空")?;
-    compatible_provider_env(key, &request.base_url, request.allow_insecure_http)?;
-    let mut resident_models = checked_model_ids(request.resident_models)?;
-    let base_url = checked_service_url_with_policy(
-        &request.base_url,
-        "服务地址",
-        request.allow_insecure_http,
-    )?;
-    let available_models = existing
-        .filter(|profile| profile.base_url == base_url && profile.api_key == key)
-        .map(|profile| profile.available_models.clone())
-        .unwrap_or_default();
-    canonicalize_resident_models(&mut resident_models, &available_models);
+        .and_then(|id| value.profiles.iter().find(|profile| profile.id == id))
+        .cloned();
     let id = request.id.unwrap_or_else(|| {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -7038,12 +7259,51 @@ fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfile
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
     {
-        return Err("无效的供应商档案 ID".into());
+        return Err(HostError::operation(
+            "PROVIDER_PROFILE_ID_INVALID",
+            "无效的供应商档案 ID",
+        ));
     }
+    let reference = provider_profile_secret_ref(&id);
+    let store = provider_secret_store()
+        .map_err(|error| provider_storage_error("SECRET_STORE_OPEN_FAILED", error))?;
+    let previous_secret = store
+        .get(&reference)
+        .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
+    let requested_key = request
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
+    let key = requested_key
+        .or_else(|| previous_secret.as_ref().map(StoredSecret::expose))
+        .ok_or_else(|| HostError::operation("PROVIDER_API_KEY_REQUIRED", "API Key 不能为空"))?;
+    checked_api_key(key)
+        .map_err(|error| HostError::operation("PROVIDER_API_KEY_INVALID", error))?;
+    let secret_changed = requested_key.is_some_and(|requested| {
+        previous_secret
+            .as_ref()
+            .is_none_or(|previous| previous.expose() != requested)
+    });
+    let mut resident_models = checked_model_ids(request.resident_models)
+        .map_err(|error| HostError::operation("PROVIDER_MODEL_ID_INVALID", error))?;
+    let base_url = checked_service_url_with_policy(
+        &request.base_url,
+        "服务地址",
+        request.allow_insecure_http,
+    )
+    .map_err(|error| HostError::operation("PROVIDER_URL_INVALID", error))?;
+    compatible_provider_metadata(&base_url, request.allow_insecure_http, Some(&id))
+        .map_err(|error| HostError::operation("PROVIDER_URL_INVALID", error))?;
+    let available_models = existing
+        .filter(|profile| profile.base_url == base_url && !secret_changed)
+        .map(|profile| profile.available_models.clone())
+        .unwrap_or_default();
+    canonicalize_resident_models(&mut resident_models, &available_models);
     let profile = StoredProviderProfile {
         id: id.clone(),
         name: name.to_owned(),
-        api_key: checked_api_key(key)?.to_owned(),
+        legacy_api_key: None,
         base_url: base_url.clone(),
         allow_insecure_http: request.allow_insecure_http,
         api_backend: request.api_backend,
@@ -7057,20 +7317,49 @@ fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfile
     } else {
         value.profiles.push(profile.clone());
     }
-    write_provider_profiles_file(&value)?;
-    Ok(provider_profile_summary(&profile))
+    if secret_changed {
+        store
+            .set(&reference, key)
+            .map_err(|error| provider_storage_error("SECRET_STORE_WRITE_FAILED", error))?;
+    }
+    let summary = provider_profile_summary(&profile)
+        .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
+    if let Err(error) = write_provider_profiles_file(&value) {
+        if secret_changed {
+            if let Err(rollback) = restore_provider_secret(
+                &store,
+                &reference,
+                previous_secret.as_ref().map(StoredSecret::expose),
+            ) {
+                return Err(provider_storage_error(
+                    "PROVIDER_PROFILE_ROLLBACK_FAILED",
+                    format!("{error}；密钥回滚也失败：{rollback}"),
+                ));
+            }
+        }
+        return Err(provider_storage_error(
+            "PROVIDER_PROFILE_WRITE_FAILED",
+            error,
+        ));
+    }
+    Ok(summary)
 }
 
 async fn fetch_compatible_models(
     api_key: &str,
     base_url: &str,
     allow_insecure_http: bool,
-) -> Result<Vec<String>, String> {
-    let key = checked_api_key(api_key.trim())?;
+) -> Result<Vec<String>, HostError> {
+    let key = checked_api_key(api_key.trim())
+        .map_err(|error| HostError::operation("PROVIDER_API_KEY_INVALID", error))?;
     if key.is_empty() {
-        return Err("API Key 不能为空".into());
+        return Err(HostError::operation(
+            "PROVIDER_API_KEY_REQUIRED",
+            "API Key 不能为空",
+        ));
     }
-    let endpoint = compatible_models_url(base_url, allow_insecure_http)?;
+    let endpoint = compatible_models_url(base_url, allow_insecure_http)
+        .map_err(|error| HostError::operation("PROVIDER_URL_INVALID", error))?;
     let mut response = reqwest::Client::builder()
         .user_agent(format!("Grox/{CLIENT_VERSION}"))
         .timeout(Duration::from_secs(15))
@@ -7094,40 +7383,75 @@ async fn fetch_compatible_models(
             }
         }))
         .build()
-        .map_err(|error| format!("无法创建模型目录客户端：{error}"))?
+        .map_err(|error| {
+            HostError::recoverable_environment(
+                "PROVIDER_HTTP_CLIENT_FAILED",
+                format!("无法创建模型目录客户端：{error}"),
+                "检查系统网络与 TLS 配置后重试",
+            )
+        })?
         .get(endpoint)
         .bearer_auth(key)
         .header("Accept", "application/json")
         .send()
         .await
-        .map_err(|error| format!("无法获取模型列表：{error}"))?
+        .map_err(|error| {
+            HostError::recoverable_environment(
+                "PROVIDER_MODELS_REQUEST_FAILED",
+                format!("无法获取模型列表：{error}"),
+                "检查服务地址、网络与代理配置后重试",
+            )
+        })?
         .error_for_status()
-        .map_err(|error| format!("模型服务返回错误：{error}"))?;
+        .map_err(|error| {
+            HostError::protocol_with_action(
+                "PROVIDER_MODELS_HTTP_ERROR",
+                format!("模型服务返回错误：{error}"),
+                "检查 API Key、服务地址和网关的 /models 路由",
+            )
+        })?;
     if response
         .content_length()
         .is_some_and(|length| length > MAX_PROVIDER_MODELS_BODY_BYTES as u64)
     {
-        return Err(format!(
-            "模型列表响应超过 {} MB 上限",
-            MAX_PROVIDER_MODELS_BODY_BYTES / 1024 / 1024
+        return Err(HostError::protocol(
+            "PROVIDER_MODELS_RESPONSE_TOO_LARGE",
+            format!(
+                "模型列表响应超过 {} MB 上限",
+                MAX_PROVIDER_MODELS_BODY_BYTES / 1024 / 1024
+            ),
         ));
     }
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| format!("无法读取模型列表：{error}"))?
+        .map_err(|error| {
+            HostError::recoverable_environment(
+                "PROVIDER_MODELS_READ_FAILED",
+                format!("无法读取模型列表：{error}"),
+                "检查网络稳定性后重试",
+            )
+        })?
     {
         if body.len().saturating_add(chunk.len()) > MAX_PROVIDER_MODELS_BODY_BYTES {
-            return Err(format!(
-                "模型列表响应超过 {} MB 上限",
-                MAX_PROVIDER_MODELS_BODY_BYTES / 1024 / 1024
+            return Err(HostError::protocol(
+                "PROVIDER_MODELS_RESPONSE_TOO_LARGE",
+                format!(
+                    "模型列表响应超过 {} MB 上限",
+                    MAX_PROVIDER_MODELS_BODY_BYTES / 1024 / 1024
+                ),
             ));
         }
         body.extend_from_slice(&chunk);
     }
-    let response: OpenAiModelsResponse = serde_json::from_slice(&body)
-        .map_err(|error| format!("模型列表不是 OpenAI 兼容格式：{error}"))?;
+    let response: OpenAiModelsResponse = serde_json::from_slice(&body).map_err(|error| {
+        HostError::protocol_with_action(
+            "PROVIDER_MODELS_INVALID_RESPONSE",
+            format!("模型列表不是 OpenAI 兼容格式：{error}"),
+            "确认网关的 /models 返回 OpenAI 兼容 JSON",
+        )
+    })?;
     let mut models = response
         .data
         .into_iter()
@@ -7143,7 +7467,7 @@ async fn fetch_compatible_models(
 }
 
 #[tauri::command]
-async fn fetch_provider_models(request: FetchProviderModels) -> Result<Vec<String>, String> {
+async fn fetch_provider_models(request: FetchProviderModels) -> Result<Vec<String>, HostError> {
     fetch_compatible_models(
         &request.api_key,
         &request.base_url,
@@ -7153,25 +7477,33 @@ async fn fetch_provider_models(request: FetchProviderModels) -> Result<Vec<Strin
 }
 
 #[tauri::command]
-async fn refresh_provider_models(id: String) -> Result<ProviderProfileSummary, String> {
-    let profile = read_provider_profiles_file()?
+async fn refresh_provider_models(id: String) -> Result<ProviderProfileSummary, HostError> {
+    migrate_legacy_provider_secrets()
+        .map_err(|error| provider_storage_error("SECRET_MIGRATION_FAILED", error))?;
+    let profile = read_provider_profiles_file()
+        .map_err(|error| provider_storage_error("PROVIDER_PROFILES_READ_FAILED", error))?
         .profiles
         .into_iter()
         .find(|profile| profile.id == id)
-        .ok_or("供应商档案不存在")?;
+        .ok_or_else(|| HostError::operation("PROVIDER_PROFILE_NOT_FOUND", "供应商档案不存在"))?;
+    let secret = require_provider_secret(&provider_profile_secret_ref(&profile.id))
+        .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
     let models = fetch_compatible_models(
-        &profile.api_key,
+        secret.expose(),
         &profile.base_url,
         profile.allow_insecure_http,
     )
     .await?;
 
-    let mut value = read_provider_profiles_file()?;
+    let mut value = read_provider_profiles_file()
+        .map_err(|error| provider_storage_error("PROVIDER_PROFILES_READ_FAILED", error))?;
     let stored = value
         .profiles
         .iter_mut()
         .find(|stored| stored.id == profile.id)
-        .ok_or("供应商档案已被删除")?;
+        .ok_or_else(|| {
+            HostError::operation("PROVIDER_PROFILE_DELETED", "供应商档案已被删除")
+        })?;
     stored.available_models = models;
     canonicalize_resident_models(&mut stored.resident_models, &stored.available_models);
     if stored.resident_models.is_empty() {
@@ -7180,132 +7512,305 @@ async fn refresh_provider_models(id: String) -> Result<ProviderProfileSummary, S
         }
     }
     stored.model = stored.resident_models.first().cloned();
-    let summary = provider_profile_summary(stored);
-    write_provider_profiles_file(&value)?;
+    let summary = provider_profile_summary(stored)
+        .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
+    write_provider_profiles_file(&value)
+        .map_err(|error| provider_storage_error("PROVIDER_PROFILE_WRITE_FAILED", error))?;
     Ok(summary)
 }
 
 #[tauri::command]
-fn activate_provider_profile(id: String) -> Result<(), String> {
-    let mut value = read_provider_profiles_file()?;
+fn activate_provider_profile(id: String) -> Result<(), HostError> {
+    migrate_legacy_provider_secrets()
+        .map_err(|error| provider_storage_error("SECRET_MIGRATION_FAILED", error))?;
+    let value = read_provider_profiles_file()
+        .map_err(|error| provider_storage_error("PROVIDER_PROFILES_READ_FAILED", error))?;
     let profile = value
         .profiles
         .iter()
         .find(|profile| profile.id == id)
         .cloned()
-        .ok_or("供应商档案不存在")?;
-    // Custom-model endpoints are configured exclusively through Grok Build's
-    // documented process environment. Older Grox versions wrote a generated
-    // `[model.*]` block for every built-in model; restore those tracked edits
-    // once, then leave the user's config.toml entirely under their control.
-    restore_grox_provider_auth_overrides()?;
+        .ok_or_else(|| HostError::operation("PROVIDER_PROFILE_NOT_FOUND", "供应商档案不存在"))?;
+    require_provider_secret(&provider_profile_secret_ref(&profile.id))
+        .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
     let model_ids = compatible_profile_backend_model_ids(&profile);
     let primary_model = model_ids
         .first()
-        .ok_or("供应商没有可用模型；请先获取模型目录并选择一个模型")?;
+        .ok_or_else(|| {
+            HostError::operation(
+                "PROVIDER_MODEL_REQUIRED",
+                "供应商没有可用模型；请先获取模型目录并选择一个模型",
+            )
+        })?;
     let backend = profile.api_backend.config_value(&profile.name, &profile.base_url);
-    apply_grox_provider_backend_overrides(&model_ids, &profile.base_url, primary_model, backend)?;
-    let replacement = compatible_provider_env(
-        &profile.api_key,
+    let replacement = compatible_provider_metadata(
         &profile.base_url,
         profile.allow_insecure_http,
-    )?;
-    let path = grok_home()?.join(".env");
-    let current = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
-    atomic_write(&path, &replace_managed_env_block(&current, &replacement))?;
-    restrict_private_file(&path)?;
-    value.active_id = Some(profile.id);
-    write_provider_profiles_file(&value)
+        Some(&profile.id),
+    )
+    .map_err(|error| HostError::operation("PROVIDER_URL_INVALID", error))?;
+    let path = grok_home()
+        .map_err(|error| provider_storage_error("PROVIDER_HOME_UNAVAILABLE", error))?
+        .join(".env");
+    let current = read_bounded_text(&path, MAX_CONFIG_BYTES)
+        .map_err(|error| provider_storage_error("PROVIDER_METADATA_READ_FAILED", error))?;
+    let transition = (|| {
+        // Custom-model endpoints are configured exclusively through Grok
+        // Build's documented process environment. Restore legacy generated
+        // auth edits, then apply only the current transport override.
+        restore_grox_provider_auth_overrides()?;
+        apply_grox_provider_backend_overrides(
+            &model_ids,
+            &profile.base_url,
+            primary_model,
+            backend,
+        )?;
+        atomic_write_private(&path, &replace_managed_env_block(&current, &replacement))
+    })();
+    if let Err(error) = transition {
+        // The old managed environment is still the runtime authority. Reapply
+        // its backend after any partial config mutation, so a failed switch
+        // cannot poison the next restart.
+        let rollback = atomic_write_private(&path, &current)
+            .and_then(|_| synchronize_active_provider_backend());
+        return Err(provider_storage_error(
+            "PROVIDER_ACTIVATION_FAILED",
+            match rollback {
+                Ok(()) => error,
+                Err(rollback) => format!("{error}；旧供应商回滚也失败：{rollback}"),
+            },
+        ));
+    }
+    Ok(())
 }
 
 #[tauri::command]
-fn delete_provider_profile(id: String) -> Result<(), String> {
-    let mut value = read_provider_profiles_file()?;
-    let before = value.profiles.len();
+fn delete_provider_profile(id: String) -> Result<(), HostError> {
+    migrate_legacy_provider_secrets()
+        .map_err(|error| provider_storage_error("SECRET_MIGRATION_FAILED", error))?;
+    let mut value = read_provider_profiles_file()
+        .map_err(|error| provider_storage_error("PROVIDER_PROFILES_READ_FAILED", error))?;
+    let profile = value
+        .profiles
+        .iter()
+        .find(|profile| profile.id == id)
+        .cloned()
+        .ok_or_else(|| HostError::operation("PROVIDER_PROFILE_NOT_FOUND", "供应商档案不存在"))?;
+    let was_active = active_profile_for_managed_environment(&value)
+        .is_some_and(|active| active.id == id);
+    let active_environment = if was_active {
+        let path = grok_home()
+            .map_err(|error| provider_storage_error("PROVIDER_HOME_UNAVAILABLE", error))?
+            .join(".env");
+        let current = read_bounded_text(&path, MAX_CONFIG_BYTES)
+            .map_err(|error| provider_storage_error("PROVIDER_METADATA_READ_FAILED", error))?;
+        Some((path, current))
+    } else {
+        None
+    };
+    let reference = provider_profile_secret_ref(&profile.id);
+    let store = provider_secret_store()
+        .map_err(|error| provider_storage_error("SECRET_STORE_OPEN_FAILED", error))?;
+    let previous_secret = store
+        .get(&reference)
+        .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
+    store
+        .delete(&reference)
+        .map_err(|error| provider_storage_error("SECRET_STORE_DELETE_FAILED", error))?;
     value.profiles.retain(|profile| profile.id != id);
-    if before == value.profiles.len() {
-        return Err("供应商档案不存在".into());
-    }
     if value.active_id.as_deref() == Some(id.as_str()) {
-        restore_grox_provider_auth_overrides()?;
-        restore_grox_provider_backend_overrides()?;
-        let path = grok_home()?.join(".env");
-        let current = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
-        atomic_write(&path, &replace_managed_env_block(&current, ""))?;
-        restrict_private_file(&path)?;
         value.active_id = None;
     }
-    write_provider_profiles_file(&value)
+    let result = (|| {
+        if was_active {
+            restore_grox_provider_auth_overrides()?;
+            restore_grox_provider_backend_overrides()?;
+            let (path, current) = active_environment
+                .as_ref()
+                .ok_or_else(|| "活动供应商缺少回滚元数据".to_string())?;
+            atomic_write_private(&path, &replace_managed_env_block(&current, ""))?;
+        }
+        write_provider_profiles_file(&value)
+    })();
+    if let Err(error) = result {
+        let mut failure = error;
+        if let Some((path, current)) = active_environment.as_ref() {
+            if let Err(rollback) = atomic_write_private(path, current)
+                .and_then(|_| synchronize_active_provider_backend())
+            {
+                failure = format!("{failure}；活动供应商回滚也失败：{rollback}");
+            }
+        }
+        if let Err(rollback) = restore_provider_secret(
+            &store,
+            &reference,
+            previous_secret.as_ref().map(StoredSecret::expose),
+        ) {
+            return Err(provider_storage_error(
+                "PROVIDER_PROFILE_ROLLBACK_FAILED",
+                format!("{failure}；密钥回滚也失败：{rollback}"),
+            ));
+        }
+        return Err(provider_storage_error(
+            "PROVIDER_PROFILE_DELETE_FAILED",
+            failure,
+        ));
+    }
+    Ok(())
 }
 
 #[tauri::command]
-fn read_provider_status() -> Result<ProviderStatus, String> {
-    let values = parse_grox_managed_provider_env(&grok_home()?.join(".env"));
-    let api_key = values
+fn read_provider_status() -> Result<ProviderStatus, HostError> {
+    let values = parse_grox_managed_provider_env(
+        &grok_home()
+            .map_err(|error| provider_storage_error("PROVIDER_HOME_UNAVAILABLE", error))?
+            .join(".env"),
+    );
+    let legacy_key = values
         .get("XAI_API_KEY")
         .filter(|value| !value.trim().is_empty());
     let base_url = values
         .get("GROK_MODELS_BASE_URL")
         .filter(|value| !value.trim().is_empty())
         .cloned();
-    let kind = if base_url.is_some() {
-        "compatible"
-    } else if api_key.is_some() {
-        "official"
+    let kind = match values.get(GROX_PROVIDER_KIND_KEY).map(String::as_str) {
+        Some("oauth") => "oauth",
+        Some("official") => "official",
+        Some("compatible") => "compatible",
+        Some(kind) => {
+            return Err(HostError::protocol(
+                "PROVIDER_METADATA_INVALID",
+                format!("未知的 Host 供应商模式：{kind}"),
+            ))
+        }
+        None if base_url.is_some() => "compatible",
+        None if legacy_key.is_some() => "official",
+        None => "oauth",
+    };
+    let secret_backend = if legacy_key.is_some() {
+        SecretBackendKind::LegacyFile
     } else {
-        "oauth"
+        let reference = match kind {
+            "official" => Some(SECRET_REF_OFFICIAL_PROVIDER.to_string()),
+            "compatible" => {
+                let profiles = read_provider_profiles_file().map_err(|error| {
+                    provider_storage_error("PROVIDER_PROFILES_READ_FAILED", error)
+                })?;
+                Some(compatible_secret_reference(&profiles, &values).map_err(|error| {
+                    HostError::protocol_with_action(
+                        "PROVIDER_PROFILE_REFERENCE_INVALID",
+                        error,
+                        "重新选择供应商档案，或切回 OAuth 后重试",
+                    )
+                })?)
+            }
+            _ => None,
+        };
+        match reference {
+            Some(reference) => provider_secret_backend(&reference, None)
+                .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?,
+            None => SecretBackendKind::Missing,
+        }
     };
     Ok(ProviderStatus {
         kind,
-        has_api_key: api_key.is_some(),
+        has_api_key: secret_backend != SecretBackendKind::Missing,
         base_url,
+        secret_backend,
     })
 }
 
 #[tauri::command]
-fn configure_provider(request: ProviderConfig) -> Result<(), String> {
-    let home = grok_home()?;
+fn configure_provider(request: ProviderConfig) -> Result<(), HostError> {
+    migrate_legacy_provider_secrets()
+        .map_err(|error| provider_storage_error("SECRET_MIGRATION_FAILED", error))?;
+    let home = grok_home()
+        .map_err(|error| provider_storage_error("PROVIDER_HOME_UNAVAILABLE", error))?;
     let path = home.join(".env");
-    let current = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
-    let current_values = parse_grox_managed_provider_env(&path);
+    let current = read_bounded_text(&path, MAX_CONFIG_BYTES)
+        .map_err(|error| provider_storage_error("PROVIDER_METADATA_READ_FAILED", error))?;
     let requested_key = request
         .api_key
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let saved_key = current_values
-        .get("XAI_API_KEY")
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+    let mut secret_change: Option<(&str, &str)> = None;
     let replacement = match request.kind.as_str() {
         "oauth" => {
-            restore_grox_provider_auth_overrides()?;
-            restore_grox_provider_backend_overrides()?;
             String::new()
         }
         "official" => {
-            restore_grox_provider_auth_overrides()?;
-            restore_grox_provider_backend_overrides()?;
-            let key = requested_key.or(saved_key).ok_or("API Key 不能为空")?;
-            let key = checked_api_key(key)?;
-            format!("XAI_API_KEY={}", env_value(key))
+            if let Some(key) = requested_key {
+                checked_api_key(key)
+                    .map_err(|error| HostError::operation("PROVIDER_API_KEY_INVALID", error))?;
+                secret_change = Some((SECRET_REF_OFFICIAL_PROVIDER, key));
+            } else {
+                require_provider_secret(SECRET_REF_OFFICIAL_PROVIDER)
+                    .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
+            }
+            official_provider_metadata()
         }
         "compatible" => {
             let base_url = request.base_url.as_deref().unwrap_or_default();
-            let key = requested_key.or(saved_key).ok_or("API Key 不能为空")?;
-            let replacement = compatible_provider_env(key, base_url, false)?;
-            restore_grox_provider_auth_overrides()?;
-            restore_grox_provider_backend_overrides()?;
-            replacement
+            if let Some(key) = requested_key {
+                checked_api_key(key)
+                    .map_err(|error| HostError::operation("PROVIDER_API_KEY_INVALID", error))?;
+                secret_change = Some((SECRET_REF_DIRECT_COMPATIBLE, key));
+            } else {
+                require_provider_secret(SECRET_REF_DIRECT_COMPATIBLE)
+                    .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
+            }
+            compatible_provider_metadata(base_url, false, None)
+                .map_err(|error| HostError::operation("PROVIDER_URL_INVALID", error))?
         }
-        _ => return Err("未知账户接入类型".into()),
+        _ => {
+            return Err(HostError::operation(
+                "PROVIDER_KIND_INVALID",
+                "未知账户接入类型",
+            ))
+        }
     };
-    atomic_write(&path, &replace_managed_env_block(&current, &replacement))?;
-    restrict_private_file(&path)?;
-    let mut profiles = read_provider_profiles_file()?;
-    if profiles.active_id.take().is_some() {
-        write_provider_profiles_file(&profiles)?;
+    let store = provider_secret_store()
+        .map_err(|error| provider_storage_error("SECRET_STORE_OPEN_FAILED", error))?;
+    let previous_secret = if let Some((reference, key)) = secret_change {
+        let previous = store
+            .get(reference)
+            .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
+        store
+            .set(reference, key)
+            .map_err(|error| provider_storage_error("SECRET_STORE_WRITE_FAILED", error))?;
+        Some((reference, previous))
+    } else {
+        None
+    };
+    let result = (|| {
+        restore_grox_provider_auth_overrides()?;
+        restore_grox_provider_backend_overrides()?;
+        atomic_write_private(&path, &replace_managed_env_block(&current, &replacement))
+    })();
+    if let Err(error) = result {
+        let mut failure = error;
+        if let Err(rollback) = atomic_write_private(&path, &current)
+            .and_then(|_| synchronize_active_provider_backend())
+        {
+            failure = format!("{failure}；旧供应商回滚也失败：{rollback}");
+        }
+        if let Some((reference, previous)) = previous_secret {
+            if let Err(rollback) = restore_provider_secret(
+                &store,
+                reference,
+                previous.as_ref().map(StoredSecret::expose),
+            ) {
+                return Err(provider_storage_error(
+                    "PROVIDER_CONFIG_ROLLBACK_FAILED",
+                    format!("{failure}；密钥回滚也失败：{rollback}"),
+                ));
+            }
+        }
+        return Err(provider_storage_error(
+            "PROVIDER_CONFIG_WRITE_FAILED",
+            failure,
+        ));
     }
     Ok(())
 }
@@ -7780,7 +8285,7 @@ async fn spawn_acp_process(
     // client marker here causes OAuth requests to hit a different upstream
     // eligibility gate. Preserve official CLI identity end to end.
     command.env("GROK_CLIENT_NAME", UPSTREAM_CLI_CLIENT_NAME);
-    apply_grox_provider_environment(&mut command);
+    apply_grox_provider_environment(&mut command)?;
 
     #[cfg(windows)]
     {
@@ -10293,36 +10798,91 @@ OPENAI_API_KEY=******** # keep env comment
     }
 
     #[test]
-    fn compatible_provider_environment_is_validated_and_complete() {
-        let env = compatible_provider_env(
-            "sk-test",
+    fn compatible_provider_metadata_is_validated_and_contains_no_secret() {
+        let env = compatible_provider_metadata(
             "https://gateway.example.com/v1",
             false,
+            Some("provider-test"),
         )
         .unwrap();
-        assert!(env.contains("XAI_API_KEY=\"sk-test\""));
+        assert!(env.contains("GROX_PROVIDER_KIND=\"compatible\""));
+        assert!(env.contains("GROX_PROVIDER_PROFILE_ID=\"provider-test\""));
         assert!(env.contains("GROK_MODELS_BASE_URL=\"https://gateway.example.com/v1\""));
         assert!(env.contains("GROK_MODELS_LIST_URL=\"https://gateway.example.com/v1/models\""));
+        assert!(!env.contains("XAI_API_KEY"));
         assert!(!env.contains("GROK_MODELS_API_BACKEND"));
-        assert!(compatible_provider_env(
-            "",
-            "https://gateway.example.com/v1",
-            false,
-        )
-        .is_err());
-        assert!(compatible_provider_env(
-            "sk-test",
+        assert!(compatible_provider_metadata(
             "http://gateway.example.com/v1",
             false,
+            None,
         )
         .is_err());
-        let insecure = compatible_provider_env(
-            "sk-test",
+        let insecure = compatible_provider_metadata(
             "http://gateway.example.com/v1",
             true,
+            None,
         )
         .unwrap();
         assert!(insecure.contains("GROK_MODELS_BASE_URL=\"http://gateway.example.com/v1\""));
+    }
+
+    #[test]
+    fn provider_profiles_never_serialize_legacy_plaintext_keys() {
+        let profile = StoredProviderProfile {
+            id: "provider-test".into(),
+            name: "Test".into(),
+            legacy_api_key: Some("must-not-leak".into()),
+            base_url: "https://gateway.example.com/v1".into(),
+            allow_insecure_http: false,
+            api_backend: ProviderApiBackend::Auto,
+            models_url: None,
+            model: None,
+            available_models: Vec::new(),
+            resident_models: Vec::new(),
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(!json.contains("apiKey"));
+        assert!(!json.contains("must-not-leak"));
+    }
+
+    #[test]
+    fn managed_profile_reference_is_single_source_for_v032_metadata() {
+        let profile = StoredProviderProfile {
+            id: "provider-test".into(),
+            name: "Test".into(),
+            legacy_api_key: None,
+            base_url: "https://gateway.example.com/v1".into(),
+            allow_insecure_http: false,
+            api_backend: ProviderApiBackend::Auto,
+            models_url: None,
+            model: None,
+            available_models: Vec::new(),
+            resident_models: Vec::new(),
+        };
+        let profiles = ProviderProfilesFile {
+            active_id: Some(profile.id.clone()),
+            profiles: vec![profile],
+        };
+        let mut values = BTreeMap::from([
+            (GROX_PROVIDER_KIND_KEY.into(), "compatible".into()),
+            (
+                "GROK_MODELS_BASE_URL".into(),
+                "https://gateway.example.com/v1".into(),
+            ),
+        ]);
+
+        // A v0.3.2 direct block intentionally ignores the legacy activeId.
+        assert_eq!(
+            compatible_secret_reference(&profiles, &values).unwrap(),
+            SECRET_REF_DIRECT_COMPATIBLE
+        );
+        values.insert(GROX_PROVIDER_PROFILE_ID_KEY.into(), "provider-test".into());
+        assert_eq!(
+            compatible_secret_reference(&profiles, &values).unwrap(),
+            "provider:provider-test"
+        );
+        values.insert("GROK_MODELS_BASE_URL".into(), "https://other.example/v1".into());
+        assert!(compatible_secret_reference(&profiles, &values).is_err());
     }
 
     #[test]
@@ -10453,27 +11013,28 @@ UNRELATED=value
         fs::write(&path, "XAI_API_KEY=inherited-shell-key\n").unwrap();
         assert!(parse_grox_managed_provider_env(&path).is_empty());
 
-        // Official API-key mode gets its key only; it must not become a
-        // custom OpenAI-compatible endpoint.
-        fs::write(
-            &path,
-            replace_managed_env_block("", "XAI_API_KEY=official-key"),
-        )
-        .unwrap();
+        // Provider metadata never persists a key. The Host injects it into
+        // the selected child process only after resolving SecretStore.
+        fs::write(&path, replace_managed_env_block("", &official_provider_metadata())).unwrap();
         let official = parse_grox_managed_provider_env(&path);
-        assert_eq!(official.get("XAI_API_KEY"), Some(&"official-key".to_string()));
+        assert_eq!(official.get(GROX_PROVIDER_KIND_KEY), Some(&"official".to_string()));
+        assert!(!official.contains_key("XAI_API_KEY"));
         assert!(!official.contains_key("GROK_MODELS_BASE_URL"));
 
         // Compatible mode intentionally carries the full endpoint contract.
-        let compatible = compatible_provider_env(
-            "gateway-key",
+        let compatible = compatible_provider_metadata(
             "https://gateway.example/v1",
             false,
+            Some("provider-test"),
         )
         .unwrap();
         fs::write(&path, replace_managed_env_block("", &compatible)).unwrap();
         let gateway = parse_grox_managed_provider_env(&path);
-        assert_eq!(gateway.get("XAI_API_KEY"), Some(&"gateway-key".to_string()));
+        assert!(!gateway.contains_key("XAI_API_KEY"));
+        assert_eq!(
+            gateway.get(GROX_PROVIDER_PROFILE_ID_KEY),
+            Some(&"provider-test".to_string())
+        );
         assert_eq!(
             gateway.get("GROK_MODELS_BASE_URL"),
             Some(&"https://gateway.example/v1".to_string())

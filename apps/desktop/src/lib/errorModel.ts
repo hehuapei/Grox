@@ -93,7 +93,7 @@ export function groxFailure(error: GroxError): GroxFailure {
 export function errorDomainLabel(domain: GroxErrorDomain): string {
   switch (domain) {
     case "protocol":
-      return "ACP 协议错误";
+      return "协议错误";
     case "operation":
       return "操作未完成";
     case "environment":

@@ -19,7 +19,7 @@ describe("errorModel", () => {
     const cause = Object.assign(new Error("invalid params"), { name: "AcpRpcError" });
     const error = toGroxError(cause, { domain: "operation", code: "SESSION_LOAD", fatal: true });
     expect(error.domain).toBe("protocol");
-    expect(formatGroxError(error)).toContain("ACP 协议错误");
+    expect(formatGroxError(error)).toContain("协议错误");
   });
 
   it("环境退出会覆盖普通协议兜底", () => {

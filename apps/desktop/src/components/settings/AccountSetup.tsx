@@ -2,8 +2,14 @@ import { useState } from "react";
 import type { ProviderKind } from "../../bridge/types";
 import { useDesktop } from "../../state/store";
 import { useI18n } from "../../lib/i18n";
+import { formatGroxError, toGroxError } from "../../lib/errorModel";
 import { Icon } from "../fx/Icon";
 import { BlackHole } from "../fx/BlackHole";
+
+const providerErrorText = (cause: unknown) => formatGroxError(toGroxError(cause, {
+  domain: "operation",
+  code: "PROVIDER_SETUP_FAILED",
+}));
 
 export function AccountSetup() {
   const { t, language } = useI18n();
@@ -94,7 +100,7 @@ export function AccountSetup() {
       }
     } catch (cause) {
       if (!wasComplete) localStorage.removeItem("grox.accountSetupComplete");
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(providerErrorText(cause));
       setBusy(false);
     }
   };

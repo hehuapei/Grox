@@ -24,7 +24,9 @@ use tokio::{
 };
 
 use crate::{
-    apply_grox_provider_environment, configured_grok_command, grok_home, is_blocked_service_host,
+    apply_grox_provider_environment, configured_grok_command, grok_home,
+    host_error::HostError,
+    is_blocked_service_host,
     path_sandbox::{checked_workspace, path_for_webview},
     prompt_image_mime, restrict_private_file,
     support_bundle::redact_token_markers,
@@ -100,40 +102,24 @@ impl MediaJobPhase {
 }
 
 #[derive(Clone, Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MediaFailure {
-    domain: &'static str,
-    code: &'static str,
-    message: String,
-    recoverable: bool,
-    fatal: bool,
-    hold_queue: bool,
-    action: &'static str,
-}
+#[serde(transparent)]
+struct MediaFailure(HostError);
 
 impl MediaFailure {
     fn environment(code: &'static str, message: impl Into<String>, action: &'static str) -> Self {
-        Self {
-            domain: "environment",
-            code,
-            message: message.into(),
-            recoverable: true,
-            fatal: false,
-            hold_queue: false,
-            action,
-        }
+        Self(HostError::recoverable_environment(code, message, action))
     }
 
     fn protocol(code: &'static str, message: impl Into<String>, action: &'static str) -> Self {
-        Self {
-            domain: "protocol",
-            code,
-            message: message.into(),
-            recoverable: true,
-            fatal: false,
-            hold_queue: false,
-            action,
-        }
+        Self(HostError::protocol_with_action(code, message, action))
+    }
+}
+
+impl std::ops::Deref for MediaFailure {
+    type Target = HostError;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 
@@ -659,7 +645,13 @@ async fn run_media_generation(
         .stderr(Stdio::piped())
         .kill_on_drop(true)
         .env("GROK_CLIENT_NAME", UPSTREAM_CLI_CLIENT_NAME);
-    apply_grox_provider_environment(&mut command);
+    apply_grox_provider_environment(&mut command).map_err(|error| {
+        MediaRunError::Failed(MediaFailure::environment(
+            "SECRET_STORE_READ_FAILED",
+            error,
+            "解锁系统凭据库，或在供应商设置中重新保存 API Key",
+        ))
+    })?;
     #[cfg(unix)]
     command.process_group(0);
     #[cfg(windows)]

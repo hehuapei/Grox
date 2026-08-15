@@ -376,6 +376,7 @@ export interface BillingInfo {
 
 export type ProviderKind = "oauth" | "official" | "compatible";
 export type ProviderApiBackend = "auto" | "responses" | "chat_completions";
+export type SecretBackendKind = "keychain" | "private_file" | "legacy_file" | "missing";
 
 export interface ProviderConfig {
   kind: ProviderKind;
@@ -386,6 +387,7 @@ export interface ProviderConfig {
 export interface ProviderStatus {
   kind: ProviderKind;
   hasApiKey: boolean;
+  secretBackend: SecretBackendKind;
   baseUrl?: string;
 }
 
@@ -395,6 +397,7 @@ export interface ProviderProfileSummary {
   /** Always empty from the native layer; use hasApiKey + blank-to-keep on save. */
   apiKey: string;
   hasApiKey: boolean;
+  secretBackend: SecretBackendKind;
   baseUrl: string;
   allowInsecureHttp: boolean;
   apiBackend: ProviderApiBackend;

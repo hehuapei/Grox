@@ -31,6 +31,12 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 toml_edit = "0.20.2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+keyring = { version = "3.6", features = [
+  "apple-native",
+  "windows-native",
+  "sync-secret-service",
+  "crypto-rust",
+] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

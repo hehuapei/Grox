@@ -170,8 +170,8 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 工作树 | Host 已持久化 session 关联并拥有创建/fork/引用检查/删除事务；旧 localStorage 安全源已删除 | worktree 与 session metadata 绑定、原生复制会话上下文 | 已完成 Host 所有权索引、干净树门禁、失败回滚、目标绑定确认和同名仓库隔离 |
 | 权限/提问 | Host 已按 session + generation 持有反向 RPC、统一权限上限、偏好事务、原生提权确认、scoped option 映射和决定审计；持久 allow cache 仍由 Grok Build 原生 option 负责 | 每会话策略、allow cache、Host resolve | 权限裁决与审计已迁移；后续再扩展项目/会话分层策略，不复制 Agent 的持久规则库 |
 | 媒体 | Host 已持有生成任务、取消、参考图租约与结构化产物授权（ADR 0004） | token loopback + path scope | 后续补跨进程任务 journal 与统一投递协议 |
-| 密钥 | 配置合并/脱敏，但无统一 secret backend | OS keychain + 受限文件后备 | 单独 SecretStore，诊断永不带值 |
-| 错误 | Rust 多为字符串，前端再推断域 | 稳定 AgentErrorCode | HostError DTO 取代正则推断 |
+| 密钥 | Host SecretStore 已接管供应商密钥，档案与 `.env` 只留非敏感路由元数据（ADR 0005） | OS keychain + 受限文件后备 | 后端类型显式投影，删除墓碑防复活，诊断永不带值 |
+| 错误 | ACP、媒体与供应商命令已共享 HostError 契约 | 稳定 AgentErrorCode | 继续清理其余字符串命令，前端不再从文案推断域 |
 | 诊断 | support bundle 已有但依赖前端快照 | 日志、运行时、审计集中 | Host 快照为主，前端快照只作补充 |
 | 测试 | 工具函数测试多，跨层运行时少 | mock ACP、路由/停机/竞态测试 | 增加故障注入和 Host 集成测试 |
 

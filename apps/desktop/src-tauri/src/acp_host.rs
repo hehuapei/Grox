@@ -7,67 +7,7 @@ use std::collections::BTreeMap;
 
 use tokio::sync::{oneshot, Mutex};
 
-#[derive(Clone, Debug, serde::Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct AcpHostError {
-    pub(crate) domain: &'static str,
-    pub(crate) code: &'static str,
-    pub(crate) message: String,
-    pub(crate) recoverable: bool,
-    pub(crate) fatal: bool,
-    pub(crate) hold_queue: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) action: Option<&'static str>,
-}
-
-impl AcpHostError {
-    pub(crate) fn protocol(code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            domain: "protocol",
-            code,
-            message: message.into(),
-            recoverable: true,
-            fatal: false,
-            hold_queue: false,
-            action: Some("若持续出现，请升级 Grok Build CLI 并导出会话诊断"),
-        }
-    }
-
-    pub(crate) fn operation(code: &'static str, message: impl Into<String>) -> Self {
-        Self {
-            domain: "operation",
-            code,
-            message: message.into(),
-            recoverable: true,
-            fatal: false,
-            hold_queue: false,
-            action: None,
-        }
-    }
-
-    pub(crate) fn environment(
-        code: &'static str,
-        message: impl Into<String>,
-        fatal: bool,
-        hold_queue: bool,
-        action: &'static str,
-    ) -> Self {
-        Self {
-            domain: "environment",
-            code,
-            message: message.into(),
-            recoverable: true,
-            fatal,
-            hold_queue,
-            action: Some(action),
-        }
-    }
-
-    fn for_method(mut self, method: &str) -> Self {
-        self.message = format!("{} · {method}", self.message);
-        self
-    }
-}
+pub(crate) type AcpHostError = crate::host_error::HostError;
 
 struct PendingRequest {
     generation: u64,

@@ -156,7 +156,7 @@ export class MockBridge implements GrokBridge {
   }
 
   async getProviderStatus() {
-    return { kind: "oauth" as const, hasApiKey: false };
+    return { kind: "oauth" as const, hasApiKey: false, secretBackend: "missing" as const };
   }
 
   async configureProvider(_config: ProviderConfig): Promise<void> {}
@@ -174,6 +174,7 @@ export class MockBridge implements GrokBridge {
       name: config.name,
       apiKey: "",
       hasApiKey: Boolean(config.apiKey?.trim()) || Boolean(existing?.hasApiKey),
+      secretBackend: config.apiKey?.trim() ? "keychain" : (existing?.secretBackend ?? "missing"),
       baseUrl: config.baseUrl,
       allowInsecureHttp: config.allowInsecureHttp,
       apiBackend: config.apiBackend,

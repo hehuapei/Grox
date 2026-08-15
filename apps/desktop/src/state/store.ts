@@ -777,6 +777,9 @@ function isPermissionMode(value: unknown): value is PermissionMode {
 }
 
 export const useDesktop = create<DesktopState>((set, get) => {
+  const formattedError = (cause: unknown, fallback: ErrorFallback) =>
+    formatGroxError(toGroxError(cause, fallback));
+
   const publishRuntimeError = (cause: unknown, fallback: ErrorFallback) => {
     const notice = runtimeNoticeFromError(toGroxError(cause, fallback));
     set((state) => ({
@@ -1809,7 +1812,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     activeId: null,
     account: null,
     billing: null,
-    provider: { kind: "oauth", hasApiKey: false },
+    provider: { kind: "oauth", hasApiKey: false, secretBackend: "missing" },
     providerProfiles: [],
     activeProviderProfileId: undefined,
     providerSwitching: false,
@@ -2706,12 +2709,19 @@ export const useDesktop = create<DesktopState>((set, get) => {
       } catch (error) {
         set({
           providerSwitching: false,
-          startupError: `模型服务切换失败：${error instanceof Error ? error.message : String(error)}`,
+          startupError: formattedError(error, {
+            domain: "environment",
+            code: "PROVIDER_RUNTIME_SWITCH_FAILED",
+            action: "确认凭据库可用、服务地址可达后重试",
+          }),
         });
         throw error;
       }
       void get().refreshAccount().catch((error) => {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
+        set({ startupError: formattedError(error, {
+          domain: "environment",
+          code: "PROVIDER_STATUS_REFRESH_FAILED",
+        }) });
       });
     },
 
@@ -2726,7 +2736,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
       try {
         profile = await bridge.refreshProviderModels(profile.id);
       } catch (error) {
-        set({ startupError: `供应商已保存，但模型列表获取失败：${error instanceof Error ? error.message : String(error)}` });
+        set({ startupError: formattedError(error, {
+          domain: "environment",
+          code: "PROVIDER_MODELS_FETCH_FAILED",
+          message: "供应商已保存，但模型列表获取失败",
+          action: "检查服务地址、API Key 与网关的 /models 兼容性",
+        }) });
       }
       if (wasActive) {
         set({ providerSwitching: true });
@@ -2792,7 +2807,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         throw error;
       }
       void Promise.all([get().refreshAccount(), get().refreshModels()]).catch((error) => {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
+        set({ startupError: formattedError(error, {
+          domain: "environment",
+          code: "PROVIDER_STATE_REFRESH_FAILED",
+        }) });
       });
     },
 

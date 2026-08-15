@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { bridge } from "../../bridge";
-import type { ConfigDocument, ProviderApiBackend, ProviderKind } from "../../bridge/types";
+import type { ConfigDocument, ProviderApiBackend, ProviderKind, SecretBackendKind } from "../../bridge/types";
 import { EFFORTS } from "../../bridge/types";
 import { useDesktop } from "../../state/store";
 import { usePreferences } from "../../state/preferences";
 import { useI18n } from "../../lib/i18n";
 import { fmtBillingDate, fmtBillingValue } from "../../lib/format";
+import { formatGroxError, toGroxError } from "../../lib/errorModel";
 import { Icon } from "../fx/Icon";
 import { Wordmark } from "../fx/Wordmark";
 import { ChipSelect } from "../common/ChipSelect";
@@ -27,6 +28,20 @@ const object = (value: unknown): Json =>
 const list = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
 const text = (value: unknown, fallback = "") => (typeof value === "string" ? value : fallback);
 const bool = (value: unknown) => value === true;
+
+const providerErrorText = (cause: unknown) => formatGroxError(toGroxError(cause, {
+  domain: "operation",
+  code: "PROVIDER_OPERATION_FAILED",
+}));
+
+function secretBackendLabel(backend: SecretBackendKind, zh: boolean) {
+  switch (backend) {
+    case "keychain": return zh ? "系统凭据库" : "System credential store";
+    case "private_file": return zh ? "私有文件（0600）" : "Private file (0600)";
+    case "legacy_file": return zh ? "旧版明文（待迁移）" : "Legacy plaintext (pending migration)";
+    case "missing": return zh ? "未设置" : "Not configured";
+  }
+}
 
 export function SettingsModal() {
   const { t, language } = useI18n();
@@ -340,7 +355,7 @@ function Account() {
         <Metric label={zh ? "周期结束" : "Period ends"} value={fmtBillingDate(billing?.periodEnd, language)} />
         <Metric label={zh ? "按量上限" : "On-demand cap"} value={fmtBillingValue(billing?.onDemandCap)} />
         <Metric label={zh ? "预付余额" : "Prepaid balance"} value={fmtBillingValue(billing?.prepaidBalance)} />
-      </> : <><Metric label={zh ? "API 密钥" : "API key"} value={provider.hasApiKey ? (zh ? "已安全保存" : "Stored securely") : (zh ? "未设置" : "Not configured")} /><Metric label={zh ? "可用模型" : "Available models"} value={`${models.length}`} /></>}</div>
+      </> : <><Metric label={zh ? "密钥存储" : "Secret storage"} value={secretBackendLabel(provider.secretBackend, zh)} /><Metric label={zh ? "可用模型" : "Available models"} value={`${models.length}`} /></>}</div>
       {provider.kind === "oauth" && <p className="mt-3 text-[10px] leading-relaxed text-dim">{billing?.creditUsagePercent !== undefined ? (zh ? `订阅额度已使用 ${Math.round(billing.creditUsagePercent)}%。` : `${Math.round(billing.creditUsagePercent)}% of plan quota used.`) : (zh ? "Grok Build 当前未公开五小时或订阅剩余额度；这里展示 CLI 实际返回的订阅周期与按量额度。" : "Grok Build does not currently expose five-hour or remaining subscription quota; the values above are the billing data actually returned by the CLI.")}</p>}
     </div>
     <div className="mt-3 flex gap-2">{provider.kind === "oauth" && !account?.authenticated && <ActionButton tone="accent" onClick={() => openSetup(true)}>{t("login")}</ActionButton>}{provider.kind === "oauth" && account?.authenticated && <ActionButton tone="danger" onClick={() => void logout()}>{t("logout")}</ActionButton>}<ActionButton onClick={() => void invoke("open_external", { url: "https://grok.com/supergrok?referrer=grok-build" })}>{t("upgrade")}</ActionButton></div>
@@ -467,7 +482,7 @@ function ProviderAndModels() {
       }
       setBusy(false);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(providerErrorText(cause));
       setBusy(false);
     }
   };
@@ -484,7 +499,7 @@ function ProviderAndModels() {
         setAvailableModels(discovered);
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(providerErrorText(cause));
     } finally {
       setBusy(false);
     }
@@ -499,14 +514,14 @@ function ProviderAndModels() {
       if (editingProfileId === id) startNewProfile();
       setError("");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(providerErrorText(cause));
     } finally {
       setBusy(false);
     }
   };
 
   return <div className="mt-7" data-testid="provider-manager">
-    <div className="mb-4 flex items-end justify-between"><div><h3 className="text-[15px] font-medium text-fg">{zh ? "模型服务" : "Model provider"}</h3><p className="mt-1 text-[11.5px] leading-relaxed text-dim">{zh ? "供应商或模型切换会等待当前请求完成，再重连后台 Grok Build ACP；运行中的请求始终保持原供应商与原模型。密钥仅保存在本机原生层，不会回传到 WebView。" : "Provider and model changes wait for the current request to finish before reconnecting Grok Build ACP; an active request always keeps its original provider and model. Keys stay in the native layer and are never returned to the WebView."}</p></div><span className="chip">{provider.kind.toUpperCase()}</span></div>
+    <div className="mb-4 flex items-end justify-between"><div><h3 className="text-[15px] font-medium text-fg">{zh ? "模型服务" : "Model provider"}</h3><p className="mt-1 text-[11.5px] leading-relaxed text-dim">{zh ? "供应商或模型切换会等待当前请求完成，再重连后台 Grok Build ACP；运行中的请求始终保持原供应商与原模型。Host 优先使用系统凭据库，平台不可用时明确降级为 0600 私有文件；真实密钥不会写入供应商档案、.env 或回传 WebView。" : "Provider and model changes wait for the current request before reconnecting Grok Build ACP. The Host prefers the system credential store and explicitly falls back to a 0600 private file; literal keys are never written to provider profiles or .env, nor returned to the WebView."}</p></div><span className="chip">{provider.kind.toUpperCase()}</span></div>
     <div className="grid grid-cols-3 gap-2">
       {(["oauth", "official", "compatible"] as ProviderKind[]).map((item) => <button key={item} onClick={() => selectProviderKind(item)} className={`min-w-0 rounded-[5px] border px-3 py-2.5 text-left transition-colors ${kind === item ? "border-acc-dim bg-acc-wash" : "border-line2 bg-raise hover:border-line3"}`}><Icon name={item === "oauth" ? "user" : item === "official" ? "bolt" : "globe"} size={12} className={kind === item ? "text-acc" : "text-dim"} /><p className="mt-2 truncate font-mono text-[9.5px] text-fg2">{item === "oauth" ? t("oauth") : item === "official" ? t("officialApi") : t("compatibleApi")}</p></button>)}
     </div>
@@ -515,8 +530,8 @@ function ProviderAndModels() {
         <div className="mb-2 flex items-center justify-between px-1"><span className="lbl !text-[8.5px]">{zh ? "供应商" : "PROVIDERS"}</span><span className="tnum text-[8.5px] text-faint">{profiles.length}</span></div>
         <button onClick={startNewProfile} className={`mb-2 flex h-8 items-center gap-2 rounded-[4px] border px-2 font-mono text-[9px] transition-colors ${editingProfileId === undefined ? "border-acc-dim bg-acc-wash text-acc" : "border-line2 text-dim hover:border-line3 hover:text-fg"}`}><Icon name="plus" size={10} /><span className="truncate">{zh ? "新建供应商" : "NEW PROVIDER"}</span></button>
         <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto pr-0.5">{profiles.map((profile) => <div key={profile.id} className={`group rounded-[5px] border px-3 py-2.5 transition-colors ${editingProfileId === profile.id ? "border-acc-dim bg-acc-wash" : "border-transparent bg-high/45 hover:border-line2"}`}>
-          <button onClick={() => editProfile(profile.id)} className="block w-full min-w-0 text-left"><span className="flex items-center gap-2"><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${activeProfileId === profile.id ? "bg-acc" : "bg-faint"}`} /><span className="min-w-0 flex-1 truncate text-[11px] font-medium text-fg2" title={profile.name}>{profile.name}</span></span><span className="mt-1.5 block truncate pl-3.5 font-mono text-[9px] text-faint" title={profile.baseUrl}>{profile.baseUrl.replace(/^https?:\/\//, "")}</span></button>
-          <div className="mt-2 flex items-center justify-end gap-3 border-t border-line/70 pt-2">{activeProfileId === profile.id ? <span className="mr-auto font-mono text-[9px] text-acc">{providerSwitching ? (zh ? "等待本轮完成…" : "WAITING FOR TURN…") : (zh ? "使用中" : "ACTIVE")}</span> : <button disabled={providerSwitching} onClick={() => void activateProfile(profile.id).catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))} className="mr-auto font-mono text-[9.5px] text-acc hover:text-fg disabled:opacity-40">{zh ? "切换" : "USE"}</button>}<button onClick={() => editProfile(profile.id)} className="font-mono text-[9.5px] text-dim hover:text-fg">{zh ? "编辑" : "EDIT"}</button><button disabled={busy || providerSwitching} onClick={() => void removeProfile(profile.id, profile.name)} className="flex items-center gap-1 font-mono text-[9.5px] text-faint hover:text-red disabled:opacity-40" title={zh ? "删除" : "Delete"}><Icon name="trash" size={10} />{zh ? "删除" : "DELETE"}</button></div>
+          <button onClick={() => editProfile(profile.id)} className="block w-full min-w-0 text-left"><span className="flex items-center gap-2"><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${activeProfileId === profile.id ? "bg-acc" : "bg-faint"}`} /><span className="min-w-0 flex-1 truncate text-[11px] font-medium text-fg2" title={profile.name}>{profile.name}</span></span><span className="mt-1.5 block truncate pl-3.5 font-mono text-[9px] text-faint" title={profile.baseUrl}>{profile.baseUrl.replace(/^https?:\/\//, "")}</span><span className="mt-1 block truncate pl-3.5 font-mono text-[8px] text-faint">{secretBackendLabel(profile.secretBackend, zh)}</span></button>
+          <div className="mt-2 flex items-center justify-end gap-3 border-t border-line/70 pt-2">{activeProfileId === profile.id ? <span className="mr-auto font-mono text-[9px] text-acc">{providerSwitching ? (zh ? "等待本轮完成…" : "WAITING FOR TURN…") : (zh ? "使用中" : "ACTIVE")}</span> : <button disabled={providerSwitching} onClick={() => void activateProfile(profile.id).catch((cause) => setError(providerErrorText(cause)))} className="mr-auto font-mono text-[9.5px] text-acc hover:text-fg disabled:opacity-40">{zh ? "切换" : "USE"}</button>}<button onClick={() => editProfile(profile.id)} className="font-mono text-[9.5px] text-dim hover:text-fg">{zh ? "编辑" : "EDIT"}</button><button disabled={busy || providerSwitching} onClick={() => void removeProfile(profile.id, profile.name)} className="flex items-center gap-1 font-mono text-[9.5px] text-faint hover:text-red disabled:opacity-40" title={zh ? "删除" : "Delete"}><Icon name="trash" size={10} />{zh ? "删除" : "DELETE"}</button></div>
         </div>)}</div>
       </aside>}
       <div className={kind === "compatible" ? "min-w-0 p-4" : "rounded-[6px] border border-line2 bg-raise p-3"}>
