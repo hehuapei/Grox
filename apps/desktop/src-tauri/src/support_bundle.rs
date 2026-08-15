@@ -123,6 +123,7 @@ pub struct SessionSupportBundle<'a> {
     pub meta: Value,
     pub runtime: Value,
     pub journal: Value,
+    pub permission_audit: Value,
     pub client: Value,
     pub official_trace: Option<&'a Path>,
 }
@@ -169,6 +170,12 @@ pub fn write_session_support_bundle(input: SessionSupportBundle<'_>) -> Result<P
         "journal.json",
         &safe_json(input.journal)?,
     )?;
+    add_text(
+        &mut zip,
+        options,
+        "permission-audit.json",
+        &safe_json(input.permission_audit)?,
+    )?;
     add_text(&mut zip, options, "client.json", &safe_json(input.client)?)?;
     add_text(
         &mut zip,
@@ -178,6 +185,7 @@ pub fn write_session_support_bundle(input: SessionSupportBundle<'_>) -> Result<P
 meta.json     app, OS and CLI version facts\n\
 runtime.json  shared Agent process topology and connection state\n\
 journal.json  journal health and selected-session metadata (no transcript body)\n\
+permission-audit.json  selected-session decisions (no raw tool input)\n\
 client.json   redacted UI state, queue state and recent error notices\n\
 official/     optional official `grok trace --local` archive\n\n\
 The official trace may contain conversation and tool records. This package is\n\
@@ -241,6 +249,7 @@ mod tests {
             meta: serde_json::json!({ "appVersion": "0.3.2" }),
             runtime: serde_json::json!({ "topology": "shared" }),
             journal: serde_json::json!({ "count": 1 }),
+            permission_audit: serde_json::json!({ "readable": true, "entries": [] }),
             client: serde_json::json!({ "status": "failed" }),
             official_trace: None,
         })
@@ -250,6 +259,7 @@ mod tests {
         assert!(archive.by_name("meta.json").is_ok());
         assert!(archive.by_name("runtime.json").is_ok());
         assert!(archive.by_name("journal.json").is_ok());
+        assert!(archive.by_name("permission-audit.json").is_ok());
         assert!(archive.by_name("client.json").is_ok());
         assert!(archive.by_name("official/grok-trace.zip").is_err());
         fs::remove_file(path).unwrap();

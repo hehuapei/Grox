@@ -115,7 +115,6 @@ import {
   isComputerUseOperatorEnabled,
   setComputerUseHostEnvEnabled,
   setComputerUseHostPrefsEnabled,
-  setComputerUseOperatorEnabled,
 } from "../lib/computerUse";
 import {
   dedupeProjects,
@@ -767,12 +766,93 @@ function blocksBeforePrompt(blocks: SessionBlock[], targetPromptIndex: number): 
   });
 }
 
+type HostPrefsProjection = {
+  computerUseEnabled: boolean;
+  browserUseEnabled: boolean;
+  permissionMode: PermissionMode;
+};
+
+function isPermissionMode(value: unknown): value is PermissionMode {
+  return value === "default" || value === "auto" || value === "bypass";
+}
+
 export const useDesktop = create<DesktopState>((set, get) => {
   const publishRuntimeError = (cause: unknown, fallback: ErrorFallback) => {
     const notice = runtimeNoticeFromError(toGroxError(cause, fallback));
     set((state) => ({
       runtimeNotices: [...state.runtimeNotices.filter((item) => item.id !== notice.id), notice],
     }));
+  };
+
+  const applyHostPrefs = (
+    prefs: HostPrefsProjection,
+    targetSessionId?: string | null,
+    updatePermission = true,
+  ) => {
+    if (!isPermissionMode(prefs.permissionMode)
+      || typeof prefs.computerUseEnabled !== "boolean"
+      || typeof prefs.browserUseEnabled !== "boolean") {
+      publishRuntimeError(new Error("Host 返回了无效的偏好快照"), {
+        domain: "protocol",
+        code: "HOST_PREFS_INVALID",
+        message: "Host 权限偏好快照无效",
+        recoverable: true,
+        action: "重启 Grox；若问题持续，请导出支持包",
+      });
+      return;
+    }
+
+    try {
+      localStorage.setItem("grok.permissionMode", prefs.permissionMode);
+      localStorage.setItem("grox.browserUseEnabled", prefs.browserUseEnabled ? "1" : "0");
+    } catch (cause) {
+      publishRuntimeError(cause, {
+        domain: "environment",
+        code: "HOST_PREFS_CACHE_FAILED",
+        message: "Host 偏好已生效，但页面缓存未能更新",
+        recoverable: true,
+        action: "当前运行仍使用 Host 权威设置；重启后会重新读取",
+      });
+    }
+    setComputerUseHostPrefsEnabled(prefs.computerUseEnabled);
+    const computerUseEnabled = isComputerUseOperatorEnabled();
+    bridge.setComputerUseEnabled(computerUseEnabled);
+    bridge.setBrowserUseEnabled(prefs.browserUseEnabled);
+
+    const state = get();
+    const appliesToVisibleSession = targetSessionId == null || state.activeId === targetSessionId;
+    if (updatePermission && appliesToVisibleSession) bridge.setPermissionMode(prefs.permissionMode);
+    if (!targetSessionId) {
+      set({
+        ...(updatePermission && appliesToVisibleSession ? { permissionMode: prefs.permissionMode } : {}),
+        computerUseEnabled,
+        browserUseEnabled: prefs.browserUseEnabled,
+      });
+      return;
+    }
+    if (!updatePermission) {
+      set({ computerUseEnabled, browserUseEnabled: prefs.browserUseEnabled });
+      return;
+    }
+    const current = state.sessionComposers[targetSessionId] ?? {
+      text: "",
+      attachments: [],
+      model: state.model,
+      effort: state.effort,
+      mode: state.mode,
+      permissionMode: prefs.permissionMode,
+    };
+    const sessionComposers = {
+      ...state.sessionComposers,
+      [targetSessionId]: { ...current, permissionMode: prefs.permissionMode },
+    };
+    persistSessionComposers(sessionComposers);
+    set({
+      ...(appliesToVisibleSession ? { permissionMode: prefs.permissionMode } : {}),
+      computerUseEnabled,
+      browserUseEnabled: prefs.browserUseEnabled,
+      sessionComposers,
+    });
   };
 
   const publishJournalReadError = (sessionId: string, cause: unknown) => {
@@ -1827,11 +1907,30 @@ export const useDesktop = create<DesktopState>((set, get) => {
           try {
             const feCu = localStorage.getItem("grox.computerUseEnabled") !== "0";
             const feBrowser = localStorage.getItem("grox.browserUseEnabled") !== "0";
-            await invoke("host_prefs_migrate_computer_use", { feEnabled: feCu }).catch(() => null);
-            await invoke("host_prefs_migrate_browser_use", { feEnabled: feBrowser }).catch(() => null);
+            await invoke("host_prefs_migrate_computer_use", { feEnabled: feCu }).catch((cause) => {
+              publishRuntimeError(cause, {
+                domain: "environment",
+                code: "HOST_PREFS_MIGRATION_FAILED",
+                message: "Computer Use 偏好迁移失败",
+                recoverable: true,
+                action: "检查应用数据目录的文件权限后重试",
+              });
+            });
+            await invoke("host_prefs_migrate_browser_use", { feEnabled: feBrowser }).catch((cause) => {
+              publishRuntimeError(cause, {
+                domain: "environment",
+                code: "HOST_PREFS_MIGRATION_FAILED",
+                message: "Browser Use 偏好迁移失败",
+                recoverable: true,
+                action: "检查应用数据目录的文件权限后重试",
+              });
+            });
 
-            const [hostPrefs, envOn, env, promptQueueLoad, automationLoad] = await Promise.all([
-              invoke<{ computerUseEnabled?: boolean; browserUseEnabled?: boolean }>("host_prefs_get").catch(() => null),
+            const [hostPrefsLoad, envOn, env, promptQueueLoad, automationLoad] = await Promise.all([
+              invoke<HostPrefsProjection>("host_prefs_get").then(
+                (value) => ({ value, error: null as unknown }),
+                (error: unknown) => ({ value: null, error }),
+              ),
               invoke<boolean>("computer_use_env_enabled").catch(() => false),
               invoke<{ appVersion?: string }>("desktop_environment").catch(() => null),
               loadPromptQueues().then(
@@ -1843,28 +1942,20 @@ export const useDesktop = create<DesktopState>((set, get) => {
                 (error: unknown) => ({ value: null, error }),
               ),
             ]);
-            if (hostPrefs && typeof hostPrefs.computerUseEnabled === "boolean") {
-              setComputerUseHostPrefsEnabled(hostPrefs.computerUseEnabled);
-            }
-            if (hostPrefs && typeof hostPrefs.browserUseEnabled === "boolean") {
-              bridge.setBrowserUseEnabled(hostPrefs.browserUseEnabled);
-            }
             setComputerUseHostEnvEnabled(Boolean(envOn));
+            if (hostPrefsLoad.value) applyHostPrefs(hostPrefsLoad.value);
             if (env?.appVersion && consumeShellUpgradeRescan(env.appVersion)) {
               upgradeForceOfflineRescan = true;
               upgradeForceRescanned.clear();
             }
             set((state) => ({
-              computerUseEnabled: isComputerUseOperatorEnabled(),
-              ...(hostPrefs && typeof hostPrefs.browserUseEnabled === "boolean"
-                ? { browserUseEnabled: hostPrefs.browserUseEnabled }
-                : {}),
               ...(promptQueueLoad.value
                 ? { promptQueues: mergeHydratedPromptQueues(promptQueueLoad.value, state.promptQueues) }
                 : {}),
               ...(automationLoad.value ? { automations: automationLoad.value } : {}),
             }));
             for (const [code, message, error] of [
+              ["HOST_PREFS_READ_FAILED", "无法读取 Host 权限偏好", hostPrefsLoad.error],
               ["PROMPT_QUEUE_READ_FAILED", "无法恢复已持久化的提示队列", promptQueueLoad.error],
               ["AUTOMATION_READ_FAILED", "无法恢复已安排任务", automationLoad.error],
             ] as const) {
@@ -1878,8 +1969,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
               }));
               set((state) => ({ runtimeNotices: [...state.runtimeNotices.filter((item) => item.id !== notice.id), notice] }));
             }
-          } catch {
-            // Host prefs are non-fatal.
+          } catch (cause) {
+            publishRuntimeError(cause, {
+              domain: "environment",
+              code: "HOST_BOOTSTRAP_FAILED",
+              message: "Host 启动偏好与持久化状态未能完整恢复",
+              recoverable: true,
+              action: "检查应用数据目录后重启 Grox",
+            });
           }
         })();
       }, 0);
@@ -3464,46 +3561,51 @@ export const useDesktop = create<DesktopState>((set, get) => {
       });
     },
     setPermissionMode: (permissionMode) => {
-      const { activeId, sessionComposers, model, effort, mode, computerUseEnabled } = get();
-      if (permissionMode === "bypass") {
-        const zh = document.documentElement.lang.startsWith("zh");
-        const confirmed = window.confirm(
-          zh
-            ? "Bypass/YOLO 会跳过工具审批，仅应在完全可信环境使用。确定启用？"
-            : "Bypass/YOLO skips tool approvals. Use only in fully trusted environments. Enable?",
-        );
-        if (!confirmed) return;
-        if (computerUseEnabled) {
-          bridge.setComputerUseEnabled(false);
-          set({ computerUseEnabled: false });
-        }
-      }
-      localStorage.setItem("grok.permissionMode", permissionMode);
-      void invoke("host_prefs_set_permission_mode", { mode: permissionMode }).catch(() => {});
-      bridge.setPermissionMode(permissionMode);
-      if (!activeId) return set({ permissionMode });
-      const current = sessionComposers[activeId] ?? { text: "", attachments: [], model, effort, mode, permissionMode };
-      const next = { ...sessionComposers, [activeId]: { ...current, permissionMode } };
-      persistSessionComposers(next);
-      set({ permissionMode, sessionComposers: next });
+      const targetSessionId = get().activeId;
+      void invoke<HostPrefsProjection>("host_prefs_set_permission_mode", { mode: permissionMode })
+        .then((prefs) => applyHostPrefs(prefs, targetSessionId))
+        .catch((cause) => {
+          publishRuntimeError(cause, {
+            domain: "environment",
+            code: "HOST_PREFS_WRITE_FAILED",
+            message: "权限模式未能保存到 Host",
+            recoverable: true,
+            action: "检查应用数据目录后重试；当前权限不会扩大",
+          });
+        });
     },
     setComputerUseEnabled(enabled) {
-      const { permissionMode } = get();
-      if (enabled && permissionMode === "bypass") {
-        localStorage.setItem("grok.permissionMode", "default");
-        bridge.setPermissionMode("default");
-        void invoke("host_prefs_set_permission_mode", { mode: "default" }).catch(() => {});
-        set({ permissionMode: "default" });
-      }
-      setComputerUseOperatorEnabled(enabled);
-      void invoke("host_prefs_set_computer_use", { enabled }).catch(() => {});
-      bridge.setComputerUseEnabled(enabled);
-      set({ computerUseEnabled: isComputerUseOperatorEnabled() });
+      const targetSessionId = get().activeId;
+      const previousHostMode = readStoredPermissionMode(localStorage.getItem("grok.permissionMode"));
+      void invoke<HostPrefsProjection>("host_prefs_set_computer_use", { enabled })
+        .then((prefs) => applyHostPrefs(
+          prefs,
+          targetSessionId,
+          prefs.permissionMode !== previousHostMode,
+        ))
+        .catch((cause) => {
+          publishRuntimeError(cause, {
+            domain: "environment",
+            code: "HOST_PREFS_WRITE_FAILED",
+            message: "Computer Use 设置未能保存到 Host",
+            recoverable: true,
+            action: "检查应用数据目录后重试；Host 不会采用未保存的设置",
+          });
+        });
     },
     setBrowserUseEnabled(enabled) {
-      bridge.setBrowserUseEnabled(enabled);
-      void invoke("host_prefs_set_browser_use", { enabled }).catch(() => {});
-      set({ browserUseEnabled: enabled });
+      const targetSessionId = get().activeId;
+      void invoke<HostPrefsProjection>("host_prefs_set_browser_use", { enabled })
+        .then((prefs) => applyHostPrefs(prefs, targetSessionId, false))
+        .catch((cause) => {
+          publishRuntimeError(cause, {
+            domain: "environment",
+            code: "HOST_PREFS_WRITE_FAILED",
+            message: "Browser Use 设置未能保存到 Host",
+            recoverable: true,
+            action: "检查应用数据目录后重试；Host 不会采用未保存的设置",
+          });
+        });
     },
     setDraft(text) {
       const { activeId, sessionComposers, model, effort, mode, permissionMode, sessions, workspace } = get();

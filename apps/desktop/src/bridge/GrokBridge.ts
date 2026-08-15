@@ -81,7 +81,7 @@ export interface GrokBridge {
   /** Models currently offered by the connected agent. */
   getModelState(): Promise<ModelState>;
 
-  /** Change permission policy for existing and future sessions. */
+  /** Project the Host-approved permission policy used by future requests. */
   setPermissionMode(mode: PermissionMode): void;
 
   /** Arm or disarm Computer Use MCP injection for new/restored sessions. */

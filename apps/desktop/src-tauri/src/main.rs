@@ -20,6 +20,8 @@ mod host_prefs;
 mod interaction_service;
 mod mcp_leases;
 mod path_sandbox;
+mod permission_audit;
+mod permission_policy;
 #[cfg(windows)]
 mod process_job;
 mod prompt_queue_store;
@@ -3351,6 +3353,11 @@ async fn export_session_support_bundle(
         "selected": selected_session_journal_diagnostic(&app, &session_id),
         "summary": session_journal_status(app.clone())?,
     });
+    let permission_audit =
+        match permission_audit::read_session(&host_prefs_dir_for_app(&app), &session_id) {
+            Ok(entries) => serde_json::json!({ "readable": true, "entries": entries }),
+            Err(error) => serde_json::json!({ "readable": false, "error": error }),
+        };
 
     let trace = export_official_session_trace(&app, &session_id).await;
     let (trace_path, trace_error) = match trace {
@@ -3373,6 +3380,7 @@ async fn export_session_support_bundle(
             meta,
             runtime,
             journal,
+            permission_audit,
             client,
             official_trace: trace_path.as_deref(),
         },
@@ -3889,7 +3897,7 @@ fn computer_use_env_enabled() -> bool {
 }
 
 #[tauri::command]
-fn host_prefs_get(app: tauri::AppHandle) -> host_prefs::HostPrefs {
+fn host_prefs_get(app: tauri::AppHandle) -> Result<host_prefs::HostPrefs, String> {
     host_prefs::load_prefs(&host_prefs_dir_for_app(&app))
 }
 
@@ -3915,11 +3923,7 @@ fn host_prefs_set_computer_use(
     enabled: bool,
 ) -> Result<host_prefs::HostPrefs, String> {
     let dir = host_prefs_dir_for_app(&app);
-    let mut prefs = host_prefs::load_prefs(&dir);
-    prefs.computer_use_enabled = enabled;
-    prefs.computer_use_fe_migrated = true;
-    host_prefs::save_prefs(&dir, &prefs)?;
-    Ok(prefs)
+    host_prefs::set_computer_use(&dir, enabled)
 }
 
 #[tauri::command]
@@ -3928,11 +3932,7 @@ fn host_prefs_set_browser_use(
     enabled: bool,
 ) -> Result<host_prefs::HostPrefs, String> {
     let dir = host_prefs_dir_for_app(&app);
-    let mut prefs = host_prefs::load_prefs(&dir);
-    prefs.browser_use_enabled = enabled;
-    prefs.browser_use_fe_migrated = true;
-    host_prefs::save_prefs(&dir, &prefs)?;
-    Ok(prefs)
+    host_prefs::set_browser_use(&dir, enabled)
 }
 
 #[tauri::command]
@@ -3940,20 +3940,33 @@ fn host_prefs_set_permission_mode(
     app: tauri::AppHandle,
     mode: String,
 ) -> Result<host_prefs::HostPrefs, String> {
-    let mode = host_prefs::normalize_permission_mode(&mode)
+    let mode = permission_policy::PermissionMode::parse(&mode)
         .ok_or_else(|| "无效的权限模式".to_string())?;
     let dir = host_prefs_dir_for_app(&app);
-    let mut prefs = host_prefs::load_prefs(&dir);
-    prefs.permission_mode = mode.to_string();
-    host_prefs::save_prefs(&dir, &prefs)?;
-    Ok(prefs)
+    host_prefs::set_permission_mode(&dir, mode, confirm_bypass_permission_mode)
+}
+
+fn confirm_bypass_permission_mode() -> bool {
+    matches!(
+        rfd::MessageDialog::new()
+            .set_title("启用 Bypass / YOLO？")
+            .set_description(
+                "这会跳过工具审批，并同时关闭 Computer Use。仅应在完全可信的项目中启用。",
+            )
+            .set_level(rfd::MessageLevel::Warning)
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .show(),
+        rfd::MessageDialogResult::Ok
+    )
 }
 
 #[tauri::command]
 fn desktop_environment(app: tauri::AppHandle) -> DesktopEnvironment {
     let runtime = configured_grok_command(&app);
     // Warm host prefs cache at first environment probe.
-    let _ = host_prefs::load_prefs(&host_prefs_dir_for_app(&app));
+    if let Err(error) = host_prefs::load_prefs(&host_prefs_dir_for_app(&app)) {
+        eprintln!("grox: {error}");
+    }
     DesktopEnvironment {
         default_workspace: path_for_webview(&default_workspace()),
         grok_command: path_for_webview(Path::new(&runtime.path)),
@@ -8439,6 +8452,13 @@ fn interaction_status(
 
 /// 原子领取并回复一个 Host 持有的交互门控。调用方只能提供不透明 block id
 /// 和用户决定；session、rpc id、wire option 与代次都从 Host 状态取回。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveInteractionResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audit_warning: Option<AcpHostError>,
+}
+
 #[tauri::command]
 async fn resolve_interaction(
     window: tauri::WebviewWindow,
@@ -8447,7 +8467,7 @@ async fn resolve_interaction(
     session_id: String,
     block_id: String,
     decision: serde_json::Value,
-) -> Result<(), AcpHostError> {
+) -> Result<ResolveInteractionResult, AcpHostError> {
     ensure_main_acp_owner(window.label())
         .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
     let _write_guard = state.interactions.lock_writes().await;
@@ -8470,6 +8490,15 @@ async fn resolve_interaction(
     if let Err(error) = write_acp_line(state.inner(), &line, lease.generation).await {
         // stdin 写失败后无法证明回复是否到达，绝不自动重发批准决定。
         state.interactions.settle(&lease);
+        if let Some(audit) = lease.permission_audit.as_ref() {
+            if let Err(audit_error) = permission_audit::append(
+                &host_prefs_dir_for_app(window.app_handle()),
+                audit,
+                "delivery_unknown",
+            ) {
+                eprintln!("grox: 权限回复与审计均未确认：{audit_error}");
+            }
+        }
         let _ = window.emit(
             "interaction-closed",
             serde_json::json!({
@@ -8493,7 +8522,24 @@ async fn resolve_interaction(
             "交互请求在回复期间已失效",
         ));
     }
-    Ok(())
+    let audit_warning = lease.permission_audit.as_ref().and_then(|audit| {
+        permission_audit::append(
+            &host_prefs_dir_for_app(window.app_handle()),
+            audit,
+            "delivered",
+        )
+        .err()
+        .map(|error| {
+            AcpHostError::environment(
+                "PERMISSION_AUDIT_WRITE_FAILED",
+                error,
+                false,
+                false,
+                "权限决定已送达；请检查应用数据目录的空间和权限",
+            )
+        })
+    });
+    Ok(ResolveInteractionResult { audit_warning })
 }
 
 /// 发送 ACP 请求并在原生 Host 内等待其响应。响应不再广播给所有 WebView。

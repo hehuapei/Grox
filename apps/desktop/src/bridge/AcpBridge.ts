@@ -90,12 +90,11 @@ export const ACP_METHODS = {
   promptHistory: "x.ai/prompt_history",
 } as const;
 
-// Grox hosts the official `grok agent stdio` process. Keep ACP metadata
-// aligned with a terminal `grok` invocation so subscription eligibility is
-// evaluated as Grok Build CLI rather than as an unreleased desktop client.
-const UPSTREAM_CLI_CLIENT_IDENTIFIER = "grok-shell";
-
 type JsonObject = Record<string, unknown>;
+
+interface ResolveInteractionResult {
+  auditWarning?: GroxError;
+}
 
 interface AgentRuntimeConnection {
   generation: number;
@@ -1005,7 +1004,6 @@ export class AcpBridge implements GrokBridge {
   private runtimeCommands: SlashCommand[] = [];
   private runtimeCommandTags = new Map<string, string>();
   private permissionMode: PermissionMode = readStoredPermissionMode(localStorage.getItem("grok.permissionMode"));
-  private pendingPermissionModeSync: PermissionMode | null = null;
   private computerUseEnabled = localStorage.getItem("grox.computerUseEnabled") !== "0";
   private browserUseEnabled = localStorage.getItem("grox.browserUseEnabled") !== "0";
   private workspace = "";
@@ -1405,12 +1403,6 @@ export class AcpBridge implements GrokBridge {
 
   private markPromptFinished(sessionId: string) {
     this.activePromptSessions.delete(sessionId);
-    if (this.activePromptSessions.size !== 0) return;
-    if (this.pendingPermissionModeSync) {
-      const mode = this.pendingPermissionModeSync;
-      this.pendingPermissionModeSync = null;
-      this.syncPermissionMode(mode);
-    }
   }
 
   private onExit(payload: ExitPayload) {
@@ -2253,7 +2245,7 @@ export class AcpBridge implements GrokBridge {
     const optionKinds = new Set<PermissionOption>();
     for (const rawOption of array(params.options)) {
       const option = record(rawOption) ?? {};
-      const optionKind = (string(option.kind) ?? string(option.name) ?? "").toLowerCase();
+      const optionKind = (string(option.kind) ?? "").toLowerCase();
       switch (optionKind) {
         case "allow_once":
           optionKinds.add("allow_once");
@@ -2411,11 +2403,6 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
-  private async notify(method: string, params: unknown): Promise<void> {
-    await this.ensureReady();
-    await this.sendRaw({ jsonrpc: "2.0", method: wireMethod(method), params });
-  }
-
   private captureModelState(responseValue: unknown) {
     const response = record(responseValue);
     const meta = record(response?._meta);
@@ -2499,48 +2486,11 @@ export class AcpBridge implements GrokBridge {
   }
 
   setPermissionMode(mode: PermissionMode): void {
-    if (mode === "bypass" && this.computerUseEnabled) {
-      this.computerUseEnabled = false;
-      localStorage.setItem("grox.computerUseEnabled", "0");
-    }
     this.permissionMode = mode;
-    localStorage.setItem("grok.permissionMode", mode);
-    if (this.activePromptSessions.size > 0) {
-      this.pendingPermissionModeSync = mode;
-      return;
-    }
-    this.syncPermissionMode(mode);
-  }
-
-  private syncPermissionMode(mode: PermissionMode) {
-    void this.notify("x.ai/yolo_mode_changed", {
-      clientIdentifier: UPSTREAM_CLI_CLIENT_IDENTIFIER,
-      permission_mode:
-        mode === "bypass" ? "always-approve" : mode === "auto" ? "auto" : "default",
-      yolo_mode: mode === "bypass",
-      auto_mode: mode === "auto",
-    }).catch((error) => {
-      this.emit({
-        type: "runtime_notice",
-        notice: runtimeNoticeFromError(toGroxError(error, {
-          domain: "protocol",
-          code: "PERMISSION_MODE_SYNC_FAILED",
-          message: "全局权限提示未能同步到 Grok Build",
-          recoverable: true,
-          fatal: false,
-          holdQueue: false,
-          action: "每一轮仍携带会话级权限参数；若反复出现请升级 CLI",
-        })),
-      });
-    });
   }
 
   setComputerUseEnabled(enabled: boolean): void {
-    if (enabled && this.permissionMode === "bypass") {
-      this.setPermissionMode("default");
-    }
     this.computerUseEnabled = enabled;
-    localStorage.setItem("grox.computerUseEnabled", enabled ? "1" : "0");
     if (!enabled) {
       void invoke("computer_shutdown_all_leases").catch(() => {});
     }
@@ -2552,7 +2502,6 @@ export class AcpBridge implements GrokBridge {
 
   setBrowserUseEnabled(enabled: boolean): void {
     this.browserUseEnabled = enabled;
-    localStorage.setItem("grox.browserUseEnabled", enabled ? "1" : "0");
     if (!enabled) {
       void invoke("browser_shutdown_all_leases").catch(() => {});
     }
@@ -3428,15 +3377,21 @@ export class AcpBridge implements GrokBridge {
       || this.resolvingInteractions.has(blockId)
     ) return;
     this.resolvingInteractions.add(blockId);
-    void invoke("resolve_interaction", {
+    void invoke<ResolveInteractionResult>("resolve_interaction", {
       sessionId,
       blockId,
       decision: { option, ...(feedback?.trim() ? { feedback: feedback.trim() } : {}) },
-    }).then(() => {
+    }).then((result) => {
       if (this.hostInteractions.get(blockId)?.sessionId !== sessionId) return;
       this.hostInteractions.delete(blockId);
       this.resolvingInteractions.delete(blockId);
       this.emit({ type: "permission_resolved", sessionId, blockId, option });
+      if (result.auditWarning) {
+        this.emit({
+          type: "runtime_notice",
+          notice: runtimeNoticeFromError(result.auditWarning),
+        });
+      }
     }).catch((error) => {
       this.resolvingInteractions.delete(blockId);
       this.emitError(sessionId, error, {

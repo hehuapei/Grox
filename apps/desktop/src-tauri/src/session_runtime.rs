@@ -246,20 +246,11 @@ fn checked_session_value(
 
 fn effective_session_permission_mode(
     requested: &str,
-    host_attested: &str,
+    host_attested: crate::permission_policy::PermissionMode,
 ) -> Result<(&'static str, bool), AcpHostError> {
-    let requested = host_prefs::normalize_permission_mode(requested)
-        .ok_or_else(|| AcpHostError::protocol("ACP_INVALID_PERMISSION_MODE", "无效的权限模式"))?;
-    let bypass_rejected = requested == "bypass"
-        && host_prefs::normalize_permission_mode(host_attested) != Some("bypass");
-    Ok((
-        if bypass_rejected {
-            "default"
-        } else {
-            requested
-        },
-        bypass_rejected,
-    ))
+    let restricted = crate::permission_policy::restrict_requested_mode(host_attested, requested)
+        .map_err(|()| AcpHostError::protocol("ACP_INVALID_PERMISSION_MODE", "无效的权限模式"))?;
+    Ok((restricted.effective.as_str(), restricted.reduced))
 }
 
 fn session_open_params(
@@ -447,9 +438,19 @@ pub(crate) async fn open_agent_session_inner(
         .transpose()?;
     let reasoning_effort = checked_reasoning_effort(request.reasoning_effort.clone())
         .map_err(|error| AcpHostError::protocol("ACP_INVALID_REASONING_EFFORT", error))?;
-    let host_permission_mode = host_prefs::load_prefs(&host_prefs_dir_for_app(app)).permission_mode;
-    let (permission_mode, bypass_rejected) =
-        effective_session_permission_mode(&request.permission_mode, &host_permission_mode)?;
+    let host_permission_mode = host_prefs::load_prefs(&host_prefs_dir_for_app(app))
+        .map_err(|error| {
+            AcpHostError::environment(
+                "HOST_PREFS_READ_FAILED",
+                error,
+                false,
+                true,
+                "修复或移除损坏的 Host 偏好文件后重试",
+            )
+        })?
+        .permission_mode;
+    let (permission_mode, permission_reduced) =
+        effective_session_permission_mode(&request.permission_mode, host_permission_mode)?;
     let (system_prompt_path, _, _) = config_path("system-prompt", &cwd).map_err(|error| {
         AcpHostError::environment(
             "SESSION_SYSTEM_PROMPT_UNAVAILABLE",
@@ -474,10 +475,10 @@ pub(crate) async fn open_agent_session_inner(
 
     let permit = state.sessions.acquire_lifecycle(request.generation).await?;
     let mut warnings = Vec::new();
-    if bypass_rejected {
+    if permission_reduced {
         warnings.push(AcpHostError::operation(
-            "PERMISSION_BYPASS_NOT_AUTHORIZED",
-            "Host 未确认 Bypass/YOLO，本会话已使用默认审批模式",
+            "PERMISSION_MODE_RESTRICTED",
+            format!("请求的权限超过 Host 当前授权，本会话已使用 {permission_mode} 模式"),
         ));
     }
     let mut attempt = prepare_session_extensions(leases, &request, permission_mode, &mut warnings)?;
@@ -987,17 +988,23 @@ mod tests {
 
     #[test]
     fn session_bypass_requires_host_attestation() {
+        use crate::permission_policy::PermissionMode;
+
         assert_eq!(
-            effective_session_permission_mode("bypass", "auto").unwrap(),
-            ("default", true)
+            effective_session_permission_mode("bypass", PermissionMode::Auto).unwrap(),
+            ("auto", true)
         );
         assert_eq!(
-            effective_session_permission_mode("bypass", "bypass").unwrap(),
+            effective_session_permission_mode("bypass", PermissionMode::Bypass).unwrap(),
             ("bypass", false)
         );
         assert_eq!(
-            effective_session_permission_mode("auto", "bypass").unwrap(),
+            effective_session_permission_mode("auto", PermissionMode::Bypass).unwrap(),
             ("auto", false)
+        );
+        assert_eq!(
+            effective_session_permission_mode("auto", PermissionMode::Default).unwrap(),
+            ("default", true)
         );
     }
 }

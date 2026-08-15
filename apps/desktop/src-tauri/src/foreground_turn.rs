@@ -613,14 +613,26 @@ async fn execute_prepared_foreground_turn(
     )
     .await?;
 
-    let prefs = host_prefs::load_prefs(&crate::host_prefs_dir_for_app(app));
-    let host_permission_mode =
-        host_prefs::normalize_permission_mode(&prefs.permission_mode).unwrap_or("auto");
+    let prefs = host_prefs::load_prefs(&crate::host_prefs_dir_for_app(app)).map_err(|error| {
+        AcpHostError::environment(
+            "HOST_PREFS_READ_FAILED",
+            error,
+            false,
+            true,
+            "修复或移除损坏的 Host 偏好文件后重试",
+        )
+    })?;
+    let host_permission_mode = prefs.permission_mode;
     let permission_mode = prepared
         .permission_mode
         .as_deref()
-        .map(|requested| restrict_permission_mode(host_permission_mode, requested))
-        .unwrap_or(host_permission_mode);
+        .map(|requested| {
+            crate::permission_policy::restrict_requested_mode(host_permission_mode, requested)
+                .map(|restricted| restricted.effective.as_str())
+                .map_err(|()| prompt_queue_invalid())
+        })
+        .transpose()?
+        .unwrap_or_else(|| host_permission_mode.as_str());
     let absolute_hours = prefs
         .prompt_absolute_hours
         .map(u64::from)
@@ -830,19 +842,6 @@ fn queue_string<'a>(
         .get(key)
         .and_then(Value::as_str)
         .ok_or_else(prompt_queue_invalid)
-}
-
-fn restrict_permission_mode(host: &str, requested: &str) -> &'static str {
-    let level = |mode| match mode {
-        "bypass" => 2,
-        "auto" => 1,
-        _ => 0,
-    };
-    match level(host).min(level(requested)) {
-        2 => "bypass",
-        1 => "auto",
-        _ => "default",
-    }
 }
 
 fn emit_prompt_queue_changed(
@@ -1537,15 +1536,6 @@ mod tests {
         assert_eq!(prepared.model, "grok-build");
         assert_eq!(prepared.mode, "plan");
         assert_eq!(prepared.permission_mode.as_deref(), Some("bypass"));
-    }
-
-    #[test]
-    fn queued_permission_can_only_reduce_current_host_authority() {
-        assert_eq!(restrict_permission_mode("default", "bypass"), "default");
-        assert_eq!(restrict_permission_mode("auto", "bypass"), "auto");
-        assert_eq!(restrict_permission_mode("bypass", "default"), "default");
-        assert_eq!(restrict_permission_mode("bypass", "auto"), "auto");
-        assert_eq!(restrict_permission_mode("bypass", "bypass"), "bypass");
     }
 
     #[test]

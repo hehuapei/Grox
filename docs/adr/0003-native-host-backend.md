@@ -121,6 +121,11 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - `session/prompt` RPC 结果仍是回合终态权威；`turn_completed` / `prompt_complete` 只更新用量或触发协议恢复，不能提前释放下一条队列；
 - `interaction_service::InteractionRegistry` 截获 `session/request_permission`、`x.ai/exit_plan_mode` 和 `x.ai/ask_user_question`：按 generation 保存 rpc id、session、原始 options/questions 和回复中状态，只向主窗口发布不含 rpc id/wire option 的不透明 block id；
 - `resolve_interaction` 不接受 WebView 回传 rpc id 或 optionId，而是用 Host 保存的协议材料构造回复；跨会话、过期、重复点击、未知选项和伪造问题键都有稳定错误，stdin 写入结果不确定时不会自动重发批准；
+- `permission_policy::PermissionMode` 是 `default / auto / bypass` 的唯一解释入口；建会话、恢复、前台发送、历史队列和自动化都以当前 Host 授权为上限，使用同一个降权函数，`auto` 与 `bypass` 不再在不同执行路径得到相互矛盾的结果；
+- `host_prefs` 的读取、迁移和设置在同一把原生锁内完成 RMW，并通过唯一原子写入口提交；损坏或不可读的现有文件返回 `HOST_PREFS_READ_FAILED`，不会再静默回退到默认权限。Bypass 提权使用原生确认对话框且与写入处于同一事务，直接调用 WebView IPC 也不能绕过；Bypass 与 Computer Use 的互斥关系由 Host 原子维护；
+- WebView 不再用 `window.confirm`、localStorage 乐观写和 `x.ai/yolo_mode_changed` 通知拼装权限切换；Store 只应用 Host 返回的完整偏好快照，异步回复仍绑定发起设置的会话，切换页面不会改写另一个会话的 composer；
+- Grok Build 的 `allow-always-command`、`allow-always-mcp` 等 scoped option 只在 Host 保存 wire id/_meta，页面仅接收规范化的 `allow_once / allow_always / deny` 语义；用户选择后 Host 从原始请求找回精确 optionId，不根据页面输入猜测持久授权范围；
+- 已送达或交付状态不确定的用户权限决定会写入有界的原生 JSONL 审计，并把选定会话最近记录加入本地支持包；记录仅含会话、代次、工具类别和决定，不保存命令、路径、prompt 或 rawInput。审计写失败作为独立环境 warning 呈现，不会把已经送达 Agent 的决定伪装成回复失败；
 - Stop 与绝对 watchdog 会先由 Host 回复当前会话的全部反向 RPC 为 cancelled，再发送 `session/cancel`；符合 ACP 对 pending permission 的取消要求，也避免 Agent 永久卡在 ask-user/plan gate；
 - `interaction_status` 允许主 WebView 重载后重新投影仍存活的门控；进程代次切换、自然退出和 CLI 更新会在 Host 清空旧请求，新页面不能把旧卡片回复到新进程；
 - `client_callbacks::ClientCallbackRegistry` 截获标准文件与 `terminal/*` Client RPC：Host 按 generation 保存 rpc id，并用 session binding epoch 绑定 canonical cwd；失败的 `session/load` 不能借旧 sessionId 执行新工作区回调，WebView 不再接收或回复这些特权请求；
@@ -163,7 +168,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 自动化 | Host 已拥有认领、建会话、运行时注册、能力租约、模型/模式、Prompt、崩溃去重与结算；页面只做 started/settled 投影 | runner 复用 SessionManager | 前台与后台共用 SessionCoordinator/turn_runtime，页面登记屏障已删除 |
 | 认证 | WebView 曾持有 authenticate promise、URL 轮询和取消时序 | 单例认证事务、可取消子进程、硬超时、认证后淘汰旧 runtime | `agent_auth` 按 generation 持有 ACP OAuth；页面只 start/cancel/status 并消费事件 |
 | 工作树 | Host 已持久化 session 关联并拥有创建/fork/引用检查/删除事务；旧 localStorage 安全源已删除 | worktree 与 session metadata 绑定、原生复制会话上下文 | 已完成 Host 所有权索引、干净树门禁、失败回滚、目标绑定确认和同名仓库隔离 |
-| 权限/提问 | Host 已按 session + generation 持有反向 RPC，WebView 只用 block id 投影；持久 allow cache 尚未统一 | 每会话策略、allow cache、Host resolve | 交互生命周期已迁移，下一步统一权限策略与审计 |
+| 权限/提问 | Host 已按 session + generation 持有反向 RPC、统一权限上限、偏好事务、原生提权确认、scoped option 映射和决定审计；持久 allow cache 仍由 Grok Build 原生 option 负责 | 每会话策略、allow cache、Host resolve | 权限裁决与审计已迁移；后续再扩展项目/会话分层策略，不复制 Agent 的持久规则库 |
 | 媒体 | 工具图已落盘，预览/生成分散 | token loopback + path scope | 统一 MediaService 与会话授权 |
 | 密钥 | 配置合并/脱敏，但无统一 secret backend | OS keychain + 受限文件后备 | 单独 SecretStore，诊断永不带值 |
 | 错误 | Rust 多为字符串，前端再推断域 | 稳定 AgentErrorCode | HostError DTO 取代正则推断 |

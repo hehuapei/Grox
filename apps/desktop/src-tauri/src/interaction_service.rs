@@ -73,6 +73,22 @@ pub(crate) struct InteractionReplyLease {
     pub(crate) kind: &'static str,
     pub(crate) generation: u64,
     pub(crate) line: String,
+    pub(crate) permission_audit: Option<PermissionAuditRecord>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PermissionAuditRecord {
+    pub(crate) session_id: String,
+    pub(crate) block_id: String,
+    pub(crate) generation: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_call_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_kind: Option<String>,
+    pub(crate) decision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) wire_option_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -222,6 +238,8 @@ impl InteractionRegistry {
             ));
         }
         let result = build_result(pending, decision)?;
+        let permission_audit = (pending.kind == InteractionKind::Permission)
+            .then(|| permission_audit_record(pending, block_id, decision, &result));
         pending.resolving = true;
         Ok(InteractionReplyLease {
             block_id: block_id.to_string(),
@@ -229,6 +247,7 @@ impl InteractionRegistry {
             kind: pending.kind.as_str(),
             generation: pending.generation,
             line: response_line(&pending.rpc_id, result),
+            permission_audit,
         })
     }
 
@@ -258,6 +277,7 @@ impl InteractionRegistry {
                     kind: pending.kind.as_str(),
                     generation,
                     line: response_line(&pending.rpc_id, pending.kind.cancelled_result()),
+                    permission_audit: None,
                 }
             })
             .collect()
@@ -306,6 +326,40 @@ impl InteractionRegistry {
         self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+fn permission_audit_record(
+    pending: &PendingInteraction,
+    block_id: &str,
+    decision: &Value,
+    result: &Value,
+) -> PermissionAuditRecord {
+    let bounded = |value: &str| value.chars().take(256).collect::<String>();
+    PermissionAuditRecord {
+        session_id: bounded(&pending.projection.session_id),
+        block_id: bounded(block_id),
+        generation: pending.generation,
+        tool_call_id: pending
+            .params
+            .pointer("/toolCall/toolCallId")
+            .or_else(|| pending.params.get("toolCallId"))
+            .and_then(Value::as_str)
+            .map(bounded),
+        tool_kind: pending
+            .params
+            .pointer("/toolCall/kind")
+            .and_then(Value::as_str)
+            .map(bounded),
+        decision: decision
+            .get("option")
+            .and_then(Value::as_str)
+            .map(bounded)
+            .unwrap_or_else(|| "unknown".into()),
+        wire_option_id: result
+            .pointer("/outcome/optionId")
+            .and_then(Value::as_str)
+            .map(bounded),
     }
 }
 
@@ -417,9 +471,13 @@ fn public_params(kind: InteractionKind, params: &Value) -> Value {
             .flatten()
         {
             if let Some(option) = option.as_object_mut() {
+                let semantic = permission_option_semantic(&Value::Object(option.clone()));
                 option.remove("optionId");
                 option.remove("option_id");
                 option.remove("_meta");
+                if let Some(semantic) = semantic {
+                    option.insert("kind".into(), Value::String(semantic.into()));
+                }
             }
         }
     }
@@ -449,24 +507,11 @@ fn build_permission_result(params: &Value, decision: &Value) -> Result<Value, Ac
         .and_then(Value::as_array)
         .and_then(|options| {
             options.iter().find_map(|option| {
-                let option_id = option.get("optionId").and_then(Value::as_str)?;
-                let kind = option
-                    .get("kind")
-                    .or_else(|| option.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_ascii_lowercase();
-                let id = option_id.to_ascii_lowercase();
-                let matches = match wanted {
-                    "deny" => {
-                        matches!(kind.as_str(), "reject_once" | "reject_always" | "deny")
-                            || id.contains("reject")
-                            || id.contains("deny")
-                    }
-                    "allow_once" => kind == wanted || (kind.is_empty() && id.contains("allow")),
-                    "allow_always" => kind == wanted,
-                    _ => false,
-                };
+                let option_id = option
+                    .get("optionId")
+                    .or_else(|| option.get("option_id"))
+                    .and_then(Value::as_str)?;
+                let matches = permission_option_semantic(option) == Some(wanted);
                 matches.then(|| option_id.to_string())
             })
         })
@@ -486,6 +531,38 @@ fn build_permission_result(params: &Value, decision: &Value) -> Result<Value, Ac
             "optionId": option_id,
         }
     }))
+}
+
+fn permission_option_semantic(option: &Value) -> Option<&'static str> {
+    let kind = option
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
+        .replace(' ', "_");
+    match kind.as_str() {
+        "allow_once" => return Some("allow_once"),
+        "allow_always" => return Some("allow_always"),
+        "reject_once" | "reject_always" | "deny" => return Some("deny"),
+        _ if !kind.is_empty() => return None,
+        _ => {}
+    }
+    let id = option
+        .get("optionId")
+        .or_else(|| option.get("option_id"))
+        .and_then(Value::as_str)?
+        .to_ascii_lowercase();
+    if id.contains("reject") || id.contains("deny") {
+        Some("deny")
+    } else if id.contains("allow") && id.contains("always") {
+        Some("allow_always")
+    } else if id.contains("allow") {
+        Some("allow_once")
+    } else {
+        None
+    }
 }
 
 fn build_plan_result(decision: &Value) -> Result<Value, AcpHostError> {
@@ -771,6 +848,61 @@ mod tests {
         let response: Value = serde_json::from_str(&lease.line).unwrap();
         assert_eq!(response["result"]["outcome"]["outcome"], "selected");
         assert_eq!(response["result"]["outcome"]["optionId"], "deny-wire");
+    }
+
+    #[test]
+    fn scoped_grok_build_options_keep_host_owned_wire_ids() {
+        assert_eq!(
+            permission_option_semantic(&json!({
+                "optionId": "allow-always-mcp",
+                "name": "Always allow this MCP tool"
+            })),
+            Some("allow_always")
+        );
+        let registry = InteractionRegistry::default();
+        registry.reset(9);
+        let line = json!({
+            "jsonrpc": "2.0",
+            "id": 33,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "s1",
+                "toolCall": {
+                    "toolCallId": "tool-9",
+                    "kind": "execute",
+                    "rawInput": { "command": "secret --token hidden" }
+                },
+                "options": [
+                    { "optionId": "allow-once", "kind": "allow_once" },
+                    { "optionId": "allow-always-command", "kind": "allow_always", "_meta": { "scope": "bash" } },
+                    { "optionId": "reject-once", "kind": "reject_once" }
+                ]
+            }
+        })
+        .to_string();
+        let InteractionInbound::Opened(opened) = registry.observe_inbound(9, &line) else {
+            panic!("expected opened permission");
+        };
+        assert_eq!(opened.params["options"][1]["kind"], "allow_always");
+        assert!(opened.params["options"][1].get("optionId").is_none());
+        assert!(opened.params["options"][1].get("_meta").is_none());
+
+        let lease = registry
+            .claim_resolution("s1", &opened.block_id, &json!({ "option": "allow_always" }))
+            .unwrap();
+        let response: Value = serde_json::from_str(&lease.line).unwrap();
+        assert_eq!(
+            response["result"]["outcome"]["optionId"],
+            "allow-always-command"
+        );
+        let audit = lease.permission_audit.unwrap();
+        assert_eq!(audit.decision, "allow_always");
+        assert_eq!(
+            audit.wire_option_id.as_deref(),
+            Some("allow-always-command")
+        );
+        assert_eq!(audit.tool_kind.as_deref(), Some("execute"));
+        assert!(!serde_json::to_string(&audit).unwrap().contains("secret"));
     }
 
     #[test]

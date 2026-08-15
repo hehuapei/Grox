@@ -314,7 +314,25 @@ async fn execute_claimed_automation(
         );
     }
     let generation = connection.generation;
-    let prefs = host_prefs::load_prefs(&host_prefs_dir_for_app(app));
+    let prefs = match host_prefs::load_prefs(&host_prefs_dir_for_app(app)) {
+        Ok(prefs) => prefs,
+        Err(error) => {
+            return complete_execution(
+                &store,
+                &path,
+                &dispatch,
+                settled,
+                None,
+                Some(AcpHostError::environment(
+                    "HOST_PREFS_READ_FAILED",
+                    error,
+                    false,
+                    true,
+                    "修复或移除损坏的 Host 偏好文件后重试",
+                )),
+            );
+        }
+    };
     let opened = match open_agent_session_inner(
         app,
         state.inner(),
