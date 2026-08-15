@@ -122,6 +122,33 @@ interface PromptQueueChanged {
   reason: "claimed" | "consumed" | "recovered";
 }
 
+interface HostSessionEvent {
+  streamId: string;
+  sequence: number;
+  generation: number;
+  receivedAt: number;
+  sessionId?: string;
+  method?: string;
+  updateType?: string;
+  validJson: boolean;
+  line: string;
+}
+
+interface HostSessionEventReplay {
+  streamId: string;
+  events: HostSessionEvent[];
+  earliestSequence: number;
+  latestSequence: number;
+  truncated: boolean;
+  reset: boolean;
+  hasMore: boolean;
+}
+
+interface HostSessionEventCursor {
+  streamId?: string;
+  sequence: number;
+}
+
 interface HostInteractionProjection {
   blockId: string;
   sessionId: string;
@@ -257,6 +284,30 @@ const MAX_JSON_NODES = 5_000;
 const MAX_JSON_ARRAY_ITEMS = 200;
 const MAX_TERMINAL_LINES = 2_000;
 const REWOUND_SESSIONS_STORAGE_KEY = "grox.rewoundSessions";
+const HOST_SESSION_EVENT_CURSOR_STORAGE_KEY = "grox.hostSessionEventCursor.v1";
+
+function loadHostSessionEventCursor(): HostSessionEventCursor {
+  try {
+    const value = record(JSON.parse(localStorage.getItem(HOST_SESSION_EVENT_CURSOR_STORAGE_KEY) ?? "null"));
+    const streamId = string(value?.streamId);
+    const sequence = number(value?.sequence);
+    return streamId && sequence !== undefined && sequence >= 0
+      ? { streamId, sequence: Math.floor(sequence) }
+      : { sequence: 0 };
+  } catch {
+    return { sequence: 0 };
+  }
+}
+
+function persistHostSessionEventCursor(cursor: HostSessionEventCursor): boolean {
+  if (!cursor.streamId) return false;
+  try {
+    localStorage.setItem(HOST_SESSION_EVENT_CURSOR_STORAGE_KEY, JSON.stringify(cursor));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 function loadRewoundSessionIds(): Set<string> {
   try {
@@ -997,6 +1048,11 @@ export class AcpBridge implements GrokBridge {
   /** toolCallIds still pending/running/awaiting_permission for UI projection. */
   private openToolCalls = new Map<string, Set<string>>();
   private unlisten: UnlistenFn[] = [];
+  /** Host ACP event cursor survives a WebView reload while the native runtime stays alive. */
+  private hostSessionEventCursor = loadHostSessionEventCursor();
+  private hostSessionEventCatchup = true;
+  private bufferedHostSessionEvents: HostSessionEvent[] = [];
+  private hostSessionEventCursorWarningShown = false;
   private streamAppends = new Map<string, Extract<BridgeEvent, { type: "assistant_append" | "thinking_append" }>>();
   private repeatedDeltas = new Map<string, { value: string; count: number }>();
   private streamFlushTimer: number | undefined;
@@ -1208,13 +1264,142 @@ export class AcpBridge implements GrokBridge {
     return cursor;
   }
 
+  private projectHostSessionEvent(event: HostSessionEvent) {
+    if (!Number.isSafeInteger(event.sequence) || event.sequence < 1 || !event.streamId) {
+      this.emitHostSessionEventGap("Host 返回了无效的 ACP 事件序号");
+      return;
+    }
+    if (this.hostSessionEventCursor.streamId !== event.streamId) {
+      this.hostSessionEventCursor = { streamId: event.streamId, sequence: 0 };
+    }
+    if (event.sequence <= this.hostSessionEventCursor.sequence) return;
+    if (event.sequence !== this.hostSessionEventCursor.sequence + 1) {
+      this.emitHostSessionEventGap(
+        `ACP 事件序列从 ${this.hostSessionEventCursor.sequence} 跳到 ${event.sequence}`,
+      );
+    }
+    this.onLine(event.line);
+    this.hostSessionEventCursor = { streamId: event.streamId, sequence: event.sequence };
+    if (!persistHostSessionEventCursor(this.hostSessionEventCursor)) {
+      this.emitHostSessionEventCursorWarning();
+    }
+  }
+
+  private onHostSessionEvent(event: HostSessionEvent) {
+    if (this.hostSessionEventCatchup) {
+      this.bufferedHostSessionEvents.push(event);
+      return;
+    }
+    this.projectHostSessionEvent(event);
+  }
+
+  private emitHostSessionEventGap(detail: string) {
+    this.diagnostics.push(detail);
+    this.diagnostics = this.diagnostics.slice(-20);
+    this.emit({
+      type: "runtime_notice",
+      notice: runtimeNoticeFromError({
+        domain: "protocol",
+        code: "ACP_EVENT_REPLAY_GAP",
+        message: "会话流补放窗口不完整，当前页面可能缺少部分输出",
+        recoverable: true,
+        fatal: false,
+        holdQueue: true,
+        action: "重新打开受影响会话以从 Agent 历史记录重建内容",
+      }),
+    });
+  }
+
+  private emitHostSessionEventCursorWarning() {
+    if (this.hostSessionEventCursorWarningShown) return;
+    this.hostSessionEventCursorWarningShown = true;
+    this.emit({
+      type: "runtime_notice",
+      notice: runtimeNoticeFromError({
+        domain: "environment",
+        code: "ACP_EVENT_CURSOR_PERSIST_FAILED",
+        message: "无法保存会话流补放游标",
+        recoverable: true,
+        fatal: false,
+        holdQueue: false,
+        action: "检查应用站点存储权限；页面重载前请等待当前回复完成",
+      }),
+    });
+  }
+
+  private async catchUpHostSessionEvents() {
+    let finalLatestSequence = this.hostSessionEventCursor.sequence;
+    let replayTruncated = false;
+    try {
+      for (let page = 0; page < 32; page += 1) {
+        const replay = await invoke<HostSessionEventReplay>("replay_session_events", {
+          streamId: this.hostSessionEventCursor.streamId,
+          afterSequence: this.hostSessionEventCursor.sequence,
+          limit: 1_000,
+        });
+        if (replay.reset || this.hostSessionEventCursor.streamId !== replay.streamId) {
+          this.hostSessionEventCursor = { streamId: replay.streamId, sequence: 0 };
+          finalLatestSequence = replay.latestSequence;
+        } else {
+          finalLatestSequence = Math.max(finalLatestSequence, replay.latestSequence);
+        }
+        replayTruncated ||= replay.truncated;
+        for (const event of [...replay.events].sort((left, right) => left.sequence - right.sequence)) {
+          this.projectHostSessionEvent(event);
+        }
+        if (!replay.hasMore) break;
+        if (page === 31) replayTruncated = true;
+      }
+    } catch (error) {
+      this.emit({
+        type: "runtime_notice",
+        notice: runtimeNoticeFromError(toGroxError(error, {
+          domain: "environment",
+          code: "ACP_EVENT_REPLAY_FAILED",
+          message: "无法从 Host 恢复会话流",
+          recoverable: true,
+          fatal: true,
+          holdQueue: true,
+          action: "重新连接 Agent 后再继续发送",
+        })),
+      });
+      throw error;
+    }
+    // 只有完整查询成功后才打开实时闸门。查询失败时继续缓冲，下一次
+    // ensureReady 会从已提交游标重试，不能让较新的实时事件越过缺口。
+    this.hostSessionEventCatchup = false;
+    const buffered = this.bufferedHostSessionEvents
+      .splice(0)
+      .sort((left, right) => left.sequence - right.sequence);
+    for (const event of buffered) this.projectHostSessionEvent(event);
+    if (replayTruncated) {
+      this.emitHostSessionEventGap("Host ACP 事件补放窗口已发生截断");
+    }
+    // 若超大事件在页面消失期间无法保留，只能确认缺口并推进游标，
+    // 否则每次重载都会重复报告同一个不可恢复区间。
+    if (
+      this.hostSessionEventCursor.streamId
+      && finalLatestSequence > this.hostSessionEventCursor.sequence
+    ) {
+      this.hostSessionEventCursor = {
+        streamId: this.hostSessionEventCursor.streamId,
+        sequence: finalLatestSequence,
+      };
+      if (!persistHostSessionEventCursor(this.hostSessionEventCursor)) {
+        this.emitHostSessionEventCursorWarning();
+      }
+    }
+  }
+
   private async connect(): Promise<void> {
     this.emit({ type: "runtime_state", state: "starting" });
     const environment = await invoke<DesktopEnvironment>("desktop_environment");
     this.workspace = localStorage.getItem("grok.workspace") ?? environment.defaultWorkspace;
 
     this.unlisten.push(
-      await listen<string>("acp-event", ({ payload }) => this.onLine(payload)),
+      await listen<HostSessionEvent>("host-session-event", ({ payload }) => {
+        this.onHostSessionEvent(payload);
+      }),
       await listen<HostInteractionProjection>("interaction-opened", ({ payload }) => {
         this.projectHostInteraction(payload);
       }),
@@ -1312,6 +1497,7 @@ export class AcpBridge implements GrokBridge {
         }
       }),
     );
+    await this.catchUpHostSessionEvents();
     this.emit({
       type: "runtime_occupancy",
       occupancy: await invoke<RuntimeOccupancy>("session_runtime_status"),

@@ -9,12 +9,25 @@ interface HostInteraction {
   params: unknown;
 }
 
+interface HostSessionEvent {
+  streamId: string;
+  sequence: number;
+  generation: number;
+  receivedAt: number;
+  sessionId?: string;
+  method?: string;
+  updateType?: string;
+  validJson: boolean;
+  line: string;
+}
+
 interface InteractionInternals {
   projectHostInteraction(interaction: HostInteraction): void;
   reconcileHostInteractions(interactions: HostInteraction[]): void;
   onLine(line: string): void;
   sendRaw(message: unknown): Promise<void>;
   projectAutomationSessionStarted(started: AutomationSessionStarted): void;
+  projectHostSessionEvent(event: HostSessionEvent): void;
 }
 
 function bridgeHarness() {
@@ -145,5 +158,56 @@ describe("AcpBridge Host interaction projection", () => {
       status: "running",
       blocks: [{ type: "user", text: "Review the repository" }],
     });
+  });
+
+  it("deduplicates replayed Host events by stream cursor", () => {
+    localStorage.removeItem("grox.hostSessionEventCursor.v1");
+    const { events, internal } = bridgeHarness();
+    const event: HostSessionEvent = {
+      streamId: "host-stream-a",
+      sequence: 1,
+      generation: 7,
+      receivedAt: 42,
+      sessionId: "session-a",
+      method: "session/update",
+      updateType: "agent_message_chunk",
+      validJson: true,
+      line: JSON.stringify({
+        jsonrpc: "2.0",
+        method: "session/update",
+        params: {
+          sessionId: "session-a",
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } },
+        },
+      }),
+    };
+
+    internal.projectHostSessionEvent(event);
+    internal.projectHostSessionEvent(event);
+
+    expect(events.filter((entry) => entry.type === "block_add")).toHaveLength(1);
+    expect(JSON.parse(localStorage.getItem("grox.hostSessionEventCursor.v1") ?? "null")).toEqual({
+      streamId: "host-stream-a",
+      sequence: 1,
+    });
+  });
+
+  it("surfaces a replay gap instead of silently accepting a sequence jump", () => {
+    localStorage.removeItem("grox.hostSessionEventCursor.v1");
+    const { events, internal } = bridgeHarness();
+    internal.projectHostSessionEvent({
+      streamId: "host-stream-a",
+      sequence: 3,
+      generation: 7,
+      receivedAt: 42,
+      validJson: true,
+      line: JSON.stringify({ jsonrpc: "2.0", method: "x.ai/models/update", params: {} }),
+    });
+
+    const notice = events.find(
+      (entry): entry is Extract<BridgeEvent, { type: "runtime_notice" }> =>
+        entry.type === "runtime_notice",
+    );
+    expect(notice?.notice.id).toBe("error-protocol-ACP_EVENT_REPLAY_GAP");
   });
 });

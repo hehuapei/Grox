@@ -153,6 +153,8 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - prompt queue、automation、session journal、draft、worktree ownership、权限审计、媒体任务和支持包等敏感文件都在临时文件创建时即限制为 0600，再原子替换；不再出现“写完后再 chmod”的短暂泄露窗口；
 - 现有持久化文件为空、损坏或无法读取时按结构性错误处理：repository 拒绝覆盖，worktree 删除引用扫描也拒绝跳过坏 journal，避免坏数据被误当成“没有引用”；
 - `MediaService` 用独立原子 journal 保存最近任务，启动时将崩溃遗留的活动任务结算为 `MEDIA_JOB_INTERRUPTED`；媒体历史、journal 状态和 Host 自动重连状态都进入环境摘要或支持包诊断。
+- `session_event_journal::SessionEventJournal` 为所有可投影 ACP 入站消息分配进程级 `streamId`、单调序号和 generation，并提取 session/method/update 元数据；Host 保留 8192 条且最多 16 MiB 的有界补放窗口，超大消息只实时投影并把缺口显式记录为 truncated，不能静默伪装成完整历史；
+- WebView 按“先监听、再分页补放、最后合并实时缓冲”的次序消费 `host-session-event`，并以 stream + sequence 去重。页面重载不再依赖不可重放的裸 `acp-event`；游标失配、窗口截断和持久化失败都有稳定错误代码。事件窗口健康状态进入 RuntimeStatus 与支持包；
 
 本切片没有把完整 SessionManager 伪装成已经迁移：连接初始化、非交互认证、建会话/恢复、
 自动化完整生命周期、普通前台回合、持久化提示队列、权限/计划/提问交互和显式 OAuth 生命周期已属于 Host。
@@ -164,7 +166,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 领域 | Grox 迁移前 | `grok-app` 可学习点 | Grox 决定 |
 | --- | --- | --- | --- |
 | 组合根 | 9k+ 行 `main.rs` 同时承担命令与业务 | `lib.rs` 组合状态，commands 为薄门面 | 随职责迁移拆模块，不做纯文件搬家 |
-| ACP | Rust 透传 stdio，Bridge 关联请求 | `AcpClient` 在 Host 维护 pending/退出 | 先完成 Native ACP transport |
+| ACP | Rust 透传 stdio，Bridge 关联请求 | `AcpClient` 在 Host 维护 pending/退出 | 请求归属、退出清算与入站事件顺序/补放已由 Host 持有；继续迁移语义消息快照 |
 | Client callback | Bridge 用当前页面 catalogue 猜 FS cwd；terminal 未宣告 | 未实现能力就不宣告，避免 Agent 挂起 | 文件与完整 terminal 生命周期均由 Host binding epoch 应答，能力已设为 true |
 | 会话 | Bridge + Store 共同裁决 | Host SessionManager + FSM + snapshots | 建立单一 SessionCoordinator |
 | 多会话 | 单进程共享、生命周期门控在前端 | 每应用会话进程、后台 busy 不被抢占 | 先迁权威，再用容量策略决定进程池 |
@@ -184,6 +186,6 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 
 - WebView 刷新或隐藏不再决定任务是否创建、执行或结算，也不会丢失仍在 Host 等待的权限/提问、正在进行的 OAuth 或 Agent terminal；会话关闭和 Host 退出会清理终端进程树。已创建会话但未结算的自动化在租约过期后会标记结果未知并禁止自动重放。完全退出 Grox 进程后调度仍会暂停，这是明确限制。
 - 迁移期间仍保留一个共享 CLI 进程；这是真实限制，不伪装成进程池。
-- `AcpBridge` 会逐步缩小为投影器，Zustand 只保存 UI 需要的快照。
+- `AcpBridge` 不再消费无序且不可补放的裸 ACP 广播；当前仍负责把 Host 有序事件转换为 UI block，后续继续把语义消息快照收回 Host。Zustand 只保存 UI 需要的快照。
 - Host 模块会增加，但每次拆分必须伴随职责迁移、测试或不变量，禁止只为了缩短文件。
 - v0.3.2 完成标准不是“看起来像 grok-app”，而是上述十二条不变量可由 Host 测试证明。

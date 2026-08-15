@@ -30,6 +30,7 @@ mod process_job;
 mod prompt_queue_store;
 mod process_env;
 mod session_coordinator;
+mod session_event_journal;
 mod session_journal_store;
 mod session_runtime;
 mod session_storage;
@@ -86,6 +87,9 @@ use percent_encoding::percent_decode_str;
 use prompt_queue_store::PromptQueueStore;
 use serde::{Deserialize, Serialize};
 use session_coordinator::{SessionCoordinator, SessionRuntimeOccupancy};
+use session_event_journal::{
+    HostSessionEventReplay, HostSessionEventStatus, SessionEventJournal,
+};
 use session_journal_store::{SessionJournalStore, SessionJournalWriteError};
 use session_runtime::{
     browser_shutdown_all_leases, close_agent_session, computer_emergency_stop_session,
@@ -177,6 +181,7 @@ struct AcpState {
     foreground_turns: Arc<ForegroundTurnRegistry>,
     interactions: Arc<InteractionRegistry>,
     client_callbacks: Arc<ClientCallbackRegistry>,
+    session_events: SessionEventJournal,
 }
 
 #[derive(Clone)]
@@ -537,6 +542,7 @@ struct AgentRuntimeStatus {
     last_connect_configured: bool,
     worktree_session_bindings: usize,
     worktree_ownership_error: Option<String>,
+    session_event_stream: HostSessionEventStatus,
 }
 
 #[derive(Serialize)]
@@ -545,6 +551,21 @@ struct DesktopEnvironment {
     default_workspace: String,
     grok_command: String,
     app_version: String,
+}
+
+#[tauri::command]
+fn replay_session_events(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    stream_id: Option<String>,
+    after_sequence: Option<u64>,
+    limit: Option<usize>,
+) -> Result<HostSessionEventReplay, HostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| HostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    Ok(state
+        .session_events
+        .replay(stream_id.as_deref(), after_sequence.unwrap_or(0), limit))
 }
 
 #[tauri::command]
@@ -586,6 +607,7 @@ async fn agent_runtime_status(
         last_connect_configured: state.last_connect().is_some(),
         worktree_session_bindings,
         worktree_ownership_error,
+        session_event_stream: state.session_events.status(),
     })
 }
 
@@ -3608,6 +3630,7 @@ async fn export_session_support_bundle(
         "lastConnectConfigured": state.last_connect().is_some(),
         "worktreeOwnership": worktree_ownership,
         "sessionOccupancy": state.sessions.snapshot(),
+        "sessionEventStream": state.session_events.status(),
         "automationRunner": automation_runner.status(state.inner()).await,
         "cli": {
             "path": support_path(&runtime_info.path),
@@ -8765,7 +8788,12 @@ async fn spawn_acp_process(
                         }
                         match stdout_state.interactions.observe_inbound(generation, &line) {
                             InteractionInbound::NotInteraction => {
-                                let _ = stdout_app.emit("acp-event", line);
+                                let event = stdout_state.session_events.append(generation, line);
+                                // 只把已编号的 Host 事件投影给运行时所有者。页面
+                                // 重载期间即使无人监听，事件仍可由游标命令补放。
+                                if let Some(window) = stdout_app.get_webview_window("main") {
+                                    let _ = window.emit("host-session-event", event);
+                                }
                             }
                             InteractionInbound::Opened(interaction) => {
                                 // 反向 RPC 只投影给主窗口；rpc id 和 wire option
@@ -10103,6 +10131,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             desktop_environment,
             agent_runtime_status,
+            replay_session_events,
             session_runtime_status,
             foreground_turn_status,
             session_gate_enter_lifecycle,
