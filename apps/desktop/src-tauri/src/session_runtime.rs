@@ -504,13 +504,19 @@ pub(crate) async fn open_agent_session_inner(
             match send(&attempt).await {
                 Ok(response) => response,
                 Err(error) => {
-                    state.client_callbacks.abort_session_open(&callback_open);
+                    state
+                        .client_callbacks
+                        .abort_session_open(&callback_open)
+                        .await;
                     return Err(error);
                 }
             }
         }
         Err(error) => {
-            state.client_callbacks.abort_session_open(&callback_open);
+            state
+                .client_callbacks
+                .abort_session_open(&callback_open)
+                .await;
             discard_session_extension_attempt(leases, &mut attempt);
             return Err(error);
         }
@@ -531,7 +537,10 @@ pub(crate) async fn open_agent_session_inner(
     let bound_session_id = match bound_session_id {
         Ok(session_id) => session_id,
         Err(error) => {
-            state.client_callbacks.abort_session_open(&callback_open);
+            state
+                .client_callbacks
+                .abort_session_open(&callback_open)
+                .await;
             discard_session_extension_attempt(leases, &mut attempt);
             return Err(error);
         }
@@ -540,7 +549,10 @@ pub(crate) async fn open_agent_session_inner(
         .client_callbacks
         .commit_session_open(&callback_open, &bound_session_id)
     {
-        state.client_callbacks.abort_session_open(&callback_open);
+        state
+            .client_callbacks
+            .abort_session_open(&callback_open)
+            .await;
         discard_session_extension_attempt(leases, &mut attempt);
         return Err(AcpHostError::protocol(
             "SESSION_CALLBACK_BINDING_INVALID",
@@ -595,7 +607,7 @@ pub(crate) async fn close_agent_session(
         Err(error) => return Err(error),
     }
     shutdown_session_resources(leases.inner(), &session_id);
-    state.client_callbacks.unbind_session(&session_id);
+    state.client_callbacks.unbind_session(&session_id).await;
     Ok(())
 }
 
@@ -635,7 +647,7 @@ pub(crate) async fn delete_agent_session(
     )
     .await?;
     shutdown_session_resources(leases.inner(), &session_id);
-    state.client_callbacks.unbind_session(&session_id);
+    state.client_callbacks.unbind_session(&session_id).await;
     Ok(())
 }
 

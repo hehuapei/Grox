@@ -129,7 +129,7 @@ fn initialize_params(client_version: Option<&str>) -> Value {
         "protocolVersion": 1,
         "clientCapabilities": {
             "fs": { "readTextFile": true, "writeTextFile": true },
-            "terminal": false,
+            "terminal": true,
         },
         "clientInfo": {
             "name": UPSTREAM_CLI_CLIENT_NAME,
@@ -215,6 +215,7 @@ mod tests {
         assert_eq!(params["clientInfo"]["version"], "0.2.106");
         assert_eq!(params["_meta"]["clientIdentifier"], "grok-shell");
         assert_eq!(params["_meta"]["clientVersion"], "0.2.106");
+        assert_eq!(params["clientCapabilities"]["terminal"], true);
     }
 
     #[test]

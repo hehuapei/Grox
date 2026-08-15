@@ -18,6 +18,7 @@ use serde_json::{json, Value};
 
 use crate::{
     acp_read_file, acp_read_text_file, acp_write_text_file, path_sandbox::path_for_webview,
+    terminal_host::{TerminalHost, TerminalMethod},
 };
 
 const MAX_CALLBACK_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
@@ -29,6 +30,7 @@ enum CallbackMethod {
     ReadText,
     ReadFile,
     WriteText,
+    Terminal(TerminalMethod),
 }
 
 #[derive(Clone, Debug)]
@@ -38,6 +40,7 @@ pub(crate) struct ClientCallbackLease {
     rpc_key: String,
     session_id: String,
     workspace: PathBuf,
+    owner_token: Option<u64>,
     method: CallbackMethod,
     params: Value,
 }
@@ -66,10 +69,16 @@ struct SessionOpening {
     workspace: PathBuf,
 }
 
+#[derive(Clone, Debug)]
+struct SessionBinding {
+    token: u64,
+    workspace: PathBuf,
+}
+
 #[derive(Default)]
 struct RegistryState {
     generation: u64,
-    sessions: BTreeMap<String, PathBuf>,
+    sessions: BTreeMap<String, SessionBinding>,
     opening: Option<SessionOpening>,
     pending_rpc: BTreeSet<String>,
 }
@@ -79,6 +88,7 @@ pub(crate) struct ClientCallbackRegistry {
     state: Mutex<RegistryState>,
     operation_lock: tokio::sync::Mutex<()>,
     next_open_token: AtomicU64,
+    terminals: TerminalHost,
 }
 
 impl ClientCallbackRegistry {
@@ -88,11 +98,14 @@ impl ClientCallbackRegistry {
 
     pub(crate) async fn reset(&self, generation: u64) {
         let _operation_guard = self.lock_operations().await;
-        let mut state = self.lock();
-        state.generation = generation;
-        state.sessions.clear();
-        state.opening = None;
-        state.pending_rpc.clear();
+        {
+            let mut state = self.lock();
+            state.generation = generation;
+            state.sessions.clear();
+            state.opening = None;
+            state.pending_rpc.clear();
+        }
+        self.terminals.reset(generation).await;
     }
 
     pub(crate) fn begin_session_open(
@@ -145,21 +158,46 @@ impl ClientCallbackRegistry {
         }
         let workspace = opening.workspace.clone();
         state.opening = None;
-        state.sessions.insert(session_id.to_string(), workspace);
+        state.sessions.insert(
+            session_id.to_string(),
+            SessionBinding {
+                token: lease.token,
+                workspace,
+            },
+        );
         Ok(())
     }
 
-    pub(crate) fn abort_session_open(&self, lease: &SessionOpenLease) {
-        let mut state = self.lock();
-        if state.opening.as_ref().is_some_and(|opening| {
-            opening.token == lease.token && opening.generation == lease.generation
-        }) {
-            state.opening = None;
+    pub(crate) async fn abort_session_open(&self, lease: &SessionOpenLease) {
+        let _operation_guard = self.lock_operations().await;
+        let aborted = {
+            let mut state = self.lock();
+            if state.opening.as_ref().is_some_and(|opening| {
+                opening.token == lease.token && opening.generation == lease.generation
+            }) {
+                state.opening = None;
+                true
+            } else {
+                false
+            }
+        };
+        if aborted {
+            self.terminals
+                .release_owner(lease.generation, lease.token)
+                .await;
         }
     }
 
-    pub(crate) fn unbind_session(&self, session_id: &str) {
-        self.lock().sessions.remove(session_id);
+    pub(crate) async fn unbind_session(&self, session_id: &str) {
+        let _operation_guard = self.lock_operations().await;
+        let generation = {
+            let mut state = self.lock();
+            state.sessions.remove(session_id);
+            state.generation
+        };
+        self.terminals
+            .release_session(generation, session_id)
+            .await;
     }
 
     pub(crate) fn pending_len(&self) -> usize {
@@ -168,6 +206,10 @@ impl ClientCallbackRegistry {
 
     pub(crate) fn bound_len(&self) -> usize {
         self.lock().sessions.len()
+    }
+
+    pub(crate) async fn terminal_len(&self) -> usize {
+        self.terminals.len().await
     }
 
     pub(crate) fn observe_inbound(&self, generation: u64, line: &str) -> ClientCallbackInbound {
@@ -223,10 +265,16 @@ impl ClientCallbackRegistry {
         let loading_workspace = state.opening.as_ref().and_then(|opening| {
             (opening.generation == generation
                 && opening.requested_session_id.as_deref() == Some(session_id.as_str()))
-            .then(|| opening.workspace.clone())
+            .then(|| (opening.workspace.clone(), Some(opening.token)))
         });
-        let workspace = loading_workspace
-            .or_else(|| state.sessions.get(&session_id).cloned())
+        let binding = loading_workspace
+            .or_else(|| {
+                state
+                    .sessions
+                    .get(&session_id)
+                    .cloned()
+                    .map(|binding| (binding.workspace, Some(binding.token)))
+            })
             .or_else(|| {
                 state.opening.as_mut().and_then(|opening| {
                     if opening.generation != generation
@@ -239,10 +287,10 @@ impl ClientCallbackRegistry {
                         return None;
                     }
                     opening.observed_session_id = Some(session_id.clone());
-                    Some(opening.workspace.clone())
+                    Some((opening.workspace.clone(), Some(opening.token)))
                 })
             });
-        let Some(workspace) = workspace else {
+        let Some((workspace, owner_token)) = binding else {
             return ClientCallbackInbound::AutoReply(error_line(
                 &rpc_id,
                 -32000,
@@ -256,13 +304,40 @@ impl ClientCallbackRegistry {
             rpc_key,
             session_id,
             workspace,
+            owner_token,
             method,
             params: Value::Object(params.clone()),
         })
     }
 
-    pub(crate) fn render_response(&self, lease: &ClientCallbackLease) -> String {
-        let result = execute_callback(lease);
+    pub(crate) async fn render_response(&self, lease: &ClientCallbackLease) -> String {
+        let result = match lease.method {
+            CallbackMethod::Terminal(TerminalMethod::Create) => {
+                // Create and session unbind/reset share this short critical
+                // section, so close cannot miss a child between spawn and insert.
+                let _operation_guard = self.lock_operations().await;
+                if !self.lease_is_authorized(lease) {
+                    Err(CallbackFailure::operation(
+                        "终端创建所属的会话或 Agent 代次已失效",
+                    ))
+                } else {
+                    self.execute_terminal(lease).await
+                }
+            }
+            CallbackMethod::Terminal(_) => self.execute_terminal(lease).await,
+            _ => {
+                // 文件写入与 generation reset 串行，避免旧进程在被替换时
+                // 继续修改工作区；异步派发后仍需重新校验 lease。
+                let _operation_guard = self.lock_operations().await;
+                if !self.lease_is_authorized(lease) {
+                    Err(CallbackFailure::operation(
+                        "Client callback 所属的会话或 Agent 代次已失效",
+                    ))
+                } else {
+                    execute_file_callback(lease)
+                }
+            }
+        };
         let line = match result {
             Ok(result) => success_line(&lease.rpc_id, result),
             Err(error) => error_line(&lease.rpc_id, error.code, &error.message),
@@ -272,6 +347,33 @@ impl ClientCallbackRegistry {
         } else {
             error_line(&lease.rpc_id, -32000, "Client callback 响应超过 8 MB 上限")
         }
+    }
+
+    async fn execute_terminal(
+        &self,
+        lease: &ClientCallbackLease,
+    ) -> Result<Value, CallbackFailure> {
+        let CallbackMethod::Terminal(method) = lease.method else {
+            unreachable!("terminal dispatcher only accepts terminal methods");
+        };
+        let params = lease
+            .params
+            .as_object()
+            .ok_or_else(|| CallbackFailure::params("Client callback params 必须是对象"))?;
+        self.terminals
+            .execute(
+                lease.generation,
+                &lease.session_id,
+                &lease.workspace,
+                lease.owner_token,
+                method,
+                params,
+            )
+            .await
+            .map_err(|error| CallbackFailure {
+                code: error.code,
+                message: error.message,
+            })
     }
 
     pub(crate) fn settle(&self, lease: &ClientCallbackLease) -> bool {
@@ -287,8 +389,36 @@ impl ClientCallbackRegistry {
             CallbackMethod::ReadText => "fs/read_text_file",
             CallbackMethod::ReadFile => "x.ai/fs/read_file",
             CallbackMethod::WriteText => "fs/write_text_file",
+            CallbackMethod::Terminal(method) => method.name(),
         };
         (&lease.session_id, method)
+    }
+
+    pub(crate) fn waits_for_terminal_exit(lease: &ClientCallbackLease) -> bool {
+        matches!(
+            lease.method,
+            CallbackMethod::Terminal(TerminalMethod::WaitForExit)
+        )
+    }
+
+    fn lease_is_authorized(&self, lease: &ClientCallbackLease) -> bool {
+        let state = self.lock();
+        if state.generation != lease.generation {
+            return false;
+        }
+        // opening 期间观察到的 lease 可能在 session/new|load 提交后才被调度；
+        // binding token 必须一致，失败 load 的新 cwd 不能借旧 sessionId 穿透。
+        if state.sessions.get(&lease.session_id).is_some_and(|binding| {
+            Some(binding.token) == lease.owner_token
+        }) {
+            return true;
+        }
+        state.opening.as_ref().is_some_and(|opening| {
+            Some(opening.token) == lease.owner_token
+                && opening.generation == lease.generation
+                && (opening.requested_session_id.as_deref() == Some(&lease.session_id)
+                    || opening.observed_session_id.as_deref() == Some(&lease.session_id))
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, RegistryState> {
@@ -319,7 +449,7 @@ impl CallbackFailure {
     }
 }
 
-fn execute_callback(lease: &ClientCallbackLease) -> Result<Value, CallbackFailure> {
+fn execute_file_callback(lease: &ClientCallbackLease) -> Result<Value, CallbackFailure> {
     let params = lease
         .params
         .as_object()
@@ -354,6 +484,7 @@ fn execute_callback(lease: &ClientCallbackLease) -> Result<Value, CallbackFailur
                 .map(|_| Value::Null)
                 .map_err(CallbackFailure::operation)
         }
+        CallbackMethod::Terminal(_) => unreachable!("terminal callbacks execute asynchronously"),
     }
 }
 
@@ -396,6 +527,13 @@ fn callback_method(method: &str) -> Option<CallbackMethod> {
         "fs/read_text_file" => Some(CallbackMethod::ReadText),
         "x.ai/fs/read_file" => Some(CallbackMethod::ReadFile),
         "fs/write_text_file" => Some(CallbackMethod::WriteText),
+        "terminal/create" => Some(CallbackMethod::Terminal(TerminalMethod::Create)),
+        "terminal/output" => Some(CallbackMethod::Terminal(TerminalMethod::Output)),
+        "terminal/wait_for_exit" => {
+            Some(CallbackMethod::Terminal(TerminalMethod::WaitForExit))
+        }
+        "terminal/kill" => Some(CallbackMethod::Terminal(TerminalMethod::Kill)),
+        "terminal/release" => Some(CallbackMethod::Terminal(TerminalMethod::Release)),
         _ => None,
     }
 }
@@ -434,7 +572,11 @@ fn error_line(id: &Value, code: i64, message: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, sync::atomic::AtomicU64};
+    use std::{
+        fs,
+        sync::{atomic::AtomicU64, Arc},
+        time::Duration,
+    };
 
     static NONCE: AtomicU64 = AtomicU64::new(0);
 
@@ -460,6 +602,33 @@ mod tests {
         .to_string()
     }
 
+    fn render(registry: &ClientCallbackRegistry, lease: &ClientCallbackLease) -> String {
+        tauri::async_runtime::block_on(registry.render_response(lease))
+    }
+
+    fn quick_terminal_params() -> Value {
+        #[cfg(unix)]
+        return json!({
+            "command": "/bin/sh",
+            "args": ["-c", "printf callback-terminal"],
+        });
+        #[cfg(windows)]
+        return json!({
+            "command": "cmd.exe",
+            "args": ["/D", "/S", "/C", "echo callback-terminal"],
+        });
+    }
+
+    fn long_terminal_params() -> Value {
+        #[cfg(unix)]
+        return json!({ "command": "/bin/sh", "args": ["-c", "sleep 30"] });
+        #[cfg(windows)]
+        return json!({
+            "command": "cmd.exe",
+            "args": ["/C", "ping -n 30 127.0.0.1 >NUL"],
+        });
+    }
+
     #[test]
     fn new_session_callbacks_use_provisional_workspace_then_commit() {
         let root = workspace();
@@ -477,7 +646,7 @@ mod tests {
         ) else {
             panic!("expected callback");
         };
-        let response: Value = serde_json::from_str(&registry.render_response(&write)).unwrap();
+        let response: Value = serde_json::from_str(&render(&registry, &write)).unwrap();
         assert_eq!(response["id"], 7);
         assert!(response["result"].is_null());
         assert_eq!(
@@ -501,7 +670,7 @@ mod tests {
         ) else {
             panic!("expected read callback");
         };
-        let response: Value = serde_json::from_str(&registry.render_response(&read)).unwrap();
+        let response: Value = serde_json::from_str(&render(&registry, &read)).unwrap();
         assert_eq!(response["result"]["content"], "host-owned");
         fs::remove_dir_all(root).ok();
     }
@@ -594,7 +763,7 @@ mod tests {
             ClientCallbackInbound::AutoReply(_)
         ));
         assert!(registry.commit_session_open(&opening, "s2").is_err());
-        registry.abort_session_open(&opening);
+        tauri::async_runtime::block_on(registry.abort_session_open(&opening));
         fs::remove_dir_all(root).ok();
     }
 
@@ -622,7 +791,7 @@ mod tests {
         ) else {
             panic!("expected callback");
         };
-        let response: Value = serde_json::from_str(&registry.render_response(&write)).unwrap();
+        let response: Value = serde_json::from_str(&render(&registry, &write)).unwrap();
         assert_eq!(response["error"]["code"], -32000);
         assert!(!escape.exists());
         fs::remove_dir_all(root).ok();
@@ -672,7 +841,7 @@ mod tests {
         ) else {
             panic!("expected callback");
         };
-        let response: Value = serde_json::from_str(&registry.render_response(&read)).unwrap();
+        let response: Value = serde_json::from_str(&render(&registry, &read)).unwrap();
         assert_eq!(response["result"]["content"], "new");
         registry.settle(&read);
         registry.commit_session_open(&loading, "s1").unwrap();
@@ -704,9 +873,190 @@ mod tests {
         let ClientCallbackInbound::Request(read) = registry.observe_inbound(5, &line) else {
             panic!("expected extension callback");
         };
-        let response: Value = serde_json::from_str(&registry.render_response(&read)).unwrap();
+        let response: Value = serde_json::from_str(&render(&registry, &read)).unwrap();
         assert_eq!(response["result"]["content"], "nested extension");
         assert_eq!(response["result"]["type"], "text/plain");
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn standard_terminal_callbacks_complete_full_lifecycle() {
+        tauri::async_runtime::block_on(async {
+            let root = workspace();
+            let registry = ClientCallbackRegistry::default();
+            registry.reset(11).await;
+            let opening = registry.begin_session_open(11, Some("s1"), &root).unwrap();
+            registry.commit_session_open(&opening, "s1").unwrap();
+
+            let ClientCallbackInbound::Request(create) = registry.observe_inbound(
+                11,
+                &request(
+                    json!(1),
+                    "terminal/create",
+                    "s1",
+                    quick_terminal_params(),
+                ),
+            ) else {
+                panic!("expected terminal/create callback");
+            };
+            let response: Value =
+                serde_json::from_str(&registry.render_response(&create).await).unwrap();
+            let terminal_id = response["result"]["terminalId"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            assert!(registry.settle(&create));
+
+            let ClientCallbackInbound::Request(wait) = registry.observe_inbound(
+                11,
+                &request(
+                    json!(2),
+                    "terminal/wait_for_exit",
+                    "s1",
+                    json!({ "terminalId": terminal_id }),
+                ),
+            ) else {
+                panic!("expected terminal/wait_for_exit callback");
+            };
+            let response: Value =
+                serde_json::from_str(&registry.render_response(&wait).await).unwrap();
+            assert_eq!(response["result"]["exitCode"], 0);
+            assert!(registry.settle(&wait));
+
+            let ClientCallbackInbound::Request(output) = registry.observe_inbound(
+                11,
+                &request(
+                    json!(3),
+                    "terminal/output",
+                    "s1",
+                    json!({ "terminalId": terminal_id }),
+                ),
+            ) else {
+                panic!("expected terminal/output callback");
+            };
+            let response: Value =
+                serde_json::from_str(&registry.render_response(&output).await).unwrap();
+            assert!(response["result"]["output"]
+                .as_str()
+                .unwrap()
+                .contains("callback-terminal"));
+            assert_eq!(response["result"]["exitStatus"]["exitCode"], 0);
+            assert!(registry.settle(&output));
+
+            let ClientCallbackInbound::Request(kill) = registry.observe_inbound(
+                11,
+                &request(
+                    json!(4),
+                    "terminal/kill",
+                    "s1",
+                    json!({ "terminalId": terminal_id }),
+                ),
+            ) else {
+                panic!("expected terminal/kill callback");
+            };
+            let response: Value =
+                serde_json::from_str(&registry.render_response(&kill).await).unwrap();
+            assert_eq!(response["result"], json!({}));
+            assert!(registry.settle(&kill));
+
+            let ClientCallbackInbound::Request(release) = registry.observe_inbound(
+                11,
+                &request(
+                    json!(5),
+                    "terminal/release",
+                    "s1",
+                    json!({ "terminalId": terminal_id }),
+                ),
+            ) else {
+                panic!("expected terminal/release callback");
+            };
+            let response: Value =
+                serde_json::from_str(&registry.render_response(&release).await).unwrap();
+            assert_eq!(response["result"], json!({}));
+            assert!(registry.settle(&release));
+            assert_eq!(registry.terminal_len().await, 0);
+            fs::remove_dir_all(root).ok();
+        });
+    }
+
+    #[test]
+    fn terminal_wait_never_blocks_generation_reset() {
+        tauri::async_runtime::block_on(async {
+            let root = workspace();
+            let registry = Arc::new(ClientCallbackRegistry::default());
+            registry.reset(12).await;
+            let opening = registry.begin_session_open(12, Some("s1"), &root).unwrap();
+            registry.commit_session_open(&opening, "s1").unwrap();
+            let ClientCallbackInbound::Request(create) = registry.observe_inbound(
+                12,
+                &request(
+                    json!(1),
+                    "terminal/create",
+                    "s1",
+                    long_terminal_params(),
+                ),
+            ) else {
+                panic!("expected terminal/create callback");
+            };
+            let response: Value =
+                serde_json::from_str(&registry.render_response(&create).await).unwrap();
+            let terminal_id = response["result"]["terminalId"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            registry.settle(&create);
+            let ClientCallbackInbound::Request(wait) = registry.observe_inbound(
+                12,
+                &request(
+                    json!(2),
+                    "terminal/wait_for_exit",
+                    "s1",
+                    json!({ "terminalId": terminal_id }),
+                ),
+            ) else {
+                panic!("expected terminal/wait_for_exit callback");
+            };
+            let waiter_registry = Arc::clone(&registry);
+            let waiter = tokio::spawn(async move { waiter_registry.render_response(&wait).await });
+            tokio::task::yield_now().await;
+            tokio::time::timeout(Duration::from_secs(1), registry.reset(13))
+                .await
+                .expect("generation reset must not wait for terminal exit callback");
+            assert_eq!(registry.terminal_len().await, 0);
+            tokio::time::timeout(Duration::from_secs(2), waiter)
+                .await
+                .expect("killed terminal waiter should settle")
+                .unwrap();
+            fs::remove_dir_all(root).ok();
+        });
+    }
+
+    #[test]
+    fn aborting_provisional_session_releases_owned_terminals() {
+        tauri::async_runtime::block_on(async {
+            let root = workspace();
+            let registry = ClientCallbackRegistry::default();
+            registry.reset(14).await;
+            let opening = registry.begin_session_open(14, None, &root).unwrap();
+            let ClientCallbackInbound::Request(create) = registry.observe_inbound(
+                14,
+                &request(
+                    json!(1),
+                    "terminal/create",
+                    "provisional",
+                    long_terminal_params(),
+                ),
+            ) else {
+                panic!("expected provisional terminal/create callback");
+            };
+            let response: Value =
+                serde_json::from_str(&registry.render_response(&create).await).unwrap();
+            assert!(response.get("result").is_some());
+            registry.settle(&create);
+            assert_eq!(registry.terminal_len().await, 1);
+            registry.abort_session_open(&opening).await;
+            assert_eq!(registry.terminal_len().await, 0);
+            fs::remove_dir_all(root).ok();
+        });
     }
 }

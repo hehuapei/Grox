@@ -1522,6 +1522,7 @@ dependencies = [
  "chrono",
  "getrandom 0.3.4",
  "image",
+ "libc",
  "percent-encoding",
  "reqwest 0.12.28",
  "rfd",

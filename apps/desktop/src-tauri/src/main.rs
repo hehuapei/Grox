@@ -23,11 +23,13 @@ mod path_sandbox;
 #[cfg(windows)]
 mod process_job;
 mod prompt_queue_store;
+mod process_env;
 mod session_coordinator;
 mod session_journal_store;
 mod session_runtime;
 mod session_storage;
 mod support_bundle;
+mod terminal_host;
 mod tray;
 mod turn_runtime;
 
@@ -441,6 +443,7 @@ struct AgentRuntimeStatus {
     pending_interactions: usize,
     pending_client_callbacks: usize,
     bound_client_sessions: usize,
+    active_terminals: usize,
 }
 
 #[derive(Serialize)]
@@ -477,6 +480,7 @@ async fn agent_runtime_status(
         pending_interactions: state.interactions.snapshots().len(),
         pending_client_callbacks: state.client_callbacks.pending_len(),
         bound_client_sessions: state.client_callbacks.bound_len(),
+        active_terminals: state.client_callbacks.terminal_len().await,
     })
 }
 
@@ -3290,6 +3294,7 @@ async fn export_session_support_bundle(
         "pendingInteractions": state.interactions.snapshots().len(),
         "pendingClientCallbacks": state.client_callbacks.pending_len(),
         "boundClientSessions": state.client_callbacks.bound_len(),
+        "activeTerminals": state.client_callbacks.terminal_len().await,
         "sessionOccupancy": state.sessions.snapshot(),
         "automationRunner": automation_runner.status(state.inner()).await,
         "cli": {
@@ -3802,7 +3807,7 @@ async fn terminate_process(mut process: AgentProcess) {
     // Job Object first: kills grandchildren that child.kill() alone orphans on Windows.
     #[cfg(windows)]
     if let Some(job) = process.job.take() {
-        job.terminate_tree();
+        let _ = job.terminate_tree();
         drop(job);
     }
     let _ = process.child.kill().await;
@@ -7646,28 +7651,35 @@ async fn discard_failed_runtime(
 
 async fn handle_client_callback_line(
     app: &tauri::AppHandle,
-    state: &AcpState,
+    state: &Arc<AcpState>,
     generation: u64,
     line: &str,
 ) -> bool {
-    // Process reset takes the same lock, so an old Agent cannot keep mutating
-    // files while its generation is being replaced.
-    let _operation_guard = state.client_callbacks.lock_operations().await;
-    match state.client_callbacks.observe_inbound(generation, line) {
+    // 短锁只保护解析与 reset 的先后关系。实际文件操作会重新取得该锁；
+    // terminal/wait_for_exit 则必须脱离 stdout reader 独立等待。
+    let inbound = {
+        let _operation_guard = state.client_callbacks.lock_operations().await;
+        state.client_callbacks.observe_inbound(generation, line)
+    };
+    match inbound {
         ClientCallbackInbound::NotCallback => false,
         ClientCallbackInbound::Request(lease) => {
-            let response = state.client_callbacks.render_response(&lease);
-            state
-                .foreground_turns
-                .observe_outbound(generation, &response);
-            let write_result = write_acp_line(state, &response, generation).await;
-            state.client_callbacks.settle(&lease);
-            if let Err(error) = write_result {
-                let (session_id, method) = ClientCallbackRegistry::describe(&lease);
-                let _ = app.emit(
-                    "acp-stderr",
-                    format!("Client callback 回复失败（{method}，session={session_id}）：{error}"),
-                );
+            if ClientCallbackRegistry::waits_for_terminal_exit(&lease) {
+                let callback_app = app.clone();
+                let callback_state = Arc::clone(state);
+                tauri::async_runtime::spawn(async move {
+                    settle_client_callback(
+                        &callback_app,
+                        callback_state.as_ref(),
+                        generation,
+                        lease,
+                    )
+                    .await;
+                });
+            } else {
+                // 文件写入和短终端操作保持 wire 到达顺序；只有可能无限
+                // 等待的 wait_for_exit 脱离 stdout reader。
+                settle_client_callback(app, state.as_ref(), generation, lease).await;
             }
             true
         }
@@ -7675,7 +7687,7 @@ async fn handle_client_callback_line(
             state
                 .foreground_turns
                 .observe_outbound(generation, &response);
-            if let Err(error) = write_acp_line(state, &response, generation).await {
+            if let Err(error) = write_acp_line(state.as_ref(), &response, generation).await {
                 let _ = app.emit(
                     "acp-stderr",
                     format!("Client callback 自动拒绝回复失败：{error}"),
@@ -7697,6 +7709,27 @@ async fn handle_client_callback_line(
             );
             true
         }
+    }
+}
+
+async fn settle_client_callback(
+    app: &tauri::AppHandle,
+    state: &AcpState,
+    generation: u64,
+    lease: client_callbacks::ClientCallbackLease,
+) {
+    let response = state.client_callbacks.render_response(&lease).await;
+    state
+        .foreground_turns
+        .observe_outbound(generation, &response);
+    let write_result = write_acp_line(state, &response, generation).await;
+    state.client_callbacks.settle(&lease);
+    if let Err(error) = write_result {
+        let (session_id, method) = ClientCallbackRegistry::describe(&lease);
+        let _ = app.emit(
+            "acp-stderr",
+            format!("Client callback 回复失败（{method}，session={session_id}）：{error}"),
+        );
     }
 }
 
@@ -7761,6 +7794,9 @@ async fn spawn_acp_process(
     };
     let command_path = PathBuf::from(&runtime.path);
     let mut command = Command::new(&command_path);
+    if let Some(path) = process_env::enriched_path_env() {
+        command.env("PATH", path);
+    }
     command.arg("agent");
     if let Some(effort) = checked_reasoning_effort(reasoning_effort)? {
         command.arg("--reasoning-effort").arg(effort);
@@ -7875,7 +7911,7 @@ async fn spawn_acp_process(
                         }
                         if handle_client_callback_line(
                             &stdout_app,
-                            stdout_state.as_ref(),
+                            &stdout_state,
                             generation,
                             &line,
                         )
