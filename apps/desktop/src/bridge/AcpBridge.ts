@@ -71,6 +71,7 @@ import {
 import { reconcileSessionJournal } from "../lib/sessionJournalReconcile";
 import { mapToolKind } from "../lib/toolKind";
 import { displayReplayUserPrompt } from "../lib/replayUserPrompt";
+import { mergeOfflineWithLive } from "../lib/offlineMerge";
 import { AcpRpcError, decodeAcpResponse } from "./acpRpc";
 
 export const ACP_METHODS = {
@@ -115,6 +116,7 @@ interface ForegroundTurnResult {
   response: unknown;
   requestedEffort: Effort;
   effectiveEffort: Effort;
+  assistantText?: string;
 }
 
 interface ForegroundTurnStalled {
@@ -1039,6 +1041,8 @@ export class AcpBridge implements GrokBridge {
   private usage = new Map<string, Usage>();
   private sessionOptions = new Map<string, PromptOptions>();
   private activePromptSessions = new Set<string>();
+  /** 本轮已经收到 ACP 文本事件；用于避免 Host 最终文本补齐产生重复气泡。 */
+  private liveAssistantSessions = new Set<string>();
   /** 客户端操作 id 只用于把“发送前 Stop”归属到同一 Host 回合。 */
   private foregroundTurnIds = new Map<string, string>();
   private stoppingSessions = new Set<string>();
@@ -2330,6 +2334,7 @@ export class AcpBridge implements GrokBridge {
             && (isWorkflowLaunchAcknowledgement(delta) || isWorkflowControlAcknowledgement(delta)))
           || (workflowCompletionContinuation && cancelledWorkflowCompletion)
         ) return;
+        this.liveAssistantSessions.add(sessionId);
         if (hostManaged) {
           if (!hostAssistant) return;
           this.emit({
@@ -3537,15 +3542,7 @@ export class AcpBridge implements GrokBridge {
 
     if (background) {
       try {
-        const preview = await invoke<SessionDiskPreview | null>("preview_session_from_disk", { id });
-        if (preview?.entries.length) {
-          this.emit({
-            type: "session_ready",
-            session: sessionFromDiskPreview(meta, preview),
-            background: true,
-            preview: true,
-          });
-        }
+        await this.emitDiskSessionPreview(id, meta, true);
       } catch {
         // A missing or unreadable local preview must not block canonical ACP restore.
       }
@@ -3578,7 +3575,7 @@ export class AcpBridge implements GrokBridge {
         await this.replayAfterLatestRewind(id, meta.cwd, meta);
       }
       const replayed = this.replaying.get(id) ?? emptySession(meta);
-      const finalized: Session = {
+      let finalized: Session = {
         ...replayed,
         usage: this.usage.get(id) ?? replayed.usage,
         status: this.sessionGateStatus(id) ?? "idle",
@@ -3590,6 +3587,20 @@ export class AcpBridge implements GrokBridge {
               : block,
         ),
       };
+      if (background) {
+        try {
+          const disk = await invoke<SessionDiskPreview | null>("preview_session_from_disk", { id });
+          if (disk?.entries.length) {
+            finalized = {
+              ...mergeOfflineWithLive(sessionFromDiskPreview(meta, disk), finalized),
+              preview: false,
+            };
+          }
+        } catch (cause) {
+          this.diagnostics.push(`会话磁盘历史合并失败：${cleanApiError(cause)}`);
+          this.diagnostics = this.diagnostics.slice(-20);
+        }
+      }
       this.replaying.delete(id);
       this.knownSessions.add(id);
       // Drop sticky model/effort so the next prompt re-binds via set_model
@@ -3614,6 +3625,22 @@ export class AcpBridge implements GrokBridge {
       this.replaying.delete(id);
       throw error;
     }
+  }
+
+  private async emitDiskSessionPreview(
+    id: string,
+    meta: SessionMeta,
+    preview: boolean,
+  ): Promise<boolean> {
+    const disk = await invoke<SessionDiskPreview | null>("preview_session_from_disk", { id });
+    if (!disk?.entries.length) return false;
+    this.emit({
+      type: "session_ready",
+      session: sessionFromDiskPreview(meta, disk),
+      background: true,
+      preview,
+    });
+    return true;
   }
 
   /**
@@ -3843,6 +3870,7 @@ export class AcpBridge implements GrokBridge {
       this.knownSessions.add(sessionId);
       this.closeUser(sessionId);
       this.openToolCalls.delete(sessionId);
+      this.liveAssistantSessions.delete(sessionId);
       this.emit({ type: "status", sessionId, status: "running" });
 
       const result = await invoke<ForegroundTurnResult>("execute_foreground_turn", {
@@ -3884,6 +3912,19 @@ export class AcpBridge implements GrokBridge {
       const meta = record(response?._meta);
       const promptUsage = record(meta?.usage);
       if (promptUsage) this.emitUsage(sessionId, promptUsage);
+      if (result.assistantText?.trim() && !this.liveAssistantSessions.has(sessionId)) {
+        this.emit({
+          type: "block_add",
+          sessionId,
+          block: {
+            type: "assistant",
+            id: uid(),
+            text: result.assistantText,
+            ts: Date.now(),
+            streaming: false,
+          },
+        });
+      }
       await this.refreshSessionInfo(sessionId);
     } catch (error) {
       const cancelled = this.stoppingSessions.has(sessionId);
@@ -3903,6 +3944,7 @@ export class AcpBridge implements GrokBridge {
         this.foregroundTurnIds.delete(sessionId);
       }
       this.stoppingSessions.delete(sessionId);
+      this.liveAssistantSessions.delete(sessionId);
       this.markPromptFinished(sessionId);
     }
   }

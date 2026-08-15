@@ -1074,11 +1074,14 @@ export const useDesktop = create<DesktopState>((set, get) => {
           if (hydration.journalError) publishJournalReadError(sessionId, hydration.journalError);
           if (hydration.agentError) publishAgentHistoryReadError(sessionId, hydration.agentError);
           if (!hydration.session) continue;
-          // An active snapshot is only crash evidence during startup. In the live
-          // process an idle event can race ahead of the queued settled write.
-          if (hydration.outcome === "interrupted") continue;
-
-          const candidate = mergeOfflineWithLive(hydration.session, latest);
+          // The Agent can persist its final answer before our queued settled
+          // journal write lands. The live idle status proves this is a normal
+          // completion, so remove the provisional crash marker and keep the
+          // Agent transcript instead of silently dropping the final answer.
+          const hydrated = hydration.outcome === "interrupted"
+            ? resumeInterruptedSessionIfHostActive(hydration.session).session
+            : hydration.session;
+          const candidate = mergeOfflineWithLive(hydrated, latest);
           candidate.status = latest.status;
           if (sessionTranscriptSignature(candidate) === sessionTranscriptSignature(latest)) continue;
           const next = { ...candidate, updatedAt: Date.now() };
@@ -1504,7 +1507,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           spineMerged = mergeOfflineWithLive(filteredSession, existing);
         }
         const readySession = e.preview && existing
-          ? existing
+          ? mergeOfflineWithLive(filteredSession, existing)
           : spineMerged
             ? spineMerged
           : localPreviewSuffix.length > 0
@@ -2255,7 +2258,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
       // Local cache + disk jsonl first (fast paint). ACP may fail with "找不到会话"
       // when the CLI catalogue no longer lists a sidebar id.
-      if (openMeta && (!existing || existing.blocks.length === 0 || existing.preview)) {
+      if (openMeta && (!existing || existing.blocks.length === 0 || existing.preview || isSessionTerminal(existing.status))) {
         void hydrateSessionOfflineDetailed(id, openMeta).then((hydration) => {
           if (hydration.journalError) publishJournalReadError(id, hydration.journalError);
           if (hydration.agentError) publishAgentHistoryReadError(id, hydration.agentError);

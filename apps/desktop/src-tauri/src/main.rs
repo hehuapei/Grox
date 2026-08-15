@@ -897,27 +897,13 @@ enum ProviderApiBackend {
 }
 
 impl ProviderApiBackend {
-    fn config_value(self, provider_name: &str, base_url: &str) -> &'static str {
+    fn config_value(self, _provider_name: &str, _base_url: &str) -> &'static str {
         match self {
             Self::Responses => "responses",
             Self::ChatCompletions => "chat_completions",
-            Self::Auto => {
-                let identity = format!("{provider_name} {base_url}").to_ascii_lowercase();
-                if [
-                    "grok2api",
-                    "cliproxyapi",
-                    "cli-proxy-api",
-                    "router-for-me",
-                    "newapi",
-                ]
-                .iter()
-                .any(|marker| identity.contains(marker))
-                {
-                    "responses"
-                } else {
-                    "chat_completions"
-                }
-            }
+            // 供应商名称不是协议证据。兼容服务默认走 Chat Completions；
+            // 仅在用户明确选择时启用 Responses。
+            Self::Auto => "chat_completions",
         }
     }
 }
@@ -10537,7 +10523,6 @@ mod tests {
             }
         );
     }
-
     #[test]
     fn atomic_write_replaces_without_delete_first_gap() {
         let root = std::env::temp_dir().join(format!(
@@ -11456,7 +11441,7 @@ OPENAI_API_KEY=******** # keep env comment
     }
 
     #[test]
-    fn provider_backend_choice_is_honored_and_auto_is_conservative() {
+    fn provider_backend_choice_is_honored_and_auto_does_not_guess_from_name() {
         assert_eq!(
             ProviderApiBackend::Responses.config_value("custom", "https://api.example/v1"),
             "responses"
@@ -11472,7 +11457,7 @@ OPENAI_API_KEY=******** # keep env comment
         );
         assert_eq!(
             ProviderApiBackend::Auto.config_value("CLIProxyAPI", "https://gateway.example/v1"),
-            "responses"
+            "chat_completions"
         );
     }
 

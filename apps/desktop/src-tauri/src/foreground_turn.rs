@@ -58,6 +58,39 @@ pub(crate) struct ForegroundTurnResult {
     response: Value,
     requested_effort: String,
     effective_effort: String,
+    assistant_text: Option<String>,
+}
+
+fn disk_assistant_messages(session_id: &str) -> Vec<String> {
+    crate::preview_session_from_disk(session_id.to_string())
+        .ok()
+        .flatten()
+        .map(|preview| {
+            preview
+                .entries
+                .into_iter()
+                .filter_map(|entry| match entry {
+                    crate::SessionPreviewEntry::Message { role, text } if role == "assistant" => {
+                        Some(text)
+                    }
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+async fn new_disk_assistant_text(session_id: &str, previous_count: usize) -> Option<String> {
+    for delay_ms in [0, 50, 150, 300] {
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        let messages = disk_assistant_messages(session_id);
+        if messages.len() > previous_count {
+            return messages.last().cloned();
+        }
+    }
+    None
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -651,6 +684,7 @@ async fn execute_prepared_foreground_turn(
     generation: u64,
     prepared: PreparedForegroundTurn,
 ) -> Result<ForegroundTurnResult, AcpHostError> {
+    let assistant_count_before = disk_assistant_messages(session_id).len();
     let permit = state
         .sessions
         .acquire_turn(session_id.to_string(), generation)
@@ -800,10 +834,12 @@ async fn execute_prepared_foreground_turn(
 
     let response = response?;
     turn.ensure_active()?;
+    let assistant_text = new_disk_assistant_text(session_id, assistant_count_before).await;
     Ok(ForegroundTurnResult {
         response,
         requested_effort: prepared.requested_effort,
         effective_effort,
+        assistant_text,
     })
 }
 
@@ -1609,6 +1645,7 @@ mod tests {
             response: json!({}),
             requested_effort: "high".into(),
             effective_effort: "high".into(),
+            assistant_text: None,
         });
         assert_eq!(
             queue_settlement_for_result(&success),
