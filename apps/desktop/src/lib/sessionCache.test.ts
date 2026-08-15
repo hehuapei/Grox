@@ -4,6 +4,7 @@ import {
   compactSession,
   nextSessionJournalSavedAt,
   parseSessionJournal,
+  recordSessionJournalHostEvent,
   sessionJournalSnapshot,
   sliceCacheBlocks,
 } from "./sessionCache";
@@ -38,7 +39,20 @@ describe("compactSession", () => {
   it("版本化 journal 保留崩溃前的回合活动事实", () => {
     const snapshot = sessionJournalSnapshot(session([], "running"), 42);
     expect(snapshot).toMatchObject({ version: 1, appSessionId: "session-1", agentSessionId: "session-1", savedAt: 42, turnState: "active" });
-    expect(snapshot.session.status).toBe("idle");
+    expect(snapshot.session.status).toBe("running");
+    expect(snapshot.session.preview).not.toBe(true);
+    expect(parseSessionJournal(JSON.stringify(snapshot), "session-1")).toEqual(snapshot);
+  });
+
+  it("journal 把待确认 Host 事件与同一份会话快照原子提交", () => {
+    recordSessionJournalHostEvent("session-1", "host-stream-a", 7);
+    recordSessionJournalHostEvent("session-1", "host-stream-a", 4);
+    const snapshot = sessionJournalSnapshot(session([
+      { type: "assistant", id: "a", text: "live", ts: 1, streaming: true },
+    ]), 43);
+
+    expect(snapshot.hostEvents).toEqual({ streamId: "host-stream-a", sequences: [4, 7] });
+    expect(snapshot.session.blocks[0]).toMatchObject({ type: "assistant", streaming: true });
     expect(parseSessionJournal(JSON.stringify(snapshot), "session-1")).toEqual(snapshot);
   });
 

@@ -1,6 +1,6 @@
 # ADR-0003：原生 Host 成为 Grox 后端唯一运行时
 
-- 状态：Accepted（迁移中）
+- 状态：Accepted（v0.3.2 已收口）
 - 日期：2026-08-14
 - 版本：v0.3.2
 - 取代：ADR-0001 第 4、6、7 条
@@ -55,6 +55,8 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 11. Agent 发起的交互请求只接受 Host 保存的 session + rpc id + generation；WebView 不得回传或猜测 wire id。
 12. Client callback 只能使用 Host 在 session/new|load 时绑定的工作区；未知会话不得回退到当前页面目录。
 13. ACP 派生的 assistant/thinking/user/tool/plan block 身份与开闭顺序只由 Host 按 session + generation + turn 推进；WebView 重载与补放不得生成第二个身份。
+14. ACP 会话事件只有在对应应用 journal 原子落盘后才能按 session + stream + 精确 sequence 确认；“WebView 已看过”不等于“事实已持久化”，媒体事件还必须等到受控文件引用落盘。
+15. WebView 重载必须先用 Host 的会话绑定、活动回合、交互门禁和自动化活动快照重建会话壳，再消费补放事件；页面消失不能把仍在运行的 Host 回合判为崩溃。
 
 ### v0.3.2 内的迁移顺序
 
@@ -65,12 +67,12 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 1 | Native ACP transport | Host 关联请求/响应并负责超时、取消、退出清算；已落地 |
 | 2 | SessionCoordinator | Host 签发/校验 lifecycle 与 turn 许可并发布占用快照；已落地 |
 | 3 | Native repositories | PromptQueueStore、AutomationStore、SessionJournalStore、DraftStore 与媒体任务 journal 已迁移；已落地 |
-| 4 | Unified turn execution | Host 自动化与普通前台回合均拥有许可、模型/模式绑定、Prompt、watchdog、取消和 effort 降级；block 身份与流式边界已归 Host，内容卡片继续由前端渲染 |
+| 4 | Unified turn execution | Host 自动化与普通前台回合均拥有许可、模型/模式绑定、Prompt、watchdog、取消和 effort 降级；block 身份、流式边界和恢复确认已归 Host；已落地 |
 | 5 | Interaction service | Host 持有权限、计划审批、ask-user 的 rpc id、代次、回复和 Stop 清算；已落地 |
 | 6 | Client callback service | Host 持有 FS/terminal callback 的 session/cwd/rpc/generation 与终端进程树生命周期；已落地 |
-| 7 | Host services | worktree 所有权、原生会话 fork 与安全删除已迁移；权限策略、媒体、密钥继续统一到会话/项目身份和路径授权 |
-| 8 | Command facade | 将 `main.rs` 按领域迁出，Tauri command 只校验 DTO 并调用服务 |
-| 9 | Error/diagnostics | 稳定错误码、运行时快照、审计事件和支持包覆盖所有上述服务 |
+| 7 | Host services | worktree、原生 fork、安全删除、权限策略、媒体与密钥均已统一到 Host 身份和路径授权；已落地 |
+| 8 | Command facade | 高风险状态、持久化和运行时职责已进入领域服务；剩余 `main.rs` 拆分只属于代码组织，不再承载第二份业务权威 |
+| 9 | Error/diagnostics | 稳定错误码、运行时快照、审计事件和支持包已覆盖上述服务；已落地 |
 
 顺序不能倒置：在 Host 尚未拥有会话状态前直接增加进程池，只会把当前分裂状态复制
 到多个进程；在 repository 尚未拥有事务前运行后台自动化，会放大队列和 journal 竞态。
@@ -160,6 +162,10 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - `session/load` 在请求前写入 `session_reset`，close/delete 写入 `session_removed`；旧进程代次的迟到事件不能清除新代次投影。AcpBridge 的 `ContentCursor` 已降为只服务 rewind 归档响应的 `ReplayContentCursor`，实时路径不再用 WebView UUID 或 Map 决定 tool/plan/text 身份；
 - Zustand 与 load replay 的 `block_add` 按 Host block id 幂等，Host 事件即使在页面重载后补放也不会追加重复卡片；assistant/thinking 的最终 streaming/live 状态由 Host close 操作收口，而不是依赖页面 Promise 的 finally 猜测当前块；
 - Host 为每个活动 user/assistant/thinking block 保存最多 1 MiB 的累计文本，只在 replay 最后一页返回同一锁截面的 active snapshot；WebView 严格按 `replay(N) → snapshot(N) → buffered(N+1...)` 恢复，游标已推进但应用 journal 尚未落盘时仍能补回正在生成的内容。截断快照只用于缺失块冷启动，不覆盖可能更完整的本地块；活动块数量与字节数进入 RuntimeStatus/支持包；
+- Host 事件不再把 localStorage 游标当作耐久性证明：应用 journal 携带当前 stream 的精确 sequence 集合，`SessionJournalStore` 校验并原子提交后才推进 Host 确认；不同会话、workflow 等其它持久化域和未完成媒体写入不能被一个全局最大游标越过；
+- 补放前通过 Host callback binding 恢复活动或含未确认事件的 session/cwd 壳，并从应用 journal 建立展示基线；已确认事件可安全跳过，未确认事件在基线之上幂等补放。活动块快照携带 `updatedThrough`，快照写入也走同一精确确认链路；
+- 应用 journal 保留 running、streaming/live 和未结算工具事实；只有 Host 活动回合已经消失时才生成 interrupted 门禁。若页面只是重载且 Host 回合仍在，occupancy 会撤销临时中断标记并继续队列与流式恢复；
+- `AutomationRunnerStatus` 持久投影当前 automation/session，页面重载不再依赖一次性 started 广播；活动状态由 reservation 析构清理，异常退出不能把任务永久留在 running；
 - Host 保留 8192 条且最多 16 MiB 的类型化有界补放窗口，超大消息只实时投影并把缺口显式记录为 truncated，不能静默伪装成完整历史；保留预算仍按原 wire 字节计量，避免结构化序列化差异绕过内存上限；
 - WebView 按“先监听、再分页补放、最后合并实时缓冲”的次序消费 `host-session-event`，并以 stream + sequence 去重。页面重载不再依赖不可重放的裸 `acp-event`；游标失配、窗口截断和持久化失败都有稳定错误代码。事件窗口健康状态进入 RuntimeStatus 与支持包；
 - Tauri single-instance 插件作为 Builder 的第一个插件注册；第二次启动只恢复并聚焦现有主窗口，不会再创建另一套 AgentRuntime、AutomationRunner 和进程内仓储锁。因此 draft、queue、automation、worktree ownership 等 Host RMW 不再暴露给两个 Grox 进程并发提交；
@@ -167,10 +173,9 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - debug binary 提供在 Tauri 初始化前退出的 mock ACP fixture；集成测试以真实 OS 子进程和 stdin/stdout 驱动交错会话流、坏 JSON、权限反向 RPC、半截 JSON EOF 与门控中异常退出，验证响应关联、EOF 和“不得伪造成功”的边界，而不是只测内存函数；
 - `file_commands` 成为工作区文件打开/定位的领域门面，路径错误、用户操作错误和系统启动失败返回稳定 `HostError`；媒体服务复用其平台动作，但保留自己的 job capability 校验，不再让原始路径 IPC 同时承担授权和执行两种职责；
 
-本切片没有把完整 SessionManager 伪装成已经迁移：连接初始化、非交互认证、建会话/恢复、
-自动化完整生命周期、普通前台回合、持久化提示队列、权限/计划/提问交互和显式 OAuth 生命周期已属于 Host。
-标准文件与 terminal client callback 及其会话工作区绑定也已属于 Host。其它仍分散的 Host 服务待迁移；
-在这些职责迁完之前不会另起一个简化 CLI 进程冒充后台运行时。
+v0.3.2 的后端职责迁移到此收口：连接、认证、会话执行与恢复、队列、自动化、交互门禁、
+Client callback、持久化、工作树、权限、媒体、密钥、错误和诊断的后台事实都由 Host 持有。
+前端仍保留卡片渲染、节流和编辑态，这是产品投影边界，不是第二套后端状态机。
 
 ## 完整后端对照结论
 
@@ -180,23 +185,23 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | ACP | Rust 透传 stdio，Bridge 关联请求 | `AcpClient` 在 Host 维护 pending/退出 | 请求归属、退出清算、入站解码、事件补放、UI block 身份/生命周期和活动文本快照已由 Host 持有 |
 | Client callback | Bridge 用当前页面 catalogue 猜 FS cwd；terminal 未宣告 | 未实现能力就不宣告，避免 Agent 挂起 | 文件与完整 terminal 生命周期均由 Host binding epoch 应答，能力已设为 true |
 | 会话 | Bridge + Store 共同裁决 | Host SessionManager + FSM + snapshots | 建立单一 SessionCoordinator |
-| 多会话 | 单进程共享、生命周期门控在前端 | 每应用会话进程、后台 busy 不被抢占 | 先迁权威，再用容量策略决定进程池 |
-| 持久化 | 前端组装完整 JSON，Host 原子写 | store + 锁 + journal 对账 | Host 提供语义操作和锁内 RMW |
-| 队列 | Store/localStorage 主导 | Host 运行时可观察 busy/退出 | 队列状态与发送事务绑定 |
+| 多会话 | 单进程共享、生命周期门控在前端 | 每应用会话进程、后台 busy 不被抢占 | Host 已按会话隔离生命周期、回合、binding 和流投影；v0.3.2 明确采用一个共享 CLI 进程 |
+| 持久化 | 前端组装完整 JSON，Host 原子写 | store + 锁 + journal 对账 | Host 仓储、tombstone、单调版本和精确事件确认共同约束落盘 |
+| 队列 | Store/localStorage 主导 | Host 运行时可观察 busy/退出 | Host 原子领取/消费/回队，异常退出不重复发送 |
 | 自动化 | Host 已拥有认领、建会话、运行时注册、能力租约、模型/模式、Prompt、崩溃去重与结算；页面只做 started/settled 投影 | runner 复用 SessionManager | 前台与后台共用 SessionCoordinator/turn_runtime，页面登记屏障已删除 |
 | 认证 | WebView 曾持有 authenticate promise、URL 轮询和取消时序 | 单例认证事务、可取消子进程、硬超时、认证后淘汰旧 runtime | `agent_auth` 按 generation 持有 ACP OAuth；页面只 start/cancel/status 并消费事件 |
 | 工作树 | Host 已持久化 session 关联并拥有创建/fork/引用检查/删除事务；旧 localStorage 安全源已删除 | worktree 与 session metadata 绑定、原生复制会话上下文 | 已完成 Host 所有权索引、干净树门禁、失败回滚、目标绑定确认和同名仓库隔离 |
 | 权限/提问 | Host 已按 session + generation 持有反向 RPC、统一权限上限、偏好事务、原生提权确认、scoped option 映射和决定审计；持久 allow cache 仍由 Grok Build 原生 option 负责 | 每会话策略、allow cache、Host resolve | 权限裁决与审计已迁移；后续再扩展项目/会话分层策略，不复制 Agent 的持久规则库 |
 | 媒体 | Host 已持有生成任务、取消、参考图租约、结构化产物授权和跨进程任务 journal（ADR 0004） | token loopback + path scope | Host 恢复有界任务历史，按 job 身份重新授权产物动作，崩溃遗留显式结算，WebView 只投影 |
 | 密钥 | Host SecretStore 已接管供应商密钥，档案与 `.env` 只留非敏感路由元数据（ADR 0005） | OS keychain + 受限文件后备 | 后端类型显式投影，删除墓碑防复活，诊断永不带值 |
-| 错误 | ACP、持久化、权限、媒体与供应商高风险命令已共享 HostError 契约 | 稳定 AgentErrorCode | 前端已删除文案推断；继续把低风险旧命令迁入领域 facade |
+| 错误 | ACP、持久化、权限、媒体与供应商命令共享 HostError 契约 | 稳定 AgentErrorCode | 前端按 protocol/operation/environment 和稳定 code 呈现，不再从文案推断 |
 | 诊断 | support bundle 已有但依赖前端快照 | 日志、运行时、审计集中 | Host runtime/event/log 快照为主，支持包含脱敏原生日志尾部，前端快照只作补充 |
-| 测试 | 工具函数测试多，跨层运行时少 | mock ACP、路由/停机/竞态测试 | 已增加真实 mock ACP 子进程故障注入；继续覆盖多 runtime 容量策略 |
+| 测试 | 工具函数测试多，跨层运行时少 | mock ACP、路由/停机/竞态测试 | 已覆盖真实 mock ACP 子进程、恢复、精确确认、门禁、异常退出和仓储竞态 |
 
 ## Consequences
 
 - WebView 刷新或隐藏不再决定任务是否创建、执行或结算，也不会丢失仍在 Host 等待的权限/提问、正在进行的 OAuth 或 Agent terminal；会话关闭和 Host 退出会清理终端进程树。已创建会话但未结算的自动化在租约过期后会标记结果未知并禁止自动重放。完全退出 Grox 进程后调度仍会暂停，这是明确限制。
-- 迁移期间仍保留一个共享 CLI 进程；这是真实限制，不伪装成进程池。
-- `AcpBridge` 不再解析 JSON-RPC、x.ai wrapper、回复 Agent 反向 RPC或为实时内容生成 block id；它仍负责把 Host 的类型化 update/operation/snapshot 转换为具体 UI 卡片。活动流的落盘窗口已由 Host 累计快照覆盖；已经关闭的历史块若要获得同等级保证，仍需让应用 journal 的持久化确认推进 Host durable frontier，而不是无限扩大内存快照。
+- v0.3.2 明确保留一个共享官方 CLI 进程；这是一项已记录的产品容量边界，不是未完成的平行后端。它支持多个 ACP 会话，但不承诺进程级隔离。
+- `AcpBridge` 不再解析 JSON-RPC、x.ai wrapper、回复 Agent 反向 RPC或为实时内容生成 block id；它只把 Host 的类型化 update/operation/snapshot 转换为 UI 卡片。活动流和已关闭历史块都通过应用 journal 的精确耐久确认闭合崩溃窗口。
 - Host 模块会增加，但每次拆分必须伴随职责迁移、测试或不变量，禁止只为了缩短文件。
-- v0.3.2 完成标准不是“看起来像 grok-app”，而是上述十三条不变量可由 Host 测试证明。
+- v0.3.2 完成标准不是“看起来像 grok-app”，而是上述十五条不变量可由 Host 与跨层测试证明；该标准已经满足。

@@ -213,6 +213,14 @@ impl ClientCallbackRegistry {
         self.lock().sessions.keys().cloned().collect()
     }
 
+    pub(crate) fn bound_session_workspaces(&self) -> Vec<(String, PathBuf)> {
+        self.lock()
+            .sessions
+            .iter()
+            .map(|(session_id, binding)| (session_id.clone(), binding.workspace.clone()))
+            .collect()
+    }
+
     /// 返回当前进程代次内实际绑定到目标目录的会话。worktree 删除门禁用
     /// Host 绑定补住 session/new 成功后 journal 尚未落盘的短窗口。
     pub(crate) fn sessions_within(&self, target: &Path) -> BTreeSet<String> {
@@ -669,6 +677,10 @@ mod tests {
             .commit_session_open(&opening, "created-session")
             .unwrap();
         assert_eq!(registry.bound_len(), 1);
+        assert_eq!(
+            registry.bound_session_workspaces(),
+            vec![("created-session".into(), root.clone())]
+        );
 
         let ClientCallbackInbound::Request(read) = registry.observe_inbound(
             3,

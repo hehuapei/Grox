@@ -34,6 +34,8 @@ pub(crate) struct HostSessionEvent {
     method: Option<String>,
     update_type: Option<String>,
     projection: HostSessionProjection,
+    journal_recoverable: bool,
+    journal_acknowledged: bool,
     #[serde(skip)]
     wire_bytes: usize,
     #[serde(skip)]
@@ -90,6 +92,7 @@ pub(crate) struct HostActiveBlockSnapshot {
     block_type: &'static str,
     block_id: String,
     started_at: u64,
+    updated_through: u64,
     text: String,
     text_complete: bool,
 }
@@ -118,6 +121,8 @@ pub(crate) struct HostSessionEventStatus {
     dropped_through: u64,
     active_blocks: usize,
     active_block_bytes: usize,
+    journal_recoverable_events: usize,
+    journal_acknowledged_events: usize,
 }
 
 struct JournalState {
@@ -134,6 +139,7 @@ struct JournalState {
 struct OpenBlock {
     id: String,
     started_at: u64,
+    updated_through: u64,
     text: String,
     text_complete: bool,
 }
@@ -188,6 +194,7 @@ impl SessionEventJournal {
         state.next_sequence = state.next_sequence.saturating_add(1);
         let received_at = unix_time_ms();
         project_block_identity(&mut state, generation, sequence, received_at, &mut decoded);
+        let journal_recoverable = projection_is_journal_recoverable(&decoded.projection);
         let event = HostSessionEvent {
             stream_id: state.stream_id.clone(),
             sequence,
@@ -197,6 +204,8 @@ impl SessionEventJournal {
             method: decoded.method,
             update_type: decoded.update_type,
             projection: decoded.projection,
+            journal_recoverable,
+            journal_acknowledged: false,
             wire_bytes,
             unsupported_response: decoded.unsupported_response,
         };
@@ -324,6 +333,46 @@ impl SessionEventJournal {
         }
     }
 
+    /// 只有应用会话 journal 成功原子落盘后才确认对应事件。确认按精确
+    /// sequence 记录，不使用“最大游标”，避免一个会话越过另一个会话或
+    /// workflow/localStorage 等不同持久化域的未落盘事件。
+    pub(crate) fn acknowledge_session_events(
+        &self,
+        stream_id: &str,
+        session_id: &str,
+        sequences: &[u64],
+    ) -> usize {
+        if sequences.is_empty() {
+            return 0;
+        }
+        let mut state = self.lock();
+        if stream_id != state.stream_id {
+            tracing::debug!(
+                target: "grox::session_events",
+                session_id,
+                "ignoring journal acknowledgement from a previous Host stream"
+            );
+            return 0;
+        }
+        let requested = sequences
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut acknowledged = 0;
+        for event in &mut state.events {
+            if !requested.contains(&event.sequence)
+                || event.session_id.as_deref() != Some(session_id)
+                || !event.journal_recoverable
+                || event.journal_acknowledged
+            {
+                continue;
+            }
+            event.journal_acknowledged = true;
+            acknowledged += 1;
+        }
+        acknowledged
+    }
+
     pub(crate) fn status(&self) -> HostSessionEventStatus {
         let state = self.lock();
         let latest_sequence = state.next_sequence.saturating_sub(1);
@@ -340,6 +389,16 @@ impl SessionEventJournal {
             dropped_through: state.dropped_through,
             active_blocks: active_block_count(&state),
             active_block_bytes: active_block_bytes(&state),
+            journal_recoverable_events: state
+                .events
+                .iter()
+                .filter(|event| event.journal_recoverable)
+                .count(),
+            journal_acknowledged_events: state
+                .events
+                .iter()
+                .filter(|event| event.journal_acknowledged)
+                .count(),
         }
     }
 
@@ -395,6 +454,7 @@ fn active_block_snapshots(state: &JournalState) -> Vec<HostActiveBlockSnapshot> 
                 block_type,
                 block_id: block.id.clone(),
                 started_at: block.started_at,
+                updated_through: block.updated_through,
                 text: block.text.clone(),
                 text_complete: block.text_complete,
             });
@@ -456,9 +516,32 @@ fn lifecycle_event(
             phase,
             block_ops,
         },
+        journal_recoverable: phase != "session_removed",
+        journal_acknowledged: false,
         wire_bytes: 0,
         unsupported_response: None,
     }
+}
+
+fn projection_is_journal_recoverable(projection: &HostSessionProjection) -> bool {
+    let HostSessionProjection::SessionUpdate { update_type, .. } = projection else {
+        return matches!(
+            projection,
+            HostSessionProjection::BlockLifecycle { phase, .. } if *phase != "session_removed"
+        );
+    };
+    !matches!(
+        update_type.as_deref(),
+        None | Some(
+            "current_mode_update"
+                | "available_commands_update"
+                | "workflow_updated"
+                | "subagent_spawned"
+                | "subagent_progress"
+                | "subagent_finished"
+                | "rewind_marker"
+        )
+    )
 }
 
 fn project_block_identity(
@@ -544,6 +627,7 @@ fn project_block_identity(
             let (delta, complete) = content_text(update.get("content").unwrap_or(&Value::Null));
             if let Some(block) = projection.user.as_mut() {
                 append_block_text(block, &delta, complete);
+                block.updated_through = sequence;
             }
             if prompt_index.is_some() {
                 projection.user_prompt_index = prompt_index;
@@ -656,6 +740,7 @@ fn project_stream_block(
     }
     if let Some(block) = slot.as_mut() {
         append_block_text(block, delta, delta_complete);
+        block.updated_through = sequence;
     }
 }
 
@@ -687,6 +772,7 @@ fn new_block(stream_id: &str, sequence: u64, suffix: &str, started_at: u64) -> O
     OpenBlock {
         id: format!("host-block-{stream_id}-{sequence}-{suffix}"),
         started_at,
+        updated_through: sequence,
         text: String::new(),
         text_complete: true,
     }
@@ -1080,6 +1166,8 @@ mod tests {
         assert_eq!(status.dropped_through, 0);
         assert_eq!(status.active_blocks, 0);
         assert_eq!(status.active_block_bytes, 0);
+        assert_eq!(status.journal_recoverable_events, 0);
+        assert_eq!(status.journal_acknowledged_events, 0);
     }
 
     #[test]
@@ -1223,6 +1311,7 @@ mod tests {
         assert_eq!(active.session_id, "s1");
         assert_eq!(active.block_type, "assistant");
         assert_eq!(active.block_id, block_ops(&first)[0].block_id);
+        assert_eq!(active.updated_through, second.sequence);
         assert_eq!(active.text, "hello world");
         assert!(active.text_complete);
         let status = journal.status();
@@ -1235,6 +1324,47 @@ mod tests {
             .active_blocks
             .is_empty());
         assert_eq!(journal.status().active_block_bytes, 0);
+    }
+
+    #[test]
+    fn journal_acknowledgement_is_exact_session_scoped_and_replay_visible() {
+        let journal = SessionEventJournal::default();
+        let transcript = journal.append(
+            8,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"saved"}}}}"#.into(),
+        );
+        let workflow = journal.append(
+            8,
+            r#"{"method":"x.ai/session_notification","params":{"sessionId":"s1","update":{"sessionUpdate":"workflow_updated","runId":"wf1"}}}"#.into(),
+        );
+        let removed = journal.remove_session(8, "s1");
+        assert!(transcript.journal_recoverable);
+        assert!(!workflow.journal_recoverable);
+        assert!(!removed.journal_recoverable);
+
+        assert_eq!(
+            journal.acknowledge_session_events(
+                &transcript.stream_id,
+                "other-session",
+                &[transcript.sequence]
+            ),
+            0
+        );
+        assert_eq!(
+            journal.acknowledge_session_events(
+                &transcript.stream_id,
+                "s1",
+                &[transcript.sequence, workflow.sequence]
+            ),
+            1
+        );
+
+        let replay = journal.replay(Some(&transcript.stream_id), 0, None);
+        assert!(replay.events[0].journal_acknowledged);
+        assert!(!replay.events[1].journal_acknowledged);
+        let status = journal.status();
+        assert_eq!(status.journal_recoverable_events, 1);
+        assert_eq!(status.journal_acknowledged_events, 1);
     }
 
     #[test]

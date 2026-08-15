@@ -558,6 +558,8 @@ export interface AutomationRunnerStatus {
   checkedAt: number | null;
   runtimeReady: boolean;
   runtimeBusy: boolean;
+  activeAutomationId?: string | null;
+  activeSession?: AutomationSessionStarted | null;
 }
 
 export interface AutomationSessionSettled {
@@ -579,6 +581,7 @@ export type BridgeEvent =
   | { type: "auth_state"; state: AuthState }
   | { type: "runtime_state"; state: RuntimeConnectionState }
   | { type: "runtime_occupancy"; occupancy: RuntimeOccupancy }
+  | { type: "session_journal_checkpoint"; sessionId: string; streamId: string; sequence: number }
   | { type: "prompt_queue_changed"; sessionId: string; itemId: string; queue: unknown[]; reason: "claimed" | "consumed" | "recovered" }
   | { type: "automation_session_started"; started: AutomationSessionStarted }
   | { type: "automation_session_settled"; settled: AutomationSessionSettled }

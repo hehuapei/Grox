@@ -1,9 +1,18 @@
 import { createInterface } from "node:readline";
 import { spawn, spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const command = process.env.GROK_COMMAND || "grok";
-const expectedVersion = process.env.GROK_EXPECTED_VERSION || "1.0.0";
+const integrationState = JSON.parse(readFileSync(
+  new URL("../.grox/official-cli.json", import.meta.url),
+  "utf8",
+));
+const expectedVersion = process.env.GROK_EXPECTED_VERSION
+  || integrationState.integrationTarget?.publicVersion;
+if (typeof expectedVersion !== "string" || !expectedVersion) {
+  throw new Error(".grox/official-cli.json 缺少 integrationTarget.publicVersion");
+}
 const versionRun = spawnSync(command, ["--version"], { encoding: "utf8", shell: process.platform === "win32" });
 const versionText = `${versionRun.stdout ?? ""}${versionRun.stderr ?? ""}`.trim();
 if (!new RegExp(`\\bgrok ${expectedVersion.replaceAll(".", "\\.")}\\b`).test(versionText)) {

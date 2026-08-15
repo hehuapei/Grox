@@ -19,6 +19,10 @@ export interface SessionJournalSnapshot {
   agentSessionId: string;
   savedAt: number;
   turnState: SessionJournalTurnState;
+  hostEvents?: {
+    streamId: string;
+    sequences: number[];
+  };
   session: Session;
 }
 
@@ -48,6 +52,24 @@ function freezeBlock(block: SessionBlock): SessionBlock {
     call: {
       ...block.call,
       status: block.call.status === "running" || block.call.status === "pending" ? "done" : block.call.status,
+      input: truncate(block.call.input, MAX_TOOL_TEXT),
+      output: truncate(block.call.output, MAX_TOOL_TEXT),
+      images: durableToolImages(block.call.images),
+      terminal: block.call.terminal ? { ...block.call.terminal, lines: block.call.terminal.lines.slice(-80) } : undefined,
+    },
+  };
+  if (block.type === "system") return { ...block, text: truncate(block.text, MAX_TOOL_TEXT) ?? "" };
+  return block;
+}
+
+function journalBlock(block: SessionBlock): SessionBlock {
+  if (block.type === "assistant") return { ...block, text: truncate(block.text, MAX_BODY_TEXT) ?? "" };
+  if (block.type === "thinking") return { ...block, text: truncate(block.text, MAX_BODY_TEXT) ?? "" };
+  if (block.type === "user") return { ...block, text: truncate(block.text, MAX_BODY_TEXT) ?? "" };
+  if (block.type === "tool") return {
+    ...block,
+    call: {
+      ...block.call,
       input: truncate(block.call.input, MAX_TOOL_TEXT),
       output: truncate(block.call.output, MAX_TOOL_TEXT),
       images: durableToolImages(block.call.images),
@@ -91,14 +113,57 @@ export function compactSession(session: Session): Session {
   };
 }
 
+function journalSession(session: Session): Session {
+  return {
+    ...session,
+    blocks: sliceCacheBlocks(session.blocks, MAX_JOURNAL_BLOCKS).map(journalBlock),
+  };
+}
+
+interface PendingHostEvents {
+  streamId: string;
+  sequences: Set<number>;
+}
+
+const pendingHostEvents = new Map<string, PendingHostEvents>();
+
+export function recordSessionJournalHostEvent(
+  sessionId: string,
+  streamId: string,
+  sequence: number,
+): void {
+  if (!sessionId || !streamId || !Number.isSafeInteger(sequence) || sequence < 1) return;
+  let pending = pendingHostEvents.get(sessionId);
+  if (!pending || pending.streamId !== streamId) {
+    pending = { streamId, sequences: new Set<number>() };
+    pendingHostEvents.set(sessionId, pending);
+  }
+  pending.sequences.add(sequence);
+  if (pending.sequences.size > 8_192) {
+    const oldest = Math.min(...pending.sequences);
+    pending.sequences.delete(oldest);
+  }
+}
+
+function snapshotHostEvents(sessionId: string): SessionJournalSnapshot["hostEvents"] {
+  const pending = pendingHostEvents.get(sessionId);
+  if (!pending || pending.sequences.size === 0) return undefined;
+  return {
+    streamId: pending.streamId,
+    sequences: [...pending.sequences].sort((left, right) => left - right),
+  };
+}
+
 export function sessionJournalSnapshot(session: Session, savedAt = Date.now()): SessionJournalSnapshot {
+  const hostEvents = snapshotHostEvents(session.id);
   return {
     version: 1,
     appSessionId: session.id,
     agentSessionId: session.id,
     savedAt,
     turnState: isSessionTerminal(session.status) ? "settled" : "active",
-    session: compactSession(session),
+    ...(hostEvents ? { hostEvents } : {}),
+    session: journalSession(session),
   };
 }
 
@@ -132,13 +197,30 @@ export function parseSessionJournal(raw: string, id: string): SessionJournalSnap
   ) {
     throw new Error("应用会话 journal 格式无效或会话身份不匹配");
   }
+  const hostEvents = parsed.hostEvents;
+  if (hostEvents && (
+    typeof hostEvents.streamId !== "string"
+    || !hostEvents.streamId
+    || hostEvents.streamId.length > 128
+    || !/^[A-Za-z0-9_.:-]+$/.test(hostEvents.streamId)
+    || !Array.isArray(hostEvents.sequences)
+    || hostEvents.sequences.length > 8_192
+    || hostEvents.sequences.some((sequence, index) => (
+      !Number.isSafeInteger(sequence)
+      || sequence < 1
+      || (index > 0 && sequence <= hostEvents.sequences[index - 1])
+    ))
+  )) {
+    throw new Error("应用会话 journal 的 Host 事件确认无效");
+  }
   return {
     version: 1,
     appSessionId: id,
     agentSessionId: parsed.agentSessionId,
     savedAt: parsed.savedAt,
     turnState: parsed.turnState as SessionJournalTurnState,
-    session: compactSession(parsed.session),
+    ...(hostEvents ? { hostEvents } : {}),
+    session: journalSession(parsed.session),
   };
 }
 
@@ -150,8 +232,7 @@ export async function loadSessionJournal(id: string): Promise<SessionJournalSnap
     return null;
   }
   const snapshot = parseSessionJournal(raw, id);
-  journalSavedAt.set(id, snapshot.savedAt);
-  journalWriteConflicts.delete(id);
+  rememberSessionJournalSnapshot(snapshot);
   return snapshot;
 }
 
@@ -163,6 +244,14 @@ const journalWriteConflicts = new Set<string>();
 /** Latest payload per id waiting for disk (survives debounce cancellation). */
 const pendingPayloads = new Map<string, string>();
 const inFlight = new Map<string, Promise<void>>();
+
+export function rememberSessionJournalSnapshot(snapshot: SessionJournalSnapshot): void {
+  journalSavedAt.set(
+    snapshot.appSessionId,
+    Math.max(journalSavedAt.get(snapshot.appSessionId) ?? 0, snapshot.savedAt),
+  );
+  journalWriteConflicts.delete(snapshot.appSessionId);
+}
 
 function writePayload(id: string, content: string): Promise<void> {
   if (journalWriteConflicts.has(id)) return Promise.resolve();
@@ -181,6 +270,7 @@ function writePayload(id: string, content: string): Promise<void> {
       if (toWrite === undefined) return;
       pendingPayloads.delete(id);
       await invoke("write_session_journal", { id, content: toWrite });
+      clearAcknowledgedHostEvents(id, toWrite);
     })
     .catch((cause) => {
       if (String(cause).includes("journal 写入冲突")) journalWriteConflicts.add(id);
@@ -191,6 +281,19 @@ function writePayload(id: string, content: string): Promise<void> {
     });
   inFlight.set(id, next);
   return next;
+}
+
+function clearAcknowledgedHostEvents(id: string, content: string): void {
+  let acknowledged: SessionJournalSnapshot["hostEvents"];
+  try {
+    acknowledged = (JSON.parse(content) as Partial<SessionJournalSnapshot>).hostEvents;
+  } catch {
+    return;
+  }
+  const pending = pendingHostEvents.get(id);
+  if (!acknowledged || !pending || pending.streamId !== acknowledged.streamId) return;
+  for (const sequence of acknowledged.sequences) pending.sequences.delete(sequence);
+  if (pending.sequences.size === 0) pendingHostEvents.delete(id);
 }
 
 function nextSessionJournalSnapshot(session: Session): SessionJournalSnapshot {
@@ -259,6 +362,7 @@ export function cancelPendingSessionJournal(id: string): void {
   pendingPayloads.delete(id);
   journalSavedAt.delete(id);
   journalWriteConflicts.delete(id);
+  pendingHostEvents.delete(id);
 }
 
 export async function scrubSessionJournalOrphans(): Promise<number> {

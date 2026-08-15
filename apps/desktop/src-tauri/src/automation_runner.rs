@@ -5,7 +5,10 @@
 
 use std::{
     path::Path,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Mutex,
+    },
     time::Duration,
 };
 
@@ -15,8 +18,9 @@ use tauri::{AppHandle, Emitter, Manager};
 use crate::{
     acp_host::AcpHostError,
     automation_store::{AutomationCompletion, AutomationDispatch, AutomationStore},
-    automations_path, ensure_agent_runtime_ready, host_prefs, host_prefs_dir_for_app,
+    automations_path, ensure_agent_runtime_ready,
     foreground_turn::SessionProjectionTurn,
+    host_prefs, host_prefs_dir_for_app,
     mcp_leases::McpLeaseStore,
     request_acp_json,
     session_runtime::{open_agent_session_inner, OpenAgentSessionRequest},
@@ -36,6 +40,13 @@ pub(crate) struct AutomationRunner {
     started: AtomicBool,
     dispatching: AtomicBool,
     last_tick_at: AtomicU64,
+    active: Mutex<Option<AutomationRunnerActive>>,
+}
+
+#[derive(Clone)]
+struct AutomationRunnerActive {
+    automation_id: String,
+    started: Option<AutomationSessionStarted>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -44,6 +55,8 @@ pub(crate) struct AutomationRunnerStatus {
     pub(crate) checked_at: Option<u64>,
     pub(crate) runtime_ready: bool,
     pub(crate) runtime_busy: bool,
+    pub(crate) active_automation_id: Option<String>,
+    pub(crate) active_session: Option<AutomationSessionStarted>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -78,11 +91,16 @@ struct AutomationTurnResult {
     usage: Option<Value>,
 }
 
-struct DispatchReservation(AppHandle);
+struct DispatchReservation {
+    app: AppHandle,
+    automation_id: String,
+}
 
 impl Drop for DispatchReservation {
     fn drop(&mut self) {
-        self.0.state::<AutomationRunner>().release_dispatch();
+        let runner = self.app.state::<AutomationRunner>();
+        runner.clear_active(&self.automation_id);
+        runner.release_dispatch();
     }
 }
 
@@ -123,6 +141,11 @@ impl AutomationRunner {
     pub(crate) async fn status(&self, state: &AcpState) -> AutomationRunnerStatus {
         let occupancy = state.sessions.snapshot();
         let phase = RuntimePhase::from_raw(state.runtime_phase.load(Ordering::Acquire));
+        let active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
         AutomationRunnerStatus {
             checked_at: match self.last_tick_at.load(Ordering::Acquire) {
                 0 => None,
@@ -134,6 +157,8 @@ impl AutomationRunner {
                 || occupancy.pending_lifecycle > 0
                 || self.dispatching.load(Ordering::Acquire)
                 || runtime_phase_blocks_dispatch(phase),
+            active_automation_id: active.as_ref().map(|active| active.automation_id.clone()),
+            active_session: active.and_then(|active| active.started),
         }
     }
 
@@ -194,8 +219,24 @@ impl AutomationRunner {
     }
 
     pub(crate) fn launch_reserved(&self, app: AppHandle, dispatch: AutomationDispatch) {
+        let automation_id = dispatch
+            .automation
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        *self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(AutomationRunnerActive {
+            automation_id: automation_id.clone(),
+            started: None,
+        });
         tauri::async_runtime::spawn(async move {
-            let reservation = DispatchReservation(app.clone());
+            let reservation = DispatchReservation {
+                app: app.clone(),
+                automation_id,
+            };
             let settled = execute_claimed_automation(&app, dispatch).await;
             drop(reservation);
             match settled.error.as_ref() {
@@ -221,6 +262,35 @@ impl AutomationRunner {
                 let _ = app.emit("automation-runner-error", error);
             }
         });
+    }
+
+    fn set_active_session(&self, started: AutomationSessionStarted) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if active
+            .as_ref()
+            .is_some_and(|active| active.automation_id == started.automation_id)
+        {
+            *active = Some(AutomationRunnerActive {
+                automation_id: started.automation_id.clone(),
+                started: Some(started),
+            });
+        }
+    }
+
+    fn clear_active(&self, automation_id: &str) {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if active
+            .as_ref()
+            .is_some_and(|active| active.automation_id == automation_id)
+        {
+            *active = None;
+        }
     }
 
     async fn runtime_ready(&self, state: &AcpState) -> bool {
@@ -423,6 +493,7 @@ async fn execute_claimed_automation(
         automation: claimed.automation.clone(),
         warnings: opened.warnings,
     };
+    runner.set_active_session(started.clone());
     if let Err(error) = app.emit("automation-session-started", started) {
         tracing::error!(
             target: "grox::automation",
@@ -912,5 +983,43 @@ mod tests {
         assert!(should_keep_process_alive_on_close(true, false));
         assert!(should_keep_process_alive_on_close(false, true));
         assert!(should_keep_process_alive_on_close(true, true));
+    }
+
+    #[test]
+    fn runner_status_restores_the_active_automation_projection() {
+        tauri::async_runtime::block_on(async {
+            let runner = AutomationRunner::default();
+            let state = AcpState::default();
+            *runner
+                .active
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()) = Some(AutomationRunnerActive {
+                automation_id: "auto-1".into(),
+                started: None,
+            });
+            let preparing = runner.status(&state).await;
+            assert_eq!(preparing.active_automation_id.as_deref(), Some("auto-1"));
+            assert!(preparing.active_session.is_none());
+
+            runner.set_active_session(AutomationSessionStarted {
+                automation_id: "auto-1".into(),
+                source: crate::automation_store::AutomationDispatchSource::Scheduled,
+                claimed_at: 42,
+                session_id: "session-1".into(),
+                automation: automation(),
+                warnings: Vec::new(),
+            });
+            let running = runner.status(&state).await;
+            assert_eq!(
+                running
+                    .active_session
+                    .as_ref()
+                    .map(|started| started.session_id.as_str()),
+                Some("session-1")
+            );
+
+            runner.clear_active("auto-1");
+            assert!(runner.status(&state).await.active_automation_id.is_none());
+        });
     }
 }

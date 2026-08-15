@@ -18,6 +18,18 @@ pub(crate) enum SessionJournalWriteError {
     Storage(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionJournalHostEvents {
+    pub(crate) stream_id: String,
+    pub(crate) sequences: Vec<u64>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SessionJournalMetadata {
+    pub(crate) saved_at: u64,
+    pub(crate) host_events: Option<SessionJournalHostEvents>,
+}
+
 impl SessionJournalStore {
     pub(crate) fn read(
         &self,
@@ -44,27 +56,25 @@ impl SessionJournalStore {
         id: &str,
         content: &str,
         max_bytes: u64,
-    ) -> Result<(), SessionJournalWriteError> {
+    ) -> Result<SessionJournalMetadata, SessionJournalWriteError> {
         if content.len() as u64 > max_bytes {
             return Err(SessionJournalWriteError::InvalidIncoming(format!(
                 "应用会话 journal 不能超过 {} MB",
                 max_bytes / 1024 / 1024
             )));
         }
-        let incoming_saved_at = validate_current_journal(content, id)
+        let incoming = current_journal_metadata(content, id)
             .map_err(SessionJournalWriteError::InvalidIncoming)?;
         if path.is_file() {
-            let current = read_bounded_text(path, max_bytes)
-                .map_err(|error| {
-                    SessionJournalWriteError::Storage(format!(
-                        "无法读取现有应用会话 journal：{error}"
-                    ))
-                })?;
+            let current = read_bounded_text(path, max_bytes).map_err(|error| {
+                SessionJournalWriteError::Storage(format!("无法读取现有应用会话 journal：{error}"))
+            })?;
             let current_saved_at = validate_current_journal(&current, id)
                 .map_err(SessionJournalWriteError::Storage)?;
-            if current_saved_at >= incoming_saved_at {
+            if current_saved_at >= incoming.saved_at {
                 return Err(SessionJournalWriteError::Conflict(format!(
-                    "应用会话 journal 写入冲突：磁盘版本 {current_saved_at} 不早于提交版本 {incoming_saved_at}"
+                    "应用会话 journal 写入冲突：磁盘版本 {current_saved_at} 不早于提交版本 {}",
+                    incoming.saved_at
                 )));
             }
         }
@@ -82,7 +92,7 @@ impl SessionJournalStore {
                 );
             }
         }
-        Ok(())
+        Ok(incoming)
     }
 }
 
@@ -104,11 +114,18 @@ fn validate_readable_journal(content: &str, id: &str) -> Result<(), String> {
 }
 
 pub(crate) fn validate_current_journal(content: &str, id: &str) -> Result<u64, String> {
+    current_journal_metadata(content, id).map(|metadata| metadata.saved_at)
+}
+
+pub(crate) fn current_journal_metadata(
+    content: &str,
+    id: &str,
+) -> Result<SessionJournalMetadata, String> {
     let value = parse_journal(content)?;
     validate_current_value(&value, id)
 }
 
-fn validate_current_value(value: &Value, id: &str) -> Result<u64, String> {
+fn validate_current_value(value: &Value, id: &str) -> Result<SessionJournalMetadata, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "应用会话 journal 必须是 JSON 对象".to_string())?;
@@ -138,7 +155,50 @@ fn validate_current_value(value: &Value, id: &str) -> Result<u64, String> {
     {
         return Err("应用会话 journal 格式无效或会话身份不匹配".into());
     }
-    Ok(saved_at.unwrap_or_default())
+    let host_events = match object.get("hostEvents") {
+        None | Some(Value::Null) => None,
+        Some(value) => Some(validate_host_events(value)?),
+    };
+    Ok(SessionJournalMetadata {
+        saved_at: saved_at.unwrap_or_default(),
+        host_events,
+    })
+}
+
+fn validate_host_events(value: &Value) -> Result<SessionJournalHostEvents, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "应用会话 journal 的 Host 事件确认必须是对象".to_string())?;
+    let stream_id = object
+        .get("streamId")
+        .and_then(Value::as_str)
+        .filter(|value| {
+            !value.is_empty()
+                && value.len() <= 128
+                && value
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':'))
+        })
+        .ok_or_else(|| "应用会话 journal 的 Host 事件 streamId 无效".to_string())?;
+    let values = object
+        .get("sequences")
+        .and_then(Value::as_array)
+        .filter(|values| values.len() <= 8_192)
+        .ok_or_else(|| "应用会话 journal 的 Host 事件序号列表无效".to_string())?;
+    let mut sequences = Vec::with_capacity(values.len());
+    let mut previous = 0;
+    for value in values {
+        let sequence = value
+            .as_u64()
+            .filter(|sequence| *sequence > previous)
+            .ok_or_else(|| "应用会话 journal 的 Host 事件序号必须严格递增".to_string())?;
+        sequences.push(sequence);
+        previous = sequence;
+    }
+    Ok(SessionJournalHostEvents {
+        stream_id: stream_id.to_string(),
+        sequences,
+    })
 }
 
 #[cfg(test)]
@@ -242,5 +302,31 @@ mod tests {
             .unwrap()
             .is_some());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn host_event_acknowledgements_are_bounded_and_strictly_ordered() {
+        let mut value = serde_json::from_str::<Value>(&journal("session-1", 10, "saved")).unwrap();
+        value["hostEvents"] = serde_json::json!({
+            "streamId": "host-stream-abc",
+            "sequences": [2, 5, 9],
+        });
+        let metadata = current_journal_metadata(&value.to_string(), "session-1").unwrap();
+        assert_eq!(metadata.saved_at, 10);
+        assert_eq!(
+            metadata.host_events,
+            Some(SessionJournalHostEvents {
+                stream_id: "host-stream-abc".into(),
+                sequences: vec![2, 5, 9],
+            })
+        );
+
+        value["hostEvents"]["sequences"] = serde_json::json!([2, 2]);
+        assert!(current_journal_metadata(&value.to_string(), "session-1").is_err());
+        value["hostEvents"] = serde_json::json!({
+            "streamId": "../../foreign",
+            "sequences": [2],
+        });
+        assert!(current_journal_metadata(&value.to_string(), "session-1").is_err());
     }
 }

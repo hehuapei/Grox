@@ -63,6 +63,12 @@ import {
 } from "../lib/errorModel";
 import type { ErrorFallback } from "../lib/errorModel";
 import { sessionFromDiskPreview, type SessionDiskPreview } from "../lib/sessionDiskPreview";
+import {
+  parseSessionJournal,
+  rememberSessionJournalSnapshot,
+  type SessionJournalSnapshot,
+} from "../lib/sessionCache";
+import { reconcileSessionJournal } from "../lib/sessionJournalReconcile";
 import { mapToolKind } from "../lib/toolKind";
 import { AcpRpcError, decodeAcpResponse } from "./acpRpc";
 
@@ -131,6 +137,8 @@ interface HostSessionEvent {
   method?: string;
   updateType?: string;
   projection: HostSessionProjection;
+  journalRecoverable: boolean;
+  journalAcknowledged: boolean;
 }
 
 type HostSessionProjection =
@@ -162,6 +170,7 @@ interface HostActiveBlockSnapshot {
   blockType: "user" | "assistant" | "thinking";
   blockId: string;
   startedAt: number;
+  updatedThrough: number;
   text: string;
   textComplete: boolean;
 }
@@ -180,6 +189,11 @@ interface HostSessionEventReplay {
 interface HostSessionEventCursor {
   streamId?: string;
   sequence: number;
+}
+
+interface HostSessionBinding {
+  sessionId: string;
+  cwd: string;
 }
 
 interface HostInteractionProjection {
@@ -309,30 +323,6 @@ const MAX_JSON_NODES = 5_000;
 const MAX_JSON_ARRAY_ITEMS = 200;
 const MAX_TERMINAL_LINES = 2_000;
 const REWOUND_SESSIONS_STORAGE_KEY = "grox.rewoundSessions";
-const HOST_SESSION_EVENT_CURSOR_STORAGE_KEY = "grox.hostSessionEventCursor.v1";
-
-function loadHostSessionEventCursor(): HostSessionEventCursor {
-  try {
-    const value = record(JSON.parse(localStorage.getItem(HOST_SESSION_EVENT_CURSOR_STORAGE_KEY) ?? "null"));
-    const streamId = string(value?.streamId);
-    const sequence = number(value?.sequence);
-    return streamId && sequence !== undefined && sequence >= 0
-      ? { streamId, sequence: Math.floor(sequence) }
-      : { sequence: 0 };
-  } catch {
-    return { sequence: 0 };
-  }
-}
-
-function persistHostSessionEventCursor(cursor: HostSessionEventCursor): boolean {
-  if (!cursor.streamId) return false;
-  try {
-    localStorage.setItem(HOST_SESSION_EVENT_CURSOR_STORAGE_KEY, JSON.stringify(cursor));
-    return true;
-  } catch {
-    return false;
-  }
-}
 
 function loadRewoundSessionIds(): Set<string> {
   try {
@@ -937,6 +927,7 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
     case "runtime_notice":
     case "runtime_state":
     case "runtime_occupancy":
+    case "session_journal_checkpoint":
     case "prompt_queue_changed":
     case "automation_session_started":
     case "automation_session_settled":
@@ -1074,17 +1065,20 @@ export class AcpBridge implements GrokBridge {
   /** toolCallIds still pending/running/awaiting_permission for UI projection. */
   private openToolCalls = new Map<string, Set<string>>();
   private unlisten: UnlistenFn[] = [];
-  /** Host ACP event cursor survives a WebView reload while the native runtime stays alive. */
-  private hostSessionEventCursor = loadHostSessionEventCursor();
+  /** 仅用于当前 WebView 去重；跨重载恢复由 Host 的 journal ACK 决定。 */
+  private hostSessionEventCursor: HostSessionEventCursor = { sequence: 0 };
   private hostSessionEventCatchup = true;
   private bufferedHostSessionEvents: HostSessionEvent[] = [];
-  private hostSessionEventCursorWarningShown = false;
+  private recoveredReplaySessions = new Set<string>();
+  private automationStartedSessions = new Set<string>();
   private streamAppends = new Map<string, Extract<BridgeEvent, { type: "assistant_append" | "thinking_append" }>>();
   private repeatedDeltas = new Map<string, { value: string; count: number }>();
   private streamFlushTimer: number | undefined;
   private toolPatches = new Map<string, Extract<BridgeEvent, { type: "tool_patch" }>>();
   private toolFlushTimer: number | undefined;
+  private pendingHostEventCheckpoints = new Map<string, HostSessionEvent>();
   private toolImagePersistGeneration = new Map<string, number>();
+  private toolImagePersistCheckpoints = new Map<string, HostSessionEvent[]>();
   private toolImagePersistFailures = new Set<string>();
   private diagnostics: string[] = [];
   private requestId = 0;
@@ -1164,7 +1158,7 @@ export class AcpBridge implements GrokBridge {
   }
 
   private emit(event: BridgeEvent) {
-    if ("sessionId" in event) {
+    if ("sessionId" in event && event.type !== "session_journal_checkpoint") {
       const replay = this.replaying.get(event.sessionId);
       if (replay) {
         this.replaying.set(event.sessionId, applyToSession(replay, event));
@@ -1211,6 +1205,7 @@ export class AcpBridge implements GrokBridge {
     if (this.streamAppends.size > 0) {
       this.streamFlushTimer = window.setTimeout(() => this.flushStreamAppends(), STREAM_FLUSH_MS);
     }
+    this.flushPendingHostEventCheckpoints(sessionId);
   }
 
   private queueToolPatch(event: Extract<BridgeEvent, { type: "tool_patch" }>) {
@@ -1235,22 +1230,62 @@ export class AcpBridge implements GrokBridge {
     if (this.toolPatches.size > 0) {
       this.toolFlushTimer = window.setTimeout(() => this.flushToolPatches(), TOOL_FLUSH_MS);
     }
+    this.flushPendingHostEventCheckpoints(sessionId);
+  }
+
+  private hasPendingSessionProjection(sessionId: string): boolean {
+    return [...this.streamAppends.values()].some((event) => event.sessionId === sessionId)
+      || [...this.toolPatches.values()].some((event) => event.sessionId === sessionId);
+  }
+
+  private queueHostEventCheckpoint(event: HostSessionEvent) {
+    if (!event.journalRecoverable || !event.sessionId) return;
+    if (this.hasPendingSessionProjection(event.sessionId)) {
+      this.pendingHostEventCheckpoints.set(`${event.streamId}:${event.sequence}`, event);
+      return;
+    }
+    this.emitHostEventCheckpoint(event);
+  }
+
+  private flushPendingHostEventCheckpoints(sessionId?: string) {
+    for (const [key, event] of this.pendingHostEventCheckpoints) {
+      if ((sessionId && event.sessionId !== sessionId)
+        || !event.sessionId
+        || this.hasPendingSessionProjection(event.sessionId)) continue;
+      this.pendingHostEventCheckpoints.delete(key);
+      this.emitHostEventCheckpoint(event);
+    }
   }
 
   private persistToolImages(
     sessionId: string,
     blockId: string,
     images: Array<{ mime: string; data: string }> | undefined,
-  ) {
-    if (!images || images.length === 0) return;
+    checkpoint?: HostSessionEvent,
+  ): boolean {
+    if (!images || images.length === 0) return false;
     const key = `${sessionId}:${blockId}`;
+    if (checkpoint) {
+      const pending = this.toolImagePersistCheckpoints.get(key) ?? [];
+      if (!pending.some((event) => (
+        event.streamId === checkpoint.streamId && event.sequence === checkpoint.sequence
+      ))) {
+        pending.push(checkpoint);
+        this.toolImagePersistCheckpoints.set(key, pending);
+      }
+    }
     const generation = (this.toolImagePersistGeneration.get(key) ?? 0) + 1;
     this.toolImagePersistGeneration.set(key, generation);
     void invoke<ToolCall["images"]>("persist_session_tool_images", { sessionId, images }).then((references) => {
-      if (this.toolImagePersistGeneration.get(key) !== generation || !references?.length) return;
+      if (this.toolImagePersistGeneration.get(key) !== generation) return;
+      if (!references?.length) throw new Error("Host 未返回可持久化的工具图片引用");
       // 先提交可能仍在节流队列中的 base64 patch，再用持久引用替换它。
       this.flushToolPatches(sessionId);
       this.emit({ type: "tool_patch", sessionId, blockId, call: { images: references } });
+      for (const event of this.toolImagePersistCheckpoints.get(key) ?? []) {
+        this.queueHostEventCheckpoint(event);
+      }
+      this.toolImagePersistCheckpoints.delete(key);
       this.toolImagePersistFailures.delete(key);
     }).catch((error) => {
       this.diagnostics.push(`工具图片持久化失败：${errorText(error)}`);
@@ -1270,11 +1305,14 @@ export class AcpBridge implements GrokBridge {
         })),
       });
     });
+    return true;
   }
 
   private forgetToolImagePersistence(sessionId: string) {
     for (const key of this.toolImagePersistGeneration.keys()) {
-      if (key.startsWith(`${sessionId}:`)) this.toolImagePersistGeneration.delete(key);
+      if (!key.startsWith(`${sessionId}:`)) continue;
+      this.toolImagePersistGeneration.delete(key);
+      this.toolImagePersistCheckpoints.delete(key);
     }
     for (const key of this.toolImagePersistFailures) {
       if (key.startsWith(`${sessionId}:`)) this.toolImagePersistFailures.delete(key);
@@ -1295,20 +1333,54 @@ export class AcpBridge implements GrokBridge {
       this.emitHostSessionEventGap("Host 返回了无效的 ACP 事件序号");
       return;
     }
-    if (this.hostSessionEventCursor.streamId !== event.streamId) {
-      this.hostSessionEventCursor = { streamId: event.streamId, sequence: 0 };
-    }
+    this.adoptHostSessionEventStream(event.streamId);
     if (event.sequence <= this.hostSessionEventCursor.sequence) return;
     if (event.sequence !== this.hostSessionEventCursor.sequence + 1) {
       this.emitHostSessionEventGap(
         `ACP 事件序列从 ${this.hostSessionEventCursor.sequence} 跳到 ${event.sequence}`,
       );
     }
-    this.projectHostSessionProjection(event.projection);
-    this.hostSessionEventCursor = { streamId: event.streamId, sequence: event.sequence };
-    if (!persistHostSessionEventCursor(this.hostSessionEventCursor)) {
-      this.emitHostSessionEventCursorWarning();
+    if (!event.journalAcknowledged) {
+      const waitsForMedia = this.hostEventWaitsForToolMedia(event);
+      const mediaDeferred = this.projectHostSessionProjection(
+        event.projection,
+        waitsForMedia ? event : undefined,
+      );
+      // 有图片不代表该投影一定会展示图片（例如已取消的 workflow 尾帧）。
+      // 只有真正启动 Host 媒体落盘时才延后确认，否则当前投影即可写 journal。
+      if (!mediaDeferred) this.queueHostEventCheckpoint(event);
     }
+    this.hostSessionEventCursor = { streamId: event.streamId, sequence: event.sequence };
+  }
+
+  private adoptHostSessionEventStream(streamId: string) {
+    if (this.hostSessionEventCursor.streamId === streamId) return;
+    this.hostSessionEventCursor = { streamId, sequence: 0 };
+    this.pendingHostEventCheckpoints.clear();
+    this.toolImagePersistGeneration.clear();
+    this.toolImagePersistCheckpoints.clear();
+    this.toolImagePersistFailures.clear();
+    this.recoveredReplaySessions.clear();
+  }
+
+  private emitHostEventCheckpoint(event: HostSessionEvent) {
+    if (!event.journalRecoverable || !event.sessionId) return;
+    this.emit({
+      type: "session_journal_checkpoint",
+      sessionId: event.sessionId,
+      streamId: event.streamId,
+      sequence: event.sequence,
+    });
+  }
+
+  private hostEventWaitsForToolMedia(event: HostSessionEvent): boolean {
+    if (!event.journalRecoverable || event.projection.kind !== "session_update") return false;
+    if (event.projection.updateType !== "tool_call" && event.projection.updateType !== "tool_call_update") {
+      return false;
+    }
+    const update = record(event.projection.update);
+    if (!update) return false;
+    return (extractImages([array(update.content), update.rawOutput])?.length ?? 0) > 0;
   }
 
   private onHostSessionEvent(event: HostSessionEvent) {
@@ -1332,23 +1404,6 @@ export class AcpBridge implements GrokBridge {
         fatal: false,
         holdQueue: true,
         action: "重新打开受影响会话以从 Agent 历史记录重建内容",
-      }),
-    });
-  }
-
-  private emitHostSessionEventCursorWarning() {
-    if (this.hostSessionEventCursorWarningShown) return;
-    this.hostSessionEventCursorWarningShown = true;
-    this.emit({
-      type: "runtime_notice",
-      notice: runtimeNoticeFromError({
-        domain: "environment",
-        code: "ACP_EVENT_CURSOR_PERSIST_FAILED",
-        message: "无法保存会话流补放游标",
-        recoverable: true,
-        fatal: false,
-        holdQueue: false,
-        action: "检查应用站点存储权限；页面重载前请等待当前回复完成",
       }),
     });
   }
@@ -1419,11 +1474,88 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
-  private async catchUpHostSessionEvents() {
+  private async recoverHostReplaySessions(
+    sessionIds: Iterable<string>,
+    bindings: Map<string, string>,
+    activeTurnSessionIds: Set<string>,
+  ): Promise<void> {
+    const pending = [...new Set(sessionIds)]
+      .filter((sessionId) => sessionId && !this.recoveredReplaySessions.has(sessionId))
+      .slice(0, 128);
+    for (let offset = 0; offset < pending.length; offset += 8) {
+      await Promise.all(pending.slice(offset, offset + 8).map(async (sessionId) => {
+        const boundCwd = bindings.get(sessionId);
+        let snapshot: SessionJournalSnapshot | null = null;
+        try {
+          const raw = await invoke<string | null>("read_session_journal", { id: sessionId });
+          if (raw) {
+            snapshot = parseSessionJournal(raw, sessionId);
+            rememberSessionJournalSnapshot(snapshot);
+          }
+        } catch (error) {
+          this.diagnostics.push(`会话 ${sessionId} 的补放基线读取失败：${errorText(error)}`);
+          this.diagnostics = this.diagnostics.slice(-20);
+          throw error;
+        }
+        if (!snapshot && !boundCwd) {
+          // 没有磁盘基线且 Host 已解除绑定，通常表示会话已被删除。记录这一
+          // 事实，避免同一补放窗口重复读取，也不能凭事件片段把它复活。
+          this.recoveredReplaySessions.add(sessionId);
+          return;
+        }
+
+        const active = activeTurnSessionIds.has(sessionId);
+        const recovered = snapshot
+          ? snapshot.turnState === "active" && !active
+            ? reconcileSessionJournal(snapshot, null).session
+            : {
+                ...snapshot.session,
+                ...(boundCwd ? { cwd: boundCwd } : {}),
+                ...(active ? { status: "running" as const, preview: false } : {}),
+              }
+          : {
+              ...emptySession({
+                id: sessionId,
+                title: "Recovered mission",
+                cwd: boundCwd!,
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+                model: this.modelState.currentId,
+              }),
+              ...(active ? { status: "running" as const, preview: false } : {}),
+            };
+        if (!recovered) return;
+        if (boundCwd) this.knownSessions.add(sessionId);
+        const meta: SessionMeta = {
+          id: recovered.id,
+          title: recovered.title,
+          cwd: recovered.cwd,
+          createdAt: recovered.createdAt,
+          updatedAt: recovered.updatedAt,
+          model: recovered.model,
+          lastStatus: recovered.status,
+        };
+        this.catalogue.set(sessionId, meta);
+        this.usage.set(sessionId, recovered.usage);
+        this.emit({ type: "session_ready", session: recovered, background: true });
+        this.recoveredReplaySessions.add(sessionId);
+      }));
+    }
+  }
+
+  private async catchUpHostSessionEvents(
+    bindings: Map<string, string>,
+    activeTurnSessionIds: Set<string>,
+  ) {
     let finalLatestSequence = this.hostSessionEventCursor.sequence;
     let replayTruncated = false;
     let activeBlocks: HostActiveBlockSnapshot[] = [];
     try {
+      await this.recoverHostReplaySessions(
+        activeTurnSessionIds,
+        bindings,
+        activeTurnSessionIds,
+      );
       for (let page = 0; page < 32; page += 1) {
         const replay = await invoke<HostSessionEventReplay>("replay_session_events", {
           streamId: this.hostSessionEventCursor.streamId,
@@ -1431,14 +1563,22 @@ export class AcpBridge implements GrokBridge {
           limit: 1_000,
         });
         if (replay.reset || this.hostSessionEventCursor.streamId !== replay.streamId) {
-          this.hostSessionEventCursor = { streamId: replay.streamId, sequence: 0 };
+          this.adoptHostSessionEventStream(replay.streamId);
           finalLatestSequence = replay.latestSequence;
         } else {
           finalLatestSequence = Math.max(finalLatestSequence, replay.latestSequence);
         }
         activeBlocks = replay.activeBlocks ?? [];
         replayTruncated ||= replay.truncated;
-        for (const event of [...replay.events].sort((left, right) => left.sequence - right.sequence)) {
+        const events = [...replay.events].sort((left, right) => left.sequence - right.sequence);
+        await this.recoverHostReplaySessions(
+          events
+            .filter((event) => !event.journalAcknowledged && event.sessionId)
+            .map((event) => event.sessionId!),
+          bindings,
+          activeTurnSessionIds,
+        );
+        for (const event of events) {
           this.projectHostSessionEvent(event);
         }
         if (!replay.hasMore) break;
@@ -1459,9 +1599,36 @@ export class AcpBridge implements GrokBridge {
       });
       throw error;
     }
+    const activeSnapshotSessionIds = [...new Set(
+      activeBlocks.map((snapshot) => snapshot.sessionId),
+    )];
+    for (const sessionId of activeSnapshotSessionIds) {
+      // occupancy 与 replay 是两个查询；两者之间新启动的后台回合以同一
+      // journal 锁内的活动块快照为准，重新投影 running 基线。
+      activeTurnSessionIds.add(sessionId);
+      this.recoveredReplaySessions.delete(sessionId);
+    }
+    await this.recoverHostReplaySessions(
+      activeSnapshotSessionIds,
+      bindings,
+      activeTurnSessionIds,
+    );
     // 快照与最后一页 replay 在同一把 Host journal 锁内读取。先恢复快照，
     // 再打开实时闸门并消费缓冲事件，才能保证 N 的累计文本先于 N+1 增量。
+    // replay 增量仍在 UI 合并队列时必须先提交，否则快照写入完整文本后，
+    // 迟到的增量会再次追加同一段内容。
+    this.flushStreamAppends();
+    this.flushToolPatches();
     this.projectHostActiveBlockSnapshots(activeBlocks);
+    for (const snapshot of activeBlocks) {
+      if (!this.hostSessionEventCursor.streamId || snapshot.updatedThrough < 1) continue;
+      this.emit({
+        type: "session_journal_checkpoint",
+        sessionId: snapshot.sessionId,
+        streamId: this.hostSessionEventCursor.streamId,
+        sequence: snapshot.updatedThrough,
+      });
+    }
     // 只有完整查询成功后才打开实时闸门。查询失败时继续缓冲，下一次
     // ensureReady 会从已提交游标重试，不能让较新的实时事件越过缺口。
     this.hostSessionEventCatchup = false;
@@ -1472,8 +1639,8 @@ export class AcpBridge implements GrokBridge {
     if (replayTruncated) {
       this.emitHostSessionEventGap("Host ACP 事件补放窗口已发生截断");
     }
-    // 若超大事件在页面消失期间无法保留，只能确认缺口并推进游标，
-    // 否则每次重载都会重复报告同一个不可恢复区间。
+    // 超大事件若无法保留，只推进当前 WebView 的内存游标；跨页面恢复仍由
+    // journal ACK 决定，绝不能把“已经看过”冒充“已经落盘”。
     if (
       this.hostSessionEventCursor.streamId
       && finalLatestSequence > this.hostSessionEventCursor.sequence
@@ -1482,9 +1649,6 @@ export class AcpBridge implements GrokBridge {
         streamId: this.hostSessionEventCursor.streamId,
         sequence: finalLatestSequence,
       };
-      if (!persistHostSessionEventCursor(this.hostSessionEventCursor)) {
-        this.emitHostSessionEventCursorWarning();
-      }
     }
   }
 
@@ -1493,7 +1657,7 @@ export class AcpBridge implements GrokBridge {
     const environment = await invoke<DesktopEnvironment>("desktop_environment");
     this.workspace = localStorage.getItem("grok.workspace") ?? environment.defaultWorkspace;
 
-    this.unlisten.push(
+    if (this.unlisten.length === 0) this.unlisten.push(
       await listen<HostSessionEvent>("host-session-event", ({ payload }) => {
         this.onHostSessionEvent(payload);
       }),
@@ -1527,8 +1691,9 @@ export class AcpBridge implements GrokBridge {
         });
       }),
       await listen<AutomationSessionStarted>("automation-session-started", ({ payload }) => {
-        this.projectAutomationSessionStarted(payload);
-        this.emit({ type: "automation_session_started", started: payload });
+        if (this.projectAutomationSessionStarted(payload)) {
+          this.emit({ type: "automation_session_started", started: payload });
+        }
       }),
       await listen<AutomationRunnerStatus>("automation-runner-tick", ({ payload }) => {
         this.emit({ type: "automation_runner_tick", status: payload });
@@ -1594,15 +1759,21 @@ export class AcpBridge implements GrokBridge {
         }
       }),
     );
-    await this.catchUpHostSessionEvents();
-    this.emit({
-      type: "runtime_occupancy",
-      occupancy: await invoke<RuntimeOccupancy>("session_runtime_status"),
-    });
-    this.emit({
-      type: "automation_runner_tick",
-      status: await invoke<AutomationRunnerStatus>("automation_runner_status"),
-    });
+    const [occupancy, automationStatus, bindingRows] = await Promise.all([
+      invoke<RuntimeOccupancy>("session_runtime_status"),
+      invoke<AutomationRunnerStatus>("automation_runner_status"),
+      invoke<HostSessionBinding[]>("host_session_bindings"),
+    ]);
+    if (
+      automationStatus.activeSession
+      && this.projectAutomationSessionStarted(automationStatus.activeSession)
+    ) {
+      this.emit({ type: "automation_session_started", started: automationStatus.activeSession });
+    }
+    const bindings = new Map(bindingRows.map((binding) => [binding.sessionId, binding.cwd]));
+    await this.catchUpHostSessionEvents(bindings, new Set(occupancy.activeTurnSessionIds));
+    this.emit({ type: "runtime_occupancy", occupancy });
+    this.emit({ type: "automation_runner_tick", status: automationStatus });
 
     try {
       await this.initializeAgent();
@@ -1818,24 +1989,32 @@ export class AcpBridge implements GrokBridge {
     this.reconnectProjection = null;
   }
 
-  private projectHostSessionProjection(projection: HostSessionProjection) {
+  private projectHostSessionProjection(
+    projection: HostSessionProjection,
+    mediaCheckpoint?: HostSessionEvent,
+  ): boolean {
     switch (projection.kind) {
       case "session_update":
         if (projection.channel === "notification") {
           this.handleXaiUpdate(projection.sessionId, projection.update);
+          return false;
         } else {
-          this.handleSessionUpdate(projection.sessionId, projection.update, projection.blockOps);
+          return Boolean(this.handleSessionUpdate(
+            projection.sessionId,
+            projection.update,
+            projection.blockOps,
+            mediaCheckpoint,
+          ));
         }
-        return;
       case "block_lifecycle":
         this.applyHostBlockCloses(projection.sessionId, projection.blockOps);
         if (projection.phase === "session_reset" || projection.phase === "session_removed") {
           this.replayCursors.delete(projection.sessionId);
         }
-        return;
+        return false;
       case "notification":
         this.onNotification(projection.method, projection.params);
-        return;
+        return false;
       case "orphan_response":
         // 正常响应已由原生 Host 定向交付；进入事件流的响应没有请求归属。
         this.emitProtocolNotice(
@@ -1843,7 +2022,7 @@ export class AcpBridge implements GrokBridge {
           "收到无法归属到当前请求的 ACP 响应",
           "若会话状态异常，请重新打开该会话",
         );
-        return;
+        return false;
       case "protocol_error":
         this.diagnostics.push(`${projection.code}：${projection.message}`);
         this.diagnostics = this.diagnostics.slice(-20);
@@ -1855,7 +2034,7 @@ export class AcpBridge implements GrokBridge {
             ? "升级 Grok Build CLI；事件不会写入其它会话"
             : "若持续出现，请升级 CLI 并导出会话诊断",
         );
-        return;
+        return false;
       case "unsupported_request": {
         const callback = projection.method === "fs/read_text_file"
           || projection.method === ACP_METHODS.fsRead
@@ -1882,6 +2061,7 @@ export class AcpBridge implements GrokBridge {
               : "升级 Grox 或 Grok Build CLI 后重试",
           callback || interaction,
         );
+        return false;
       }
     }
   }
@@ -2025,6 +2205,7 @@ export class AcpBridge implements GrokBridge {
     sessionId: string,
     updateValue: unknown,
     hostBlockOps?: HostBlockOperation[],
+    mediaCheckpoint?: HostSessionEvent,
   ) {
     const update = record(updateValue);
     if (!update) return;
@@ -2284,17 +2465,15 @@ export class AcpBridge implements GrokBridge {
         if (hostManaged && !hostTool) return;
         if (!hostManaged) this.closeUser(sessionId);
         if (hostTool?.action === "update") {
-          this.patchTool(sessionId, update, hostTool);
+          return this.patchTool(sessionId, update, hostTool, mediaCheckpoint);
         } else {
-          this.addTool(sessionId, update, hostTool);
+          return this.addTool(sessionId, update, hostTool, mediaCheckpoint);
         }
-        return;
       }
       case "tool_call_update":
         if (workflowCompletionContinuation) return;
         if (hostManaged && !blockOperation("tool")) return;
-        this.patchTool(sessionId, update, blockOperation("tool"));
-        return;
+        return this.patchTool(sessionId, update, blockOperation("tool"), mediaCheckpoint);
       case "plan": {
         const steps = mapPlanSteps(update.entries);
         const hostPlan = blockOperation("plan");
@@ -2337,7 +2516,13 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
-  private addTool(sessionId: string, update: JsonObject, hostBlock?: HostBlockOperation) {
+  private addTool(
+    sessionId: string,
+    update: JsonObject,
+    hostBlock?: HostBlockOperation,
+    mediaCheckpoint?: HostSessionEvent,
+    persistImages = true,
+  ): boolean {
     const cursor = hostBlock ? undefined : this.replayCursor(sessionId);
     if (!hostBlock) {
       this.closeThinking(sessionId);
@@ -2382,22 +2567,30 @@ export class AcpBridge implements GrokBridge {
       sessionId,
       block: { type: "tool", id: blockId, call, ts: Date.now() },
     });
-    this.persistToolImages(sessionId, blockId, images);
+    return persistImages
+      ? this.persistToolImages(sessionId, blockId, images, mediaCheckpoint)
+      : false;
   }
 
-  private patchTool(sessionId: string, update: JsonObject, hostBlock?: HostBlockOperation) {
+  private patchTool(
+    sessionId: string,
+    update: JsonObject,
+    hostBlock?: HostBlockOperation,
+    mediaCheckpoint?: HostSessionEvent,
+  ): boolean {
     const cursor = hostBlock ? undefined : this.replayCursor(sessionId);
     const toolCallId = hostBlock?.sourceId ?? string(update.toolCallId);
-    if (!toolCallId) return;
+    if (!toolCallId) return false;
     let blockId = hostBlock?.blockId ?? cursor?.toolBlocks.get(toolCallId);
+    let mediaDeferred = false;
     if (!blockId) {
-      this.addTool(sessionId, update);
+      mediaDeferred = this.addTool(sessionId, update, undefined, mediaCheckpoint);
       blockId = cursor?.toolBlocks.get(toolCallId);
-      if (!blockId) return;
+      if (!blockId) return mediaDeferred;
     } else if (hostBlock) {
       // 页面可能在 tool_call 与 update 之间重载。稳定 ID + 幂等 block_add
       // 可先补一个最小工具块，再用当前 update 完成投影。
-      this.addTool(sessionId, update, hostBlock);
+      this.addTool(sessionId, update, hostBlock, undefined, false);
     }
     const status = mapToolStatus(update.status);
     this.markOpenTool(sessionId, toolCallId, status);
@@ -2452,7 +2645,10 @@ export class AcpBridge implements GrokBridge {
         ...(locations ? { locations } : {}),
       },
     });
-    this.persistToolImages(sessionId, blockId, images);
+    if (!mediaDeferred) {
+      mediaDeferred = this.persistToolImages(sessionId, blockId, images, mediaCheckpoint);
+    }
+    return mediaDeferred;
   }
 
   private handleXaiUpdate(sessionId: string, updateValue: unknown) {
@@ -3229,7 +3425,9 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
-  private projectAutomationSessionStarted(started: AutomationSessionStarted): void {
+  private projectAutomationSessionStarted(started: AutomationSessionStarted): boolean {
+    if (this.automationStartedSessions.has(started.sessionId)) return false;
+    this.automationStartedSessions.add(started.sessionId);
     const automation = started.automation;
     const now = started.claimedAt || Date.now();
     const meta: SessionMeta = {
@@ -3264,6 +3462,7 @@ export class AcpBridge implements GrokBridge {
       background: true,
     });
     this.emit({ type: "available_commands", sessionId: started.sessionId, commands: this.runtimeCommands });
+    return true;
   }
 
   private async createSession(cwd: string, background: boolean): Promise<string> {

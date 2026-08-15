@@ -17,6 +17,8 @@ interface HostSessionEvent {
   sessionId?: string;
   method?: string;
   updateType?: string;
+  journalRecoverable?: boolean;
+  journalAcknowledged?: boolean;
   projection:
     | { kind: "session_update"; channel: "session" | "notification"; sessionId: string; updateType?: string; update: unknown; blockOps: HostBlockOperation[] }
     | { kind: "block_lifecycle"; sessionId: string; phase: "turn_started" | "turn_finished" | "session_reset" | "session_removed"; blockOps: HostBlockOperation[] }
@@ -40,6 +42,7 @@ interface HostActiveBlockSnapshot {
   blockType: "user" | "assistant" | "thinking";
   blockId: string;
   startedAt: number;
+  updatedThrough?: number;
   text: string;
   textComplete: boolean;
 }
@@ -50,6 +53,8 @@ interface InteractionInternals {
   projectAutomationSessionStarted(started: AutomationSessionStarted): void;
   projectHostSessionEvent(event: HostSessionEvent): void;
   projectHostActiveBlockSnapshots(snapshots: HostActiveBlockSnapshot[]): void;
+  hostEventWaitsForToolMedia(event: HostSessionEvent): boolean;
+  flushStreamAppends(sessionId?: string): void;
 }
 
 function bridgeHarness() {
@@ -147,7 +152,7 @@ describe("AcpBridge Host interaction projection", () => {
 
   it("projects a Host-created automation session without asking WebView to create it", () => {
     const { events, internal } = bridgeHarness();
-    internal.projectAutomationSessionStarted({
+    const started: AutomationSessionStarted = {
       automationId: "auto-1",
       source: "scheduled",
       claimedAt: 42,
@@ -167,7 +172,9 @@ describe("AcpBridge Host interaction projection", () => {
         enabled: true,
         nextRunAt: 100,
       },
-    });
+    };
+    internal.projectAutomationSessionStarted(started);
+    internal.projectAutomationSessionStarted(started);
 
     const ready = events.find(
       (event): event is Extract<BridgeEvent, { type: "session_ready" }> =>
@@ -180,10 +187,63 @@ describe("AcpBridge Host interaction projection", () => {
       status: "running",
       blocks: [{ type: "user", text: "Review the repository" }],
     });
+    expect(events.filter((event) => event.type === "session_ready")).toHaveLength(1);
+  });
+
+  it("skips journal-acknowledged replay without treating the sequence as a gap", () => {
+    const { events, internal } = bridgeHarness();
+    internal.projectHostSessionEvent({
+      streamId: "host-stream-acked",
+      sequence: 1,
+      generation: 7,
+      receivedAt: 41,
+      sessionId: "session-a",
+      journalRecoverable: true,
+      journalAcknowledged: true,
+      projection: {
+        kind: "session_update",
+        channel: "session",
+        sessionId: "session-a",
+        updateType: "agent_message_chunk",
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "already saved" } },
+        blockOps: [{
+          action: "open",
+          blockType: "assistant",
+          blockId: "host-block-acked",
+          startedAt: 41,
+        }],
+      },
+    });
+    internal.projectHostSessionEvent({
+      streamId: "host-stream-acked",
+      sequence: 2,
+      generation: 7,
+      receivedAt: 42,
+      sessionId: "session-a",
+      journalRecoverable: true,
+      journalAcknowledged: false,
+      projection: {
+        kind: "session_update",
+        channel: "session",
+        sessionId: "session-a",
+        updateType: "agent_message_chunk",
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "new" } },
+        blockOps: [{
+          action: "open",
+          blockType: "assistant",
+          blockId: "host-block-new",
+          startedAt: 42,
+        }],
+      },
+    });
+    internal.flushStreamAppends("session-a");
+
+    expect(events.filter((event) => event.type === "block_add")).toHaveLength(1);
+    expect(events.some((event) => event.type === "runtime_notice")).toBe(false);
+    expect(events.filter((event) => event.type === "session_journal_checkpoint")).toHaveLength(1);
   });
 
   it("deduplicates replayed Host events by stream cursor", () => {
-    localStorage.removeItem("grox.hostSessionEventCursor.v1");
     const { events, internal } = bridgeHarness();
     const event: HostSessionEvent = {
       streamId: "host-stream-a",
@@ -193,6 +253,8 @@ describe("AcpBridge Host interaction projection", () => {
       sessionId: "session-a",
       method: "session/update",
       updateType: "agent_message_chunk",
+      journalRecoverable: true,
+      journalAcknowledged: false,
       projection: {
         kind: "session_update",
         channel: "session",
@@ -210,16 +272,94 @@ describe("AcpBridge Host interaction projection", () => {
 
     internal.projectHostSessionEvent(event);
     internal.projectHostSessionEvent(event);
+    internal.flushStreamAppends("session-a");
 
     expect(events.filter((entry) => entry.type === "block_add")).toHaveLength(1);
-    expect(JSON.parse(localStorage.getItem("grox.hostSessionEventCursor.v1") ?? "null")).toEqual({
+    expect(events.findIndex((entry) => entry.type === "assistant_append")).toBeLessThan(
+      events.findIndex((entry) => entry.type === "session_journal_checkpoint"),
+    );
+    expect(events.filter((entry) => entry.type === "session_journal_checkpoint")).toEqual([{
+      type: "session_journal_checkpoint",
+      sessionId: "session-a",
       streamId: "host-stream-a",
       sequence: 1,
+    }]);
+  });
+
+  it("detects tool media that requires durable persistence before acknowledgement", () => {
+    const { internal } = bridgeHarness();
+    const event: HostSessionEvent = {
+      streamId: "host-stream-media",
+      sequence: 1,
+      generation: 7,
+      receivedAt: 42,
+      sessionId: "session-a",
+      journalRecoverable: true,
+      journalAcknowledged: false,
+      projection: {
+        kind: "session_update",
+        channel: "session",
+        sessionId: "session-a",
+        updateType: "tool_call_update",
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "tool-1",
+          content: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }],
+        },
+        blockOps: [],
+      },
+    };
+
+    expect(internal.hostEventWaitsForToolMedia(event)).toBe(true);
+    event.projection = {
+      kind: "session_update",
+      channel: "session",
+      sessionId: "session-a",
+      updateType: "tool_call_update",
+      update: {
+        sessionUpdate: "tool_call_update",
+        toolCallId: "tool-1",
+        content: [{ type: "text", text: "done" }],
+      },
+      blockOps: [],
+    };
+    expect(internal.hostEventWaitsForToolMedia(event)).toBe(false);
+  });
+
+  it("acknowledges a suppressed tool-media tail instead of replaying it forever", () => {
+    const { events, internal } = bridgeHarness();
+    internal.projectHostSessionEvent({
+      streamId: "host-stream-suppressed-media",
+      sequence: 1,
+      generation: 7,
+      receivedAt: 42,
+      sessionId: "session-a",
+      journalRecoverable: true,
+      journalAcknowledged: false,
+      projection: {
+        kind: "session_update",
+        channel: "session",
+        sessionId: "session-a",
+        updateType: "tool_call_update",
+        update: {
+          sessionUpdate: "tool_call_update",
+          toolCallId: "tool-1",
+          content: [{ type: "image", mimeType: "image/png", data: "aGVsbG8=" }],
+        },
+        // Host 已决定忽略这个工具尾帧，因此没有可持久化的工具 block。
+        blockOps: [],
+      },
     });
+
+    expect(events.filter((event) => event.type === "session_journal_checkpoint")).toEqual([{
+      type: "session_journal_checkpoint",
+      sessionId: "session-a",
+      streamId: "host-stream-suppressed-media",
+      sequence: 1,
+    }]);
   });
 
   it("uses Host block identity and lifecycle closes across stream phases", () => {
-    localStorage.removeItem("grox.hostSessionEventCursor.v1");
     const { events, internal } = bridgeHarness();
     internal.projectHostSessionEvent({
       streamId: "host-stream-blocks",
@@ -345,7 +485,6 @@ describe("AcpBridge Host interaction projection", () => {
   });
 
   it("surfaces a replay gap instead of silently accepting a sequence jump", () => {
-    localStorage.removeItem("grox.hostSessionEventCursor.v1");
     const { events, internal } = bridgeHarness();
     internal.projectHostSessionEvent({
       streamId: "host-stream-a",

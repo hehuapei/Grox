@@ -562,6 +562,13 @@ struct DesktopEnvironment {
     app_version: String,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HostSessionBinding {
+    session_id: String,
+    cwd: String,
+}
+
 #[tauri::command]
 fn replay_session_events(
     window: tauri::WebviewWindow,
@@ -575,6 +582,24 @@ fn replay_session_events(
     Ok(state
         .session_events
         .replay(stream_id.as_deref(), after_sequence.unwrap_or(0), limit))
+}
+
+#[tauri::command]
+fn host_session_bindings(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+) -> Result<Vec<HostSessionBinding>, HostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| HostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    Ok(state
+        .client_callbacks
+        .bound_session_workspaces()
+        .into_iter()
+        .map(|(session_id, workspace)| HostSessionBinding {
+            session_id,
+            cwd: path_for_webview(&workspace),
+        })
+        .collect())
 }
 
 pub(crate) fn emit_host_session_event(app: &tauri::AppHandle, event: HostSessionEvent) {
@@ -2208,6 +2233,7 @@ fn session_persistence_error(code: &'static str, error: String) -> HostError {
 fn write_session_journal(
     app: tauri::AppHandle,
     storage: tauri::State<'_, SessionStorageState>,
+    state: tauri::State<'_, Arc<AcpState>>,
     id: String,
     content: String,
 ) -> Result<(), HostError> {
@@ -2220,7 +2246,7 @@ fn write_session_journal(
         .map_err(|error| session_persistence_error("SESSION_JOURNAL_WRITE_FAILED", error))?;
     let legacy = legacy_session_cache_path(&app, &id)
         .map_err(|error| session_persistence_error("SESSION_JOURNAL_WRITE_FAILED", error))?;
-    SessionJournalStore.write(
+    let metadata = SessionJournalStore.write(
         &path,
         &legacy,
         &id,
@@ -2238,6 +2264,21 @@ fn write_session_journal(
             session_persistence_error("SESSION_JOURNAL_WRITE_FAILED", message)
         }
     })?;
+    if let Some(host_events) = metadata.host_events {
+        let acknowledged = state.session_events.acknowledge_session_events(
+            &host_events.stream_id,
+            &id,
+            &host_events.sequences,
+        );
+        tracing::debug!(
+            target: "grox::session_events",
+            session_id = %id,
+            saved_at = metadata.saved_at,
+            requested = host_events.sequences.len(),
+            acknowledged,
+            "application journal advanced Host event durability"
+        );
+    }
     Ok(())
 }
 
@@ -10166,6 +10207,7 @@ fn main() {
             desktop_environment,
             agent_runtime_status,
             replay_session_events,
+            host_session_bindings,
             session_runtime_status,
             foreground_turn_status,
             session_gate_enter_lifecycle,

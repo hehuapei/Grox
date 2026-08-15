@@ -49,6 +49,7 @@ import {
   cancelPendingSessionJournal,
   flushAllPendingSessionJournals,
   flushSessionJournal,
+  recordSessionJournalHostEvent,
   scheduleSaveSessionJournal,
   scrubSessionJournalOrphans,
   setSessionJournalFailureHandler,
@@ -143,6 +144,7 @@ import {
 } from "../lib/offlineSessionHydrate";
 import {
   POST_TURN_RECONCILE_DELAYS_MS,
+  resumeInterruptedSessionIfHostActive,
   sessionTranscriptSignature,
 } from "../lib/sessionJournalReconcile";
 import { isUnavailableSessionError } from "../lib/sessionUnavailable";
@@ -1203,8 +1205,35 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({ runtimeConnection: e.state });
         break;
       case "runtime_occupancy":
-        set({ runtimeOccupancy: e.occupancy });
+        set((state) => {
+          let sessions = state.sessions;
+          let queueDrainParked = state.queueDrainParked;
+          for (const sessionId of e.occupancy.activeTurnSessionIds) {
+            const current = sessions[sessionId];
+            if (!current) continue;
+            const resumed = resumeInterruptedSessionIfHostActive(current);
+            const shouldMarkRunning = current.status === "idle" || current.status === "disconnected";
+            if (!resumed.resumed && !shouldMarkRunning) continue;
+            const activeSession = shouldMarkRunning
+              ? { ...resumed.session, status: "running" as const, preview: false }
+              : resumed.session;
+            if (resumed.resumed) {
+              suppressedQueueDrain.delete(sessionId);
+              queueDrainParked = nextQueueDrainParked(queueDrainParked, sessionId, false);
+            }
+            sessions = { ...sessions, [sessionId]: activeSession };
+            scheduleSaveSessionJournal(activeSession);
+          }
+          return { runtimeOccupancy: e.occupancy, sessions, queueDrainParked };
+        });
         break;
+      case "session_journal_checkpoint": {
+        const session = get().sessions[e.sessionId];
+        if (!session) break;
+        recordSessionJournalHostEvent(e.sessionId, e.streamId, e.sequence);
+        scheduleSaveSessionJournal(session);
+        break;
+      }
       case "prompt_queue_changed": {
         const queue = parsePromptQueueSnapshot(e.queue);
         if (queue.length !== e.queue.length) {
@@ -1349,7 +1378,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         break;
       }
       case "automation_runner_tick":
-        set({ automationLastTickAt: e.status.checkedAt ?? null });
+        set({
+          automationLastTickAt: e.status.checkedAt ?? null,
+          automationRunningId: e.status.activeAutomationId ?? null,
+        });
         break;
       case "model_state":
         {
