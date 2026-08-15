@@ -79,17 +79,6 @@ pub fn path_for_webview(path: &Path) -> String {
         .replace('\\', "/")
 }
 
-/// True when `candidate` is a regular file inside `workspace` after canonicalize.
-pub fn is_workspace_file(workspace: &Path, candidate: &Path) -> bool {
-    let Ok(root) = workspace.canonicalize() else {
-        return false;
-    };
-    let Ok(canonical) = candidate.canonicalize() else {
-        return false;
-    };
-    canonical.is_file() && canonical.starts_with(&root)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

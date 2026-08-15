@@ -19,6 +19,7 @@ mod git_confirm;
 mod host_prefs;
 mod interaction_service;
 mod mcp_leases;
+mod media_service;
 mod path_sandbox;
 mod permission_audit;
 mod permission_policy;
@@ -66,9 +67,13 @@ use foreground_turn::{
 };
 use interaction_service::{InteractionInbound, InteractionProjection, InteractionRegistry};
 use mcp_leases::McpLeaseStore;
+use media_service::{
+    cancel_media_generation, is_media_https_host_allowed, media_generation_capabilities,
+    media_generation_status, release_media_reference, save_media_reference,
+    start_media_generation, MediaService,
+};
 use path_sandbox::{
-    checked_workspace, checked_workspace_file, checked_workspace_target, is_workspace_file,
-    path_for_webview,
+    checked_workspace, checked_workspace_file, checked_workspace_target, path_for_webview,
 };
 use percent_encoding::percent_decode_str;
 use prompt_queue_store::PromptQueueStore;
@@ -123,15 +128,6 @@ const PROVIDER_ENV_KEYS: [&str; 3] = [
 const MAX_PROMPT_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PROMPT_IMAGE_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_PROVIDER_MODELS_BODY_BYTES: usize = 4 * 1024 * 1024;
-const MAX_MEDIA_REFERENCE_BYTES: usize = 24 * 1024 * 1024;
-const MEDIA_HTTPS_HOST_ALLOWLIST: &[&str] = &[
-    "x.ai",
-    "grok.com",
-    "grok.x.ai",
-    "cdn.x.ai",
-    "assets.x.ai",
-    "imagine.x.ai",
-];
 const MAX_SESSION_PREVIEW_MESSAGES: usize = 200;
 const MAX_SESSION_PREVIEW_TEXT_CHARS: usize = 64 * 1024;
 const MAX_SESSION_PREVIEW_TOOL_INPUT_CHARS: usize = 16 * 1024;
@@ -616,33 +612,6 @@ struct GrokRuntimeInfo {
     grox_commit: &'static str,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MediaGenerationRequest {
-    kind: String,
-    prompt: String,
-    aspect: String,
-    count: u8,
-    duration: u16,
-    resolution: String,
-    reference_path: Option<String>,
-    cwd: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MediaArtifact {
-    path: Option<String>,
-    url: Option<String>,
-    mime: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MediaGenerationResult {
-    artifacts: Vec<MediaArtifact>,
-    summary: String,
-}
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -4442,10 +4411,6 @@ fn confirm_destructive_git_action(title: &str, description: &str) -> Result<(), 
     }
 }
 
-/// Media generation must never widen beyond this closed allowlist without a
-/// real permission path — `--always-approve` is intentional only for these tools.
-const MEDIA_GENERATION_TOOLS: &str = "image_gen,video_gen,image_to_video,reference_to_video";
-
 #[derive(Debug)]
 struct ListedWorktree {
     path: PathBuf,
@@ -7408,15 +7373,6 @@ fn open_external(url: String) -> Result<(), String> {
     spawn_system_browser(&parsed)
 }
 
-fn is_media_https_host_allowed(host: Option<&str>) -> bool {
-    let Some(host) = host.map(|value| value.trim().trim_end_matches('.').to_ascii_lowercase()) else {
-        return false;
-    };
-    MEDIA_HTTPS_HOST_ALLOWLIST
-        .iter()
-        .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
-}
-
 #[tauri::command]
 fn open_media_external(url: String) -> Result<(), String> {
     let parsed = parse_browser_url(&url).map_err(|error| format!("无效媒体链接：{error}"))?;
@@ -7484,256 +7440,6 @@ fn register_computer_emergency_shortcut(app: tauri::AppHandle) {
 #[cfg(not(windows))]
 fn register_computer_emergency_shortcut(app: tauri::AppHandle) {
     let _ = app.emit("computer-emergency-shortcut-status", false);
-}
-
-#[tauri::command]
-fn save_media_reference(cwd: String, name: String, data: String) -> Result<String, String> {
-    let cwd = checked_workspace(&cwd)?;
-    let extension = Path::new(&name)
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(str::to_ascii_lowercase)
-        .ok_or("参考图片缺少扩展名")?;
-    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp") {
-        return Err("参考图片仅支持 PNG、JPEG 或 WebP".into());
-    }
-    // Base64 约为原文件的 4/3；同时限制编码前后大小，不能只信任 WebView 字符数。
-    if data.len() > MAX_MEDIA_REFERENCE_BYTES.saturating_mul(4) / 3 + 1024 {
-        return Err("参考图片不能超过 24 MB".into());
-    }
-    let payload = data
-        .rsplit_once(',')
-        .map(|(_, value)| value)
-        .unwrap_or(&data);
-    let bytes = BASE64
-        .decode(payload)
-        .map_err(|error| format!("参考图片编码无效：{error}"))?;
-    if bytes.len() > MAX_MEDIA_REFERENCE_BYTES {
-        return Err("参考图片不能超过 24 MB".into());
-    }
-    let detected = prompt_image_mime(&bytes).ok_or("参考图片内容不是有效的 PNG、JPEG 或 WebP")?;
-    let expected = match extension.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        _ => unreachable!(),
-    };
-    if detected != expected {
-        return Err(format!(
-            "参考图片内容与扩展名不符（内容 {detected}，扩展名 .{extension}）"
-        ));
-    }
-    let directory = cwd.join(".grox").join("media-input");
-    fs::create_dir_all(&directory).map_err(|error| format!("无法创建媒体输入目录：{error}"))?;
-    let path = directory.join(format!(
-        "reference-{}-{}.{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-        extension
-    ));
-    fs::write(&path, bytes).map_err(|error| format!("无法保存参考图片：{error}"))?;
-    Ok(path_for_webview(&path))
-}
-
-#[tauri::command]
-async fn generate_media(
-    app: tauri::AppHandle,
-    request: MediaGenerationRequest,
-) -> Result<MediaGenerationResult, String> {
-    let cwd = checked_workspace(&request.cwd)?;
-    let prompt = checked_media_prompt(&request)?;
-    let runtime = configured_grok_command(&app);
-    let mut command = Command::new(&runtime.path);
-    command
-        .arg("--single")
-        .arg(&prompt)
-        .args(["--output-format", "streaming-json", "--always-approve"])
-        .args(["--tools", MEDIA_GENERATION_TOOLS])
-        .current_dir(&cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    // Keep media generation on the same authentication path as a terminal
-    // invocation. API variables are added only for the provider explicitly
-    // managed by Grox; OAuth gets a clean official CLI environment.
-    command.env("GROK_CLIENT_NAME", UPSTREAM_CLI_CLIENT_NAME);
-    apply_grox_provider_environment(&mut command);
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    let output = tokio::time::timeout(Duration::from_secs(600), command.output())
-        .await
-        .map_err(|_| "媒体生成超过 10 分钟，任务已终止".to_string())?
-        .map_err(|error| format!("无法启动 Grok Build 媒体生成：{error}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = if stderr.trim().is_empty() {
-            stdout.as_ref()
-        } else {
-            stderr.as_ref()
-        };
-        return Err(format!(
-            "Grok Build 媒体生成失败：{}",
-            detail.trim().chars().take(4_000).collect::<String>()
-        ));
-    }
-    let artifacts = extract_media_artifacts(&stdout, &cwd)?;
-    if artifacts.is_empty() {
-        return Err(format!(
-            "Grok Build 已结束，但未返回媒体产物：{}",
-            stdout
-                .trim()
-                .chars()
-                .rev()
-                .take(2_000)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>()
-        ));
-    }
-    for artifact in &artifacts {
-        if let Some(path) = artifact.path.as_deref() {
-            app.asset_protocol_scope()
-                .allow_file(PathBuf::from(path))
-                .map_err(|error| format!("无法授权媒体预览：{error}"))?;
-        }
-    }
-    Ok(MediaGenerationResult {
-        artifacts,
-        summary: format!("Grok Build 已生成 {} 个媒体产物", request.count),
-    })
-}
-
-fn checked_media_prompt(request: &MediaGenerationRequest) -> Result<String, String> {
-    let cwd = checked_workspace(&request.cwd)?;
-    let prompt = request.prompt.trim();
-    if prompt.is_empty() || prompt.chars().count() > 4_000 {
-        return Err("媒体提示词必须为 1–4000 个字符".into());
-    }
-    let aspect = match request.aspect.as_str() {
-        "1:1" | "16:9" | "9:16" | "4:3" => request.aspect.as_str(),
-        _ => return Err("不支持的画面比例".into()),
-    };
-    let instruction = match request.kind.as_str() {
-        "image" => format!(
-            "必须调用内置 image_gen 工具真实生成 {count} 张图片。画面比例 {aspect}。生成完成后仅列出每个实际输出文件的绝对路径或 URL。用户提示：{prompt}",
-            count = request.count.clamp(1, 4)
-        ),
-        "video" => {
-            let reference = if let Some(path) = request.reference_path.as_deref() {
-                let file = checked_workspace_file(&cwd, path)?;
-                if !file.is_file() {
-                    return Err("参考图片不存在".into());
-                }
-                format!(
-                    "参考图片绝对路径：{}。必须使用 image_to_video 或 reference_to_video。",
-                    path_for_webview(&file)
-                )
-            } else {
-                "必须使用 video_gen。".to_string()
-            };
-            format!(
-                "{reference}真实生成视频，画面比例 {aspect}，时长 {duration} 秒，分辨率 {resolution}。生成完成后仅列出实际输出文件的绝对路径或 URL。用户提示：{prompt}",
-                duration = request.duration.clamp(1, 30),
-                resolution = request.resolution
-            )
-        }
-        _ => return Err("不支持的媒体类型".into()),
-    };
-    Ok(instruction)
-}
-
-fn extract_media_artifacts(output: &str, cwd: &Path) -> Result<Vec<MediaArtifact>, String> {
-    let mut candidates = Vec::new();
-    for line in output.lines() {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-            collect_media_strings(&value, &mut candidates);
-        } else {
-            candidates.extend(line.split_whitespace().map(|value| {
-                value
-                    .trim_matches(|c| matches!(c, '"' | '\'' | ',' | ')' | '('))
-                    .to_string()
-            }));
-        }
-    }
-    let mut artifacts = Vec::new();
-    for candidate in candidates {
-        let clean = candidate.trim().trim_matches('"');
-        let lower = clean.to_ascii_lowercase();
-        let mime = if lower.contains(".png") {
-            "image/png"
-        } else if lower.contains(".jpg") || lower.contains(".jpeg") {
-            "image/jpeg"
-        } else if lower.contains(".webp") {
-            "image/webp"
-        } else if lower.contains(".mp4") {
-            "video/mp4"
-        } else if lower.contains(".webm") {
-            "video/webm"
-        } else {
-            continue;
-        };
-        if let Ok(parsed) = url::Url::parse(clean) {
-            let allowed = match parsed.scheme() {
-                "https" => is_media_https_host_allowed(parsed.host_str()),
-                "http" => is_loopback_host(parsed.host_str()),
-                _ => false,
-            };
-            if allowed && parsed.username().is_empty() && parsed.password().is_none() {
-                artifacts.push(MediaArtifact {
-                    path: None,
-                    url: Some(parsed.to_string()),
-                    mime: mime.into(),
-                });
-                continue;
-            }
-        }
-        let path = PathBuf::from(clean);
-        let path = if path.is_absolute() {
-            path
-        } else {
-            cwd.join(path)
-        };
-        if !is_workspace_file(cwd, &path) {
-            continue;
-        }
-        let Ok(canonical) = path.canonicalize() else {
-            continue;
-        };
-        let display = path_for_webview(&canonical);
-        if !artifacts
-            .iter()
-            .any(|item| item.path.as_deref() == Some(&display))
-        {
-            artifacts.push(MediaArtifact {
-                path: Some(display),
-                url: None,
-                mime: mime.into(),
-            });
-        }
-    }
-    Ok(artifacts)
-}
-
-fn collect_media_strings(value: &serde_json::Value, output: &mut Vec<String>) {
-    match value {
-        serde_json::Value::String(value) => output.push(value.clone()),
-        serde_json::Value::Array(values) => values
-            .iter()
-            .for_each(|value| collect_media_strings(value, output)),
-        serde_json::Value::Object(values) => values
-            .values()
-            .for_each(|value| collect_media_strings(value, output)),
-        _ => {}
-    }
 }
 
 fn checked_reasoning_effort(effort: Option<String>) -> Result<Option<String>, String> {
@@ -9415,6 +9121,7 @@ fn main() {
         .manage(AutomationStore::default())
         .manage(WorktreeOwnershipStore::default())
         .manage(AutomationRunner::default())
+        .manage(Arc::new(MediaService::default()))
         .manage(AppShutdown::default())
         .setup(|app| {
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?;
@@ -9424,6 +9131,9 @@ fn main() {
             tray::setup(app.handle()).map_err(std::io::Error::other)?;
             register_computer_emergency_shortcut(app.handle().clone());
             app.state::<AutomationRunner>().start(app.handle().clone());
+            if let Err(error) = media_service::scrub_reference_cache(app.handle()) {
+                eprintln!("grox: 无法清理媒体参考图缓存：{error}");
+            }
             let coordinator = app.state::<Arc<AcpState>>().sessions.clone();
             let mut occupancy = coordinator.subscribe();
             let occupancy_app = app.handle().clone();
@@ -9541,7 +9251,11 @@ fn main() {
             computer_emergency_stop_session,
             browser_shutdown_all_leases,
             save_media_reference,
-            generate_media,
+            release_media_reference,
+            start_media_generation,
+            media_generation_capabilities,
+            media_generation_status,
+            cancel_media_generation,
             agent_runtime_connect,
             agent_runtime_auth_status,
             agent_runtime_authenticate,
@@ -10834,97 +10548,6 @@ UNRELATED=value
         );
         assert_eq!(cli_version_number("grok"), None);
         assert_eq!(cli_version_number(""), None);
-    }
-
-    #[test]
-    fn media_generation_tools_allowlist_stays_closed() {
-        assert_eq!(
-            MEDIA_GENERATION_TOOLS,
-            "image_gen,video_gen,image_to_video,reference_to_video"
-        );
-        assert!(!MEDIA_GENERATION_TOOLS.contains("bash"));
-        assert!(!MEDIA_GENERATION_TOOLS.contains("shell"));
-        assert!(!MEDIA_GENERATION_TOOLS.contains("computer"));
-    }
-
-    #[test]
-    fn media_prompt_selects_native_grok_tools() {
-        let cwd = env!("CARGO_MANIFEST_DIR");
-        let image = MediaGenerationRequest {
-            kind: "image".into(),
-            prompt: "黑洞边缘的空间站".into(),
-            aspect: "16:9".into(),
-            count: 2,
-            duration: 5,
-            resolution: "1080p".into(),
-            reference_path: None,
-            cwd: cwd.into(),
-        };
-        let prompt = checked_media_prompt(&image).unwrap();
-        assert!(prompt.contains("image_gen"));
-        assert!(prompt.contains("2 张"));
-
-        let reference = PathBuf::from(cwd).join("icons").join("icon.png");
-        let video = MediaGenerationRequest {
-            kind: "video".into(),
-            reference_path: Some(path_for_webview(&reference)),
-            ..image
-        };
-        let prompt = checked_media_prompt(&video).unwrap();
-        assert!(prompt.contains("image_to_video"));
-        assert!(prompt.contains("1080p"));
-        assert!(checked_media_prompt(&MediaGenerationRequest {
-            reference_path: Some("/tmp/outside-reference.png".into()),
-            ..video
-        })
-        .is_err());
-    }
-
-    #[test]
-    fn media_artifacts_are_limited_to_workspace_files_or_safe_urls() {
-        let root = std::env::temp_dir().join(format!(
-            "grox-media-test-{}",
-            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let image = root.join("result.png");
-        fs::write(&image, b"png").unwrap();
-        let outside = std::env::temp_dir().join(format!(
-            "grox-media-outside-{}.png",
-            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::write(&outside, b"png").unwrap();
-        let output = format!(
-            "{{\"path\":{}}}\n{{\"path\":{}}}\n{{\"url\":\"https://cdn.x.ai/result.mp4\"}}\n{{\"url\":\"https://evil.example/result.mp4\"}}",
-            serde_json::to_string(&path_for_webview(&image)).unwrap(),
-            serde_json::to_string(&path_for_webview(&outside)).unwrap()
-        );
-        let artifacts = extract_media_artifacts(&output, &root).unwrap();
-        assert_eq!(artifacts.len(), 2);
-        assert_eq!(artifacts[0].mime, "image/png");
-        assert!(artifacts[0].path.is_some());
-        assert_eq!(artifacts[1].mime, "video/mp4");
-        assert!(artifacts[1].url.is_some());
-        assert!(artifacts.iter().all(|artifact| {
-            artifact
-                .url
-                .as_deref()
-                .is_none_or(|url| !url.contains("evil.example"))
-        }));
-        let _ = fs::remove_file(&outside);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn media_reference_rejects_extension_content_mismatch() {
-        let root = std::env::temp_dir().join(format!(
-            "grox-media-reference-{}",
-            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let jpeg = BASE64.encode(b"\xff\xd8\xffpayload");
-        assert!(save_media_reference(path_for_webview(&root), "fake.png".into(), jpeg).is_err());
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

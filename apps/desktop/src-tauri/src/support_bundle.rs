@@ -42,7 +42,7 @@ fn sensitive_key(key: &str) -> bool {
     .any(|marker| key.contains(marker))
 }
 
-fn redact_token_markers(text: &str) -> String {
+pub(crate) fn redact_token_markers(text: &str) -> String {
     let mut output = text.to_string();
     for variable in ["HOME", "USERPROFILE"] {
         if let Ok(directory) = std::env::var(variable) {
