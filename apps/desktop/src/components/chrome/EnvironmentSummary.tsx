@@ -4,7 +4,6 @@ import { useDesktop } from "../../state/store";
 import { MAX_ATTACHMENTS, prepareAttachment, validateAttachmentSet } from "../../lib/attachments";
 import { baseName } from "../../lib/format";
 import { useI18n } from "../../lib/i18n";
-import { worktreeRemovalBlocker } from "../../lib/worktreeOwnership";
 import { Icon } from "../fx/Icon";
 import { ChipSelect } from "../common/ChipSelect";
 
@@ -51,6 +50,8 @@ interface AgentRuntimeStatus {
   pendingClientCallbacks: number;
   boundClientSessions: number;
   activeTerminals: number;
+  worktreeSessionBindings: number;
+  worktreeOwnershipError?: string;
 }
 
 interface SummarySource {
@@ -159,7 +160,7 @@ export function EnvironmentSummary() {
         });
         setWorktrees([]);
         setJournalStatus({ count: 12, totalBytes: 1_480_000, latestSavedAt: Date.now(), migrationPending: 0, unreadableCount: 0 });
-        setRuntimeStatus({ topology: "shared_process", processCapacity: 1, running: true, ready: true, phase: "ready", generation: 1, pid: 12345, pendingRequests: 0, pendingInteractions: 0, pendingClientCallbacks: 0, boundClientSessions: 0, activeTerminals: 0 });
+        setRuntimeStatus({ topology: "shared_process", processCapacity: 1, running: true, ready: true, phase: "ready", generation: 1, pid: 12345, pendingRequests: 0, pendingInteractions: 0, pendingClientCallbacks: 0, boundClientSessions: 0, activeTerminals: 0, worktreeSessionBindings: 0 });
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -373,6 +374,12 @@ export function EnvironmentSummary() {
                       runtimeStatus.activeTerminals > 0
                         ? `${runtimeStatus.activeTerminals} ${zh ? "个 Host 终端仍被持有" : "Host terminals retained"}`
                         : "",
+                      runtimeStatus.worktreeSessionBindings > 0
+                        ? `${runtimeStatus.worktreeSessionBindings} ${zh ? "个会话绑定到 worktree" : "sessions bound to worktrees"}`
+                        : "",
+                      runtimeStatus.worktreeOwnershipError
+                        ? `${zh ? "Worktree 所有权索引异常" : "Worktree ownership index error"}: ${runtimeStatus.worktreeOwnershipError}`
+                        : "",
                       activeTurns > 0 ? `${activeTurns} ${zh ? "个活动回合" : "active turns"}` : "",
                       runtimeOccupancy.lifecycleActive ? (zh ? "会话同步占用中" : "Session sync active") : "",
                       runtimeOccupancy.pendingLifecycle > 0
@@ -491,31 +498,19 @@ export function EnvironmentSummary() {
                             disabled={busy !== null}
                             onClick={() => {
                               void runAction("worktree", async () => {
-                                const state = useDesktop.getState();
-                                const blocker = worktreeRemovalBlocker(
-                                  item.path,
-                                  state.workspace,
-                                  state.sessionIndex.map((entry) => entry.cwd),
-                                  state.automations.map((automation) => automation.cwd),
-                                );
-                                if (blocker?.kind === "current_workspace") {
-                                  throw new Error(zh ? "不能删除当前正在使用的工作树" : "The current worktree cannot be removed");
-                                }
-                                if (blocker?.kind === "references") {
-                                  throw new Error(zh
-                                    ? `该工作树仍被 ${blocker.sessions} 个会话和 ${blocker.automations} 个自动化引用，请先迁移或删除这些记录`
-                                    : `This worktree is still referenced by ${blocker.sessions} session(s) and ${blocker.automations} automation(s)`);
-                                }
                                 if (!inTauri()) return zh ? "Worktree 已移除" : "Worktree removed";
-                                // Native shell confirms via OS dialog inside prepare_git_worktree_remove.
+                                // Host 在确认前和执行前都按持久会话、活动绑定与自动化
+                                // 重新检查引用；页面状态不再承担安全门禁。
                                 const confirmToken = await invoke<string>("prepare_git_worktree_remove", {
                                   cwd: workspace,
                                   path: item.path,
                                 });
                                 return invoke<string>("git_worktree_remove", {
-                                  cwd: workspace,
-                                  path: item.path,
-                                  confirmToken,
+                                  request: {
+                                    cwd: workspace,
+                                    path: item.path,
+                                    confirmToken,
+                                  },
                                 });
                               });
                             }}

@@ -66,8 +66,8 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 3 | Native repositories | PromptQueueStore、AutomationStore、SessionJournalStore 已迁移；草稿持久化边界继续收口 |
 | 4 | Unified turn execution | Host 自动化与普通前台回合均拥有许可、模型/模式绑定、Prompt、watchdog、取消和 effort 降级；流内容继续由前端投影 |
 | 5 | Interaction service | Host 持有权限、计划审批、ask-user 的 rpc id、代次、回复和 Stop 清算；已落地 |
-| 6 | Client callback service | Host 持有 FS callback 的 session/cwd/rpc/generation；标准 FS 已落地，terminal 仍保持未宣告 |
-| 7 | Host services | worktree、权限策略、媒体、密钥统一使用会话/项目身份和路径授权 |
+| 6 | Client callback service | Host 持有 FS/terminal callback 的 session/cwd/rpc/generation 与终端进程树生命周期；已落地 |
+| 7 | Host services | worktree 所有权、原生会话 fork 与安全删除已迁移；权限策略、媒体、密钥继续统一到会话/项目身份和路径授权 |
 | 8 | Command facade | 将 `main.rs` 按领域迁出，Tauri command 只校验 DTO 并调用服务 |
 | 9 | Error/diagnostics | 稳定错误码、运行时快照、审计事件和支持包覆盖所有上述服务 |
 
@@ -78,6 +78,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 
 - `acp_host::AcpRequestBroker` 已成为出站 RPC 的 Host 请求表；
 - `acp_request` 定向返回响应，`acp_send` 拒绝绕过 Host 的出站请求；
+- Host 内部统一使用规范化的 `x.ai/...` 方法名做门禁与错误分类，唯一请求入口负责在 ACP wire 上编码为 `_x.ai/...`；自动化、会话删除与 fork 不再依赖 WebView 才拥有的扩展编码；
 - 普通请求超时与长回合 watchdog 都由 Host 处理；WebView 不再持有 prompt RPC id 或调用任意请求取消命令；
 - 进程替换、自然退出、停止、CLI 更新和主窗口退出都会清算请求；
 - Host 为退出、通道替换、超时、停滞、取消和协议校验返回稳定错误代码，前端不再用字符串正则覆盖这些分类；
@@ -128,6 +129,11 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - `terminal_host::TerminalHost` 完整实现标准 `create/output/wait_for_exit/kill/release` 后才把 `clientCapabilities.terminal` 设为 true：terminal id 同时绑定 generation 与 session，cwd 必须位于已绑定工作区，参数/环境/输出均有硬上限，输出只保留 UTF-8 尾部且报告 truncated；
 - `wait_for_exit` 在独立 Host task 中等待，不阻塞 ACP stdout reader 或其它会话；Unix 使用独立进程组、Windows 使用 Kill-on-close Job Object，kill/release/session close/generation reset/Host shutdown 都终止完整进程树，release 保持幂等；
 - Agent 与 ACP terminal 共用 GUI PATH 补齐规则，只加入实际存在的 Grok/Cargo/Bun/pyenv/asdf/Volta/NVM/Conda 等工具目录；ACP 显式传入的 PATH 仍有最高优先级，解决系统终端可用但桌面 Agent 找不到命令的问题；
+- `worktree_ownership::WorktreeOwnershipStore` 以原子文件持久化 session 与 linked worktree 的 Host 关联，并用现存 journal 兼容旧会话；前端 localStorage 不再参与删除裁决；
+- “在新工作树中继续”改为调用 Grok Build 的 `x.ai/session/fork` 复制完整服务端上下文，再用新 session id 加载投影；不再截取最后一轮消息拼提示词伪装续接。源工作区必须干净，monorepo 子目录会在目标 worktree 中保持相对位置；
+- worktree 创建、原生会话 fork 与所有权落盘作为一个 Host 事务呈现：fork 或落盘失败只回滚本次创建的唯一 worktree/branch，并尽力删除已复制会话，不触碰源会话和用户已有目录；
+- worktree 删除令牌同时绑定仓库与规范化目标，执行时在 Host 生命周期锁内重新核对持久会话、活动 callback、正在打开的会话、旧 journal 与自动化 cwd 后才运行 `git worktree remove`，关闭确认后换目标和检查后新增引用两类竞态；
+- Grox 管理目录由“仓库 basename”升级为“basename + 主工作树路径摘要”，同名仓库不再共享命名空间；旧版管理目录仍可通过原有边界安全删除；
 - 自动化执行不再定向派发给 `main` WebView；供应商、认证或全局配置切换会先暂停 runner，并取得 Host lifecycle permit 后才替换进程，因此能够等待 Host 后台回合而不是只观察 `activePromptSessions`；
 - `agent_auth` 持有显式 OAuth 的唯一活动事务：认证方法只从 Host initialize 快照解析，并发点击附着同一次登录；URL 轮询、系统浏览器、五分钟 watchdog、用户取消、请求清算和 generation 换代均不再依赖 WebView promise 或 localStorage；
 - 主窗口关闭与进程退出已经拆分：存在已启用自动化或 Host 正在执行会话/生命周期事务时，CloseRequested 只隐藏窗口并保留托盘；没有后台责任时关闭才进入真正退出；
@@ -156,7 +162,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 队列 | Store/localStorage 主导 | Host 运行时可观察 busy/退出 | 队列状态与发送事务绑定 |
 | 自动化 | Host 已拥有认领、建会话、运行时注册、能力租约、模型/模式、Prompt、崩溃去重与结算；页面只做 started/settled 投影 | runner 复用 SessionManager | 前台与后台共用 SessionCoordinator/turn_runtime，页面登记屏障已删除 |
 | 认证 | WebView 曾持有 authenticate promise、URL 轮询和取消时序 | 单例认证事务、可取消子进程、硬超时、认证后淘汰旧 runtime | `agent_auth` 按 generation 持有 ACP OAuth；页面只 start/cancel/status 并消费事件 |
-| 工作树 | 命令安全性已有，生命周期仍偏 UI | worktree 与 session metadata 绑定 | 引入 Host 所有权记录和清理策略 |
+| 工作树 | Host 已持久化 session 关联并拥有创建/fork/引用检查/删除事务；旧 localStorage 安全源已删除 | worktree 与 session metadata 绑定、原生复制会话上下文 | 已完成 Host 所有权索引、干净树门禁、失败回滚、目标绑定确认和同名仓库隔离 |
 | 权限/提问 | Host 已按 session + generation 持有反向 RPC，WebView 只用 block id 投影；持久 allow cache 尚未统一 | 每会话策略、allow cache、Host resolve | 交互生命周期已迁移，下一步统一权限策略与审计 |
 | 媒体 | 工具图已落盘，预览/生成分散 | token loopback + path scope | 统一 MediaService 与会话授权 |
 | 密钥 | 配置合并/脱敏，但无统一 secret backend | OS keychain + 受限文件后备 | 单独 SecretStore，诊断永不带值 |

@@ -31,6 +31,7 @@ import type {
   RewindMode,
   RewindPoint,
   RewindResult,
+  WorktreeForkResult,
 } from "./types";
 
 export interface GrokBridge {
@@ -99,6 +100,9 @@ export interface GrokBridge {
 
   /** 为自动化创建不抢占当前视图的会话，并返回 Agent 会话 ID。 */
   newBackgroundSession(cwd: string): Promise<string>;
+
+  /** 在干净 linked worktree 中复制完整 Agent 会话，并返回新的 sessionId。 */
+  forkSessionInNewWorktree(sessionId: string, cwd: string): Promise<WorktreeForkResult>;
 
   /** ACP: session/load — emits session_ready with the restored transcript. */
   loadSession(id: string, options?: { background?: boolean }): Promise<void>;

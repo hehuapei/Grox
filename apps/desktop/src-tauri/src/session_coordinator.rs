@@ -1,6 +1,6 @@
 //! 共享 ACP 进程的会话并发协调器。
 //!
-//! `session/new` 与 `session/load` 会改变进程级上下文；`session/prompt` 则占用
+//! `session/new`、`session/load` 与原生会话 fork 会改变进程级上下文；`session/prompt` 则占用
 //! 一个具体会话。许可必须由原生 Host 签发并校验，WebView 只负责在操作结束时
 //! 归还 token，不能自行声明运行时是否空闲。
 
@@ -226,7 +226,9 @@ impl SessionCoordinator {
             .map(|suffix| format!("x.ai/{suffix}"))
             .unwrap_or_else(|| method.to_string());
         let requirement = match method.as_str() {
-            "session/new" | "session/load" => GateRequirement::Lifecycle,
+            "session/new" | "session/load" | "x.ai/session/fork" => {
+                GateRequirement::Lifecycle
+            }
             "session/prompt" => {
                 let session_id = params
                     .get("sessionId")
@@ -516,6 +518,14 @@ mod tests {
                 assert!(coordinator
                     .verify_request(
                         "session/new",
+                        &serde_json::json!({}),
+                        Some(permit.token()),
+                        6
+                    )
+                    .is_ok());
+                assert!(coordinator
+                    .verify_request(
+                        "_x.ai/session/fork",
                         &serde_json::json!({}),
                         Some(permit.token()),
                         6

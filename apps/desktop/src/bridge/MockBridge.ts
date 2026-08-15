@@ -263,6 +263,32 @@ export class MockBridge implements GrokBridge {
     return this.createSession(cwd, true);
   }
 
+  async forkSessionInNewWorktree(sessionId: string, cwd: string) {
+    const source = this.sessions.get(sessionId);
+    if (!source) throw new Error(`找不到会话：${sessionId}`);
+    const now = Date.now();
+    const nextId = uid();
+    const worktree = `${cwd.replace(/[\\/]$/, "")}-worktree-${nextId.slice(0, 8)}`;
+    this.sessions.set(nextId, {
+      ...structuredClone(source),
+      id: nextId,
+      cwd: worktree,
+      parentId: sessionId,
+      createdAt: now,
+      updatedAt: now,
+      status: "idle",
+    });
+    return {
+      sessionId: nextId,
+      parentSessionId: sessionId,
+      cwd: worktree,
+      worktreePath: worktree,
+      branch: `grox/worktree-${nextId.slice(0, 8)}`,
+      chatMessagesCopied: source.blocks.length,
+      updatesCopied: 0,
+    };
+  }
+
   private async createSession(cwd: string, background: boolean): Promise<string> {
     const now = Date.now();
     const session: Session = {

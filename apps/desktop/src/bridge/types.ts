@@ -310,6 +310,16 @@ export interface SessionMeta {
   archived?: boolean;
 }
 
+export interface WorktreeForkResult {
+  sessionId: string;
+  parentSessionId: string;
+  cwd: string;
+  worktreePath: string;
+  branch: string;
+  chatMessagesCopied?: number;
+  updatesCopied?: number;
+}
+
 export interface Session extends SessionMeta {
   blocks: SessionBlock[];
   usage: Usage;

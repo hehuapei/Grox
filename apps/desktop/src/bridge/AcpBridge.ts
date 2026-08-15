@@ -48,6 +48,7 @@ import type {
   WorkflowAgentTrace,
   WorkflowTraceEntry,
   WorkflowRun,
+  WorktreeForkResult,
 } from "./types";
 import { readStoredPermissionMode } from "../lib/permissionMode";
 import { cleanApiError, toolCanonicalKind, toolReadOnly, versionMismatchNotice } from "../lib/runtimeNotice";
@@ -2781,6 +2782,29 @@ export class AcpBridge implements GrokBridge {
     } finally {
       this.markPromptFinished(creationLock);
     }
+  }
+
+  async forkSessionInNewWorktree(sessionId: string, cwd: string): Promise<WorktreeForkResult> {
+    await this.ensureReady();
+    const source = this.catalogue.get(sessionId);
+    const result = await invoke<WorktreeForkResult>("fork_agent_session_in_worktree", {
+      request: {
+        sourceSessionId: sessionId,
+        sourceCwd: cwd,
+        generation: this.acpGeneration,
+      },
+    });
+    const now = Date.now();
+    this.catalogue.set(result.sessionId, {
+      id: result.sessionId,
+      title: source?.title ? `Fork of ${source.title}` : "Forked mission",
+      cwd: result.cwd,
+      createdAt: now,
+      updatedAt: now,
+      model: source?.model ?? localStorage.getItem("grok.model") ?? "grok-build",
+      parentId: sessionId,
+    });
+    return result;
   }
 
   private emitHostWarnings(warnings: GroxError[] | undefined): void {

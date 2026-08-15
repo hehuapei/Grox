@@ -94,6 +94,26 @@ impl AutomationStore {
         Ok(Some(content))
     }
 
+    /// Worktree 删除门禁必须读取 Host 的自动化仓储，不能相信 WebView 当前
+    /// 渲染出来的数组。返回 id 便于错误信息明确指出真实占用者。
+    pub(crate) fn worktree_references(
+        &self,
+        path: &Path,
+        target: &Path,
+        max_bytes: u64,
+    ) -> Result<BTreeSet<String>, String> {
+        let _transaction = self.lock_transaction();
+        Ok(self
+            .read_locked(path, max_bytes)?
+            .into_iter()
+            .filter_map(|automation| {
+                let id = automation_id(&automation)?.to_string();
+                let cwd = automation.get("cwd")?.as_str()?;
+                crate::worktree_ownership::path_is_within(Path::new(cwd), target).then_some(id)
+            })
+            .collect())
+    }
+
     pub(crate) fn patch(
         &self,
         path: &Path,
@@ -912,6 +932,41 @@ mod tests {
             .unwrap();
         assert!(!store.any_enabled(&path, 1024 * 1024).unwrap());
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn worktree_references_are_resolved_from_host_storage() {
+        let path = temp_file("worktree-references");
+        let target = std::env::temp_dir().join(format!(
+            "grox-automation-worktree-{}-{}",
+            std::process::id(),
+            crate::CONFIG_WRITE_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let nested = target.join("packages").join("app");
+        fs::create_dir_all(&nested).unwrap();
+        let mut inside = automation("inside", true);
+        inside["cwd"] = Value::from(crate::path_sandbox::path_for_webview(&nested));
+        fs::write(
+            &path,
+            serde_json::json!([inside, automation("outside", true)]).to_string(),
+        )
+        .unwrap();
+        let store = AutomationStore::default();
+        assert_eq!(
+            store
+                .worktree_references(&path, &target, 1024 * 1024)
+                .unwrap(),
+            BTreeSet::from(["inside".to_string()])
+        );
+        fs::remove_dir_all(&nested).unwrap();
+        assert_eq!(
+            store
+                .worktree_references(&path, &target, 1024 * 1024)
+                .unwrap(),
+            BTreeSet::from(["inside".to_string()])
+        );
+        fs::remove_file(path).ok();
+        fs::remove_dir_all(target).ok();
     }
 
     #[test]

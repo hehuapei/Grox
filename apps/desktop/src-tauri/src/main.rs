@@ -32,6 +32,7 @@ mod support_bundle;
 mod terminal_host;
 mod tray;
 mod turn_runtime;
+mod worktree_ownership;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -74,7 +75,8 @@ use session_coordinator::{SessionCoordinator, SessionRuntimeOccupancy};
 use session_journal_store::SessionJournalStore;
 use session_runtime::{
     browser_shutdown_all_leases, close_agent_session, computer_emergency_stop_session,
-    computer_shutdown_all_leases, delete_agent_session, open_agent_session,
+    computer_shutdown_all_leases, delete_agent_session, fork_agent_session_in_worktree,
+    open_agent_session,
     shutdown_all_mcp_resources,
 };
 use session_storage::SessionStorageState;
@@ -86,6 +88,7 @@ use tokio::{
     sync::Mutex,
 };
 use toml_edit::{value as toml_value, Document, Item, Table, TableLike};
+use worktree_ownership::WorktreeOwnershipStore;
 
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GROX_BUILD_COMMIT: &str = env!("GROX_BUILD_COMMIT");
@@ -444,6 +447,8 @@ struct AgentRuntimeStatus {
     pending_client_callbacks: usize,
     bound_client_sessions: usize,
     active_terminals: usize,
+    worktree_session_bindings: usize,
+    worktree_ownership_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -456,7 +461,9 @@ struct DesktopEnvironment {
 
 #[tauri::command]
 async fn agent_runtime_status(
+    app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AcpState>>,
+    worktrees: tauri::State<'_, WorktreeOwnershipStore>,
 ) -> Result<AgentRuntimeStatus, String> {
     let (running, generation, pid) = {
         let process = state.process.lock().await;
@@ -465,6 +472,12 @@ async fn agent_runtime_status(
             process.as_ref().map(|process| process.generation),
             process.as_ref().and_then(|process| process.child.id()),
         )
+    };
+    let (worktree_session_bindings, worktree_ownership_error) = match worktree_bindings_path(&app)
+        .and_then(|path| worktrees.count(&path))
+    {
+        Ok(count) => (count, None),
+        Err(error) => (0, Some(error)),
     };
     Ok(AgentRuntimeStatus {
         topology: "shared_process",
@@ -481,6 +494,8 @@ async fn agent_runtime_status(
         pending_client_callbacks: state.client_callbacks.pending_len(),
         bound_client_sessions: state.client_callbacks.bound_len(),
         active_terminals: state.client_callbacks.terminal_len().await,
+        worktree_session_bindings,
+        worktree_ownership_error,
     })
 }
 
@@ -2190,6 +2205,13 @@ fn automations_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("无法定位自动化文件：{error}"))
 }
 
+fn worktree_bindings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("worktree-bindings.json"))
+        .map_err(|error| format!("无法定位 worktree 会话索引：{error}"))
+}
+
 #[tauri::command]
 fn read_automations(
     app: tauri::AppHandle,
@@ -2203,9 +2225,13 @@ fn read_automations(
 fn patch_automations(
     app: tauri::AppHandle,
     automations: tauri::State<'_, AutomationStore>,
+    worktrees: tauri::State<'_, WorktreeOwnershipStore>,
     upserts: Vec<serde_json::Value>,
     deletes: Vec<String>,
 ) -> Result<(), String> {
+    // cwd 变更与 worktree 删除串行；否则删除检查完成后，一个页面 patch
+    // 可能把自动化重新指向即将消失的目录。
+    let _worktree_lifecycle = worktrees.lock_lifecycle();
     let path = automations_path(&app)?;
     automations.patch(&path, upserts, deletes, AUTOMATIONS_MAX_BYTES)
 }
@@ -2295,6 +2321,7 @@ fn delete_session_data(
     app: tauri::AppHandle,
     storage: tauri::State<'_, SessionStorageState>,
     queues: tauri::State<'_, PromptQueueStore>,
+    worktrees: tauri::State<'_, WorktreeOwnershipStore>,
     id: String,
 ) -> Result<bool, String> {
     if !valid_session_id(&id) {
@@ -2318,6 +2345,12 @@ fn delete_session_data(
         errors.push(format!("无法删除会话提示队列：{error}"));
     }
     if errors.is_empty() {
+        let binding_path = worktree_bindings_path(&app)?;
+        if let Err(error) = worktrees.delete_sessions(&binding_path, std::slice::from_ref(&id)) {
+            errors.push(format!("无法解除会话 worktree 关联：{error}"));
+        }
+    }
+    if errors.is_empty() {
         Ok(removed)
     } else {
         Err(errors.join("；"))
@@ -2329,6 +2362,7 @@ fn delete_project_session_data(
     app: tauri::AppHandle,
     storage: tauri::State<'_, SessionStorageState>,
     queues: tauri::State<'_, PromptQueueStore>,
+    worktrees: tauri::State<'_, WorktreeOwnershipStore>,
     cwd: String,
 ) -> Result<Vec<String>, String> {
     let ids = delete_project_session_history_data(&grok_home()?, &cwd)?;
@@ -2338,6 +2372,8 @@ fn delete_project_session_data(
     }
     let path = prompt_queues_path(&app)?;
     queues.delete_sessions(&path, &ids, PROMPT_QUEUES_MAX_BYTES)?;
+    let binding_path = worktree_bindings_path(&app)?;
+    worktrees.delete_sessions(&binding_path, &ids)?;
     Ok(ids)
 }
 
@@ -3274,6 +3310,12 @@ async fn export_session_support_bundle(
     }
 
     let runtime_info = configured_grok_command(&app);
+    let worktree_ownership = match worktree_bindings_path(&app).and_then(|path| {
+        app.state::<WorktreeOwnershipStore>().count(&path)
+    }) {
+        Ok(count) => serde_json::json!({ "readable": true, "sessionBindings": count }),
+        Err(error) => serde_json::json!({ "readable": false, "error": error }),
+    };
     let process = {
         let guard = state.process.lock().await;
         guard.as_ref().map(|process| {
@@ -3295,6 +3337,7 @@ async fn export_session_support_bundle(
         "pendingClientCallbacks": state.client_callbacks.pending_len(),
         "boundClientSessions": state.client_callbacks.bound_len(),
         "activeTerminals": state.client_callbacks.terminal_len().await,
+        "worktreeOwnership": worktree_ownership,
         "sessionOccupancy": state.sessions.snapshot(),
         "automationRunner": automation_runner.status(state.inner()).await,
         "cli": {
@@ -4162,12 +4205,8 @@ fn git_worktree_add(cwd: String, name: String, branch: Option<String>) -> Result
     {
         return Err("Worktree 名称需为 1–64 个安全字符".into());
     }
-    let home = grok_home()?;
-    let project = root
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("project");
-    let target = home.join("worktrees").join(project).join(name);
+    let primary = primary_worktree(&root)?;
+    let target = managed_worktree_project_dir(&primary)?.join(name);
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("无法创建 worktree 目录：{error}"))?;
     }
@@ -4198,15 +4237,28 @@ fn git_worktree_add(cwd: String, name: String, branch: Option<String>) -> Result
 
 #[tauri::command]
 fn git_worktree_remove(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AcpState>>,
     confirms: tauri::State<'_, Arc<GitConfirmStore>>,
-    cwd: String,
-    path: String,
-    confirm_token: String,
+    automations: tauri::State<'_, AutomationStore>,
+    worktrees: tauri::State<'_, WorktreeOwnershipStore>,
+    request: GitWorktreeRemoveRequest,
 ) -> Result<String, String> {
-    let root = checked_workspace(&cwd)?;
+    let root = checked_workspace(&request.cwd)?;
     let root_key = path_for_webview(&root);
-    confirms.consume_worktree_remove(&root_key, &confirm_token)?;
-    let target = checked_removable_worktree(&root, &path)?;
+    let target = checked_removable_worktree(&root, &request.path)?;
+    let target_key = path_for_webview(&target);
+    // 与 session/new|load 绑定、会话本机删除和自动化 cwd patch 串行，关闭
+    // “确认后新引用出现”的 TOCTOU 窗口。
+    let _lifecycle = worktrees.lock_lifecycle();
+    ensure_worktree_unreferenced(
+        &app,
+        state.inner(),
+        worktrees.inner(),
+        automations.inner(),
+        &target,
+    )?;
+    confirms.consume_worktree_remove(&root_key, &target_key, &request.confirm_token)?;
     let target_text = target.to_string_lossy().to_string();
     git_text(&root, &["worktree", "remove", "--force", &target_text])?;
     Ok("Worktree 已移除".into())
@@ -4411,6 +4463,37 @@ fn parse_worktree_list(porcelain: &str) -> Vec<ListedWorktree> {
     entries
 }
 
+fn primary_worktree(root: &Path) -> Result<PathBuf, String> {
+    let listed = git_text(root, &["worktree", "list", "--porcelain"])?;
+    parse_worktree_list(&listed)
+        .into_iter()
+        .next()
+        .map(|entry| entry.path)
+        .ok_or_else(|| "无法确定仓库主工作树".to_string())?
+        .canonicalize()
+        .map_err(|error| format!("无法解析仓库主工作树：{error}"))
+}
+
+/// 同名仓库不能共享一个 `~/.grok/worktrees/<basename>` 命名空间；否则两个
+/// 项目创建同名 worktree 时会互相碰撞。可读项目名后附主工作树身份摘要，
+/// 旧目录仍保留在删除允许范围内。
+fn managed_worktree_project_dir(primary: &Path) -> Result<PathBuf, String> {
+    use sha2::{Digest as _, Sha256};
+
+    let primary = primary
+        .canonicalize()
+        .map_err(|error| format!("无法解析仓库主工作树：{error}"))?;
+    let project = primary
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("grox-project");
+    let digest = format!("{:x}", Sha256::digest(path_for_webview(&primary).as_bytes()));
+    Ok(grok_home()?
+        .join("worktrees")
+        .join(format!("{project}-{}", &digest[..12])))
+}
+
 fn is_legacy_grox_worktree(primary: &Path, target: &Path, branch: Option<&str>) -> bool {
     let Some(primary_name) = primary.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -4470,6 +4553,100 @@ fn checked_removable_worktree(root: &Path, requested: &str) -> Result<PathBuf, S
     Ok(canonical)
 }
 
+struct WorktreeRemovalReferences {
+    sessions: BTreeSet<String>,
+    automations: BTreeSet<String>,
+    opening_sessions: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitWorktreeRemoveRequest {
+    cwd: String,
+    path: String,
+    confirm_token: String,
+}
+
+fn worktree_removal_references(
+    app: &tauri::AppHandle,
+    state: &AcpState,
+    worktrees: &WorktreeOwnershipStore,
+    automations: &AutomationStore,
+    target: &Path,
+) -> Result<WorktreeRemovalReferences, String> {
+    let binding_path = worktree_bindings_path(app)?;
+    let mut sessions = worktrees.session_references(&binding_path, target)?;
+    sessions.extend(state.client_callbacks.sessions_within(target));
+    let config = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("无法定位应用会话目录：{error}"))?;
+    sessions.extend(worktree_ownership::journal_session_references(
+        &config, target,
+    ));
+    let automations = automations.worktree_references(
+        &automations_path(app)?,
+        target,
+        AUTOMATIONS_MAX_BYTES,
+    )?;
+    Ok(WorktreeRemovalReferences {
+        sessions,
+        automations,
+        opening_sessions: worktrees.opening_references(target),
+    })
+}
+
+fn ensure_worktree_unreferenced(
+    app: &tauri::AppHandle,
+    state: &AcpState,
+    worktrees: &WorktreeOwnershipStore,
+    automations: &AutomationStore,
+    target: &Path,
+) -> Result<(), String> {
+    let references = worktree_removal_references(app, state, worktrees, automations, target)?;
+    let session_count = references
+        .sessions
+        .len()
+        .saturating_add(references.opening_sessions);
+    if session_count == 0 && references.automations.is_empty() {
+        return Ok(());
+    }
+    let session_examples = references
+        .sessions
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let automation_examples = references
+        .automations
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut owners = Vec::new();
+    if session_count > 0 {
+        let suffix = if session_examples.is_empty() {
+            "正在创建或恢复".to_string()
+        } else {
+            session_examples
+        };
+        owners.push(format!("{session_count} 个会话（{suffix}）"));
+    }
+    if !references.automations.is_empty() {
+        owners.push(format!(
+            "{} 个自动化（{}）",
+            references.automations.len(),
+            automation_examples
+        ));
+    }
+    Err(format!(
+        "该 worktree 仍被 {} 引用；请先迁移或删除这些记录",
+        owners.join("、")
+    ))
+}
+
 #[tauri::command]
 fn prepare_git_commit(
     confirms: tauri::State<'_, Arc<GitConfirmStore>>,
@@ -4495,17 +4672,28 @@ fn prepare_git_push(
 
 #[tauri::command]
 fn prepare_git_worktree_remove(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AcpState>>,
     confirms: tauri::State<'_, Arc<GitConfirmStore>>,
+    automations: tauri::State<'_, AutomationStore>,
+    worktrees: tauri::State<'_, WorktreeOwnershipStore>,
     cwd: String,
     path: String,
 ) -> Result<String, String> {
     let root = checked_workspace(&cwd)?;
     let target = checked_removable_worktree(&root, &path)?;
+    ensure_worktree_unreferenced(
+        &app,
+        state.inner(),
+        worktrees.inner(),
+        automations.inner(),
+        &target,
+    )?;
     confirm_destructive_git_action(
         "Grox",
         &format!("确认强制移除 worktree？\n{}", path_for_webview(&target)),
     )?;
-    confirms.issue_worktree_remove(&path_for_webview(&root))
+    confirms.issue_worktree_remove(&path_for_webview(&root), &path_for_webview(&target))
 }
 
 #[tauri::command]
@@ -5870,12 +6058,33 @@ fn open_file_with_application(cwd: String, path: String, application: String) ->
     }
 }
 
-/// 永久工作树与手动工作树共用同一管理目录和删除边界。
-#[tauri::command]
-fn create_permanent_worktree(cwd: String) -> Result<String, String> {
-    let requested = checked_workspace(&cwd)?;
+#[derive(Clone, Debug)]
+struct CreatedManagedWorktree {
+    source_root: PathBuf,
+    path: PathBuf,
+    branch: String,
+}
+
+fn ensure_clean_worktree(root: &Path) -> Result<(), String> {
+    let status = git_text(
+        root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    if status.is_empty() {
+        Ok(())
+    } else {
+        Err("源工作树存在未提交改动；请先提交或暂存处理后再分叉，避免新 worktree 与当前代码状态不一致".into())
+    }
+}
+
+fn create_managed_worktree(
+    cwd: &str,
+    directory_prefix: &str,
+    require_clean: bool,
+) -> Result<CreatedManagedWorktree, String> {
+    let requested = checked_workspace(cwd)?;
     let top_level = git_text(&requested, &["rev-parse", "--show-toplevel"])
-        .map_err(|_| "当前项目不是 Git 仓库，无法创建永久工作树".to_string())?;
+        .map_err(|_| "当前项目不是 Git 仓库，无法创建 worktree".to_string())?;
     let root = PathBuf::from(top_level)
         .canonicalize()
         .map_err(|error| format!("无法解析 Git 仓库根目录：{error}"))?;
@@ -5885,21 +6094,17 @@ fn create_permanent_worktree(cwd: String) -> Result<String, String> {
         .next()
         .map(|entry| entry.path)
         .unwrap_or_else(|| root.clone());
-    let project = primary
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("grox-project");
+    if require_clean {
+        ensure_clean_worktree(&root)?;
+    }
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
     let nonce = CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
     let unique = format!("{timestamp}-{nonce}");
-    let target = grok_home()?
-        .join("worktrees")
-        .join(project)
-        .join(format!("permanent-{unique}"));
+    let target = managed_worktree_project_dir(&primary)?
+        .join(format!("{directory_prefix}-{unique}"));
     let parent = target
         .parent()
         .ok_or_else(|| "无法确定工作树管理目录".to_string())?;
@@ -5922,12 +6127,45 @@ fn create_permanent_worktree(cwd: String) -> Result<String, String> {
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if message.is_empty() {
-            "创建永久工作树失败".into()
+            "创建 worktree 失败".into()
         } else {
-            format!("创建永久工作树失败：{message}")
+            format!("创建 worktree 失败：{message}")
         });
     }
-    Ok(path_for_webview(&target))
+    Ok(CreatedManagedWorktree {
+        source_root: root,
+        path: target,
+        branch,
+    })
+}
+
+fn rollback_managed_worktree(created: &CreatedManagedWorktree) -> Result<(), String> {
+    let target = created.path.to_string_lossy().to_string();
+    let mut errors = Vec::new();
+    if let Err(error) = git_text(
+        &created.source_root,
+        &["worktree", "remove", "--force", &target],
+    ) {
+        errors.push(format!("无法移除 worktree：{error}"));
+    }
+    if let Err(error) = git_text(
+        &created.source_root,
+        &["branch", "-D", &created.branch],
+    ) {
+        errors.push(format!("无法删除分叉分支：{error}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
+}
+
+/// 永久工作树与手动工作树共用同一管理目录和删除边界。
+#[tauri::command]
+fn create_permanent_worktree(cwd: String) -> Result<String, String> {
+    create_managed_worktree(&cwd, "permanent", false)
+        .map(|created| path_for_webview(&created.path))
 }
 
 /// Let the operating system present its application chooser for a workspace
@@ -8407,6 +8645,13 @@ pub(crate) async fn request_acp_json(
     .await
 }
 
+fn acp_wire_method(method: &str) -> String {
+    method
+        .strip_prefix("x.ai/")
+        .map(|suffix| format!("_x.ai/{suffix}"))
+        .unwrap_or_else(|| method.to_string())
+}
+
 /// 与普通 Host 请求共用同一 broker；tracker 只记录当前事务可定向取消的 id。
 pub(crate) async fn request_acp_json_tracked(
     state: &AcpState,
@@ -8437,10 +8682,14 @@ pub(crate) async fn request_acp_json_tracked(
         tracker,
         request_id,
     };
+    // ACP 扩展在 wire 上使用前导下划线；Host 内部始终使用规范化的
+    // `x.ai/...` 名称做门禁、诊断和错误分类。此前只有 WebView 做了这层
+    // 编码，迁到 Host 的自动化/删除/fork 请求会在真实 CLI 上找不到方法。
+    let wire_method = acp_wire_method(method);
     let line = serde_json::json!({
         "jsonrpc": "2.0",
         "id": request_id,
-        "method": method,
+        "method": wire_method,
         "params": params,
     })
     .to_string();
@@ -9118,6 +9367,7 @@ fn main() {
         .manage(SessionStorageState::default())
         .manage(PromptQueueStore::default())
         .manage(AutomationStore::default())
+        .manage(WorktreeOwnershipStore::default())
         .manage(AutomationRunner::default())
         .manage(AppShutdown::default())
         .setup(|app| {
@@ -9180,6 +9430,7 @@ fn main() {
             automation_runner_status,
             run_automation_now,
             open_agent_session,
+            fork_agent_session_in_worktree,
             close_agent_session,
             delete_agent_session,
             delete_session_data,
@@ -9852,6 +10103,85 @@ mod tests {
             entries[1].branch.as_deref(),
             Some("refs/heads/grox/worktree-123")
         );
+    }
+
+    #[test]
+    fn managed_worktree_namespaces_distinguish_same_named_repositories() {
+        let base = std::env::temp_dir().join(format!(
+            "grox-worktree-namespace-{}-{}",
+            std::process::id(),
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let first = base.join("one").join("project");
+        let second = base.join("two").join("project");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let first_namespace = managed_worktree_project_dir(&first).unwrap();
+        let second_namespace = managed_worktree_project_dir(&second).unwrap();
+        assert_ne!(first_namespace, second_namespace);
+        assert!(first_namespace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("project-")));
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_worktree_fork_refuses_a_dirty_source_checkout() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-worktree-clean-gate-{}-{}",
+            std::process::id(),
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        git_text(&root, &["init"]).unwrap();
+        git_text(&root, &["config", "user.email", "grox@example.invalid"]).unwrap();
+        git_text(&root, &["config", "user.name", "Grox Test"]).unwrap();
+        fs::write(root.join("README.md"), "clean\n").unwrap();
+        assert!(ensure_clean_worktree(&root).is_err());
+        git_text(&root, &["add", "README.md"]).unwrap();
+        git_text(&root, &["commit", "-m", "init"]).unwrap();
+        assert!(ensure_clean_worktree(&root).is_ok());
+        fs::write(root.join("README.md"), "dirty\n").unwrap();
+        assert!(ensure_clean_worktree(&root).is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn failed_session_fork_rolls_back_only_its_worktree_and_branch() {
+        let base = std::env::temp_dir().join(format!(
+            "grox-worktree-rollback-{}-{}",
+            std::process::id(),
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let root = base.join("source");
+        let target = base.join("fork");
+        fs::create_dir_all(&root).unwrap();
+        git_text(&root, &["init"]).unwrap();
+        git_text(&root, &["config", "user.email", "grox@example.invalid"]).unwrap();
+        git_text(&root, &["config", "user.name", "Grox Test"]).unwrap();
+        fs::write(root.join("README.md"), "clean\n").unwrap();
+        git_text(&root, &["add", "README.md"]).unwrap();
+        git_text(&root, &["commit", "-m", "init"]).unwrap();
+        let target_text = target.to_string_lossy().to_string();
+        let branch = "grox/worktree-rollback-test";
+        git_text(
+            &root,
+            &["worktree", "add", "-b", branch, &target_text],
+        )
+        .unwrap();
+        rollback_managed_worktree(&CreatedManagedWorktree {
+            source_root: root.clone(),
+            path: target.clone(),
+            branch: branch.to_string(),
+        })
+        .unwrap();
+        assert!(!target.exists());
+        assert!(git_text(&root, &["branch", "--list", branch])
+            .unwrap()
+            .is_empty());
+        assert!(root.join("README.md").is_file());
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]
@@ -10604,6 +10934,13 @@ UNRELATED=value
         assert!(acp_method_allowed("x.ai/future_extension"));
         assert!(acp_method_allowed("_x.ai/future_extension"));
         assert!(!acp_method_allowed("session/../../evil"));
+    }
+
+    #[test]
+    fn host_requests_encode_extension_methods_for_the_acp_wire() {
+        assert_eq!(acp_wire_method("x.ai/session/fork"), "_x.ai/session/fork");
+        assert_eq!(acp_wire_method("session/load"), "session/load");
+        assert_eq!(acp_wire_method("_x.ai/session/fork"), "_x.ai/session/fork");
     }
 
     #[test]

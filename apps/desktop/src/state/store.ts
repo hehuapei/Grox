@@ -3048,20 +3048,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const meta = get().sessionIndex.find((entry) => entry.id === id);
       if (!meta) return;
       try {
-        const path = await invoke<string>("create_permanent_worktree", { cwd: meta.cwd });
-        const session = get().sessions[id];
-        const lastUser = [...(session?.blocks ?? [])].reverse().find((block) => block.type === "user");
-        const lastAssistant = [...(session?.blocks ?? [])].reverse().find((block) => block.type === "assistant");
-        const text = [
-          `请在这个隔离的 Git 工作树中继续原会话 ${id} 的任务。`,
-          `原始请求：${lastUser?.type === "user" ? lastUser.text : meta.title}`,
-          lastAssistant?.type === "assistant"
-            ? `上一会话的最新结果：${lastAssistant.text.slice(-2_000)}`
-            : "",
-          "先检查当前分支与工作区状态，再继续修改；不要假设原工作树中的未提交改动已出现在这里。",
-        ].filter(Boolean).join("\n\n");
-        await get().setWorkspace(path);
-        await get().newSession({ text });
+        // Host 等待源回合结算、创建干净 worktree，并通过 Grok Build
+        // x.ai/session/fork 复制完整上下文；不再用摘要提示伪装会话继续。
+        const forked = await bridge.forkSessionInNewWorktree(id, meta.cwd);
+        await get().setWorkspace(forked.cwd);
+        await bridge.loadSession(forked.sessionId);
       } catch (error) {
         set({ startupError: error instanceof Error ? error.message : String(error) });
       }

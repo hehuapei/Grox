@@ -208,6 +208,19 @@ impl ClientCallbackRegistry {
         self.lock().sessions.len()
     }
 
+    /// 返回当前进程代次内实际绑定到目标目录的会话。worktree 删除门禁用
+    /// Host 绑定补住 session/new 成功后 journal 尚未落盘的短窗口。
+    pub(crate) fn sessions_within(&self, target: &Path) -> BTreeSet<String> {
+        self.lock()
+            .sessions
+            .iter()
+            .filter_map(|(id, binding)| {
+                crate::worktree_ownership::path_is_within(&binding.workspace, target)
+                    .then_some(id.clone())
+            })
+            .collect()
+    }
+
     pub(crate) async fn terminal_len(&self) -> usize {
         self.terminals.len().await
     }

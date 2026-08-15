@@ -3,6 +3,7 @@
 use std::{path::Path, sync::Arc};
 
 use serde::{Deserialize, Serialize};
+use tauri::Manager as _;
 
 use crate::{
     acp_host::AcpHostError,
@@ -41,6 +42,26 @@ pub(crate) struct OpenAgentSessionResult {
     pub(crate) response: serde_json::Value,
     pub(crate) warnings: Vec<AcpHostError>,
     pub(crate) effective_permission_mode: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ForkAgentSessionInWorktreeRequest {
+    pub(crate) source_session_id: String,
+    pub(crate) source_cwd: String,
+    pub(crate) generation: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ForkAgentSessionInWorktreeResult {
+    pub(crate) session_id: String,
+    pub(crate) parent_session_id: String,
+    pub(crate) cwd: String,
+    pub(crate) worktree_path: String,
+    pub(crate) branch: String,
+    pub(crate) chat_messages_copied: Option<u64>,
+    pub(crate) updates_copied: Option<u64>,
 }
 
 #[derive(Default)]
@@ -312,6 +333,20 @@ fn session_open_params(
     serde_json::Value::Object(params)
 }
 
+fn session_fork_params(
+    source_session_id: &str,
+    source_cwd: &str,
+    new_cwd: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "sourceSessionId": source_session_id,
+        "sourceCwd": source_cwd,
+        "newCwd": new_cwd,
+        "sessionKind": "worktree",
+        "sourceWorkspaceDir": source_cwd,
+    })
+}
+
 fn prepare_session_extensions(
     leases: &McpLeaseStore,
     request: &OpenAgentSessionRequest,
@@ -446,6 +481,17 @@ pub(crate) async fn open_agent_session_inner(
         ));
     }
     let mut attempt = prepare_session_extensions(leases, &request, permission_mode, &mut warnings)?;
+    let worktrees = app.state::<crate::worktree_ownership::WorktreeOwnershipStore>();
+    let _worktree_use = worktrees.begin_session_use(&cwd).map_err(|error| {
+        discard_session_extension_attempt(leases, &mut attempt);
+        AcpHostError::environment(
+            "SESSION_WORKSPACE_DISAPPEARED",
+            error,
+            true,
+            false,
+            "重新选择仍然存在的项目目录",
+        )
+    })?;
     let callback_open = match state.client_callbacks.begin_session_open(
         request.generation,
         session_id.as_deref(),
@@ -560,12 +606,233 @@ pub(crate) async fn open_agent_session_inner(
         ));
     }
     let binding = std::mem::take(&mut attempt.leases);
-    let previous = leases.bind_session(bound_session_id, binding.clone());
+    let previous = leases.bind_session(bound_session_id.clone(), binding.clone());
     shutdown_replaced_session_resources(leases, previous, &binding);
+    let worktree_binding = crate::worktree_bindings_path(app)
+        .and_then(|path| worktrees.bind_session(&path, &bound_session_id, &cwd).map(|_| ()));
+    if let Err(error) = worktree_binding {
+        // Agent 会话已经成功建立，不能伪装成 session/new 失败并在上游留下
+        // 隐形会话；显式告警，同时删除门禁仍会读取活动绑定和 journal。
+        warnings.push(AcpHostError::environment(
+            "WORKTREE_BINDING_PERSIST_FAILED",
+            error,
+            false,
+            false,
+            "修复应用配置目录权限；在问题解决前不要删除该会话使用的 worktree",
+        ));
+    }
     Ok(OpenAgentSessionResult {
         response,
         warnings,
         effective_permission_mode: permission_mode.to_string(),
+    })
+}
+
+async fn rollback_created_worktree(created: crate::CreatedManagedWorktree) -> Option<String> {
+    match tauri::async_runtime::spawn_blocking(move || crate::rollback_managed_worktree(&created))
+        .await
+    {
+        Ok(Ok(())) => None,
+        Ok(Err(error)) => Some(error),
+        Err(error) => Some(format!("worktree 回滚任务异常：{error}")),
+    }
+}
+
+/// 在干净 linked worktree 中原生分叉完整 Grok Build 会话。创建目录、复制
+/// session、写入 Host 所有权必须作为一个结果呈现；失败时只回滚本次创建的
+/// 唯一 worktree/branch，绝不删除源会话或用户已有目录。
+#[tauri::command]
+pub(crate) async fn fork_agent_session_in_worktree(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    leases: tauri::State<'_, Arc<McpLeaseStore>>,
+    request: ForkAgentSessionInWorktreeRequest,
+) -> Result<ForkAgentSessionInWorktreeResult, AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    {
+        let process = state.process.lock().await;
+        if !process
+            .as_ref()
+            .is_some_and(|process| process.generation == request.generation)
+        {
+            return Err(AcpHostError::environment(
+                "ACP_CHANNEL_REPLACED",
+                "ACP 通道已切换，无法在旧运行时分叉会话",
+                true,
+                true,
+                "等待 Agent 重连完成后重试",
+            ));
+        }
+    }
+    let source_session_id = checked_session_value(
+        &request.source_session_id,
+        "sourceSessionId",
+        512,
+    )?;
+    let source_cwd = checked_workspace(&request.source_cwd).map_err(|error| {
+        AcpHostError::environment(
+            "SESSION_WORKSPACE_INVALID",
+            error,
+            false,
+            false,
+            "重新选择源会话的项目目录",
+        )
+    })?;
+    let binding_path = crate::worktree_bindings_path(&app).map_err(|error| {
+        AcpHostError::environment(
+            "WORKTREE_BINDING_PATH_FAILED",
+            error,
+            false,
+            false,
+            "修复应用配置目录权限后重试",
+        )
+    })?;
+    let permit = state.sessions.acquire_lifecycle(request.generation).await?;
+    let source_text = path_for_webview(&source_cwd);
+    let create_source = source_text.clone();
+    let created = tauri::async_runtime::spawn_blocking(move || {
+        crate::create_managed_worktree(&create_source, "session", true)
+    })
+    .await
+    .map_err(|error| {
+        AcpHostError::environment(
+            "WORKTREE_CREATE_TASK_FAILED",
+            format!("worktree 创建任务异常：{error}"),
+            false,
+            false,
+            "检查 Git 安装和仓库状态后重试",
+        )
+    })?
+    .map_err(|error| AcpHostError::operation("WORKTREE_CREATE_FAILED", error))?;
+    let relative_cwd = source_cwd
+        .strip_prefix(&created.source_root)
+        .unwrap_or_else(|_| Path::new(""));
+    let fork_cwd = created.path.join(relative_cwd);
+    if !fork_cwd.is_dir() {
+        let rollback = rollback_created_worktree(created).await;
+        return Err(AcpHostError::environment(
+            "WORKTREE_EFFECTIVE_CWD_MISSING",
+            format!(
+                "新 worktree 中缺少源会话子目录{}",
+                rollback
+                    .map(|error| format!("；回滚失败：{error}"))
+                    .unwrap_or_default()
+            ),
+            false,
+            false,
+            "确认源会话目录仍属于当前 Git 仓库",
+        ));
+    }
+    let worktrees = app.state::<crate::worktree_ownership::WorktreeOwnershipStore>();
+    let _worktree_use = match worktrees.begin_session_use(&fork_cwd) {
+        Ok(lease) => lease,
+        Err(error) => {
+            let rollback = rollback_created_worktree(created).await;
+            return Err(AcpHostError::environment(
+                "WORKTREE_DISAPPEARED_BEFORE_FORK",
+                format!(
+                    "{error}{}",
+                    rollback
+                        .map(|error| format!("；回滚失败：{error}"))
+                        .unwrap_or_default()
+                ),
+                true,
+                false,
+                "重新执行 worktree 会话分叉",
+            ));
+        }
+    };
+    let fork_cwd_text = path_for_webview(&fork_cwd);
+    let response = match request_acp_json(
+        state.inner(),
+        leases.inner(),
+        "x.ai/session/fork",
+        session_fork_params(&source_session_id, &source_text, &fork_cwd_text),
+        request.generation,
+        2 * 60_000,
+        Some(permit.token()),
+    )
+    .await
+    {
+        Ok(response) => response,
+        Err(mut error) => {
+            if let Some(rollback) = rollback_created_worktree(created).await {
+                error.message = format!("{}；新 worktree 回滚失败：{rollback}", error.message);
+            }
+            return Err(error);
+        }
+    };
+    let forked_session_id = response
+        .get("newSessionId")
+        .or_else(|| response.get("sessionId"))
+        .and_then(serde_json::Value::as_str);
+    let session_id = forked_session_id
+        .map(|value| checked_session_value(value, "fork sessionId", 512))
+        .transpose();
+    let session_id = match session_id {
+        Ok(Some(session_id)) if session_id != source_session_id => session_id,
+        _ => {
+            let rollback = rollback_created_worktree(created).await;
+            return Err(AcpHostError::protocol(
+                "ACP_INVALID_FORK_RESPONSE",
+                format!(
+                    "x.ai/session/fork 未返回新的 sessionId{}",
+                    rollback
+                        .map(|error| format!("；worktree 回滚失败：{error}"))
+                        .unwrap_or_default()
+                ),
+            ));
+        }
+    };
+    if let Err(binding_error) = worktrees.bind_session(&binding_path, &session_id, &fork_cwd) {
+        let delete_error = request_acp_json(
+            state.inner(),
+            leases.inner(),
+            "x.ai/session/delete",
+            serde_json::json!({
+                "sessionId": session_id.clone(),
+                "cwd": fork_cwd_text.clone(),
+                "kind": "build",
+            }),
+            request.generation,
+            30_000,
+            Some(permit.token()),
+        )
+        .await
+        .err()
+        .map(|error| error.message);
+        let rollback = rollback_created_worktree(created).await;
+        let detail = [
+            Some(format!("无法持久化 worktree 会话关联：{binding_error}")),
+            delete_error.map(|error| format!("分叉会话回滚失败：{error}")),
+            rollback.map(|error| format!("worktree 回滚失败：{error}")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("；");
+        return Err(AcpHostError::environment(
+            "WORKTREE_FORK_COMMIT_FAILED",
+            detail,
+            false,
+            false,
+            "修复应用配置目录权限并检查 Git worktree 列表",
+        ));
+    }
+    Ok(ForkAgentSessionInWorktreeResult {
+        session_id,
+        parent_session_id: source_session_id,
+        cwd: fork_cwd_text,
+        worktree_path: path_for_webview(&created.path),
+        branch: created.branch,
+        chat_messages_copied: response
+            .get("chatMessagesCopied")
+            .and_then(serde_json::Value::as_u64),
+        updates_copied: response
+            .get("updatesCopied")
+            .and_then(serde_json::Value::as_u64),
     })
 }
 
@@ -702,6 +969,20 @@ mod tests {
         );
         assert!(checked_session_value("session\npoison", "sessionId", 32).is_err());
         assert!(checked_session_value(&"x".repeat(33), "sessionId", 32).is_err());
+    }
+
+    #[test]
+    fn worktree_fork_uses_grok_build_native_context_copy_contract() {
+        assert_eq!(
+            session_fork_params("source-1", "/repo", "/managed/worktree"),
+            serde_json::json!({
+                "sourceSessionId": "source-1",
+                "sourceCwd": "/repo",
+                "newCwd": "/managed/worktree",
+                "sessionKind": "worktree",
+                "sourceWorkspaceDir": "/repo",
+            })
+        );
     }
 
     #[test]
