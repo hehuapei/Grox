@@ -9,7 +9,7 @@ use chrono::{Datelike, Days, Local, LocalResult, NaiveTime, TimeZone};
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::{atomic_write, read_bounded_text, restrict_private_file};
+use crate::{atomic_write_bounded_private, read_bounded_text};
 
 const MAX_AUTOMATIONS: usize = 2_000;
 const HOST_RUNTIME_KEY: &str = "_hostRuntime";
@@ -83,7 +83,7 @@ impl AutomationStore {
         let content = read_bounded_text(path, max_bytes)
             .map_err(|error| format!("无法读取自动化文件：{error}"))?;
         if content.trim().is_empty() {
-            return Ok(None);
+            return Err("自动化文件为空，拒绝当作没有任务继续".into());
         }
         let automations = serde_json::from_str::<Value>(&content)
             .map_err(|error| format!("自动化文件不是有效 JSON：{error}"))?
@@ -482,7 +482,7 @@ impl AutomationStore {
         let content = read_bounded_text(path, max_bytes)
             .map_err(|error| format!("无法读取自动化文件：{error}"))?;
         if content.trim().is_empty() {
-            return Ok(Vec::new());
+            return Err("自动化文件为空，拒绝当作没有任务继续".into());
         }
         let automations = serde_json::from_str::<Value>(&content)
             .map_err(|error| format!("自动化文件不是有效 JSON：{error}"))?
@@ -504,8 +504,7 @@ impl AutomationStore {
         if content.len() as u64 > max_bytes {
             return Err(format!("自动化文件不能超过 {} MB", max_bytes / 1024 / 1024));
         }
-        atomic_write(path, &content)?;
-        restrict_private_file(path)
+        atomic_write_bounded_private(path, &content, max_bytes)
     }
 
     fn lock_transaction(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -1048,6 +1047,17 @@ mod tests {
             .patch(&path, vec![fractional_time], vec![], 1024 * 1024)
             .is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn zero_length_file_fails_closed() {
+        let path = temp_file("zero-length");
+        fs::write(&path, "").unwrap();
+        assert!(AutomationStore::default()
+            .read(&path, 1024 * 1024)
+            .unwrap_err()
+            .contains("文件为空"));
         let _ = fs::remove_file(path);
     }
 

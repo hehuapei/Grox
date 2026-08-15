@@ -152,8 +152,18 @@ pub fn write_session_support_bundle(input: SessionSupportBundle<'_>) -> Result<P
         path: path.clone(),
         complete: false,
     };
-    let file = fs::File::create(&path)
+    let mut file_options = fs::OpenOptions::new();
+    file_options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        file_options.mode(0o600);
+    }
+    let file = file_options
+        .open(&path)
         .map_err(|error| format!("无法创建会话支持包 {}：{error}", path.display()))?;
+    #[cfg(not(unix))]
+    crate::restrict_private_file(&path)?;
     let mut zip = ZipWriter::new(file);
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
 
@@ -262,6 +272,11 @@ mod tests {
         assert!(archive.by_name("permission-audit.json").is_ok());
         assert!(archive.by_name("client.json").is_ok());
         assert!(archive.by_name("official/grok-trace.zip").is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
         fs::remove_file(path).unwrap();
     }
 }

@@ -22,13 +22,13 @@ describe("errorModel", () => {
     expect(formatGroxError(error)).toContain("协议错误");
   });
 
-  it("环境退出会覆盖普通协议兜底", () => {
+  it("未结构化错误只使用调用边界提供的分类", () => {
     const error = toGroxError(new Error("Grok Agent 已退出（代码 1）"), {
       domain: "protocol",
       code: "PROMPT_FAILED",
       fatal: true,
     });
-    expect(error.domain).toBe("environment");
+    expect(error.domain).toBe("protocol");
     expect(error.holdQueue).toBe(true);
   });
 

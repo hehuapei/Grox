@@ -63,7 +63,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | --- | --- | --- |
 | 1 | Native ACP transport | Host 关联请求/响应并负责超时、取消、退出清算；已落地 |
 | 2 | SessionCoordinator | Host 签发/校验 lifecycle 与 turn 许可并发布占用快照；已落地 |
-| 3 | Native repositories | PromptQueueStore、AutomationStore、SessionJournalStore 已迁移；草稿持久化边界继续收口 |
+| 3 | Native repositories | PromptQueueStore、AutomationStore、SessionJournalStore、DraftStore 与媒体任务 journal 已迁移；已落地 |
 | 4 | Unified turn execution | Host 自动化与普通前台回合均拥有许可、模型/模式绑定、Prompt、watchdog、取消和 effort 降级；流内容继续由前端投影 |
 | 5 | Interaction service | Host 持有权限、计划审批、ask-user 的 rpc id、代次、回复和 Stop 清算；已落地 |
 | 6 | Client callback service | Host 持有 FS/terminal callback 的 session/cwd/rpc/generation 与终端进程树生命周期；已落地 |
@@ -81,6 +81,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - Host 内部统一使用规范化的 `x.ai/...` 方法名做门禁与错误分类，唯一请求入口负责在 ACP wire 上编码为 `_x.ai/...`；自动化、会话删除与 fork 不再依赖 WebView 才拥有的扩展编码；
 - 普通请求超时与长回合 watchdog 都由 Host 处理；WebView 不再持有 prompt RPC id 或调用任意请求取消命令；
 - 进程替换、自然退出、停止、CLI 更新和主窗口退出都会清算请求；
+- 自然退出时 Host 会冻结受影响会话与活动回合清单，并由单一 RuntimeSupervisor 使用最后一次成功连接参数限次重连；WebView 只投影 reconnecting/ready/offline，不再自己 spawn 或维护重试循环；重连成功仍把被中断回合保留为 failed，绝不自动重发；显式停止、配置强制切换和 Host 退出会推进取消代次，旧退避任务不能把已停止的 Agent 再次拉起；
 - Host 为退出、通道替换、超时、停滞、取消和协议校验返回稳定错误代码，前端不再用字符串正则覆盖这些分类；
 - 环境摘要和支持包记录 Host 悬挂请求、待用户交互门控、Client callback 与已绑定工作区会话数；
 - WebView 只解释已经归属的响应，未知广播响应仍呈现为协议错误。
@@ -148,6 +149,10 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - `session_storage::SessionStorageState` 改为按会话写/删除租约：同一会话串行、不同会话并行，删除先标 tombstone 再等待现有 writer，避免全局文件锁拖慢多会话；
 - `session_journal_store::SessionJournalStore` 校验现有和提交快照，前端以磁盘 savedAt 为基线生成单调逻辑版本；旧窗口的等版本/低版本写入会明确冲突并停止续写，不能覆盖新 journal；
 - 旧版裸 Session 只保留只读迁移入口，损坏的现有 journal 不会被新快照静默覆盖。
+- `draft_store::DraftStore` 按规范化工作区保存草稿、附件和单调 revision；删除保留 tombstone revision，晚到旧页面写入与旧 localStorage 迁移都不能让草稿复活。WebView 只做串行合并与投影，原生环境下 localStorage 不再是草稿权威；
+- prompt queue、automation、session journal、draft、worktree ownership、权限审计、媒体任务和支持包等敏感文件都在临时文件创建时即限制为 0600，再原子替换；不再出现“写完后再 chmod”的短暂泄露窗口；
+- 现有持久化文件为空、损坏或无法读取时按结构性错误处理：repository 拒绝覆盖，worktree 删除引用扫描也拒绝跳过坏 journal，避免坏数据被误当成“没有引用”；
+- `MediaService` 用独立原子 journal 保存最近任务，启动时将崩溃遗留的活动任务结算为 `MEDIA_JOB_INTERRUPTED`；媒体历史、journal 状态和 Host 自动重连状态都进入环境摘要或支持包诊断。
 
 本切片没有把完整 SessionManager 伪装成已经迁移：连接初始化、非交互认证、建会话/恢复、
 自动化完整生命周期、普通前台回合、持久化提示队列、权限/计划/提问交互和显式 OAuth 生命周期已属于 Host。
@@ -169,9 +174,9 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 认证 | WebView 曾持有 authenticate promise、URL 轮询和取消时序 | 单例认证事务、可取消子进程、硬超时、认证后淘汰旧 runtime | `agent_auth` 按 generation 持有 ACP OAuth；页面只 start/cancel/status 并消费事件 |
 | 工作树 | Host 已持久化 session 关联并拥有创建/fork/引用检查/删除事务；旧 localStorage 安全源已删除 | worktree 与 session metadata 绑定、原生复制会话上下文 | 已完成 Host 所有权索引、干净树门禁、失败回滚、目标绑定确认和同名仓库隔离 |
 | 权限/提问 | Host 已按 session + generation 持有反向 RPC、统一权限上限、偏好事务、原生提权确认、scoped option 映射和决定审计；持久 allow cache 仍由 Grok Build 原生 option 负责 | 每会话策略、allow cache、Host resolve | 权限裁决与审计已迁移；后续再扩展项目/会话分层策略，不复制 Agent 的持久规则库 |
-| 媒体 | Host 已持有生成任务、取消、参考图租约与结构化产物授权（ADR 0004） | token loopback + path scope | 后续补跨进程任务 journal 与统一投递协议 |
+| 媒体 | Host 已持有生成任务、取消、参考图租约、结构化产物授权和跨进程任务 journal（ADR 0004） | token loopback + path scope | Host 恢复有界任务历史，崩溃遗留显式结算，WebView 只投影 |
 | 密钥 | Host SecretStore 已接管供应商密钥，档案与 `.env` 只留非敏感路由元数据（ADR 0005） | OS keychain + 受限文件后备 | 后端类型显式投影，删除墓碑防复活，诊断永不带值 |
-| 错误 | ACP、媒体与供应商命令已共享 HostError 契约 | 稳定 AgentErrorCode | 继续清理其余字符串命令，前端不再从文案推断域 |
+| 错误 | ACP、持久化、权限、媒体与供应商高风险命令已共享 HostError 契约 | 稳定 AgentErrorCode | 前端已删除文案推断；继续把低风险旧命令迁入领域 facade |
 | 诊断 | support bundle 已有但依赖前端快照 | 日志、运行时、审计集中 | Host 快照为主，前端快照只作补充 |
 | 测试 | 工具函数测试多，跨层运行时少 | mock ACP、路由/停机/竞态测试 | 增加故障注入和 Host 集成测试 |
 

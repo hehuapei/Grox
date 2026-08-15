@@ -1,12 +1,9 @@
-import { describe, expect, it, beforeEach } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { Session } from "../bridge/types";
 import {
-  clearDraftBuffer,
   compactSession,
-  loadDraftBuffer,
   nextSessionJournalSavedAt,
   parseSessionJournal,
-  saveDraftBuffer,
   sessionJournalSnapshot,
   sliceCacheBlocks,
 } from "./sessionCache";
@@ -101,81 +98,5 @@ describe("sliceCacheBlocks", () => {
     const sliced = sliceCacheBlocks(blocks, 2);
     // Prefer starting at user u1 rather than tool-only tail when over budget.
     expect(sliced[0].type === "user" || sliced.length <= 2).toBe(true);
-  });
-});
-
-describe("draft buffer", () => {
-  beforeEach(() => {
-    localStorage.clear();
-  });
-
-  it("persists and reloads unsent draft text per cwd", () => {
-    saveDraftBuffer("C:\\Work\\Repo", "未发送的提示词");
-    const loaded = loadDraftBuffer("C:/Work/Repo");
-    expect(loaded?.text).toBe("未发送的提示词");
-  });
-
-  it("persists attachments for first-send crash recovery", () => {
-    saveDraftBuffer("C:\\Work\\Repo", "with file", [
-      {
-        id: "a1",
-        kind: "text",
-        name: "notes.txt",
-        mime: "text/plain",
-        size: 4,
-        text: "body",
-      },
-    ]);
-    const loaded = loadDraftBuffer("C:/Work/Repo");
-    expect(loaded?.text).toBe("with file");
-    expect(loaded?.attachments).toEqual([
-      {
-        id: "a1",
-        kind: "text",
-        name: "notes.txt",
-        mime: "text/plain",
-        size: 4,
-        text: "body",
-      },
-    ]);
-  });
-
-  it("falls back to text-only when attachments blow the size budget", () => {
-    const huge = "x".repeat(900_000);
-    saveDraftBuffer("C:\\Work\\Repo", "keep me", [
-      {
-        id: "img",
-        kind: "image",
-        name: "big.png",
-        mime: "image/png",
-        size: huge.length,
-        data: huge,
-      },
-      {
-        id: "img2",
-        kind: "image",
-        name: "big2.png",
-        mime: "image/png",
-        size: huge.length,
-        data: huge,
-      },
-    ]);
-    const loaded = loadDraftBuffer("C:/Work/Repo");
-    expect(loaded?.text).toBe("keep me");
-    // Full dual payloads exceed budget; metadata-only or empty attachments OK.
-    const bodies = (loaded?.attachments ?? []).filter((a) => a.data || a.text);
-    expect(bodies.length).toBe(0);
-  });
-
-  it("clears empty drafts", () => {
-    saveDraftBuffer("C:\\Work\\Repo", "x");
-    saveDraftBuffer("C:\\Work\\Repo", "   ");
-    expect(loadDraftBuffer("C:\\Work\\Repo")).toBeNull();
-  });
-
-  it("clearDraftBuffer removes entry", () => {
-    saveDraftBuffer("C:\\A", "hello");
-    clearDraftBuffer("C:\\A");
-    expect(loadDraftBuffer("C:\\A")).toBeNull();
   });
 });

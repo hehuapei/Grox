@@ -13,7 +13,8 @@ use std::{
 use serde::Serialize;
 
 use crate::{
-    atomic_write_bounded, interaction_service::PermissionAuditRecord, restrict_private_file,
+    atomic_write_bounded_private, interaction_service::PermissionAuditRecord,
+    restrict_private_file,
 };
 
 const AUDIT_DIR: &str = "audit";
@@ -52,9 +53,8 @@ pub(crate) fn append(
         let previous = dir.join(PREVIOUS_AUDIT_FILE);
         let current = fs::read_to_string(&path)
             .map_err(|error| format!("无法轮换权限审计文件 {}：{error}", path.display()))?;
-        atomic_write_bounded(&previous, &current, MAX_ROTATED_BYTES)?;
-        restrict_private_file(&previous)?;
-        atomic_write_bounded(&path, "", MAX_AUDIT_LINE_BYTES)?;
+        atomic_write_bounded_private(&previous, &current, MAX_ROTATED_BYTES)?;
+        atomic_write_bounded_private(&path, "", MAX_AUDIT_LINE_BYTES)?;
     }
     let row = PermissionAuditRow {
         schema_version: 1,
@@ -68,11 +68,19 @@ pub(crate) fn append(
     if line.len() as u64 > MAX_AUDIT_LINE_BYTES {
         return Err("权限审计事件超过大小限制".into());
     }
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(&path)
         .map_err(|error| format!("无法打开权限审计文件 {}：{error}", path.display()))?;
+    // Windows 没有 Unix 创建 mode；在写入任何审计内容前先收紧 ACL。
+    #[cfg(not(unix))]
+    restrict_private_file(&path)?;
     file.write_all(&line)
         .and_then(|_| file.sync_data())
         .map_err(|error| format!("无法写入权限审计文件 {}：{error}", path.display()))?;

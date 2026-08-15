@@ -155,6 +155,17 @@ interface DesktopEnvironment {
 interface ExitPayload {
   code?: number | null;
   reason: "exited" | "killed";
+  affectedSessionIds?: string[];
+  interruptedSessionIds?: string[];
+}
+
+interface RuntimeReconnectPayload {
+  state: "reconnecting" | "ready" | "offline";
+  attempt: number;
+  affectedSessionIds: string[];
+  interruptedSessionIds: string[];
+  connection?: AgentRuntimeConnection;
+  error?: GroxError;
 }
 
 interface SessionGatePermit {
@@ -997,7 +1008,11 @@ export class AcpBridge implements GrokBridge {
   private requestId = 0;
   /** 与原生 ACP 子进程绑定，防止旧异步请求写入新子进程。 */
   private acpGeneration = 0;
-  private reconnecting: Promise<void> | null = null;
+  private reconnectProjection: {
+    promise: Promise<void>;
+    resolve: () => void;
+    reject: (cause: unknown) => void;
+  } | null = null;
   private authState: AuthState = { required: false, inProgress: false };
   private modelState: ModelState = { models: MODELS, currentId: MODELS[0].id };
   private runtimeCommandBase: SlashCommand[] = [];
@@ -1211,6 +1226,9 @@ export class AcpBridge implements GrokBridge {
         this.diagnostics = this.diagnostics.slice(-20);
       }),
       await listen<ExitPayload>("acp-exit", ({ payload }) => this.onExit(payload)),
+      await listen<RuntimeReconnectPayload>("agent-runtime-reconnect", ({ payload }) => {
+        void this.onRuntimeReconnect(payload);
+      }),
       await listen<HostAuthenticationState>("agent-runtime-auth-state", ({ payload }) => {
         this.projectAuthState(payload);
       }),
@@ -1331,8 +1349,11 @@ export class AcpBridge implements GrokBridge {
       reasoningEffort: storedEffort(),
       forceReconnect,
     });
+    await this.projectRuntimeConnection(connection);
+  }
+
+  private async projectRuntimeConnection(connection: AgentRuntimeConnection): Promise<void> {
     this.acpGeneration = connection.generation;
-    await this.syncHostInteractions();
     this.captureModelState(connection.initialize);
     this.captureRuntimeCommands(connection.initialize);
     this.projectAuthState({
@@ -1340,6 +1361,21 @@ export class AcpBridge implements GrokBridge {
       inProgress: connection.auth.inProgress,
       label: connection.auth.label,
       error: connection.auth.error,
+    });
+    // 运行时连接已经由 Host 提交；交互门控投影失败不能把一个真实可用的
+    // 新代次误判为重连失败。保留明确诊断，并让下次状态同步继续修复投影。
+    await this.syncHostInteractions().catch((error) => {
+      const failure = toGroxError(error, {
+        domain: "environment",
+        code: "INTERACTION_SYNC_FAILED",
+        message: "Agent 已连接，但待处理交互未能同步",
+        recoverable: true,
+        fatal: false,
+        holdQueue: true,
+        action: "重新打开会话；若问题持续，请导出支持包",
+      });
+      this.diagnostics.push(`交互门控同步失败：${formatGroxError(failure)}`);
+      this.emit({ type: "runtime_notice", notice: runtimeNoticeFromError(failure) });
     });
     // v1 source snapshots make startup structurally non-blocking: initialize
     // may expose a cached/bundled catalog before the authenticated fetch ends.
@@ -1426,10 +1462,7 @@ export class AcpBridge implements GrokBridge {
     const message = `Grok Agent 已退出${payload.code == null ? "" : `（代码 ${payload.code}）`}${
       diagnostic ? `：${diagnostic}` : ""
     }`;
-    const affected = [...this.knownSessions];
-    const interrupted = new Set(
-      affected.filter((sessionId) => this.activePromptSessions.has(sessionId)),
-    );
+    const affected = payload.affectedSessionIds ?? [...this.knownSessions];
     for (const sessionId of affected) {
       this.emit({ type: "status", sessionId, status: "disconnected" });
     }
@@ -1438,62 +1471,68 @@ export class AcpBridge implements GrokBridge {
     this.loadPromises.clear();
     this.cursors.clear();
     this.sessionOptions.clear();
-    this.beginReconnect(affected, interrupted, message);
+    if (!this.reconnectProjection) {
+      let resolve!: () => void;
+      let reject!: (cause: unknown) => void;
+      const promise = new Promise<void>((accept, decline) => {
+        resolve = accept;
+        reject = decline;
+      });
+      this.reconnectProjection = { promise, resolve, reject };
+      this.boot = promise;
+      void promise.catch(() => {
+        if (this.boot === promise) this.boot = null;
+      });
+    }
+    this.emit({ type: "runtime_state", state: "reconnecting" });
+    if (diagnostic) this.diagnostics.push(message);
   }
 
-  private beginReconnect(sessionIds: string[], interrupted: ReadonlySet<string>, reason: string) {
-    if (this.reconnecting) return;
-    this.emit({ type: "runtime_state", state: "reconnecting" });
-    const reconnect = (async () => {
-      let lastError = reason;
-      for (let attempt = 1; attempt <= 2; attempt += 1) {
-        await new Promise((resolve) => window.setTimeout(resolve, attempt * 800));
-        try {
-          await this.initializeAgent();
-          this.emit({ type: "runtime_state", state: "ready" });
-          for (const sessionId of sessionIds) {
-            this.emit({
-              type: "block_add",
-              sessionId,
-              block: { type: "system", id: uid(), text: "Agent 已自动重连；下次发送会重新绑定会话", ts: Date.now(), kind: "info" },
-            });
-            this.emit({
-              type: "status",
-              sessionId,
-              status: interrupted.has(sessionId) ? "failed" : "idle",
-            });
-          }
-          return;
-        } catch (error) {
-          lastError = errorText(error);
-        }
-      }
-      this.emit({ type: "runtime_state", state: "offline" });
-      for (const sessionId of sessionIds) {
-        this.emitError(sessionId, lastError, {
-          domain: "environment",
-          code: "ACP_RECONNECT_FAILED",
-          message: `Agent 自动重连失败：${lastError}`,
-          recoverable: true,
-          fatal: true,
-          holdQueue: true,
-          action: "检查 Grok Build CLI 与网络后重新发送",
+  private async onRuntimeReconnect(payload: RuntimeReconnectPayload): Promise<void> {
+    if (payload.state === "reconnecting") {
+      this.emit({ type: "runtime_state", state: "reconnecting" });
+      return;
+    }
+    if (payload.state === "ready" && payload.connection) {
+      await this.projectRuntimeConnection(payload.connection);
+      this.emit({ type: "runtime_state", state: "ready" });
+      const interrupted = new Set(payload.interruptedSessionIds);
+      for (const sessionId of payload.affectedSessionIds) {
+        this.emit({
+          type: "block_add",
+          sessionId,
+          block: {
+            type: "system",
+            id: uid(),
+            text: "Agent 已由 Host 自动重连；下次发送会重新绑定会话",
+            ts: Date.now(),
+            kind: "info",
+          },
+        });
+        this.emit({
+          type: "status",
+          sessionId,
+          status: interrupted.has(sessionId) ? "failed" : "idle",
         });
       }
-      throw new Error(lastError);
-    })();
-    const tracked = reconnect.finally(() => {
-      if (this.reconnecting === tracked) this.reconnecting = null;
-    });
-    const retryableBoot = tracked.catch((error) => {
-      // 自动重连耗尽后允许下一次用户操作重新拉起 CLI；保留 rejected
-      // boot 会让 ensureReady 永久复用同一个失败 Promise。
-      if (this.boot === retryableBoot) this.boot = null;
-      throw error;
-    });
-    this.reconnecting = tracked;
-    this.boot = retryableBoot;
-    void retryableBoot.catch(() => {});
+      this.reconnectProjection?.resolve();
+      this.reconnectProjection = null;
+      return;
+    }
+    this.emit({ type: "runtime_state", state: "offline" });
+    const cause = payload.error ?? new Error("Agent 自动重连失败");
+    for (const sessionId of payload.affectedSessionIds) {
+      this.emitError(sessionId, cause, {
+        domain: "environment",
+        code: "ACP_RECONNECT_FAILED",
+        recoverable: true,
+        fatal: true,
+        holdQueue: true,
+        action: "检查 Grok Build CLI、认证与网络后重新连接；重发前先检查最后一轮结果",
+      });
+    }
+    this.reconnectProjection?.reject(cause);
+    this.reconnectProjection = null;
   }
 
   private onLine(line: string) {

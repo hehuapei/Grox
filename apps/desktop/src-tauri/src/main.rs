@@ -14,6 +14,7 @@ mod automation_store;
 mod browser_mcp;
 mod client_callbacks;
 mod computer_mcp;
+mod draft_store;
 mod foreground_turn;
 mod git_confirm;
 mod host_error;
@@ -62,6 +63,9 @@ use automation_runner::{storage_error as automation_storage_error, AutomationRun
 use automation_store::AutomationStore;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use client_callbacks::{ClientCallbackInbound, ClientCallbackRegistry};
+use draft_store::{
+    DraftAttachment, DraftSnapshot, DraftStore, DraftStoreError, DRAFTS_MAX_BYTES,
+};
 use git_confirm::GitConfirmStore;
 use foreground_turn::{
     cancel_foreground_turn, execute_foreground_turn, foreground_turn_status,
@@ -72,8 +76,8 @@ use interaction_service::{InteractionInbound, InteractionProjection, Interaction
 use mcp_leases::McpLeaseStore;
 use media_service::{
     cancel_media_generation, is_media_https_host_allowed, media_generation_capabilities,
-    media_generation_status, release_media_reference, save_media_reference,
-    start_media_generation, MediaService,
+    media_generation_status, media_journal_status, release_media_reference,
+    restore_job_journal, save_media_reference, start_media_generation, MediaService,
 };
 use path_sandbox::{
     checked_workspace, checked_workspace_file, checked_workspace_target, path_for_webview,
@@ -82,7 +86,7 @@ use percent_encoding::percent_decode_str;
 use prompt_queue_store::PromptQueueStore;
 use serde::{Deserialize, Serialize};
 use session_coordinator::{SessionCoordinator, SessionRuntimeOccupancy};
-use session_journal_store::SessionJournalStore;
+use session_journal_store::{SessionJournalStore, SessionJournalWriteError};
 use session_runtime::{
     browser_shutdown_all_leases, close_agent_session, computer_emergency_stop_session,
     computer_shutdown_all_leases, delete_agent_session, fork_agent_session_in_worktree,
@@ -163,12 +167,28 @@ struct AcpState {
     ready_generation: AtomicU64,
     paused_generation: AtomicU64,
     runtime_phase: AtomicU8,
+    last_connect: RwLock<Option<RuntimeConnectSpec>>,
+    automatic_reconnect_owner: AtomicU64,
+    next_reconnect_owner: AtomicU64,
+    reconnect_epoch: AtomicU64,
     requests: AcpRequestBroker,
     authentication: AgentAuthenticationLifecycle,
     sessions: Arc<SessionCoordinator>,
     foreground_turns: Arc<ForegroundTurnRegistry>,
     interactions: Arc<InteractionRegistry>,
     client_callbacks: Arc<ClientCallbackRegistry>,
+}
+
+#[derive(Clone)]
+struct RuntimeConnectSpec {
+    cwd: String,
+    reasoning_effort: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeReconnectClaim {
+    owner: u64,
+    epoch: u64,
 }
 
 impl AcpState {
@@ -187,6 +207,51 @@ impl AcpState {
 
     fn set_runtime_phase(&self, phase: RuntimePhase) {
         self.runtime_phase.store(phase as u8, Ordering::Release);
+    }
+
+    fn remember_connect(&self, spec: RuntimeConnectSpec) {
+        *self
+            .last_connect
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(spec);
+    }
+
+    fn last_connect(&self) -> Option<RuntimeConnectSpec> {
+        self.last_connect
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn claim_automatic_reconnect(&self) -> Option<RuntimeReconnectClaim> {
+        let owner = self.next_reconnect_owner.fetch_add(1, Ordering::Relaxed) + 1;
+        let claim = RuntimeReconnectClaim {
+            owner,
+            epoch: self.reconnect_epoch.load(Ordering::Acquire),
+        };
+        self.automatic_reconnect_owner
+            .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| claim)
+    }
+
+    fn automatic_reconnect_cancelled(&self, claim: RuntimeReconnectClaim) -> bool {
+        self.reconnect_epoch.load(Ordering::Acquire) != claim.epoch
+            || self.automatic_reconnect_owner.load(Ordering::Acquire) != claim.owner
+    }
+
+    fn finish_automatic_reconnect(&self, claim: RuntimeReconnectClaim) {
+        let _ = self.automatic_reconnect_owner.compare_exchange(
+            claim.owner,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn cancel_automatic_reconnect(&self) {
+        self.reconnect_epoch.fetch_add(1, Ordering::AcqRel);
+        self.automatic_reconnect_owner.store(0, Ordering::Release);
     }
 
     fn cached_connection(&self, generation: u64) -> Option<AgentRuntimeConnection> {
@@ -436,6 +501,21 @@ struct AppShutdown {
 struct AcpExitPayload {
     code: Option<i32>,
     reason: &'static str,
+    affected_session_ids: Vec<String>,
+    interrupted_session_ids: Vec<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeReconnectPayload {
+    state: &'static str,
+    attempt: u8,
+    affected_session_ids: Vec<String>,
+    interrupted_session_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connection: Option<AgentRuntimeConnection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<AcpHostError>,
 }
 
 #[derive(Serialize)]
@@ -453,6 +533,8 @@ struct AgentRuntimeStatus {
     pending_client_callbacks: usize,
     bound_client_sessions: usize,
     active_terminals: usize,
+    automatic_reconnect_active: bool,
+    last_connect_configured: bool,
     worktree_session_bindings: usize,
     worktree_ownership_error: Option<String>,
 }
@@ -470,7 +552,7 @@ async fn agent_runtime_status(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AcpState>>,
     worktrees: tauri::State<'_, WorktreeOwnershipStore>,
-) -> Result<AgentRuntimeStatus, String> {
+) -> Result<AgentRuntimeStatus, HostError> {
     let (running, generation, pid) = {
         let process = state.process.lock().await;
         (
@@ -500,6 +582,8 @@ async fn agent_runtime_status(
         pending_client_callbacks: state.client_callbacks.pending_len(),
         bound_client_sessions: state.client_callbacks.bound_len(),
         active_terminals: state.client_callbacks.terminal_len().await,
+        automatic_reconnect_active: state.automatic_reconnect_owner.load(Ordering::Acquire) != 0,
+        last_connect_configured: state.last_connect().is_some(),
         worktree_session_bindings,
         worktree_ownership_error,
     })
@@ -1726,14 +1810,18 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
 }
 
 fn atomic_write_private(path: &Path, content: &str) -> Result<(), String> {
-    atomic_write_bounded_with_privacy(path, content, MAX_CONFIG_BYTES, true)?;
+    atomic_write_bounded_private(path, content, MAX_CONFIG_BYTES)
+}
+
+fn atomic_write_bounded_private(
+    path: &Path,
+    content: &str,
+    max_bytes: u64,
+) -> Result<(), String> {
+    atomic_write_bounded_with_privacy(path, content, max_bytes, true)?;
     #[cfg(not(unix))]
     restrict_private_file(path)?;
     Ok(())
-}
-
-fn atomic_write_bounded(path: &Path, content: &str, max_bytes: u64) -> Result<(), String> {
-    atomic_write_bounded_with_privacy(path, content, max_bytes, false)
 }
 
 fn atomic_write_bounded_with_privacy(
@@ -1972,11 +2060,18 @@ fn write_tool_image(path: &Path, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("无法创建工具图片目录：{error}"))?;
     let nonce = CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
     let temp = parent.join(format!(".tool-media-{}-{nonce}.tmp", std::process::id()));
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
         .open(&temp)
         .map_err(|error| format!("无法创建工具图片临时文件：{error}"))?;
+    #[cfg(not(unix))]
+    restrict_private_file(&temp)?;
     if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
         drop(file);
         let _ = fs::remove_file(&temp);
@@ -1987,7 +2082,9 @@ fn write_tool_image(path: &Path, bytes: &[u8]) -> Result<(), String> {
         let _ = fs::remove_file(&temp);
         return Err(error);
     }
-    restrict_private_file(path)
+    #[cfg(not(unix))]
+    restrict_private_file(path)?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -2025,24 +2122,48 @@ fn persist_session_tool_images(
 }
 
 #[tauri::command]
-fn read_session_journal(app: tauri::AppHandle, id: String) -> Result<Option<String>, String> {
-    let media_dir = session_journal_dir(&app, &id)?.join("media");
+fn read_session_journal(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<Option<String>, HostError> {
+    safe_session_storage_id(&id)
+        .map_err(|error| HostError::operation("SESSION_ID_INVALID", error))?;
+    let media_dir = session_journal_dir(&app, &id)
+        .map_err(|error| session_persistence_error("SESSION_JOURNAL_READ_FAILED", error))?
+        .join("media");
     if media_dir.is_dir() {
         app.asset_protocol_scope()
             .allow_directory(&media_dir, false)
-            .map_err(|error| format!("无法授权会话工具图片预览：{error}"))?;
+            .map_err(|error| {
+                session_persistence_error(
+                    "SESSION_MEDIA_SCOPE_FAILED",
+                    format!("无法授权会话工具图片预览：{error}"),
+                )
+            })?;
     }
-    let path = session_journal_path(&app, &id)?;
+    let path = session_journal_path(&app, &id)
+        .map_err(|error| session_persistence_error("SESSION_JOURNAL_READ_FAILED", error))?;
     let source = if path.is_file() {
         path
     } else {
-        let legacy = legacy_session_cache_path(&app, &id)?;
+        let legacy = legacy_session_cache_path(&app, &id)
+            .map_err(|error| session_persistence_error("SESSION_JOURNAL_READ_FAILED", error))?;
         if !legacy.is_file() {
             return Ok(None);
         }
         legacy
     };
-    SessionJournalStore.read(&source, &id, SESSION_JOURNAL_MAX_BYTES)
+    SessionJournalStore
+        .read(&source, &id, SESSION_JOURNAL_MAX_BYTES)
+        .map_err(|error| session_persistence_error("SESSION_JOURNAL_READ_FAILED", error))
+}
+
+fn session_persistence_error(code: &'static str, error: String) -> HostError {
+    HostError::recoverable_environment(
+        code,
+        error,
+        "检查应用数据目录权限、可用空间和磁盘健康后重试；Host 不会覆盖损坏数据",
+    )
 }
 
 #[tauri::command]
@@ -2051,18 +2172,34 @@ fn write_session_journal(
     storage: tauri::State<'_, SessionStorageState>,
     id: String,
     content: String,
-) -> Result<(), String> {
-    safe_session_storage_id(&id)?;
-    let _write = storage.begin_write(&id)?;
-    let path = session_journal_path(&app, &id)?;
-    let legacy = legacy_session_cache_path(&app, &id)?;
+) -> Result<(), HostError> {
+    safe_session_storage_id(&id)
+        .map_err(|error| HostError::operation("SESSION_ID_INVALID", error))?;
+    let _write = storage
+        .begin_write(&id)
+        .map_err(|error| HostError::operation("SESSION_STORAGE_REJECTED", error))?;
+    let path = session_journal_path(&app, &id)
+        .map_err(|error| session_persistence_error("SESSION_JOURNAL_WRITE_FAILED", error))?;
+    let legacy = legacy_session_cache_path(&app, &id)
+        .map_err(|error| session_persistence_error("SESSION_JOURNAL_WRITE_FAILED", error))?;
     SessionJournalStore.write(
         &path,
         &legacy,
         &id,
         &content,
         SESSION_JOURNAL_MAX_BYTES,
-    )?;
+    )
+    .map_err(|error| match error {
+        SessionJournalWriteError::InvalidIncoming(message) => {
+            HostError::protocol("SESSION_JOURNAL_INVALID", message)
+        }
+        SessionJournalWriteError::Conflict(message) => {
+            HostError::operation("SESSION_JOURNAL_CONFLICT", message)
+        }
+        SessionJournalWriteError::Storage(message) => {
+            session_persistence_error("SESSION_JOURNAL_WRITE_FAILED", message)
+        }
+    })?;
     Ok(())
 }
 
@@ -2083,10 +2220,14 @@ fn delete_session_journal(
     app: tauri::AppHandle,
     storage: tauri::State<'_, SessionStorageState>,
     id: String,
-) -> Result<(), String> {
-    safe_session_storage_id(&id)?;
-    let _delete = storage.begin_delete(&id)?;
+) -> Result<(), HostError> {
+    safe_session_storage_id(&id)
+        .map_err(|error| HostError::operation("SESSION_ID_INVALID", error))?;
+    let _delete = storage
+        .begin_delete(&id)
+        .map_err(|error| HostError::operation("SESSION_STORAGE_REJECTED", error))?;
     delete_session_journal_files(&app, &id)
+        .map_err(|error| session_persistence_error("SESSION_JOURNAL_DELETE_FAILED", error))
 }
 
 #[derive(Serialize)]
@@ -2124,8 +2265,7 @@ fn add_journal_status(path: &Path, status: &mut SessionJournalStatus) {
     }
 }
 
-#[tauri::command]
-fn session_journal_status(app: tauri::AppHandle) -> Result<SessionJournalStatus, String> {
+fn session_journal_status_inner(app: tauri::AppHandle) -> Result<SessionJournalStatus, String> {
     let config = app
         .path()
         .app_config_dir()
@@ -2165,6 +2305,12 @@ fn session_journal_status(app: tauri::AppHandle) -> Result<SessionJournalStatus,
     Ok(status)
 }
 
+#[tauri::command]
+fn session_journal_status(app: tauri::AppHandle) -> Result<SessionJournalStatus, HostError> {
+    session_journal_status_inner(app)
+        .map_err(|error| session_persistence_error("SESSION_JOURNAL_STATUS_FAILED", error))
+}
+
 fn prompt_queues_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
     app.path()
         .app_config_dir()
@@ -2172,13 +2318,96 @@ fn prompt_queues_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("无法定位提示队列文件：{error}"))
 }
 
+fn drafts_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("drafts.json"))
+        .map_err(|error| format!("无法定位草稿文件：{error}"))
+}
+
+fn draft_workspace(cwd: &str) -> Result<String, HostError> {
+    checked_workspace(cwd)
+        .map(|path| path_for_webview(&path))
+        .map_err(|error| HostError::operation("DRAFT_WORKSPACE_INVALID", error))
+}
+
+fn draft_storage_error(error: String) -> HostError {
+    HostError::recoverable_environment(
+        "DRAFT_STORAGE_FAILED",
+        error,
+        "检查应用数据目录权限；不要关闭当前页面，以免丢失尚未发送的内容",
+    )
+}
+
+fn draft_store_error(error: DraftStoreError) -> HostError {
+    match error {
+        DraftStoreError::Conflict(message) => {
+            HostError::operation("DRAFT_WRITE_CONFLICT", message)
+        }
+        DraftStoreError::Invalid(message) => HostError::operation("DRAFT_INVALID", message),
+        DraftStoreError::Storage(message) => draft_storage_error(message),
+    }
+}
+
+#[tauri::command]
+fn read_draft(
+    app: tauri::AppHandle,
+    drafts: tauri::State<'_, DraftStore>,
+    cwd: String,
+) -> Result<DraftSnapshot, HostError> {
+    let workspace = draft_workspace(&cwd)?;
+    let path = drafts_path(&app).map_err(draft_storage_error)?;
+    drafts
+        .read(&path, &workspace)
+        .map_err(draft_store_error)
+}
+
+#[tauri::command]
+fn write_draft(
+    app: tauri::AppHandle,
+    drafts: tauri::State<'_, DraftStore>,
+    cwd: String,
+    expected_revision: u64,
+    text: String,
+    attachments: Vec<DraftAttachment>,
+) -> Result<DraftSnapshot, HostError> {
+    let workspace = draft_workspace(&cwd)?;
+    let path = drafts_path(&app).map_err(draft_storage_error)?;
+    drafts
+        .write(
+            &path,
+            &workspace,
+            expected_revision,
+            text,
+            attachments,
+        )
+        .map_err(draft_store_error)
+}
+
+#[tauri::command]
+fn delete_draft(
+    app: tauri::AppHandle,
+    drafts: tauri::State<'_, DraftStore>,
+    cwd: String,
+    expected_revision: u64,
+) -> Result<DraftSnapshot, HostError> {
+    let workspace = draft_workspace(&cwd)?;
+    let path = drafts_path(&app).map_err(draft_storage_error)?;
+    drafts
+        .delete(&path, &workspace, expected_revision)
+        .map_err(draft_store_error)
+}
+
 #[tauri::command]
 fn read_prompt_queues(
     app: tauri::AppHandle,
     queues: tauri::State<'_, PromptQueueStore>,
-) -> Result<Option<String>, String> {
-    let path = prompt_queues_path(&app)?;
-    queues.read(&path, PROMPT_QUEUES_MAX_BYTES)
+) -> Result<Option<String>, HostError> {
+    let path = prompt_queues_path(&app)
+        .map_err(|error| session_persistence_error("PROMPT_QUEUE_READ_FAILED", error))?;
+    queues
+        .read(&path, PROMPT_QUEUES_MAX_BYTES)
+        .map_err(|error| session_persistence_error("PROMPT_QUEUE_READ_FAILED", error))
 }
 
 #[tauri::command]
@@ -2188,7 +2417,7 @@ fn patch_prompt_queues(
     storage: tauri::State<'_, SessionStorageState>,
     upserts: BTreeMap<String, serde_json::Value>,
     deletes: Vec<String>,
-) -> Result<(), String> {
+) -> Result<(), HostError> {
     let upsert_ids = upserts.keys().cloned().collect::<Vec<_>>();
     let patch_ids = upsert_ids
         .iter()
@@ -2196,12 +2425,18 @@ fn patch_prompt_queues(
         .cloned()
         .collect::<Vec<_>>();
     for id in &patch_ids {
-        safe_session_storage_id(id)?;
+        safe_session_storage_id(id)
+            .map_err(|error| HostError::operation("SESSION_ID_INVALID", error))?;
     }
     // 与删除命令采用相同锁序：先 tombstone，再队列事务，防止延迟 patch 复活。
-    let _write = storage.begin_write_ids(&patch_ids)?;
-    let path = prompt_queues_path(&app)?;
-    queues.patch(&path, upserts, deletes, PROMPT_QUEUES_MAX_BYTES)
+    let _write = storage
+        .begin_write_ids(&patch_ids)
+        .map_err(|error| HostError::operation("PROMPT_QUEUE_PATCH_REJECTED", error))?;
+    let path = prompt_queues_path(&app)
+        .map_err(|error| session_persistence_error("PROMPT_QUEUE_WRITE_FAILED", error))?;
+    queues
+        .patch(&path, upserts, deletes, PROMPT_QUEUES_MAX_BYTES)
+        .map_err(|error| session_persistence_error("PROMPT_QUEUE_WRITE_FAILED", error))
 }
 
 fn automations_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
@@ -2222,9 +2457,12 @@ fn worktree_bindings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
 fn read_automations(
     app: tauri::AppHandle,
     automations: tauri::State<'_, AutomationStore>,
-) -> Result<Option<String>, String> {
-    let path = automations_path(&app)?;
-    automations.read(&path, AUTOMATIONS_MAX_BYTES)
+) -> Result<Option<String>, HostError> {
+    let path = automations_path(&app)
+        .map_err(|error| session_persistence_error("AUTOMATION_READ_FAILED", error))?;
+    automations
+        .read(&path, AUTOMATIONS_MAX_BYTES)
+        .map_err(|error| session_persistence_error("AUTOMATION_READ_FAILED", error))
 }
 
 #[tauri::command]
@@ -2234,12 +2472,15 @@ fn patch_automations(
     worktrees: tauri::State<'_, WorktreeOwnershipStore>,
     upserts: Vec<serde_json::Value>,
     deletes: Vec<String>,
-) -> Result<(), String> {
+) -> Result<(), HostError> {
     // cwd 变更与 worktree 删除串行；否则删除检查完成后，一个页面 patch
     // 可能把自动化重新指向即将消失的目录。
     let _worktree_lifecycle = worktrees.lock_lifecycle();
-    let path = automations_path(&app)?;
-    automations.patch(&path, upserts, deletes, AUTOMATIONS_MAX_BYTES)
+    let path = automations_path(&app)
+        .map_err(|error| session_persistence_error("AUTOMATION_WRITE_FAILED", error))?;
+    automations
+        .patch(&path, upserts, deletes, AUTOMATIONS_MAX_BYTES)
+        .map_err(|error| session_persistence_error("AUTOMATION_WRITE_FAILED", error))
 }
 
 fn automation_claim_error(message: String) -> AcpHostError {
@@ -3320,6 +3561,7 @@ async fn export_session_support_bundle(
     app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AcpState>>,
     automation_runner: tauri::State<'_, AutomationRunner>,
+    drafts: tauri::State<'_, DraftStore>,
     session_id: String,
     client_snapshot: String,
 ) -> Result<SessionSupportExport, String> {
@@ -3362,6 +3604,8 @@ async fn export_session_support_bundle(
         "pendingClientCallbacks": state.client_callbacks.pending_len(),
         "boundClientSessions": state.client_callbacks.bound_len(),
         "activeTerminals": state.client_callbacks.terminal_len().await,
+        "automaticReconnectActive": state.automatic_reconnect_owner.load(Ordering::Acquire) != 0,
+        "lastConnectConfigured": state.last_connect().is_some(),
         "worktreeOwnership": worktree_ownership,
         "sessionOccupancy": state.sessions.snapshot(),
         "automationRunner": automation_runner.status(state.inner()).await,
@@ -3374,8 +3618,23 @@ async fn export_session_support_bundle(
     });
     let journal = serde_json::json!({
         "selected": selected_session_journal_diagnostic(&app, &session_id),
-        "summary": session_journal_status(app.clone())?,
+        "summary": session_journal_status_inner(app.clone())?,
     });
+    let draft_storage = match drafts_path(&app).and_then(|path| {
+        drafts
+            .status(&path)
+            .map(|(active, tracked, bytes)| (active, tracked, bytes))
+            .map_err(DraftStoreError::into_message)
+    }) {
+        Ok((active, tracked, bytes)) => serde_json::json!({
+            "readable": true,
+            "activeDrafts": active,
+            "trackedWorkspaces": tracked,
+            "bytes": bytes,
+            "maxBytes": DRAFTS_MAX_BYTES,
+        }),
+        Err(error) => serde_json::json!({ "readable": false, "error": error }),
+    };
     let permission_audit =
         match permission_audit::read_session(&host_prefs_dir_for_app(&app), &session_id) {
             Ok(entries) => serde_json::json!({ "readable": true, "entries": entries }),
@@ -3394,6 +3653,8 @@ async fn export_session_support_bundle(
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "sessionId": session_id,
+        "draftStorage": draft_storage,
+        "mediaJobStorage": media_journal_status(app.state::<Arc<MediaService>>().inner()),
         "officialTraceIncluded": trace_path.is_some(),
         "officialTraceError": trace_error,
     });
@@ -3920,53 +4181,64 @@ fn computer_use_env_enabled() -> bool {
 }
 
 #[tauri::command]
-fn host_prefs_get(app: tauri::AppHandle) -> Result<host_prefs::HostPrefs, String> {
-    host_prefs::load_prefs(&host_prefs_dir_for_app(&app))
+fn host_prefs_get(app: tauri::AppHandle) -> Result<host_prefs::HostPrefs, HostError> {
+    host_prefs::load_prefs(&host_prefs_dir_for_app(&app)).map_err(host_prefs_storage_error)
+}
+
+fn host_prefs_storage_error(error: String) -> HostError {
+    HostError::recoverable_environment(
+        "HOST_PREFS_STORAGE_FAILED",
+        error,
+        "检查应用数据目录的文件权限和可用空间后重试；Host 不会采用未保存的设置",
+    )
 }
 
 #[tauri::command]
 fn host_prefs_migrate_computer_use(
     app: tauri::AppHandle,
     fe_enabled: bool,
-) -> Result<host_prefs::HostPrefs, String> {
+) -> Result<host_prefs::HostPrefs, HostError> {
     host_prefs::migrate_computer_use_from_fe(&host_prefs_dir_for_app(&app), fe_enabled)
+        .map_err(host_prefs_storage_error)
 }
 
 #[tauri::command]
 fn host_prefs_migrate_browser_use(
     app: tauri::AppHandle,
     fe_enabled: bool,
-) -> Result<host_prefs::HostPrefs, String> {
+) -> Result<host_prefs::HostPrefs, HostError> {
     host_prefs::migrate_browser_use_from_fe(&host_prefs_dir_for_app(&app), fe_enabled)
+        .map_err(host_prefs_storage_error)
 }
 
 #[tauri::command]
 fn host_prefs_set_computer_use(
     app: tauri::AppHandle,
     enabled: bool,
-) -> Result<host_prefs::HostPrefs, String> {
+) -> Result<host_prefs::HostPrefs, HostError> {
     let dir = host_prefs_dir_for_app(&app);
-    host_prefs::set_computer_use(&dir, enabled)
+    host_prefs::set_computer_use(&dir, enabled).map_err(host_prefs_storage_error)
 }
 
 #[tauri::command]
 fn host_prefs_set_browser_use(
     app: tauri::AppHandle,
     enabled: bool,
-) -> Result<host_prefs::HostPrefs, String> {
+) -> Result<host_prefs::HostPrefs, HostError> {
     let dir = host_prefs_dir_for_app(&app);
-    host_prefs::set_browser_use(&dir, enabled)
+    host_prefs::set_browser_use(&dir, enabled).map_err(host_prefs_storage_error)
 }
 
 #[tauri::command]
 fn host_prefs_set_permission_mode(
     app: tauri::AppHandle,
     mode: String,
-) -> Result<host_prefs::HostPrefs, String> {
+) -> Result<host_prefs::HostPrefs, HostError> {
     let mode = permission_policy::PermissionMode::parse(&mode)
-        .ok_or_else(|| "无效的权限模式".to_string())?;
+        .ok_or_else(|| HostError::operation("PERMISSION_MODE_INVALID", "无效的权限模式"))?;
     let dir = host_prefs_dir_for_app(&app);
     host_prefs::set_permission_mode(&dir, mode, confirm_bypass_permission_mode)
+        .map_err(host_prefs_storage_error)
 }
 
 fn confirm_bypass_permission_mode() -> bool {
@@ -4613,9 +4885,7 @@ fn worktree_removal_references(
         .path()
         .app_config_dir()
         .map_err(|error| format!("无法定位应用会话目录：{error}"))?;
-    sessions.extend(worktree_ownership::journal_session_references(
-        &config, target,
-    ));
+    sessions.extend(worktree_ownership::journal_session_references(&config, target)?);
     let automations = automations.worktree_references(
         &automations_path(app)?,
         target,
@@ -7977,13 +8247,17 @@ async fn agent_runtime_connect(
 ) -> Result<AgentRuntimeConnection, AcpHostError> {
     ensure_main_acp_owner(window.label())
         .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    let force_reconnect = force_reconnect.unwrap_or(false);
+    if force_reconnect {
+        state.cancel_automatic_reconnect();
+    }
     ensure_agent_runtime_ready(
         &app,
         state.inner(),
         leases.inner(),
         cwd,
         reasoning_effort,
-        force_reconnect.unwrap_or(false),
+        force_reconnect,
     )
     .await
 }
@@ -8023,12 +8297,17 @@ pub(crate) async fn ensure_agent_runtime_ready(
     state.clear_cached_connection(None);
     state.set_runtime_phase(RuntimePhase::Starting);
 
+    let connect_spec = RuntimeConnectSpec {
+        cwd,
+        reasoning_effort,
+    };
+
     let (generation, client_version) = match spawn_acp_process(
         app,
         state,
         leases,
-        cwd,
-        reasoning_effort,
+        connect_spec.cwd.clone(),
+        connect_spec.reasoning_effort.clone(),
     )
     .await
     {
@@ -8078,6 +8357,7 @@ pub(crate) async fn ensure_agent_runtime_ready(
         discard_failed_runtime(state, leases, generation, error.clone()).await;
         return Err(error);
     }
+    state.remember_connect(connect_spec);
     Ok(connection)
 }
 
@@ -8109,6 +8389,108 @@ async fn discard_failed_runtime(
         state.sessions.reset(next_generation);
         terminate_process(process).await;
     }
+}
+
+fn schedule_automatic_runtime_reconnect(
+    app: tauri::AppHandle,
+    state: Arc<AcpState>,
+    leases: Arc<McpLeaseStore>,
+    affected_session_ids: Vec<String>,
+    interrupted_session_ids: Vec<String>,
+) {
+    let Some(spec) = state.last_connect() else {
+        return;
+    };
+    let Some(claim) = state.claim_automatic_reconnect() else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        let _ = app.emit(
+            "agent-runtime-reconnect",
+            RuntimeReconnectPayload {
+                state: "reconnecting",
+                attempt: 0,
+                affected_session_ids: affected_session_ids.clone(),
+                interrupted_session_ids: interrupted_session_ids.clone(),
+                connection: None,
+                error: None,
+            },
+        );
+        let mut last_error = None;
+        for attempt in 1..=2u8 {
+            if app.state::<AppShutdown>().started.load(Ordering::Acquire)
+                || state.automatic_reconnect_cancelled(claim)
+            {
+                state.finish_automatic_reconnect(claim);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(u64::from(attempt) * 800)).await;
+            if app.state::<AppShutdown>().started.load(Ordering::Acquire)
+                || state.automatic_reconnect_cancelled(claim)
+            {
+                state.finish_automatic_reconnect(claim);
+                return;
+            }
+            match ensure_agent_runtime_ready(
+                &app,
+                &state,
+                &leases,
+                spec.cwd.clone(),
+                spec.reasoning_effort.clone(),
+                false,
+            )
+            .await
+            {
+                Ok(connection) => {
+                    if state.automatic_reconnect_cancelled(claim) {
+                        state.finish_automatic_reconnect(claim);
+                        return;
+                    }
+                    let _ = app.emit(
+                        "agent-runtime-reconnect",
+                        RuntimeReconnectPayload {
+                            state: "ready",
+                            attempt,
+                            affected_session_ids: affected_session_ids.clone(),
+                            interrupted_session_ids: interrupted_session_ids.clone(),
+                            connection: Some(connection),
+                            error: None,
+                        },
+                    );
+                    state.finish_automatic_reconnect(claim);
+                    return;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if state.automatic_reconnect_cancelled(claim) {
+            state.finish_automatic_reconnect(claim);
+            return;
+        }
+        let detail = last_error
+            .as_ref()
+            .map(|error| error.message.as_str())
+            .unwrap_or("未知运行时错误");
+        let error = AcpHostError::environment(
+            "ACP_RECONNECT_FAILED",
+            format!("Agent 自动重连失败：{detail}"),
+            true,
+            true,
+            "检查 Grok Build CLI、认证与网络后重新连接；重发前先检查最后一轮结果",
+        );
+        let _ = app.emit(
+            "agent-runtime-reconnect",
+            RuntimeReconnectPayload {
+                state: "offline",
+                attempt: 2,
+                affected_session_ids,
+                interrupted_session_ids,
+                connection: None,
+                error: Some(error),
+            },
+        );
+        state.finish_automatic_reconnect(claim);
+    });
 }
 
 async fn handle_client_callback_line(
@@ -8434,6 +8816,12 @@ async fn spawn_acp_process(
             }
         };
         if let Some(mut process) = process {
+            let occupancy = stdout_state.sessions.snapshot();
+            let mut affected_session_ids = stdout_state.client_callbacks.bound_session_ids();
+            affected_session_ids.extend(occupancy.active_turn_session_ids.iter().cloned());
+            affected_session_ids.sort();
+            affected_session_ids.dedup();
+            let interrupted_session_ids = occupancy.active_turn_session_ids;
             stdout_state.mark_generation_unready(generation, RuntimePhase::Offline);
             shutdown_all_mcp_resources(stdout_app.state::<Arc<McpLeaseStore>>().inner());
             let next_generation = stdout_state
@@ -8479,7 +8867,16 @@ async fn spawn_acp_process(
                 AcpExitPayload {
                     code,
                     reason: "exited",
+                    affected_session_ids: affected_session_ids.clone(),
+                    interrupted_session_ids: interrupted_session_ids.clone(),
                 },
+            );
+            schedule_automatic_runtime_reconnect(
+                stdout_app.clone(),
+                Arc::clone(&stdout_state),
+                Arc::clone(stdout_app.state::<Arc<McpLeaseStore>>().inner()),
+                affected_session_ids,
+                interrupted_session_ids,
             );
         }
     });
@@ -8637,16 +9034,36 @@ async fn acp_send(
     leases: tauri::State<'_, Arc<McpLeaseStore>>,
     line: String,
     generation: u64,
-) -> Result<(), String> {
-    ensure_main_acp_owner(window.label())?;
-    let line = prepare_acp_line(line, leases.inner())?;
+) -> Result<(), AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    let line = prepare_acp_line(line, leases.inner())
+        .map_err(|error| AcpHostError::protocol("ACP_OUTBOUND_INVALID", error))?;
     let message = serde_json::from_str::<serde_json::Value>(&line)
-        .map_err(|error| format!("ACP 消息不是合法 JSON：{error}"))?;
+        .map_err(|error| {
+            AcpHostError::protocol(
+                "ACP_OUTBOUND_INVALID",
+                format!("ACP 消息不是合法 JSON：{error}"),
+            )
+        })?;
     if message.get("id").is_some() && message.get("method").is_some() {
-        return Err("ACP 请求必须通过原生请求通道发送".into());
+        return Err(AcpHostError::protocol(
+            "ACP_REQUEST_CHANNEL_REQUIRED",
+            "ACP 请求必须通过原生请求通道发送",
+        ));
     }
     state.foreground_turns.observe_outbound(generation, &line);
-    write_acp_line(state.inner(), &line, generation).await
+    write_acp_line(state.inner(), &line, generation)
+        .await
+        .map_err(|error| {
+            AcpHostError::environment(
+                "ACP_WRITE_FAILED",
+                error,
+                true,
+                true,
+                "等待 Host 重连后检查最后一轮结果",
+            )
+        })
 }
 
 /// 返回当前 Host 代次仍待用户处理的交互门控。WebView 重载后用它恢复
@@ -9025,8 +9442,11 @@ async fn acp_kill(
     window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<AcpState>>,
     leases: tauri::State<'_, Arc<McpLeaseStore>>,
-) -> Result<(), String> {
-    ensure_main_acp_owner(window.label())?;
+) -> Result<(), AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    state.cancel_automatic_reconnect();
+    let _connect_guard = state.connect_lock.lock().await;
     state.ready_generation.store(0, Ordering::Release);
     state.paused_generation.store(0, Ordering::Release);
     state.clear_cached_connection(None);
@@ -9055,6 +9475,8 @@ async fn acp_kill(
             AcpExitPayload {
                 code: None,
                 reason: "killed",
+                affected_session_ids: Vec::new(),
+                interrupted_session_ids: Vec::new(),
             },
         );
     }
@@ -9530,6 +9952,8 @@ fn main_window_close_keeps_host_alive(app: &tauri::AppHandle) -> bool {
 
 async fn shutdown_host(app: &tauri::AppHandle) {
     let state = app.state::<Arc<AcpState>>().inner().clone();
+    state.cancel_automatic_reconnect();
+    let _connect_guard = state.connect_lock.lock().await;
     state.authentication.reset(AcpHostError::operation(
         "AUTH_CANCELLED",
         "Grox 正在退出，登录已取消",
@@ -9569,6 +9993,7 @@ pub(crate) fn request_host_exit(app: tauri::AppHandle) {
     if shutdown.started.swap(true, Ordering::AcqRel) {
         return;
     }
+    app.state::<Arc<AcpState>>().cancel_automatic_reconnect();
     tauri::async_runtime::spawn(async move {
         if tokio::time::timeout(Duration::from_secs(5), shutdown_host(&app))
             .await
@@ -9622,6 +10047,7 @@ fn main() {
         .manage(Arc::new(McpLeaseStore::default()))
         .manage(Arc::new(GitConfirmStore::default()))
         .manage(SessionStorageState::default())
+        .manage(DraftStore::default())
         .manage(PromptQueueStore::default())
         .manage(AutomationStore::default())
         .manage(WorktreeOwnershipStore::default())
@@ -9636,6 +10062,12 @@ fn main() {
             tray::setup(app.handle()).map_err(std::io::Error::other)?;
             register_computer_emergency_shortcut(app.handle().clone());
             app.state::<AutomationRunner>().start(app.handle().clone());
+            if let Err(error) = restore_job_journal(
+                app.handle(),
+                app.state::<Arc<MediaService>>().inner(),
+            ) {
+                eprintln!("grox: 无法恢复媒体任务记录：{error}");
+            }
             if let Err(error) = media_service::scrub_reference_cache(app.handle()) {
                 eprintln!("grox: 无法清理媒体参考图缓存：{error}");
             }
@@ -9682,6 +10114,9 @@ fn main() {
             persist_session_tool_images,
             delete_session_journal,
             session_journal_status,
+            read_draft,
+            write_draft,
+            delete_draft,
             read_prompt_queues,
             patch_prompt_queues,
             read_automations,
@@ -9873,6 +10308,27 @@ mod tests {
             RuntimePhase::from_raw(state.runtime_phase.load(Ordering::Acquire)).as_str(),
             "stopped"
         );
+    }
+
+    #[test]
+    fn runtime_supervisor_keeps_one_reconnect_owner_and_last_successful_spec() {
+        let state = AcpState::default();
+        state.remember_connect(RuntimeConnectSpec {
+            cwd: "/workspace".into(),
+            reasoning_effort: Some("high".into()),
+        });
+        let first = state.claim_automatic_reconnect().unwrap();
+        assert!(state.claim_automatic_reconnect().is_none());
+        let spec = state.last_connect().unwrap();
+        assert_eq!(spec.cwd, "/workspace");
+        assert_eq!(spec.reasoning_effort.as_deref(), Some("high"));
+        state.cancel_automatic_reconnect();
+        assert!(state.automatic_reconnect_cancelled(first));
+        let second = state.claim_automatic_reconnect().unwrap();
+        state.finish_automatic_reconnect(first);
+        assert!(!state.automatic_reconnect_cancelled(second));
+        state.finish_automatic_reconnect(second);
+        assert!(state.claim_automatic_reconnect().is_some());
     }
 
     #[test]

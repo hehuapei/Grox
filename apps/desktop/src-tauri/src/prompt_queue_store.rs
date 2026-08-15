@@ -15,7 +15,7 @@ use std::{
 
 use serde_json::{Map, Value};
 
-use crate::{atomic_write, read_bounded_text, restrict_private_file};
+use crate::{atomic_write_bounded_private, read_bounded_text};
 
 const MAX_QUEUE_ITEMS_PER_SESSION: usize = 1_000;
 const MAX_ATTACHMENTS_PER_ITEM: usize = 64;
@@ -290,7 +290,7 @@ impl PromptQueueStore {
         let content = read_bounded_text(path, max_bytes)
             .map_err(|error| format!("无法读取提示队列：{error}"))?;
         if content.trim().is_empty() {
-            return Ok(Map::new());
+            return Err("提示队列文件为空，拒绝当作空队列继续".into());
         }
         let queues = serde_json::from_str::<Value>(&content)
             .map_err(|error| format!("提示队列文件不是有效 JSON：{error}"))?
@@ -314,8 +314,7 @@ impl PromptQueueStore {
         if content.len() as u64 > max_bytes {
             return Err(format!("提示队列不能超过 {} MB", max_bytes / 1024 / 1024));
         }
-        atomic_write(path, &content)?;
-        restrict_private_file(path)
+        atomic_write_bounded_private(path, &content, max_bytes)
     }
 
     fn lock_transaction(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -768,6 +767,17 @@ mod tests {
             .unwrap();
 
         assert_eq!(fs::read_to_string(&path).unwrap(), "{}");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn zero_length_file_fails_closed() {
+        let path = temp_file("zero-length");
+        fs::write(&path, "").unwrap();
+        assert!(PromptQueueStore::default()
+            .read(&path, 1024 * 1024)
+            .unwrap_err()
+            .contains("文件为空"));
         let _ = fs::remove_file(path);
     }
 

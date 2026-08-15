@@ -24,7 +24,7 @@ use tokio::{
 };
 
 use crate::{
-    apply_grox_provider_environment, configured_grok_command, grok_home,
+    apply_grox_provider_environment, atomic_write_bounded_private, configured_grok_command, grok_home,
     host_error::HostError,
     is_blocked_service_host,
     path_sandbox::{checked_workspace, path_for_webview},
@@ -34,11 +34,14 @@ use crate::{
 };
 
 const MEDIA_GENERATION_EVENT: &str = "media-generation-changed";
+const MEDIA_DIAGNOSTIC_EVENT: &str = "media-generation-diagnostic";
 const MEDIA_GENERATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const MAX_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MEDIA_REFERENCE_BYTES: usize = 24 * 1024 * 1024;
 const MAX_RETAINED_JOBS: usize = 40;
 const MAX_ACTIVE_JOBS: usize = 4;
+pub(crate) const MEDIA_JOBS_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const MEDIA_JOURNAL_VERSION: u8 = 1;
 const MEDIA_GENERATION_TOOLS: &str = "image_gen,image_to_video";
 const VIDEO_DURATIONS: &[u16] = &[6, 10];
 const VIDEO_RESOLUTIONS: &[&str] = &["480p", "720p"];
@@ -72,7 +75,7 @@ pub(crate) struct MediaGenerationRequest {
     cwd: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MediaArtifact {
     path: Option<String>,
@@ -80,7 +83,7 @@ pub(crate) struct MediaArtifact {
     mime: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum MediaJobPhase {
     Queued,
@@ -101,7 +104,7 @@ impl MediaJobPhase {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(transparent)]
 struct MediaFailure(HostError);
 
@@ -123,7 +126,13 @@ impl std::ops::Deref for MediaFailure {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+impl From<HostError> for MediaFailure {
+    fn from(error: HostError) -> Self {
+        Self(error)
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MediaJobSnapshot {
     id: String,
@@ -174,6 +183,9 @@ struct MediaState {
     jobs: BTreeMap<String, MediaJob>,
     order: VecDeque<String>,
     references: BTreeMap<String, StoredReference>,
+    journal_path: Option<PathBuf>,
+    journal_blocked: Option<String>,
+    journal_last_error: Option<String>,
 }
 
 #[derive(Default)]
@@ -205,17 +217,136 @@ enum MediaRunError {
     Failed(MediaFailure),
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MediaJournal {
+    version: u8,
+    jobs: Vec<MediaJobSnapshot>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MediaJournalStatus {
+    readable: bool,
+    jobs: usize,
+    active_jobs: usize,
+    bytes: u64,
+    max_bytes: u64,
+    error: Option<String>,
+}
+
 struct CapturedStream {
     bytes: Vec<u8>,
     truncated: bool,
 }
 
 impl MediaService {
+    fn initialize(&self, path: PathBuf, home: &Path) -> Result<(), String> {
+        let mut state = self.lock();
+        state.journal_path = Some(path.clone());
+        state.journal_blocked = None;
+        state.journal_last_error = None;
+        if !path.exists() {
+            return Ok(());
+        }
+        let load = (|| {
+            let metadata = fs::metadata(&path)
+                .map_err(|error| format!("无法读取媒体任务记录 {}：{error}", path.display()))?;
+            if metadata.len() == 0 {
+                return Err("媒体任务记录为空，已拒绝覆盖；请先导出或移走损坏文件".into());
+            }
+            if metadata.len() > MEDIA_JOBS_MAX_BYTES {
+                return Err(format!(
+                    "媒体任务记录超过 {} MB 上限，已拒绝加载",
+                    MEDIA_JOBS_MAX_BYTES / 1024 / 1024
+                ));
+            }
+            let raw = fs::read_to_string(&path)
+                .map_err(|error| format!("无法读取媒体任务记录 {}：{error}", path.display()))?;
+            let journal: MediaJournal = serde_json::from_str(&raw)
+                .map_err(|error| format!("媒体任务记录损坏，已拒绝覆盖：{error}"))?;
+            if journal.version != MEDIA_JOURNAL_VERSION {
+                return Err(format!("不支持的媒体任务记录版本：{}", journal.version));
+            }
+            if journal.jobs.len() > MAX_RETAINED_JOBS {
+                return Err(format!(
+                    "媒体任务记录超过 {MAX_RETAINED_JOBS} 条上限，已拒绝加载"
+                ));
+            }
+            let mut jobs = BTreeMap::new();
+            let mut order = VecDeque::new();
+            let mut interrupted = false;
+            for mut snapshot in journal.jobs {
+                validate_persisted_snapshot(&snapshot, home)?;
+                if jobs.contains_key(&snapshot.id) {
+                    return Err(format!("媒体任务记录包含重复 ID：{}", snapshot.id));
+                }
+                if snapshot.phase.is_active() {
+                    snapshot.phase = MediaJobPhase::Failed;
+                    snapshot.completed_at = Some(unix_time_ms());
+                    snapshot.artifacts.clear();
+                    snapshot.error = Some(MediaFailure::environment(
+                        "MEDIA_JOB_INTERRUPTED",
+                        "Grox 上次退出时媒体任务仍在运行，Host 已将其结算为中断",
+                        "重新发起该媒体任务",
+                    ));
+                    interrupted = true;
+                }
+                order.push_back(snapshot.id.clone());
+                jobs.insert(
+                    snapshot.id.clone(),
+                    MediaJob {
+                        snapshot,
+                        cancel: None,
+                    },
+                );
+            }
+            Ok((jobs, order, interrupted))
+        })();
+        let (jobs, order, interrupted) = match load {
+            Ok(result) => result,
+            Err(error) => {
+                state.journal_blocked = Some(error.clone());
+                return Err(error);
+            }
+        };
+        state.jobs = jobs;
+        state.order = order;
+        if interrupted {
+            persist_jobs_locked(&mut state)?;
+        }
+        Ok(())
+    }
+
+    fn journal_status(&self) -> MediaJournalStatus {
+        let state = self.lock();
+        let bytes = state
+            .journal_path
+            .as_ref()
+            .and_then(|path| fs::metadata(path).ok())
+            .map_or(0, |metadata| metadata.len());
+        MediaJournalStatus {
+            readable: state.journal_blocked.is_none(),
+            jobs: state.jobs.len(),
+            active_jobs: state
+                .jobs
+                .values()
+                .filter(|job| job.snapshot.phase.is_active())
+                .count(),
+            bytes,
+            max_bytes: MEDIA_JOBS_MAX_BYTES,
+            error: state
+                .journal_blocked
+                .clone()
+                .or_else(|| state.journal_last_error.clone()),
+        }
+    }
+
     fn create_job(
         &self,
         workspace: &Path,
         request: &MediaGenerationRequest,
-    ) -> Result<(MediaJobSnapshot, oneshot::Receiver<()>), String> {
+    ) -> Result<(MediaJobSnapshot, oneshot::Receiver<()>), HostError> {
         let mut state = self.lock();
         let workspace_text = path_for_webview(workspace);
         if let Some(active) = state.jobs.values().find(|job| {
@@ -223,9 +354,9 @@ impl MediaService {
                 && job.snapshot.kind == request.kind
                 && job.snapshot.phase.is_active()
         }) {
-            return Err(format!(
-                "当前工作区已有媒体任务正在运行：{}",
-                active.snapshot.id
+            return Err(HostError::operation(
+                "MEDIA_JOB_ACTIVE",
+                format!("当前工作区已有媒体任务正在运行：{}", active.snapshot.id),
             ));
         }
         if state
@@ -235,10 +366,12 @@ impl MediaService {
             .count()
             >= MAX_ACTIVE_JOBS
         {
-            return Err(format!(
-                "媒体任务并发数已达到上限（{MAX_ACTIVE_JOBS}），请等待或停止一个任务"
+            return Err(HostError::operation(
+                "MEDIA_CAPACITY_REACHED",
+                format!("媒体任务并发数已达到上限（{MAX_ACTIVE_JOBS}），请等待或停止一个任务"),
             ));
         }
+        let mut removed = Vec::new();
         while state.jobs.len() >= MAX_RETAINED_JOBS {
             let Some(index) = state.order.iter().position(|id| {
                 state
@@ -249,9 +382,11 @@ impl MediaService {
                 break;
             };
             let oldest = state.order.remove(index).expect("已定位的任务必须存在");
-            state.jobs.remove(&oldest);
+            if let Some(job) = state.jobs.remove(&oldest) {
+                removed.push((index, oldest, job));
+            }
         }
-        let id = random_id("media")?;
+        let id = random_id("media").map_err(media_storage_error)?;
         let (cancel, receiver) = oneshot::channel();
         let snapshot = MediaJobSnapshot {
             id: id.clone(),
@@ -270,22 +405,40 @@ impl MediaService {
         };
         state.order.push_back(id.clone());
         state.jobs.insert(
-            id,
+            id.clone(),
             MediaJob {
                 snapshot: snapshot.clone(),
                 cancel: Some(cancel),
             },
         );
+        if let Err(error) = persist_jobs_locked(&mut state) {
+            state.jobs.remove(&id);
+            state.order.retain(|queued| queued != &id);
+            for (index, removed_id, job) in removed.into_iter().rev() {
+                state.order.insert(index, removed_id.clone());
+                state.jobs.insert(removed_id, job);
+            }
+            return Err(media_storage_error(error));
+        }
         Ok((snapshot, receiver))
     }
 
-    fn mark_running(&self, id: &str) -> Option<MediaJobSnapshot> {
+    fn mark_running(&self, id: &str) -> Result<Option<MediaJobSnapshot>, HostError> {
         let mut state = self.lock();
-        let job = state.jobs.get_mut(id)?;
-        if job.snapshot.phase == MediaJobPhase::Queued {
-            job.snapshot.phase = MediaJobPhase::Running;
+        let queued = state
+            .jobs
+            .get(id)
+            .is_some_and(|job| job.snapshot.phase == MediaJobPhase::Queued);
+        if queued {
+            state.jobs.get_mut(id).expect("已检查媒体任务存在").snapshot.phase =
+                MediaJobPhase::Running;
+            if let Err(error) = persist_jobs_locked(&mut state) {
+                state.jobs.get_mut(id).expect("持久化期间媒体任务不会移除").snapshot.phase =
+                    MediaJobPhase::Queued;
+                return Err(media_storage_error(error));
+            }
         }
-        Some(job.snapshot.clone())
+        Ok(state.jobs.get(id).map(|job| job.snapshot.clone()))
     }
 
     fn finish(
@@ -294,31 +447,49 @@ impl MediaService {
         phase: MediaJobPhase,
         artifacts: Vec<MediaArtifact>,
         error: Option<MediaFailure>,
-    ) -> Option<MediaJobSnapshot> {
+    ) -> Result<Option<MediaJobSnapshot>, HostError> {
         let mut state = self.lock();
-        let job = state.jobs.get_mut(id)?;
+        let Some(job) = state.jobs.get_mut(id) else {
+            return Ok(None);
+        };
         job.snapshot.phase = phase;
         job.snapshot.completed_at = Some(unix_time_ms());
         job.snapshot.artifacts = artifacts;
         job.snapshot.error = error;
         job.cancel = None;
-        Some(job.snapshot.clone())
+        let snapshot = job.snapshot.clone();
+        persist_jobs_locked(&mut state).map_err(media_storage_error)?;
+        Ok(Some(snapshot))
     }
 
-    fn cancel(&self, id: &str, workspace: &Path) -> Result<(MediaJobSnapshot, bool), String> {
+    fn cancel(
+        &self,
+        id: &str,
+        workspace: &Path,
+    ) -> Result<(MediaJobSnapshot, bool), HostError> {
         let mut state = self.lock();
         let workspace = path_for_webview(workspace);
-        let job = state
-            .jobs
-            .get_mut(id)
-            .ok_or_else(|| "媒体任务不存在或已被清理".to_string())?;
+        let job = state.jobs.get(id).ok_or_else(|| {
+            HostError::operation("MEDIA_JOB_NOT_FOUND", "媒体任务不存在或已被清理")
+        })?;
         if job.snapshot.workspace != workspace {
-            return Err("媒体任务不属于当前工作区".into());
+            return Err(HostError::operation(
+                "MEDIA_JOB_WORKSPACE_MISMATCH",
+                "媒体任务不属于当前工作区",
+            ));
         }
         if job.snapshot.phase.is_terminal() || job.snapshot.phase == MediaJobPhase::Cancelling {
             return Ok((job.snapshot.clone(), false));
         }
-        job.snapshot.phase = MediaJobPhase::Cancelling;
+        let previous_phase = job.snapshot.phase;
+        state.jobs.get_mut(id).expect("已检查媒体任务存在").snapshot.phase =
+            MediaJobPhase::Cancelling;
+        if let Err(error) = persist_jobs_locked(&mut state) {
+            state.jobs.get_mut(id).expect("持久化期间媒体任务不会移除").snapshot.phase =
+                previous_phase;
+            return Err(media_storage_error(error));
+        }
+        let job = state.jobs.get_mut(id).expect("持久化后媒体任务必须存在");
         let sent = job
             .cancel
             .take()
@@ -336,6 +507,20 @@ impl MediaService {
             .filter_map(|id| state.jobs.get(id))
             .find(|job| job.snapshot.workspace == workspace && job.snapshot.kind == kind)
             .map(|job| job.snapshot.clone())
+    }
+
+    fn snapshot(&self, id: &str) -> Option<MediaJobSnapshot> {
+        self.lock().jobs.get(id).map(|job| job.snapshot.clone())
+    }
+
+    fn snapshots(&self) -> Vec<MediaJobSnapshot> {
+        let state = self.lock();
+        state
+            .order
+            .iter()
+            .filter_map(|id| state.jobs.get(id))
+            .map(|job| job.snapshot.clone())
+            .collect()
     }
 
     fn register_reference(&self, id: String, workspace: PathBuf, path: PathBuf) {
@@ -418,6 +603,180 @@ impl MediaService {
     }
 }
 
+fn media_storage_error(message: String) -> HostError {
+    HostError::recoverable_environment(
+        "MEDIA_JOURNAL_FAILED",
+        message,
+        "检查应用数据目录的磁盘空间和文件权限；不要退出当前页面",
+    )
+}
+
+fn media_jobs_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("media-jobs.json"))
+        .map_err(|error| format!("无法定位媒体任务记录：{error}"))
+}
+
+fn validate_persisted_snapshot(snapshot: &MediaJobSnapshot, home: &Path) -> Result<(), String> {
+    if !snapshot.id.starts_with("media-") || snapshot.id.len() > 80 {
+        return Err("媒体任务记录包含无效任务 ID".into());
+    }
+    if !Path::new(&snapshot.workspace).is_absolute() {
+        return Err(format!("媒体任务 {} 的工作区不是绝对路径", snapshot.id));
+    }
+    let prompt_len = snapshot.prompt.chars().count();
+    if !(1..=4_000).contains(&prompt_len) {
+        return Err(format!("媒体任务 {} 的提示词长度无效", snapshot.id));
+    }
+    if !MEDIA_ASPECTS.contains(&snapshot.aspect.as_str()) {
+        return Err(format!("媒体任务 {} 的画面比例无效", snapshot.id));
+    }
+    if snapshot.phase.is_terminal() != snapshot.completed_at.is_some() {
+        return Err(format!("媒体任务 {} 的生命周期时间戳不一致", snapshot.id));
+    }
+    if snapshot.artifacts.len() > 4 {
+        return Err(format!("媒体任务 {} 的产物数量无效", snapshot.id));
+    }
+    if snapshot.phase == MediaJobPhase::Failed && snapshot.error.is_none() {
+        return Err(format!("媒体任务 {} 缺少失败原因", snapshot.id));
+    }
+    if snapshot.phase != MediaJobPhase::Failed && snapshot.error.is_some() {
+        return Err(format!("媒体任务 {} 在非失败状态携带错误", snapshot.id));
+    }
+    if let Some(error) = snapshot.error.as_ref() {
+        if !matches!(error.domain.as_str(), "protocol" | "environment")
+            || error.code.is_empty()
+            || error.code.len() > 128
+            || !error
+                .code
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            || error.message.len() > 8 * 1024
+            || error.action.as_ref().is_some_and(|action| action.len() > 2 * 1024)
+        {
+            return Err(format!("媒体任务 {} 的错误契约无效", snapshot.id));
+        }
+    }
+    for artifact in &snapshot.artifacts {
+        validate_persisted_artifact(snapshot, artifact, home)?;
+    }
+    Ok(())
+}
+
+fn validate_persisted_artifact(
+    snapshot: &MediaJobSnapshot,
+    artifact: &MediaArtifact,
+    home: &Path,
+) -> Result<(), String> {
+    match (artifact.path.as_deref(), artifact.url.as_deref()) {
+        (Some(value), None) => {
+            let requested = PathBuf::from(value);
+            if !requested.is_absolute() {
+                return Err(format!("媒体任务 {} 的产物路径不是绝对路径", snapshot.id));
+            }
+            let tool = match snapshot.kind {
+                MediaKind::Image => "image_gen",
+                MediaKind::Video => "image_to_video",
+            };
+            if media_mime(&requested, tool) != Some(artifact.mime.as_str()) {
+                return Err(format!("媒体任务 {} 的产物类型与路径不匹配", snapshot.id));
+            }
+            let workspace = PathBuf::from(&snapshot.workspace);
+            let sessions = home.join("sessions");
+            let in_scope = if requested.exists() {
+                let canonical = requested.canonicalize().map_err(|error| {
+                    format!("无法验证媒体任务 {} 的产物路径：{error}", snapshot.id)
+                })?;
+                workspace
+                    .canonicalize()
+                    .ok()
+                    .is_some_and(|root| canonical.starts_with(root))
+                    || sessions
+                        .canonicalize()
+                        .ok()
+                        .is_some_and(|root| canonical.starts_with(root))
+            } else {
+                requested.starts_with(&workspace) || requested.starts_with(&sessions)
+            };
+            if !in_scope {
+                return Err(format!("媒体任务 {} 的产物路径越过授权边界", snapshot.id));
+            }
+            Ok(())
+        }
+        (None, Some(value)) => {
+            let tool = match snapshot.kind {
+                MediaKind::Image => "image_gen",
+                MediaKind::Video => "image_to_video",
+            };
+            let checked = checked_remote_artifact(value, tool)
+                .map_err(|error| format!("媒体任务 {} 的远程产物无效：{}", snapshot.id, error.message))?;
+            if checked.url != artifact.url || checked.mime != artifact.mime {
+                return Err(format!("媒体任务 {} 的远程产物契约不匹配", snapshot.id));
+            }
+            Ok(())
+        }
+        _ => Err(format!("媒体任务 {} 的产物引用无效", snapshot.id)),
+    }
+}
+
+fn persist_jobs_locked(state: &mut MediaState) -> Result<(), String> {
+    if let Some(error) = state.journal_blocked.as_ref() {
+        return Err(format!("媒体任务记录处于只读保护状态：{error}"));
+    }
+    let Some(path) = state.journal_path.clone() else {
+        return Ok(());
+    };
+    let jobs = state
+        .order
+        .iter()
+        .map(|id| {
+            state
+                .jobs
+                .get(id)
+                .map(|job| job.snapshot.clone())
+                .ok_or_else(|| format!("媒体任务顺序索引缺少任务：{id}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let content = serde_json::to_string_pretty(&MediaJournal {
+        version: MEDIA_JOURNAL_VERSION,
+        jobs,
+    })
+    .map_err(|error| format!("无法序列化媒体任务记录：{error}"))?;
+    match atomic_write_bounded_private(&path, &content, MEDIA_JOBS_MAX_BYTES) {
+        Ok(()) => {
+            state.journal_last_error = None;
+            Ok(())
+        }
+        Err(error) => {
+            state.journal_last_error = Some(error.clone());
+            Err(error)
+        }
+    }
+}
+
+pub(crate) fn restore_job_journal(
+    app: &tauri::AppHandle,
+    service: &Arc<MediaService>,
+) -> Result<(), String> {
+    let home = grok_home()?;
+    service.initialize(media_jobs_path(app)?, &home)?;
+    for snapshot in service.snapshots() {
+        for artifact in snapshot.artifacts {
+            if let Some(path) = artifact.path.filter(|path| Path::new(path).is_file()) {
+                app.asset_protocol_scope()
+                    .allow_file(PathBuf::from(path))
+                    .map_err(|error| format!("无法恢复媒体产物预览授权：{error}"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn media_journal_status(service: &Arc<MediaService>) -> MediaJournalStatus {
+    service.journal_status()
+}
+
 #[tauri::command]
 pub(crate) fn save_media_reference(
     app: tauri::AppHandle,
@@ -426,31 +785,34 @@ pub(crate) fn save_media_reference(
     cwd: String,
     name: String,
     data: String,
-) -> Result<MediaReferenceResponse, String> {
-    crate::ensure_main_acp_owner(window.label())?;
-    let workspace = checked_workspace(&cwd)?;
-    let (bytes, extension) = checked_reference_payload(&name, &data)?;
-    let root = reference_cache_root(&app)?;
-    create_private_directory(&root)?;
+) -> Result<MediaReferenceResponse, HostError> {
+    crate::ensure_main_acp_owner(window.label())
+        .map_err(|error| HostError::operation("MEDIA_WINDOW_NOT_OWNER", error))?;
+    let workspace = checked_workspace(&cwd)
+        .map_err(|error| HostError::operation("MEDIA_WORKSPACE_INVALID", error))?;
+    let (bytes, extension) = checked_reference_payload(&name, &data)
+        .map_err(|error| HostError::operation("MEDIA_REFERENCE_INVALID", error))?;
+    let root = reference_cache_root(&app).map_err(media_storage_error)?;
+    create_private_directory(&root).map_err(media_storage_error)?;
 
     for _ in 0..4 {
-        let id = random_id("ref")?;
+        let id = random_id("ref").map_err(media_storage_error)?;
         let directory = root.join(&id);
         match create_exclusive_private_directory(&directory) {
             Ok(()) => {}
             Err(error) if directory.exists() => continue,
-            Err(error) => return Err(error),
+            Err(error) => return Err(media_storage_error(error)),
         }
         let path = directory.join(format!("reference.{extension}"));
         let written = write_private_file(&path, &bytes);
         if let Err(error) = written {
             let _ = fs::remove_dir_all(&directory);
-            return Err(error);
+            return Err(media_storage_error(error));
         }
         service.register_reference(id.clone(), workspace, path);
         return Ok(MediaReferenceResponse { id });
     }
-    Err("无法分配参考图片存储 ID，请重试".into())
+    Err(media_storage_error("无法分配参考图片存储 ID，请重试".into()))
 }
 
 #[tauri::command]
@@ -459,10 +821,14 @@ pub(crate) fn release_media_reference(
     service: tauri::State<'_, Arc<MediaService>>,
     cwd: String,
     id: String,
-) -> Result<bool, String> {
-    crate::ensure_main_acp_owner(window.label())?;
-    let workspace = checked_workspace(&cwd)?;
-    service.release_reference(id.trim(), &workspace)
+) -> Result<bool, HostError> {
+    crate::ensure_main_acp_owner(window.label())
+        .map_err(|error| HostError::operation("MEDIA_WINDOW_NOT_OWNER", error))?;
+    let workspace = checked_workspace(&cwd)
+        .map_err(|error| HostError::operation("MEDIA_WORKSPACE_INVALID", error))?;
+    service
+        .release_reference(id.trim(), &workspace)
+        .map_err(|error| HostError::operation("MEDIA_REFERENCE_RELEASE_FAILED", error))
 }
 
 #[tauri::command]
@@ -471,16 +837,18 @@ pub(crate) fn start_media_generation(
     window: tauri::WebviewWindow,
     service: tauri::State<'_, Arc<MediaService>>,
     request: MediaGenerationRequest,
-) -> Result<MediaJobSnapshot, String> {
-    crate::ensure_main_acp_owner(window.label())?;
+) -> Result<MediaJobSnapshot, HostError> {
+    crate::ensure_main_acp_owner(window.label())
+        .map_err(|error| HostError::operation("MEDIA_WINDOW_NOT_OWNER", error))?;
     let service = Arc::clone(service.inner());
-    let prepared = prepare_request(Arc::clone(&service), request)?;
+    let prepared = prepare_request(Arc::clone(&service), request)
+        .map_err(|error| HostError::operation("MEDIA_REQUEST_INVALID", error))?;
     let (snapshot, cancel) = service.create_job(&prepared.workspace, &prepared.request)?;
     emit_snapshot(&app, &snapshot);
     let job_id = snapshot.id.clone();
     tauri::async_runtime::spawn(async move {
         let result = run_media_generation(&app, &service, &job_id, prepared, cancel).await;
-        let snapshot = match result {
+        let settled = match result {
             Ok(artifacts) => service.finish(&job_id, MediaJobPhase::Completed, artifacts, None),
             Err(MediaRunError::Cancelled) => {
                 service.finish(&job_id, MediaJobPhase::Cancelled, Vec::new(), None)
@@ -489,8 +857,18 @@ pub(crate) fn start_media_generation(
                 service.finish(&job_id, MediaJobPhase::Failed, Vec::new(), Some(error))
             }
         };
-        if let Some(snapshot) = snapshot {
-            emit_snapshot(&app, &snapshot);
+        match settled {
+            Ok(Some(snapshot)) => emit_snapshot(&app, &snapshot),
+            Ok(None) => emit_diagnostic(
+                &app,
+                HostError::operation("MEDIA_JOB_NOT_FOUND", "媒体任务完成时 Host 已找不到任务记录"),
+            ),
+            Err(error) => {
+                if let Some(snapshot) = service.snapshot(&job_id) {
+                    emit_snapshot(&app, &snapshot);
+                }
+                emit_diagnostic(&app, error);
+            }
         }
     });
     Ok(snapshot)
@@ -502,9 +880,11 @@ pub(crate) fn media_generation_status(
     service: tauri::State<'_, Arc<MediaService>>,
     cwd: String,
     kind: MediaKind,
-) -> Result<Option<MediaJobSnapshot>, String> {
-    crate::ensure_main_acp_owner(window.label())?;
-    let workspace = checked_workspace(&cwd)?;
+) -> Result<Option<MediaJobSnapshot>, HostError> {
+    crate::ensure_main_acp_owner(window.label())
+        .map_err(|error| HostError::operation("MEDIA_WINDOW_NOT_OWNER", error))?;
+    let workspace = checked_workspace(&cwd)
+        .map_err(|error| HostError::operation("MEDIA_WORKSPACE_INVALID", error))?;
     Ok(service.latest(&workspace, kind))
 }
 
@@ -526,9 +906,11 @@ pub(crate) fn cancel_media_generation(
     service: tauri::State<'_, Arc<MediaService>>,
     cwd: String,
     id: String,
-) -> Result<MediaJobSnapshot, String> {
-    crate::ensure_main_acp_owner(window.label())?;
-    let workspace = checked_workspace(&cwd)?;
+) -> Result<MediaJobSnapshot, HostError> {
+    crate::ensure_main_acp_owner(window.label())
+        .map_err(|error| HostError::operation("MEDIA_WINDOW_NOT_OWNER", error))?;
+    let workspace = checked_workspace(&cwd)
+        .map_err(|error| HostError::operation("MEDIA_WORKSPACE_INVALID", error))?;
     let (snapshot, _) = service.cancel(id.trim(), &workspace)?;
     emit_snapshot(&app, &snapshot);
     Ok(snapshot)
@@ -632,6 +1014,12 @@ async fn run_media_generation(
     if cancel.try_recv().is_ok() {
         return Err(MediaRunError::Cancelled);
     }
+    if let Some(snapshot) = service
+        .mark_running(job_id)
+        .map_err(|error| MediaRunError::Failed(error.into()))?
+    {
+        emit_snapshot(app, &snapshot);
+    }
     let runtime = configured_grok_command(app);
     let mut command = Command::new(&runtime.path);
     command
@@ -712,10 +1100,6 @@ async fn run_media_generation(
     })?;
     let stdout_task = tokio::spawn(capture_stream(stdout));
     let stderr_task = tokio::spawn(capture_stream(stderr));
-    if let Some(snapshot) = service.mark_running(job_id) {
-        emit_snapshot(app, &snapshot);
-    }
-
     enum Exit {
         Status(std::process::ExitStatus),
         Cancelled,
@@ -1207,6 +1591,10 @@ fn emit_snapshot(app: &tauri::AppHandle, snapshot: &MediaJobSnapshot) {
     let _ = app.emit_to("main", MEDIA_GENERATION_EVENT, snapshot.clone());
 }
 
+fn emit_diagnostic(app: &tauri::AppHandle, error: HostError) {
+    let _ = app.emit_to("main", MEDIA_DIAGNOSTIC_EVENT, error);
+}
+
 fn unix_time_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1351,7 +1739,9 @@ mod tests {
         assert!(sent);
         assert_eq!(cancelled.phase, MediaJobPhase::Cancelling);
         assert!(receiver.try_recv().is_ok());
-        service.finish(&snapshot.id, MediaJobPhase::Cancelled, Vec::new(), None);
+        service
+            .finish(&snapshot.id, MediaJobPhase::Cancelled, Vec::new(), None)
+            .unwrap();
         assert!(service.create_job(&workspace, &request).is_ok());
         fs::remove_dir_all(workspace).unwrap();
         fs::remove_dir_all(other_workspace).unwrap();
@@ -1373,6 +1763,98 @@ mod tests {
             fs::remove_dir_all(workspace).unwrap();
         }
         fs::remove_dir_all(overflow).unwrap();
+    }
+
+    #[test]
+    fn journal_restores_jobs_and_settles_crash_leftovers() {
+        let root = temp_root("journal-restore");
+        let path = root.join("media-jobs.json");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        let service = MediaService::default();
+        service.initialize(path.clone(), &root).unwrap();
+        let (created, _cancel) = service
+            .create_job(&workspace, &request(MediaKind::Image))
+            .unwrap();
+        assert!(path.is_file());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+
+        let restored = MediaService::default();
+        restored.initialize(path.clone(), &root).unwrap();
+        let snapshot = restored.latest(&workspace, MediaKind::Image).unwrap();
+        assert_eq!(snapshot.id, created.id);
+        assert_eq!(snapshot.phase, MediaJobPhase::Failed);
+        assert_eq!(snapshot.error.unwrap().code, "MEDIA_JOB_INTERRUPTED");
+        let persisted: MediaJournal =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        assert_eq!(persisted.jobs[0].phase, MediaJobPhase::Failed);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn corrupt_journal_blocks_new_writes_instead_of_resurrecting_state() {
+        let root = temp_root("journal-corrupt");
+        let path = root.join("media-jobs.json");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let workspace = workspace.canonicalize().unwrap();
+        fs::write(&path, b"{broken").unwrap();
+        let before = fs::read(&path).unwrap();
+        let service = MediaService::default();
+        assert!(service.initialize(path.clone(), &root).is_err());
+        let error = service
+            .create_job(&workspace, &request(MediaKind::Image))
+            .unwrap_err();
+        assert_eq!(error.code, "MEDIA_JOURNAL_FAILED");
+        assert_eq!(fs::read(path).unwrap(), before);
+        assert!(!service.journal_status().readable);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn restored_journal_rejects_artifacts_outside_authorized_roots() {
+        let root = temp_root("journal-artifact-scope");
+        let path = root.join("media-jobs.json");
+        let workspace = root.join("workspace");
+        let home = root.join("grok-home");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(home.join("sessions")).unwrap();
+        let outside = root.join("outside.png");
+        fs::write(&outside, b"image").unwrap();
+        let journal = MediaJournal {
+            version: MEDIA_JOURNAL_VERSION,
+            jobs: vec![MediaJobSnapshot {
+                id: "media-0123456789abcdef".into(),
+                workspace: path_for_webview(&workspace.canonicalize().unwrap()),
+                kind: MediaKind::Image,
+                prompt: "scope test".into(),
+                aspect: "1:1".into(),
+                count: 1,
+                duration: 6,
+                resolution: "480p".into(),
+                phase: MediaJobPhase::Completed,
+                started_at: 1,
+                completed_at: Some(2),
+                artifacts: vec![MediaArtifact {
+                    path: Some(path_for_webview(&outside.canonicalize().unwrap())),
+                    url: None,
+                    mime: "image/png".into(),
+                }],
+                error: None,
+            }],
+        };
+        let content = serde_json::to_string(&journal).unwrap();
+        fs::write(&path, &content).unwrap();
+        let service = MediaService::default();
+        assert!(service.initialize(path.clone(), &home).is_err());
+        assert_eq!(fs::read_to_string(path).unwrap(), content);
+        assert!(!service.journal_status().readable);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

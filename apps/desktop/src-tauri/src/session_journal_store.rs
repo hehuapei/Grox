@@ -7,10 +7,16 @@ use std::{fs, path::Path};
 
 use serde_json::Value;
 
-use crate::{atomic_write_bounded, read_bounded_text, restrict_private_file};
+use crate::{atomic_write_bounded_private, read_bounded_text};
 
 #[derive(Default)]
 pub(crate) struct SessionJournalStore;
+
+pub(crate) enum SessionJournalWriteError {
+    InvalidIncoming(String),
+    Conflict(String),
+    Storage(String),
+}
 
 impl SessionJournalStore {
     pub(crate) fn read(
@@ -25,7 +31,7 @@ impl SessionJournalStore {
         let content = read_bounded_text(source, max_bytes)
             .map_err(|error| format!("无法读取应用会话 journal：{error}"))?;
         if content.trim().is_empty() {
-            return Ok(None);
+            return Err("应用会话 journal 为空，拒绝当作没有历史继续".into());
         }
         validate_readable_journal(&content, id)?;
         Ok(Some(content))
@@ -38,27 +44,33 @@ impl SessionJournalStore {
         id: &str,
         content: &str,
         max_bytes: u64,
-    ) -> Result<(), String> {
+    ) -> Result<(), SessionJournalWriteError> {
         if content.len() as u64 > max_bytes {
-            return Err(format!(
+            return Err(SessionJournalWriteError::InvalidIncoming(format!(
                 "应用会话 journal 不能超过 {} MB",
                 max_bytes / 1024 / 1024
-            ));
+            )));
         }
-        let incoming_saved_at = validate_current_journal(content, id)?;
+        let incoming_saved_at = validate_current_journal(content, id)
+            .map_err(SessionJournalWriteError::InvalidIncoming)?;
         if path.is_file() {
             let current = read_bounded_text(path, max_bytes)
-                .map_err(|error| format!("无法读取现有应用会话 journal：{error}"))?;
-            let current_saved_at = validate_current_journal(&current, id)?;
+                .map_err(|error| {
+                    SessionJournalWriteError::Storage(format!(
+                        "无法读取现有应用会话 journal：{error}"
+                    ))
+                })?;
+            let current_saved_at = validate_current_journal(&current, id)
+                .map_err(SessionJournalWriteError::Storage)?;
             if current_saved_at >= incoming_saved_at {
-                return Err(format!(
+                return Err(SessionJournalWriteError::Conflict(format!(
                     "应用会话 journal 写入冲突：磁盘版本 {current_saved_at} 不早于提交版本 {incoming_saved_at}"
-                ));
+                )));
             }
         }
 
-        atomic_write_bounded(path, content, max_bytes)?;
-        restrict_private_file(path)?;
+        atomic_write_bounded_private(path, content, max_bytes)
+            .map_err(SessionJournalWriteError::Storage)?;
         if legacy.is_file() {
             if let Err(error) = fs::remove_file(legacy) {
                 // 新版 journal 已经持久化；保留旧文件并通过状态诊断暴露即可。
@@ -196,6 +208,17 @@ mod tests {
             )
             .is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "not-json");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn empty_existing_journal_is_not_missing_history() {
+        let path = temp_file("empty");
+        fs::write(&path, "").unwrap();
+        assert!(SessionJournalStore
+            .read(&path, "session-1", 1024 * 1024)
+            .unwrap_err()
+            .contains("journal 为空"));
         let _ = fs::remove_file(path);
     }
 

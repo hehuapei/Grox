@@ -59,12 +59,8 @@ function structuredHostError(cause: unknown): GroxError | undefined {
   };
 }
 
-function inferredDomain(cause: unknown, fallback: GroxErrorDomain): GroxErrorDomain {
+function resolvedDomain(cause: unknown, fallback: GroxErrorDomain): GroxErrorDomain {
   if (cause instanceof Error && cause.name === "AcpRpcError") return "protocol";
-  const message = errorText(cause).toLowerCase();
-  if (/agent (?:已)?退出|process exited|child process|acp_send|generation|spawn|enoent|not found.*grok|无法启动|网络|network|econn|认证|登录/.test(message)) {
-    return "environment";
-  }
   return fallback;
 }
 
@@ -73,7 +69,7 @@ export function toGroxError(cause: unknown, fallback: ErrorFallback): GroxError 
   const hostError = structuredHostError(cause);
   if (hostError) return hostError;
   const detail = errorText(cause);
-  const domain = inferredDomain(cause, fallback.domain);
+  const domain = resolvedDomain(cause, fallback.domain);
   return {
     domain,
     code: fallback.code,

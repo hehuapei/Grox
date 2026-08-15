@@ -18,7 +18,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{atomic_write_bounded, git_text, read_bounded_text, restrict_private_file};
+use crate::{atomic_write_bounded_private, git_text, read_bounded_text};
 
 pub(crate) const WORKTREE_BINDINGS_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const WORKTREE_BINDINGS_VERSION: u32 = 1;
@@ -194,8 +194,7 @@ impl WorktreeOwnershipStore {
         }
         let content = serde_json::to_string(file)
             .map_err(|error| format!("无法序列化 worktree 会话索引：{error}"))?;
-        atomic_write_bounded(path, &content, WORKTREE_BINDINGS_MAX_BYTES)?;
-        restrict_private_file(path)
+        atomic_write_bounded_private(path, &content, WORKTREE_BINDINGS_MAX_BYTES)
     }
 
     fn lock_transaction(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -283,34 +282,58 @@ fn detect_linked_worktree(cwd: &Path) -> Result<Option<DetectedWorktree>, String
 }
 
 /// 兼容 v0.3.2 以前尚未建立 Host 索引的会话；journal 只补充引用，不反向
-/// 覆盖所有权文件。损坏 journal 不会被当成“没有引用”，其绑定仍由索引保护。
-pub(crate) fn journal_session_references(app_config_dir: &Path, target: &Path) -> BTreeSet<String> {
+/// 覆盖所有权文件。任何已有 journal 无法读取时都拒绝删除 worktree，不能把
+/// “诊断失败”误当成“没有引用”。
+pub(crate) fn journal_session_references(
+    app_config_dir: &Path,
+    target: &Path,
+) -> Result<BTreeSet<String>, String> {
     let mut references = BTreeSet::new();
     let sessions = app_config_dir.join("sessions");
-    if let Ok(entries) = fs::read_dir(sessions) {
-        for entry in entries.filter_map(Result::ok) {
-            collect_journal_reference(&entry.path().join("journal.json"), target, &mut references);
+    match fs::read_dir(&sessions) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    format!("无法枚举应用会话目录 {}：{error}", sessions.display())
+                })?;
+                collect_journal_reference(
+                    &entry.path().join("journal.json"),
+                    target,
+                    &mut references,
+                )?;
+            }
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("无法读取应用会话目录 {}：{error}", sessions.display())),
     }
     let legacy = app_config_dir.join("session-cache");
-    if let Ok(entries) = fs::read_dir(legacy) {
-        for entry in entries.filter_map(Result::ok) {
-            collect_journal_reference(&entry.path(), target, &mut references);
+    match fs::read_dir(&legacy) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    format!("无法枚举旧版会话缓存 {}：{error}", legacy.display())
+                })?;
+                collect_journal_reference(&entry.path(), target, &mut references)?;
+            }
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("无法读取旧版会话缓存 {}：{error}", legacy.display())),
     }
-    references
+    Ok(references)
 }
 
-fn collect_journal_reference(path: &Path, target: &Path, output: &mut BTreeSet<String>) {
+fn collect_journal_reference(
+    path: &Path,
+    target: &Path,
+    output: &mut BTreeSet<String>,
+) -> Result<(), String> {
     if !path.is_file() {
-        return;
+        return Ok(());
     }
-    let Ok(content) = read_bounded_text(path, JOURNAL_SCAN_MAX_BYTES) else {
-        return;
-    };
-    let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return;
-    };
+    let content = read_bounded_text(path, JOURNAL_SCAN_MAX_BYTES)
+        .map_err(|error| format!("无法检查会话 journal {}：{error}", path.display()))?;
+    let value = serde_json::from_str::<serde_json::Value>(&content)
+        .map_err(|error| format!("会话 journal 损坏 {}：{error}", path.display()))?;
     let session = value.get("session").unwrap_or(&value);
     let id = session
         .get("id")
@@ -321,11 +344,14 @@ fn collect_journal_reference(path: &Path, target: &Path, output: &mut BTreeSet<S
                 .and_then(serde_json::Value::as_str)
         });
     let cwd = session.get("cwd").and_then(serde_json::Value::as_str);
-    if let (Some(id), Some(cwd)) = (id, cwd) {
-        if validate_session_id(id).is_ok() && path_is_within(Path::new(cwd), target) {
-            output.insert(id.to_string());
-        }
+    let id = id.ok_or_else(|| format!("会话 journal 缺少会话 ID：{}", path.display()))?;
+    let cwd = cwd.ok_or_else(|| format!("会话 journal 缺少工作区：{}", path.display()))?;
+    validate_session_id(id)
+        .map_err(|error| format!("会话 journal ID 无效 {}：{error}", path.display()))?;
+    if path_is_within(Path::new(cwd), target) {
+        output.insert(id.to_string());
     }
+    Ok(())
 }
 
 pub(crate) fn path_is_within(candidate: &Path, target: &Path) -> bool {
@@ -458,9 +484,23 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            journal_session_references(&config, &target),
+            journal_session_references(&config, &target).unwrap(),
             BTreeSet::from(["session-1".to_string()])
         );
+        fs::remove_dir_all(config).ok();
+    }
+
+    #[test]
+    fn corrupt_legacy_journal_blocks_worktree_removal_scan() {
+        let config = temp_dir("corrupt-journal");
+        let target = config.join("linked");
+        fs::create_dir_all(&target).unwrap();
+        let session_dir = config.join("sessions").join("session-1");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(session_dir.join("journal.json"), "not-json").unwrap();
+        assert!(journal_session_references(&config, &target)
+            .unwrap_err()
+            .contains("journal 损坏"));
         fs::remove_dir_all(config).ok();
     }
 

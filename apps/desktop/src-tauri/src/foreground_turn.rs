@@ -884,22 +884,22 @@ fn prompt_queue_storage_error(message: String) -> AcpHostError {
 fn prompt_queue_claim_error(error: PromptQueueClaimError) -> AcpHostError {
     match error {
         PromptQueueClaimError::Busy => AcpHostError {
-            domain: "operation",
-            code: "PROMPT_QUEUE_CLAIM_BUSY",
+            domain: "operation".into(),
+            code: "PROMPT_QUEUE_CLAIM_BUSY".into(),
             message: "该会话已有 Host 正在派发的队列提示".into(),
             recoverable: true,
             fatal: false,
             hold_queue: true,
-            action: Some("等待当前回合结束；若运行时已退出，请确认最后一轮后恢复队列"),
+            action: Some("等待当前回合结束；若运行时已退出，请确认最后一轮后恢复队列".into()),
         },
         PromptQueueClaimError::Stale => AcpHostError {
-            domain: "operation",
-            code: "PROMPT_QUEUE_CLAIM_STALE",
+            domain: "operation".into(),
+            code: "PROMPT_QUEUE_CLAIM_STALE".into(),
             message: "队列顺序已变化，Host 拒绝发送过期条目".into(),
             recoverable: true,
             fatal: false,
             hold_queue: true,
-            action: Some("核对最新队列后，确认并继续"),
+            action: Some("核对最新队列后，确认并继续".into()),
         },
         PromptQueueClaimError::Invalid(message) => AcpHostError::environment(
             "PROMPT_QUEUE_INVALID",

@@ -19,7 +19,7 @@ interface MediaArtifact {
 type MediaJobPhase = "queued" | "running" | "cancelling" | "completed" | "failed" | "cancelled";
 
 interface MediaFailure {
-  domain: "protocol" | "environment";
+  domain: "protocol" | "operation" | "environment";
   code: string;
   message: string;
   recoverable: boolean;
@@ -88,6 +88,7 @@ export function MediaStudio({ mode }: { mode: MediaMode }) {
   useEffect(() => {
     let disposed = false;
     let unlisten: (() => void) | undefined;
+    let unlistenDiagnostic: (() => void) | undefined;
     setJob(null);
     setCapabilities(null);
     setError("");
@@ -98,6 +99,9 @@ export function MediaStudio({ mode }: { mode: MediaMode }) {
           void invoke<MediaJobSnapshot | null>("media_generation_status", { cwd: workspace, kind: mode })
             .then((latest) => { if (!disposed) setJob(latest); })
             .catch((cause) => { if (!disposed) setError(mediaErrorText(cause, "environment", "MEDIA_STATUS_FAILED")); });
+        });
+        unlistenDiagnostic = await listen<MediaFailure>("media-generation-diagnostic", ({ payload }) => {
+          if (!disposed) setError(formatGroxError(payload));
         });
         const [latest, contract] = await Promise.all([
           invoke<MediaJobSnapshot | null>("media_generation_status", { cwd: workspace, kind: mode }),
@@ -126,6 +130,7 @@ export function MediaStudio({ mode }: { mode: MediaMode }) {
     return () => {
       disposed = true;
       unlisten?.();
+      unlistenDiagnostic?.();
     };
   }, [mode, workspace]);
 

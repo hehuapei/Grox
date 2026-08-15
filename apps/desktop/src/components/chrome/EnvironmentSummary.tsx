@@ -50,6 +50,8 @@ interface AgentRuntimeStatus {
   pendingClientCallbacks: number;
   boundClientSessions: number;
   activeTerminals: number;
+  automaticReconnectActive: boolean;
+  lastConnectConfigured: boolean;
   worktreeSessionBindings: number;
   worktreeOwnershipError?: string;
 }
@@ -160,7 +162,7 @@ export function EnvironmentSummary() {
         });
         setWorktrees([]);
         setJournalStatus({ count: 12, totalBytes: 1_480_000, latestSavedAt: Date.now(), migrationPending: 0, unreadableCount: 0 });
-        setRuntimeStatus({ topology: "shared_process", processCapacity: 1, running: true, ready: true, phase: "ready", generation: 1, pid: 12345, pendingRequests: 0, pendingInteractions: 0, pendingClientCallbacks: 0, boundClientSessions: 0, activeTerminals: 0, worktreeSessionBindings: 0 });
+        setRuntimeStatus({ topology: "shared_process", processCapacity: 1, running: true, ready: true, phase: "ready", generation: 1, pid: 12345, pendingRequests: 0, pendingInteractions: 0, pendingClientCallbacks: 0, boundClientSessions: 0, activeTerminals: 0, automaticReconnectActive: false, lastConnectConfigured: true, worktreeSessionBindings: 0 });
       }
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -373,6 +375,12 @@ export function EnvironmentSummary() {
                         : "",
                       runtimeStatus.activeTerminals > 0
                         ? `${runtimeStatus.activeTerminals} ${zh ? "个 Host 终端仍被持有" : "Host terminals retained"}`
+                        : "",
+                      runtimeStatus.automaticReconnectActive
+                        ? (zh ? "Host 正在自动重连" : "Host automatic reconnect active")
+                        : "",
+                      !runtimeStatus.lastConnectConfigured
+                        ? (zh ? "尚未建立可自动恢复的连接" : "No reconnectable connection yet")
                         : "",
                       runtimeStatus.worktreeSessionBindings > 0
                         ? `${runtimeStatus.worktreeSessionBindings} ${zh ? "个会话绑定到 worktree" : "sessions bound to worktrees"}`

@@ -3,17 +3,17 @@
 //! 协议、操作和环境错误必须在原生边界完成分类；前端只负责展示，不能再根据
 //! 中文或英文错误文本推断是否重试、暂停队列或要求用户修复环境。
 
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HostError {
-    pub(crate) domain: &'static str,
-    pub(crate) code: &'static str,
+    pub(crate) domain: String,
+    pub(crate) code: String,
     pub(crate) message: String,
     pub(crate) recoverable: bool,
     pub(crate) fatal: bool,
     pub(crate) hold_queue: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) action: Option<&'static str>,
+    pub(crate) action: Option<String>,
 }
 
 impl HostError {
@@ -31,20 +31,20 @@ impl HostError {
         action: &'static str,
     ) -> Self {
         Self {
-            domain: "protocol",
-            code,
+            domain: "protocol".into(),
+            code: code.into(),
             message: message.into(),
             recoverable: true,
             fatal: false,
             hold_queue: false,
-            action: Some(action),
+            action: Some(action.into()),
         }
     }
 
     pub(crate) fn operation(code: &'static str, message: impl Into<String>) -> Self {
         Self {
-            domain: "operation",
-            code,
+            domain: "operation".into(),
+            code: code.into(),
             message: message.into(),
             recoverable: true,
             fatal: false,
@@ -61,13 +61,13 @@ impl HostError {
         action: &'static str,
     ) -> Self {
         Self {
-            domain: "environment",
-            code,
+            domain: "environment".into(),
+            code: code.into(),
             message: message.into(),
             recoverable: true,
             fatal,
             hold_queue,
-            action: Some(action),
+            action: Some(action.into()),
         }
     }
 

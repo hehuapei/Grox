@@ -12,7 +12,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{atomic_write_bounded, permission_policy::PermissionMode, restrict_private_file};
+use crate::{atomic_write_bounded_private, permission_policy::PermissionMode};
 
 const PREFS_FILE: &str = "host_prefs.json";
 const MAX_PREFS_BYTES: u64 = 64 * 1024;
@@ -132,8 +132,7 @@ fn save_prefs_unlocked(app_data: &Path, prefs: &HostPrefs) -> Result<(), String>
     set_data_dir(app_data.to_path_buf());
     let path = prefs_path_from_dir(app_data);
     let raw = serde_json::to_string_pretty(prefs).map_err(|e| format!("序列化 host_prefs：{e}"))?;
-    atomic_write_bounded(&path, &raw, MAX_PREFS_BYTES)?;
-    restrict_private_file(&path)?;
+    atomic_write_bounded_private(&path, &raw, MAX_PREFS_BYTES)?;
     if let Ok(mut guard) = PREFS_CACHE.lock() {
         *guard = Some(prefs.clone());
     }

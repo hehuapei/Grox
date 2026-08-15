@@ -46,16 +46,20 @@ import type {
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
 import {
-  clearDraftBuffer,
   cancelPendingSessionJournal,
   flushAllPendingSessionJournals,
   flushSessionJournal,
-  loadDraftBuffer,
-  saveDraftBuffer,
   scheduleSaveSessionJournal,
   scrubSessionJournalOrphans,
   setSessionJournalFailureHandler,
 } from "../lib/sessionCache";
+import {
+  clearDraftBuffer,
+  flushDraftPersistence,
+  loadDraftBuffer,
+  saveDraftBuffer,
+  setDraftFailureHandler,
+} from "../lib/draftPersistence";
 import { readStoredPermissionMode } from "../lib/permissionMode";
 import { turnHasLiveText } from "../lib/processFold";
 import {
@@ -908,6 +912,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
     });
   });
 
+  setDraftFailureHandler((cwd, cause) => {
+    publishRuntimeError(cause, {
+      domain: "environment",
+      code: "DRAFT_STORAGE_FAILED",
+      message: `工作区 ${cwd} 的未发送草稿未能写入 Host`,
+      recoverable: true,
+      action: "当前编辑器仍保留内容；请不要关闭页面，并检查应用数据目录权限与磁盘空间",
+    });
+  });
+
   const savePromptQueues = (queues: Record<string, QueuedPrompt[]>) => {
     void persistPromptQueues(queues).catch((cause) => {
       publishRuntimeError(cause, {
@@ -1553,7 +1567,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         });
         if (launch) {
           // Create path succeeded — crash buffer is no longer needed.
-          clearDraftBuffer(readySession.cwd);
+          void clearDraftBuffer(readySession.cwd).catch(() => {});
           void bridge.prompt(readySession.id, launch.text, {
             model: composer.model,
             effort: composer.effort,
@@ -2288,7 +2302,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
         viewNavigation = nextViewNavigation(viewNavigation, draftId, beforeNew.workspace);
         const now = Date.now();
         const workspace = get().workspace;
-        const recovered = loadDraftBuffer(workspace);
+        let recovered: Awaited<ReturnType<typeof loadDraftBuffer>> = null;
+        try {
+          recovered = await loadDraftBuffer(workspace);
+        } catch (cause) {
+          publishRuntimeError(cause, {
+            domain: "environment",
+            code: "DRAFT_READ_FAILED",
+            message: "未发送草稿无法从 Host 恢复",
+            recoverable: true,
+            action: "已保留磁盘文件且打开空编辑器；请检查应用数据目录后重试",
+          });
+        }
         const recoveredText = recovered?.text ?? "";
         const recoveredAttachments = (recovered?.attachments ?? []).map((item) => ({
           id: item.id,
@@ -2417,7 +2442,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           now: Date.now(),
         });
         if (restored.draftText.trim() || restored.draftAttachments.length > 0) {
-          saveDraftBuffer(workspace, restored.draftText, restored.draftAttachments);
+          void saveDraftBuffer(workspace, restored.draftText, restored.draftAttachments).catch(() => {});
         }
         persistSessionComposers(restored.sessionComposers);
         set({
@@ -3195,9 +3220,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
       // 只有编辑器提交能消费其 crash buffer；队列、自动化和 Inspector 的
       // 内部发送不得顺手删除用户尚未发送的附件草稿。
       if (!shouldRetainDraftBufferUntilSessionReady(session.id) && submission) {
-        clearDraftBuffer(cwd);
+        void clearDraftBuffer(cwd).catch(() => {});
       } else if (shouldRetainDraftBufferUntilSessionReady(session.id)) {
-        saveDraftBuffer(cwd, trimmed, attachments);
+        void saveDraftBuffer(cwd, trimmed, attachments).catch(() => {});
       }
 
       // Promote a local draft into a real ACP session on first send only.
@@ -3636,7 +3661,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const session = sessions[activeId];
       const cwd = session?.cwd || workspace;
       if (isDraftSessionId(activeId) || !session || isSessionTerminal(session.status)) {
-        saveDraftBuffer(cwd, text, current.attachments);
+        void saveDraftBuffer(cwd, text, current.attachments).catch(() => {});
       }
     },
     setComposerAttachments(attachments) {
@@ -3648,7 +3673,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const session = sessions[activeId];
       const cwd = session?.cwd || workspace;
       if (isDraftSessionId(activeId) || !session || isSessionTerminal(session.status)) {
-        saveDraftBuffer(cwd, current.text, attachments);
+        void saveDraftBuffer(cwd, current.text, attachments).catch(() => {});
       }
     },
     flushDurableState() {
@@ -3681,9 +3706,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         const attachments = composer?.attachments ?? [];
         const cwd = state.sessions[activeId]?.cwd || state.workspace;
         if (isDraftSessionId(activeId) || isSessionTerminal(state.sessions[activeId]?.status ?? "idle")) {
-          saveDraftBuffer(cwd, text, attachments);
+          void saveDraftBuffer(cwd, text, attachments).catch(() => {});
         }
       }
+      flushDraftPersistence();
     },
     setInspectorTab: (inspectorTab) => set({ inspectorTab, inspectorOpen: true, terminalOpen: false, previewOpen: false, planPreviewOpen: false }),
     setPlanPreviewOpen: (planPreviewOpen) => set({ planPreviewOpen, ...(planPreviewOpen ? { previewOpen: false, inspectorOpen: false, terminalOpen: false } : {}) }),

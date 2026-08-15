@@ -208,6 +208,10 @@ impl ClientCallbackRegistry {
         self.lock().sessions.len()
     }
 
+    pub(crate) fn bound_session_ids(&self) -> Vec<String> {
+        self.lock().sessions.keys().cloned().collect()
+    }
+
     /// 返回当前进程代次内实际绑定到目标目录的会话。worktree 删除门禁用
     /// Host 绑定补住 session/new 成功后 journal 尚未落盘的短窗口。
     pub(crate) fn sessions_within(&self, target: &Path) -> BTreeSet<String> {
