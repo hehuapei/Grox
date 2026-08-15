@@ -1,5 +1,6 @@
 import type { Session, SessionBlock, SessionMeta, ToolStatus } from "../bridge/types";
 import { mapToolKind } from "./toolKind";
+import { displayReplayUserPrompt } from "./replayUserPrompt";
 
 export type SessionDiskPreviewEntry =
   | { type: "message"; role: "user" | "assistant"; text: string }
@@ -29,19 +30,21 @@ const EMPTY_USAGE = {
 };
 
 export function sessionFromDiskPreview(meta: SessionMeta, preview: SessionDiskPreview): Session {
-  const entries = preview.entries.map((entry, index): SessionBlock => {
+  const entries = preview.entries.flatMap((entry, index): SessionBlock[] => {
     const ts = meta.createdAt + index;
     if (entry.type === "message") {
-      return {
+      const text = entry.role === "user" ? displayReplayUserPrompt(entry.text) : entry.text;
+      if (!text) return [];
+      return [{
         type: entry.role,
         id: `preview-${meta.id}-${index}`,
-        text: entry.text,
+        text,
         ts,
-      };
+      }];
     }
     const kind = mapToolKind(entry.name, entry.title);
     const status: ToolStatus = entry.status === "done" ? "done" : "cancelled";
-    return {
+    return [{
       type: "tool",
       id: `preview-tool-${entry.id || index}`,
       call: {
@@ -56,7 +59,7 @@ export function sessionFromDiskPreview(meta: SessionMeta, preview: SessionDiskPr
         ...(entry.output ? { output: entry.output } : {}),
       },
       ts,
-    };
+    }];
   });
   const blocks: SessionBlock[] = preview.truncated
     ? [{

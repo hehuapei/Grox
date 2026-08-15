@@ -77,7 +77,8 @@ export function MediaStudio({ mode }: { mode: MediaMode }) {
   mediaScopeRef.current = `${mode}\0${workspace}`;
   const [prompt, setPrompt] = useState("");
   const [aspect, setAspect] = useState(mode === "image" ? "1:1" : "16:9");
-  const [count, setCount] = useState(2);
+  // 新工作区默认只生成一张，避免用户首次点击就无意消耗双份额度。
+  const [count, setCount] = useState(1);
   const [duration, setDuration] = useState(6);
   const [resolution, setResolution] = useState("480p");
   const [jobs, setJobs] = useState<MediaJobSnapshot[]>([]);

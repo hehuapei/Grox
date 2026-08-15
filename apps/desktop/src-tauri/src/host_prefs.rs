@@ -10,7 +10,7 @@ use std::{
     sync::Mutex,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 
 use crate::{atomic_write_bounded_private, permission_policy::PermissionMode};
 
@@ -27,7 +27,7 @@ pub struct HostPrefs {
     #[serde(default)]
     pub browser_use_enabled: bool,
     /// Host 授权上限；页面、队列和自动化只能请求更严格的模式。
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_permission_mode")]
     pub permission_mode: PermissionMode,
     /// Optional override for FE mid-turn idle (minutes).
     #[serde(default)]
@@ -43,6 +43,19 @@ pub struct HostPrefs {
     /// 一次性把旧版 localStorage Browser Use 选择迁入 Host。
     #[serde(default)]
     pub browser_use_fe_migrated: bool,
+}
+
+fn deserialize_permission_mode<'de, D>(deserializer: D) -> Result<PermissionMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    if raw.is_empty() {
+        // 0.3.2 之前的前端会把未初始化的选择保存为空串；升级时按新安装默认值迁移。
+        return Ok(PermissionMode::default());
+    }
+    PermissionMode::parse(&raw)
+        .ok_or_else(|| de::Error::unknown_variant(&raw, &["default", "auto", "bypass"]))
 }
 
 impl Default for HostPrefs {
@@ -333,6 +346,40 @@ mod tests {
         let error = load_prefs(&dir).unwrap_err();
         assert!(error.contains("Host 偏好文件损坏"));
         assert_eq!(fs::read_to_string(&path).unwrap(), "{not-json");
+        assert!(!is_computer_use_enabled());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_empty_permission_mode_uses_current_default() {
+        let _test = isolate_process_state();
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            prefs_path_from_dir(&dir),
+            r#"{"computerUseEnabled":true,"permissionMode":""}"#,
+        )
+        .unwrap();
+
+        let loaded = load_prefs(&dir).unwrap();
+        assert_eq!(loaded.permission_mode, PermissionMode::Auto);
+        assert!(loaded.computer_use_enabled);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_permission_mode_still_fails_closed() {
+        let _test = isolate_process_state();
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            prefs_path_from_dir(&dir),
+            r#"{"computerUseEnabled":true,"permissionMode":"root"}"#,
+        )
+        .unwrap();
+
+        let error = load_prefs(&dir).unwrap_err();
+        assert!(error.contains("Host 偏好文件损坏"));
         assert!(!is_computer_use_enabled());
         let _ = fs::remove_dir_all(&dir);
     }

@@ -42,6 +42,20 @@ describe("preferRicherSession", () => {
 });
 
 describe("sessionFromDiskPreview", () => {
+  it("filters transport envelopes before painting offline history", () => {
+    const session = sessionFromDiskPreview(base([]), {
+      entries: [
+        { type: "message", role: "user", text: "<user_info>internal</user_info>" },
+        { type: "message", role: "user", text: "<user_query>duplicate</user_query>" },
+        { type: "message", role: "user", text: "真实请求" },
+      ],
+      truncated: false,
+    });
+
+    expect(session.blocks).toHaveLength(1);
+    expect(session.blocks[0]).toMatchObject({ type: "user", text: "真实请求" });
+  });
+
   it("restores durable tool calls with their real identity and result", () => {
     const session = sessionFromDiskPreview(base([]), {
       entries: [

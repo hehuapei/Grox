@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Session, SessionBlock, ToolImage } from "../bridge/types";
 import { isSessionTerminal } from "../bridge/types";
+import { displayReplayUserPrompt } from "./replayUserPrompt";
 
 const MAX_JOURNAL_BLOCKS = 600;
 const MAX_BODY_TEXT = 64_000;
@@ -80,6 +81,12 @@ function journalBlock(block: SessionBlock): SessionBlock {
   return block;
 }
 
+function visibleJournalBlock(block: SessionBlock): SessionBlock[] {
+  if (block.type !== "user") return [block];
+  const text = displayReplayUserPrompt(block.text);
+  return text ? [{ ...block, text }] : [];
+}
+
 /**
  * Take the last N blocks but never start mid-turn.
  * Evidence: raw slice(-160) can begin on a tool mid-stream and seam badly on reopen.
@@ -109,14 +116,14 @@ export function compactSession(session: Session): Session {
     ...session,
     status: "idle",
     preview: true,
-    blocks: sliceCacheBlocks(session.blocks, MAX_JOURNAL_BLOCKS).map(freezeBlock),
+    blocks: sliceCacheBlocks(session.blocks, MAX_JOURNAL_BLOCKS).map(freezeBlock).flatMap(visibleJournalBlock),
   };
 }
 
 function journalSession(session: Session): Session {
   return {
     ...session,
-    blocks: sliceCacheBlocks(session.blocks, MAX_JOURNAL_BLOCKS).map(journalBlock),
+    blocks: sliceCacheBlocks(session.blocks, MAX_JOURNAL_BLOCKS).map(journalBlock).flatMap(visibleJournalBlock),
   };
 }
 

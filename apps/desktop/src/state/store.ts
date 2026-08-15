@@ -79,6 +79,7 @@ import { mergeProjectSessionsPure } from "../lib/sessionCatalogMerge";
 import { isLiveBusyStatus, mergeOfflineWithLive } from "../lib/offlineMerge";
 import {
   consumeShellUpgradeRescan,
+  sanitizeCatalogStatusOnColdStart,
   shouldCloseDetachedSession,
   shouldForceOfflineRescan,
 } from "../lib/sessionOpenPolicy";
@@ -1933,7 +1934,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
         decorateSessions(loadJson<SessionMeta[]>("grox.sessionCatalog", [])),
       );
       const deletedSessions = loadDeletedSessions();
-      const visibleSessionIndex = migration.sessions.filter((session) => !deletedSessions.has(session.id));
+      const visibleSessionIndex = migration.sessions
+        .filter((session) => !deletedSessions.has(session.id))
+        .map((session) => ({
+          ...session,
+          lastStatus: sanitizeCatalogStatusOnColdStart(session.lastStatus),
+        }));
+      persistSessionCatalog(visibleSessionIndex);
       const cachedWorkspace = (() => {
         try {
           return localStorage.getItem("grok.workspace")?.trim() || "";

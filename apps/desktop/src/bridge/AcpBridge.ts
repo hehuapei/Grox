@@ -70,6 +70,7 @@ import {
 } from "../lib/sessionCache";
 import { reconcileSessionJournal } from "../lib/sessionJournalReconcile";
 import { mapToolKind } from "../lib/toolKind";
+import { displayReplayUserPrompt } from "../lib/replayUserPrompt";
 import { AcpRpcError, decodeAcpResponse } from "./acpRpc";
 
 export const ACP_METHODS = {
@@ -258,25 +259,6 @@ interface ReplayContentCursor {
 
 function isMethodUnavailable(error: unknown): boolean {
   return error instanceof AcpRpcError && (error.code === -32601 || error.code === -32602);
-}
-
-/** Keep Grox's transport-only workflow alias out of the conversation replay. */
-function displayDeepResearchPrompt(text: string): string {
-  const match = text.trim().match(/^\/workflow\s+grox-deep-research\s+([\s\S]+)$/i);
-  if (!match) {
-    // Some older CLI session/load replays collapse the next user chunk and a
-    // stale host-side workflow command into one string (for example
-    // `你好/workflow grox-deep-research {...}`). The command was never typed by
-    // the user and, after a rewind, must not be allowed to resurrect itself.
-    const leaked = text.search(/\/workflow\s+(?:grox-deep-research|(?:pause|resume|stop)\s+\S+)\b/i);
-    return leaked > 0 ? text.slice(0, leaked).trimEnd() : text;
-  }
-  try {
-    const args = JSON.parse(match[1]) as { query?: unknown };
-    return typeof args.query === "string" ? `/deep-research${args.query ? ` ${args.query}` : ""}` : text;
-  } catch {
-    return text;
-  }
 }
 
 /** Workflow controls are task-panel protocol, never authored chat content. */
@@ -1414,7 +1396,8 @@ export class AcpBridge implements GrokBridge {
         ? snapshot.text
         : `${snapshot.text}\n… [Grox 活动流快照已截断]`;
       if (snapshot.blockType === "user") {
-        const text = displayDeepResearchPrompt(recoveredText);
+        const text = displayReplayUserPrompt(recoveredText);
+        if (!text) continue;
         this.emit({
           type: "block_add",
           sessionId: snapshot.sessionId,
@@ -2247,7 +2230,7 @@ export class AcpBridge implements GrokBridge {
           const userOperations = blockOperations.filter((operation) => operation.blockType === "user");
           for (const [index, text] of combined.entries()) {
             if (isWorkflowControlCommand(text)) continue;
-            const displayText = displayDeepResearchPrompt(text);
+            const displayText = displayReplayUserPrompt(text);
             if (!displayText || isWorkflowControlCommand(displayText)) continue;
             const blockId = userOperations[index]?.blockId ?? uid();
             this.emit({
@@ -2277,6 +2260,7 @@ export class AcpBridge implements GrokBridge {
         }
         const delta = contentText(update.content);
         if (isWorkflowControlCommand(delta)) return;
+        if (!displayReplayUserPrompt(delta)) return;
         const hostUser = blockOperation("user");
         if (hostManaged) {
           if (!hostUser) return;
@@ -2287,7 +2271,7 @@ export class AcpBridge implements GrokBridge {
             block: {
               type: "user",
               id: hostUser.blockId,
-              text: opened ? displayDeepResearchPrompt(delta) : "",
+              text: opened ? displayReplayUserPrompt(delta) : "",
               ts: hostUser.startedAt ?? Date.now(),
             },
           });
@@ -2313,14 +2297,14 @@ export class AcpBridge implements GrokBridge {
         if (beginsNewPrompt) {
           const nextUserId = uid();
           cursor.userId = nextUserId;
-          cursor.userText = displayDeepResearchPrompt(delta);
+          cursor.userText = displayReplayUserPrompt(delta);
           this.emit({
             type: "block_add",
             sessionId,
             block: { type: "user", id: nextUserId, text: cursor.userText, ts: Date.now() },
           });
         } else {
-          cursor.userText = displayDeepResearchPrompt(`${cursor.userText ?? ""}${delta}`);
+          cursor.userText = displayReplayUserPrompt(`${cursor.userText ?? ""}${delta}`);
           this.emit({
             type: "block_patch",
             sessionId,
@@ -3567,7 +3551,10 @@ export class AcpBridge implements GrokBridge {
       }
     }
 
-    this.emit({ type: "status", sessionId: id, status: "connecting" });
+    // 后台打开先用本地历史完成切换。Host 可能正等另一个会话的活动回合
+    // 释放生命周期许可，此时展示“正在恢复”会把正常排队伪装成卡死。
+    // 只有显式恢复（例如切换供应商）才需要锁住编辑器并显示连接状态。
+    if (!background) this.emit({ type: "status", sessionId: id, status: "connecting" });
     this.replaying.set(id, emptySession(meta));
     try {
       const opened = await invoke<OpenAgentSessionResult>("open_agent_session", {

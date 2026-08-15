@@ -29,6 +29,16 @@ describe("compactSession", () => {
     expect(result.blocks[0]).toMatchObject({ type: "assistant", streaming: false });
   });
 
+  it("旧 journal 的传输信封不会再次显示或写回", () => {
+    const result = compactSession(session([
+      { type: "user", id: "internal", text: "<user_info>internal</user_info>", ts: 1 },
+      { type: "user", id: "wrapped", text: "<user_query>duplicate</user_query>", ts: 2 },
+      { type: "user", id: "real", text: "真实请求", ts: 3 },
+    ]));
+    expect(result.blocks).toHaveLength(1);
+    expect(result.blocks[0]).toMatchObject({ id: "real", text: "真实请求" });
+  });
+
   it("journal 在体积边界内保留最近 600 个块", () => {
     const blocks = Array.from({ length: 610 }, (_, index) => ({ type: "user" as const, id: String(index), text: String(index), ts: index }));
     const result = compactSession(session(blocks));
