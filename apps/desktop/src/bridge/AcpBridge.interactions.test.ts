@@ -17,15 +17,17 @@ interface HostSessionEvent {
   sessionId?: string;
   method?: string;
   updateType?: string;
-  validJson: boolean;
-  line: string;
+  projection:
+    | { kind: "session_update"; channel: "session" | "notification"; sessionId: string; updateType?: string; update: unknown }
+    | { kind: "notification"; method: string; params: unknown }
+    | { kind: "unsupported_request"; method: string }
+    | { kind: "orphan_response" }
+    | { kind: "protocol_error"; code: string; message: string };
 }
 
 interface InteractionInternals {
   projectHostInteraction(interaction: HostInteraction): void;
   reconcileHostInteractions(interactions: HostInteraction[]): void;
-  onLine(line: string): void;
-  sendRaw(message: unknown): Promise<void>;
   projectAutomationSessionStarted(started: AutomationSessionStarted): void;
   projectHostSessionEvent(event: HostSessionEvent): void;
 }
@@ -106,21 +108,21 @@ describe("AcpBridge Host interaction projection", () => {
 
   it("never answers a file callback after it bypasses Host ownership", () => {
     const { events, internal } = bridgeHarness();
-    let replied = false;
-    internal.sendRaw = async () => { replied = true; };
-    internal.onLine(JSON.stringify({
-      jsonrpc: "2.0",
-      id: 11,
-      method: "_x.ai/fs/read_file",
-      params: { sessionId: "session-a", path: "/tmp/a.txt" },
-    }));
+    internal.projectHostSessionEvent({
+      streamId: "host-stream-callback",
+      sequence: 1,
+      generation: 7,
+      receivedAt: 42,
+      sessionId: "session-a",
+      method: "x.ai/fs/read_file",
+      projection: { kind: "unsupported_request", method: "x.ai/fs/read_file" },
+    });
 
     const notice = events.find(
       (event): event is Extract<BridgeEvent, { type: "runtime_notice" }> =>
         event.type === "runtime_notice",
     );
     expect(notice?.notice.id).toBe("error-protocol-CLIENT_CALLBACK_HOST_BYPASSED");
-    expect(replied).toBe(false);
   });
 
   it("projects a Host-created automation session without asking WebView to create it", () => {
@@ -171,15 +173,13 @@ describe("AcpBridge Host interaction projection", () => {
       sessionId: "session-a",
       method: "session/update",
       updateType: "agent_message_chunk",
-      validJson: true,
-      line: JSON.stringify({
-        jsonrpc: "2.0",
-        method: "session/update",
-        params: {
-          sessionId: "session-a",
-          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } },
-        },
-      }),
+      projection: {
+        kind: "session_update",
+        channel: "session",
+        sessionId: "session-a",
+        updateType: "agent_message_chunk",
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } },
+      },
     };
 
     internal.projectHostSessionEvent(event);
@@ -200,8 +200,7 @@ describe("AcpBridge Host interaction projection", () => {
       sequence: 3,
       generation: 7,
       receivedAt: 42,
-      validJson: true,
-      line: JSON.stringify({ jsonrpc: "2.0", method: "x.ai/models/update", params: {} }),
+      projection: { kind: "notification", method: "x.ai/models/update", params: {} },
     });
 
     const notice = events.find(

@@ -7,6 +7,8 @@ use std::collections::BTreeMap;
 
 use tokio::sync::{oneshot, Mutex};
 
+use crate::acp_inbound::AcpInbound;
+
 pub(crate) type AcpHostError = crate::host_error::HostError;
 
 struct PendingRequest {
@@ -46,15 +48,25 @@ impl AcpRequestBroker {
         Ok(receiver)
     }
 
-    /// 消费属于当前 Host 请求的响应。未知响应继续交给事件通道报告协议异常。
+    #[cfg(test)]
     pub(crate) async fn resolve_response(&self, generation: u64, line: &str) -> bool {
-        let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+        let Ok(message) = AcpInbound::parse(line) else {
             return false;
         };
-        if message.get("method").is_some() {
+        self.resolve_decoded_response(generation, line, &message).await
+    }
+
+    /// 消费属于当前 Host 请求的已解码响应。未知响应继续交给事件通道报告协议异常。
+    pub(crate) async fn resolve_decoded_response(
+        &self,
+        generation: u64,
+        line: &str,
+        message: &AcpInbound,
+    ) -> bool {
+        if message.method().is_some() {
             return false;
         }
-        let Some(request_id) = message.get("id").and_then(serde_json::Value::as_u64) else {
+        let Some(request_id) = message.id().and_then(serde_json::Value::as_u64) else {
             return false;
         };
 

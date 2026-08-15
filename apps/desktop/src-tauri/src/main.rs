@@ -7,6 +7,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod acp_host;
+mod acp_inbound;
 mod agent_auth;
 mod agent_runtime;
 mod automation_runner;
@@ -59,6 +60,7 @@ use std::{
 };
 
 use acp_host::{AcpHostError, AcpRequestBroker};
+use acp_inbound::AcpInbound;
 use agent_auth::{
     agent_runtime_auth_cancel, agent_runtime_auth_status, agent_runtime_authenticate,
     AgentAuthenticationLifecycle,
@@ -8498,17 +8500,19 @@ fn schedule_automatic_runtime_reconnect(
     });
 }
 
-async fn handle_client_callback_line(
+async fn handle_client_callback_inbound(
     app: &tauri::AppHandle,
     state: &Arc<AcpState>,
     generation: u64,
-    line: &str,
+    message: &AcpInbound,
 ) -> bool {
-    // 短锁只保护解析与 reset 的先后关系。实际文件操作会重新取得该锁；
+    // 短锁只保护 callback 登记与 reset 的先后关系。实际文件操作会重新取得该锁；
     // terminal/wait_for_exit 则必须脱离 stdout reader 独立等待。
     let inbound = {
         let _operation_guard = state.client_callbacks.lock_operations().await;
-        state.client_callbacks.observe_inbound(generation, line)
+        state
+            .client_callbacks
+            .observe_decoded_inbound(generation, message)
     };
     match inbound {
         ClientCallbackInbound::NotCallback => false,
@@ -8736,17 +8740,21 @@ async fn spawn_acp_process(
                         break;
                     }
                     if !line.trim().is_empty() {
-                        if stdout_state
-                            .requests
-                            .resolve_response(generation, &line)
-                            .await
-                        {
-                            continue;
+                        let inbound = AcpInbound::parse(&line);
+                        if let Ok(message) = &inbound {
+                            if stdout_state
+                                .requests
+                                .resolve_decoded_response(generation, &line, message)
+                                .await
+                            {
+                                continue;
+                            }
                         }
-                        if let Some(abort) = stdout_state
-                            .foreground_turns
-                            .observe_inbound(generation, &line)
-                        {
+                        if let Some(abort) = inbound.as_ref().ok().and_then(|message| {
+                            stdout_state
+                                .foreground_turns
+                                .observe_decoded_inbound(generation, message)
+                        }) {
                             stdout_state
                                 .requests
                                 .reject(
@@ -8759,19 +8767,51 @@ async fn spawn_acp_process(
                                 )
                                 .await;
                         }
-                        if handle_client_callback_line(
-                            &stdout_app,
-                            &stdout_state,
-                            generation,
-                            &line,
-                        )
-                        .await
-                        {
-                            continue;
+                        if let Ok(message) = &inbound {
+                            if handle_client_callback_inbound(
+                                &stdout_app,
+                                &stdout_state,
+                                generation,
+                                message,
+                            )
+                            .await
+                            {
+                                continue;
+                            }
                         }
-                        match stdout_state.interactions.observe_inbound(generation, &line) {
+                        let interaction = inbound
+                            .as_ref()
+                            .ok()
+                            .map(|message| {
+                                stdout_state
+                                    .interactions
+                                    .observe_decoded_inbound(generation, message)
+                            })
+                            .unwrap_or(InteractionInbound::NotInteraction);
+                        match interaction {
                             InteractionInbound::NotInteraction => {
-                                let event = stdout_state.session_events.append(generation, line);
+                                let event = stdout_state.session_events.append_inbound(
+                                    generation,
+                                    line.len(),
+                                    inbound.as_ref(),
+                                );
+                                if let Some(response) = event.unsupported_response() {
+                                    stdout_state
+                                        .foreground_turns
+                                        .observe_outbound(generation, response);
+                                    if let Err(error) = write_acp_line(
+                                        stdout_state.as_ref(),
+                                        response,
+                                        generation,
+                                    )
+                                    .await
+                                    {
+                                        let _ = stdout_app.emit(
+                                            "acp-stderr",
+                                            format!("Host 拒绝未知 Agent 回调失败：{error}"),
+                                        );
+                                    }
+                                }
                                 // 只把已编号的 Host 事件投影给运行时所有者。页面
                                 // 重载期间即使无人监听，事件仍可由游标命令补放。
                                 if let Some(window) = stdout_app.get_webview_window("main") {
@@ -9044,45 +9084,6 @@ async fn write_acp_line(
         .flush()
         .await
         .map_err(|error| format!("刷新 Grok Agent 输入失败：{error}"))
-}
-
-#[tauri::command]
-async fn acp_send(
-    window: tauri::WebviewWindow,
-    state: tauri::State<'_, Arc<AcpState>>,
-    leases: tauri::State<'_, Arc<McpLeaseStore>>,
-    line: String,
-    generation: u64,
-) -> Result<(), AcpHostError> {
-    ensure_main_acp_owner(window.label())
-        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
-    let line = prepare_acp_line(line, leases.inner())
-        .map_err(|error| AcpHostError::protocol("ACP_OUTBOUND_INVALID", error))?;
-    let message = serde_json::from_str::<serde_json::Value>(&line)
-        .map_err(|error| {
-            AcpHostError::protocol(
-                "ACP_OUTBOUND_INVALID",
-                format!("ACP 消息不是合法 JSON：{error}"),
-            )
-        })?;
-    if message.get("id").is_some() && message.get("method").is_some() {
-        return Err(AcpHostError::protocol(
-            "ACP_REQUEST_CHANNEL_REQUIRED",
-            "ACP 请求必须通过原生请求通道发送",
-        ));
-    }
-    state.foreground_turns.observe_outbound(generation, &line);
-    write_acp_line(state.inner(), &line, generation)
-        .await
-        .map_err(|error| {
-            AcpHostError::environment(
-                "ACP_WRITE_FAILED",
-                error,
-                true,
-                true,
-                "等待 Host 重连后检查最后一轮结果",
-            )
-        })
 }
 
 /// 返回当前 Host 代次仍待用户处理的交互门控。WebView 重载后用它恢复
@@ -10265,7 +10266,6 @@ fn main() {
             interaction_status,
             resolve_interaction,
             acp_request,
-            acp_send,
             acp_kill,
         ])
         .on_window_event(|window, event| {

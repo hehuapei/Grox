@@ -15,7 +15,7 @@ use std::{
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-use crate::acp_host::AcpHostError;
+use crate::{acp_host::AcpHostError, acp_inbound::AcpInbound};
 
 const MAX_RESOLVED_TOMBSTONES: usize = 2_048;
 const MAX_PENDING_INTERACTIONS: usize = 256;
@@ -131,17 +131,27 @@ impl InteractionRegistry {
         state.resolved_order.clear();
     }
 
+    #[cfg(test)]
     pub(crate) fn observe_inbound(&self, generation: u64, line: &str) -> InteractionInbound {
-        let Ok(message) = serde_json::from_str::<Value>(line) else {
+        let Ok(message) = AcpInbound::parse(line) else {
             return InteractionInbound::NotInteraction;
         };
-        let Some((method, params)) = normalized_request(&message) else {
+        self.observe_decoded_inbound(generation, &message)
+    }
+
+    pub(crate) fn observe_decoded_inbound(
+        &self,
+        generation: u64,
+        message: &AcpInbound,
+    ) -> InteractionInbound {
+        let Some(method) = message.method() else {
             return InteractionInbound::NotInteraction;
         };
+        let params = message.params();
         let Some(kind) = interaction_kind(method) else {
             return InteractionInbound::NotInteraction;
         };
-        let Some(rpc_id) = valid_rpc_id(message.get("id")) else {
+        let Some(rpc_id) = valid_rpc_id(message.id()) else {
             // 没有合法 id 的消息不是可回复请求；让普通协议诊断通道处理。
             return InteractionInbound::NotInteraction;
         };
@@ -361,23 +371,6 @@ fn permission_audit_record(
             .and_then(Value::as_str)
             .map(bounded),
     }
-}
-
-fn normalized_request(message: &Value) -> Option<(&str, &Value)> {
-    let method = message.get("method")?.as_str()?;
-    let params = message.get("params").unwrap_or(&Value::Null);
-    if method.starts_with("_x.ai/") {
-        if let (Some(nested_method), Some(nested_params)) = (
-            params.get("method").and_then(Value::as_str),
-            params.get("params"),
-        ) {
-            if nested_method.starts_with("x.ai/") {
-                return Some((nested_method, nested_params));
-            }
-        }
-        return Some((method.strip_prefix('_').unwrap_or(method), params));
-    }
-    Some((method, params))
 }
 
 fn interaction_kind(method: &str) -> Option<InteractionKind> {

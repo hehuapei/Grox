@@ -1,8 +1,9 @@
-//! ACP 入站事件的 Host 权威顺序与短期重放。
+//! ACP 入站事件的 Host 权威解码、顺序与短期重放。
 //!
 //! WebView 可能在 Agent 仍运行时重载。原先裸 `app.emit` 没有序号和补放，
 //! 页面消失期间的流片段会永久丢失。这里为所有需要投影给页面的消息分配
 //! 单调序号并保留有界窗口；页面先订阅再按游标补放，因而不会留下竞态窗口。
+//! JSON-RPC 与 x.ai 扩展封装只在 Host 解码，页面不会收到原始 wire 行或 rpc id。
 
 use std::{
     collections::VecDeque,
@@ -11,7 +12,9 @@ use std::{
 };
 
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
+
+use crate::acp_inbound::{AcpInbound, AcpInboundError};
 
 const MAX_RETAINED_EVENTS: usize = 8_192;
 const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
@@ -28,8 +31,34 @@ pub(crate) struct HostSessionEvent {
     session_id: Option<String>,
     method: Option<String>,
     update_type: Option<String>,
-    valid_json: bool,
-    line: String,
+    projection: HostSessionProjection,
+    #[serde(skip)]
+    wire_bytes: usize,
+    #[serde(skip)]
+    unsupported_response: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum HostSessionProjection {
+    SessionUpdate {
+        channel: &'static str,
+        session_id: String,
+        update_type: Option<String>,
+        update: Value,
+    },
+    Notification {
+        method: String,
+        params: Value,
+    },
+    UnsupportedRequest {
+        method: String,
+    },
+    OrphanResponse,
+    ProtocolError {
+        code: &'static str,
+        message: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -82,8 +111,20 @@ impl Default for SessionEventJournal {
 }
 
 impl SessionEventJournal {
+    #[cfg(test)]
     pub(crate) fn append(&self, generation: u64, line: String) -> HostSessionEvent {
-        let (session_id, method, update_type, valid_json) = classify(&line);
+        let wire_bytes = line.len();
+        let inbound = AcpInbound::parse(&line);
+        self.append_inbound(generation, wire_bytes, inbound.as_ref())
+    }
+
+    pub(crate) fn append_inbound(
+        &self,
+        generation: u64,
+        wire_bytes: usize,
+        inbound: Result<&AcpInbound, &AcpInboundError>,
+    ) -> HostSessionEvent {
+        let decoded = decode_inbound(inbound);
         let mut state = self.lock();
         let sequence = state.next_sequence;
         state.next_sequence = state.next_sequence.saturating_add(1);
@@ -92,14 +133,15 @@ impl SessionEventJournal {
             sequence,
             generation,
             received_at: unix_time_ms(),
-            session_id,
-            method,
-            update_type,
-            valid_json,
-            line,
+            session_id: decoded.session_id,
+            method: decoded.method,
+            update_type: decoded.update_type,
+            projection: decoded.projection,
+            wire_bytes,
+            unsupported_response: decoded.unsupported_response,
         };
 
-        let event_bytes = event.line.len();
+        let event_bytes = event.wire_bytes;
         if event_bytes > MAX_RETAINED_EVENT_BYTES {
             // 超大多模态消息仍实时投影，但不允许单条消息吃掉整个补放窗口。
             state.dropped_through = sequence;
@@ -120,7 +162,7 @@ impl SessionEventJournal {
             let Some(dropped) = state.events.pop_front() else {
                 break;
             };
-            state.retained_bytes = state.retained_bytes.saturating_sub(dropped.line.len());
+            state.retained_bytes = state.retained_bytes.saturating_sub(dropped.wire_bytes);
             state.dropped_through = state.dropped_through.max(dropped.sequence);
         }
         event
@@ -194,51 +236,165 @@ impl SessionEventJournal {
     }
 }
 
-fn classify(line: &str) -> (Option<String>, Option<String>, Option<String>, bool) {
-    let Ok(message) = serde_json::from_str::<Value>(line) else {
-        return (None, None, None, false);
+impl HostSessionEvent {
+    pub(crate) fn unsupported_response(&self) -> Option<&str> {
+        self.unsupported_response.as_deref()
+    }
+}
+
+struct DecodedInbound {
+    session_id: Option<String>,
+    method: Option<String>,
+    update_type: Option<String>,
+    projection: HostSessionProjection,
+    unsupported_response: Option<String>,
+}
+
+#[cfg(test)]
+fn decode(line: &str) -> DecodedInbound {
+    let inbound = AcpInbound::parse(line);
+    decode_inbound(inbound.as_ref())
+}
+
+fn decode_inbound(
+    inbound: Result<&AcpInbound, &AcpInboundError>,
+) -> DecodedInbound {
+    let inbound = match inbound {
+        Ok(inbound) => inbound,
+        Err(error) => return protocol_error(error.code(), error.message()),
     };
-    let Some(message) = message.as_object() else {
-        return (None, None, None, false);
-    };
-    let raw_method = message.get("method").and_then(Value::as_str);
-    let raw_params = message.get("params");
-    let (method, params) = match raw_method {
-        Some(method) if method.starts_with("_x.ai/") => {
-            let envelope = raw_params.and_then(Value::as_object);
-            match (
-                envelope
-                    .and_then(|value| value.get("method"))
-                    .and_then(Value::as_str),
-                envelope.and_then(|value| value.get("params")),
-            ) {
-                (Some(nested), Some(params)) if nested.starts_with("x.ai/") => {
-                    (Some(nested.to_string()), Some(params))
-                }
-                _ => (Some(method[1..].to_string()), raw_params),
+    let Some(raw_method) = inbound.method() else {
+        return if inbound.has_id() {
+            DecodedInbound {
+                session_id: None,
+                method: None,
+                update_type: None,
+                projection: HostSessionProjection::OrphanResponse,
+                unsupported_response: None,
             }
-        }
-        Some(method) => (Some(method.to_string()), raw_params),
-        None => (None, raw_params),
+        } else {
+            protocol_error("ACP_INVALID_MESSAGE", "ACP 消息既不是请求、通知也不是响应")
+        };
     };
-    let params = params.and_then(Value::as_object);
-    let update = params
-        .and_then(|value| value.get("update"))
-        .and_then(Value::as_object);
-    let session_id = params
-        .and_then(|value| value.get("sessionId"))
-        .and_then(Value::as_str)
-        .or_else(|| {
-            update
-                .and_then(|value| value.get("sessionId"))
-                .and_then(Value::as_str)
+    let method = raw_method.to_string();
+    let params = inbound.params();
+
+    if inbound.has_id() {
+        let id = inbound.id().unwrap_or(&Value::Null);
+        let response = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32601, "message": format!("Unsupported client method: {method}") },
         })
-        .map(str::to_string);
-    let update_type = update
-        .and_then(|value| value.get("sessionUpdate"))
+        .to_string();
+        return DecodedInbound {
+            session_id: session_id(params),
+            method: Some(method.clone()),
+            update_type: None,
+            projection: HostSessionProjection::UnsupportedRequest { method },
+            unsupported_response: Some(response),
+        };
+    }
+
+    if matches!(
+        method.as_str(),
+        "session/update" | "x.ai/session/update" | "x.ai/session_notification"
+    ) {
+        let update = params.get("update").cloned();
+        let Some(session_id) =
+            session_id(params).or_else(|| update.as_ref().and_then(|update| session_id(update)))
+        else {
+            return DecodedInbound {
+                session_id: None,
+                method: Some(method.clone()),
+                update_type: None,
+                projection: HostSessionProjection::ProtocolError {
+                    code: "ACP_MISSING_SESSION_ID",
+                    message: format!("{method} 缺少 sessionId，事件已被隔离"),
+                },
+                unsupported_response: None,
+            };
+        };
+        let Some(update) = update else {
+            return DecodedInbound {
+                session_id: Some(session_id),
+                method: Some(method.clone()),
+                update_type: None,
+                projection: HostSessionProjection::ProtocolError {
+                    code: "ACP_INVALID_SESSION_UPDATE",
+                    message: format!("{method} 缺少 update，事件已被隔离"),
+                },
+                unsupported_response: None,
+            };
+        };
+        if !update.is_object() {
+            return DecodedInbound {
+                session_id: Some(session_id),
+                method: Some(method.clone()),
+                update_type: None,
+                projection: HostSessionProjection::ProtocolError {
+                    code: "ACP_INVALID_SESSION_UPDATE",
+                    message: format!("{method} 的 update 不是对象，事件已被隔离"),
+                },
+                unsupported_response: None,
+            };
+        }
+        let update_type = update
+            .get("sessionUpdate")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let channel = if method == "x.ai/session_notification" {
+            "notification"
+        } else {
+            "session"
+        };
+        return DecodedInbound {
+            session_id: Some(session_id.clone()),
+            method: Some(method),
+            update_type: update_type.clone(),
+            projection: HostSessionProjection::SessionUpdate {
+                channel,
+                session_id,
+                update_type,
+                update,
+            },
+            unsupported_response: None,
+        };
+    }
+
+    DecodedInbound {
+        session_id: session_id(params),
+        method: Some(method.clone()),
+        update_type: None,
+        projection: HostSessionProjection::Notification {
+            method,
+            params: params.clone(),
+        },
+        unsupported_response: None,
+    }
+}
+
+fn session_id(params: &Value) -> Option<String> {
+    params
+        .get("sessionId")
+        .or_else(|| params.get("session_id"))
         .and_then(Value::as_str)
-        .map(str::to_string);
-    (session_id, method, update_type, true)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && value.chars().count() <= 512)
+        .map(str::to_string)
+}
+
+fn protocol_error(code: &'static str, message: impl Into<String>) -> DecodedInbound {
+    DecodedInbound {
+        session_id: None,
+        method: None,
+        update_type: None,
+        projection: HostSessionProjection::ProtocolError {
+            code,
+            message: message.into(),
+        },
+        unsupported_response: None,
+    }
 }
 
 fn new_stream_id() -> String {
@@ -283,12 +439,19 @@ mod tests {
 
     #[test]
     fn normalizes_wrapped_extension_metadata() {
-        let (_, method, update_type, valid) = classify(
+        let decoded = decode(
             r#"{"method":"_x.ai/wrapped","params":{"method":"x.ai/session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call"}}}}"#,
         );
-        assert!(valid);
-        assert_eq!(method.as_deref(), Some("x.ai/session/update"));
-        assert_eq!(update_type.as_deref(), Some("tool_call"));
+        assert_eq!(decoded.method.as_deref(), Some("x.ai/session/update"));
+        assert_eq!(decoded.update_type.as_deref(), Some("tool_call"));
+        assert!(matches!(
+            decoded.projection,
+            HostSessionProjection::SessionUpdate {
+                channel: "session",
+                session_id,
+                ..
+            } if session_id == "s1"
+        ));
     }
 
     #[test]
@@ -314,11 +477,40 @@ mod tests {
     fn malformed_json_remains_visible_but_is_classified() {
         let journal = SessionEventJournal::default();
         let event = journal.append(1, "not-json".into());
-        assert!(!event.valid_json);
+        assert!(matches!(
+            &event.projection,
+            HostSessionProjection::ProtocolError {
+                code: "ACP_INVALID_JSON",
+                ..
+            }
+        ));
         assert_eq!(
             journal.replay(Some(&event.stream_id), 0, None).events.len(),
             1
         );
+    }
+
+    #[test]
+    fn unknown_client_request_is_rejected_without_exposing_rpc_id() {
+        let journal = SessionEventJournal::default();
+        let event = journal.append(
+            4,
+            r#"{"jsonrpc":"2.0","id":17,"method":"x.ai/unknown","params":{"sessionId":"s1"}}"#
+                .into(),
+        );
+
+        assert!(matches!(
+            &event.projection,
+            HostSessionProjection::UnsupportedRequest { method }
+                if method == "x.ai/unknown"
+        ));
+        assert_eq!(
+            serde_json::from_str::<Value>(event.unsupported_response().unwrap()).unwrap()["id"],
+            json!(17)
+        );
+        let public = serde_json::to_value(&event).unwrap();
+        assert!(public.get("line").is_none());
+        assert!(public.pointer("/projection/id").is_none());
     }
 
     #[test]

@@ -130,9 +130,21 @@ interface HostSessionEvent {
   sessionId?: string;
   method?: string;
   updateType?: string;
-  validJson: boolean;
-  line: string;
+  projection: HostSessionProjection;
 }
+
+type HostSessionProjection =
+  | {
+      kind: "session_update";
+      channel: "session" | "notification";
+      sessionId: string;
+      updateType?: string;
+      update: unknown;
+    }
+  | { kind: "notification"; method: string; params: unknown }
+  | { kind: "unsupported_request"; method: string }
+  | { kind: "orphan_response" }
+  | { kind: "protocol_error"; code: string; message: string };
 
 interface HostSessionEventReplay {
   streamId: string;
@@ -163,15 +175,6 @@ interface HostInteractionClosed {
   reason: "resolved" | "cancelled" | "write_failed";
 }
 type RpcId = string | number;
-
-interface JsonRpcMessage extends JsonObject {
-  jsonrpc?: string;
-  id?: RpcId;
-  method?: string;
-  params?: unknown;
-  result?: unknown;
-  error?: unknown;
-}
 
 interface DesktopEnvironment {
   defaultWorkspace: string;
@@ -457,16 +460,6 @@ function promptContent(text: string, attachments: PromptAttachment[]): JsonObjec
 
 function wireMethod(method: string): string {
   return method.startsWith("x.ai/") ? `_${method}` : method;
-}
-
-function normalizeInboundExtension(message: JsonRpcMessage): JsonRpcMessage {
-  if (!message.method?.startsWith("_x.ai/")) return message;
-  const envelope = record(message.params);
-  const nestedMethod = string(envelope?.method);
-  if (nestedMethod?.startsWith("x.ai/") && envelope && "params" in envelope) {
-    return { ...message, method: nestedMethod, params: envelope.params };
-  }
-  return { ...message, method: message.method.slice(1) };
 }
 
 function byteText(value: unknown): string | undefined {
@@ -1278,7 +1271,7 @@ export class AcpBridge implements GrokBridge {
         `ACP 事件序列从 ${this.hostSessionEventCursor.sequence} 跳到 ${event.sequence}`,
       );
     }
-    this.onLine(event.line);
+    this.projectHostSessionProjection(event.projection);
     this.hostSessionEventCursor = { streamId: event.streamId, sequence: event.sequence };
     if (!persistHostSessionEventCursor(this.hostSessionEventCursor)) {
       this.emitHostSessionEventCursorWarning();
@@ -1721,94 +1714,80 @@ export class AcpBridge implements GrokBridge {
     this.reconnectProjection = null;
   }
 
-  private onLine(line: string) {
-    let message: JsonRpcMessage;
-    try {
-      message = normalizeInboundExtension(JSON.parse(line) as JsonRpcMessage);
-    } catch {
-      this.diagnostics.push(`无效 ACP JSON：${line.slice(0, 500)}`);
-      this.emit({
-        type: "runtime_notice",
-        notice: runtimeNoticeFromError({
-          domain: "protocol",
-          code: "ACP_INVALID_JSON",
-          message: "Grok Build 返回了无法解析的 ACP 消息",
-          recoverable: true,
-          fatal: false,
-          holdQueue: false,
-          action: "若持续出现，请升级 CLI 并导出会话诊断",
-        }),
-      });
-      return;
+  private projectHostSessionProjection(projection: HostSessionProjection) {
+    switch (projection.kind) {
+      case "session_update":
+        if (projection.channel === "notification") {
+          this.handleXaiUpdate(projection.sessionId, projection.update);
+        } else {
+          this.handleSessionUpdate(projection.sessionId, projection.update);
+        }
+        return;
+      case "notification":
+        this.onNotification(projection.method, projection.params);
+        return;
+      case "orphan_response":
+        // 正常响应已由原生 Host 定向交付；进入事件流的响应没有请求归属。
+        this.emitProtocolNotice(
+          "ACP_ORPHAN_RESPONSE",
+          "收到无法归属到当前请求的 ACP 响应",
+          "若会话状态异常，请重新打开该会话",
+        );
+        return;
+      case "protocol_error":
+        this.diagnostics.push(`${projection.code}：${projection.message}`);
+        this.diagnostics = this.diagnostics.slice(-20);
+        this.emitProtocolNotice(
+          projection.code,
+          projection.message,
+          projection.code === "ACP_MISSING_SESSION_ID"
+            || projection.code === "ACP_INVALID_SESSION_UPDATE"
+            ? "升级 Grok Build CLI；事件不会写入其它会话"
+            : "若持续出现，请升级 CLI 并导出会话诊断",
+        );
+        return;
+      case "unsupported_request": {
+        const callback = projection.method === "fs/read_text_file"
+          || projection.method === ACP_METHODS.fsRead
+          || projection.method === "fs/write_text_file"
+          || projection.method.startsWith("terminal/");
+        const interaction = projection.method === ACP_METHODS.requestPermission
+          || projection.method === "x.ai/exit_plan_mode"
+          || projection.method === "x.ai/ask_user_question";
+        this.emitProtocolNotice(
+          callback
+            ? "CLIENT_CALLBACK_HOST_BYPASSED"
+            : interaction
+              ? "INTERACTION_HOST_BYPASSED"
+              : "ACP_UNSUPPORTED_CLIENT_METHOD",
+          callback
+            ? "收到未由 Host 处理的 Client callback"
+            : interaction
+              ? "收到未由 Host 登记的交互请求"
+              : `Agent 请求了 Host 不支持的方法：${projection.method}`,
+          callback
+            ? "重新连接 Agent；Host 不会猜测回调所属工作区"
+            : interaction
+              ? "重新连接 Agent；不要重复批准当前请求"
+              : "升级 Grox 或 Grok Build CLI 后重试",
+          callback || interaction,
+        );
+      }
     }
-
-    if (message.id !== undefined && !message.method) {
-      // 正常响应已由原生 Host 定向交付；广播到这里的一定没有请求归属。
-      this.emit({
-        type: "runtime_notice",
-        notice: runtimeNoticeFromError({
-          domain: "protocol",
-          code: "ACP_ORPHAN_RESPONSE",
-          message: "收到无法归属到当前请求的 ACP 响应",
-          recoverable: true,
-          fatal: false,
-          holdQueue: false,
-          action: "若会话状态异常，请重新打开该会话",
-        }),
-      });
-      return;
-    }
-
-    if (message.method && message.id !== undefined) {
-      this.onServerRequest(message);
-      return;
-    }
-    if (message.method) this.onNotification(message.method, message.params);
   }
 
-  private onServerRequest(message: JsonRpcMessage) {
-    if (
-      message.method === "fs/read_text_file"
-      || message.method === ACP_METHODS.fsRead
-      || message.method === "fs/write_text_file"
-    ) {
-      this.emit({
-        type: "runtime_notice",
-        notice: runtimeNoticeFromError({
-          domain: "protocol",
-          code: "CLIENT_CALLBACK_HOST_BYPASSED",
-          message: "收到未由 Host 处理的文件回调",
-          recoverable: true,
-          fatal: false,
-          holdQueue: true,
-          action: "重新连接 Agent；当前页面不会猜测回调所属工作区",
-        }),
-      });
-      return;
-    }
-    if (
-      message.method === ACP_METHODS.requestPermission
-      || message.method === "x.ai/exit_plan_mode"
-      || message.method === "x.ai/ask_user_question"
-    ) {
-      this.emit({
-        type: "runtime_notice",
-        notice: runtimeNoticeFromError({
-          domain: "protocol",
-          code: "INTERACTION_HOST_BYPASSED",
-          message: "收到未由 Host 登记的交互请求",
-          recoverable: true,
-          fatal: false,
-          holdQueue: true,
-          action: "重新连接 Agent；不要在当前页面重复批准",
-        }),
-      });
-      return;
-    }
-    void this.sendRaw({
-      jsonrpc: "2.0",
-      id: message.id,
-      error: { code: -32601, message: `Unsupported client method: ${message.method}` },
+  private emitProtocolNotice(code: string, message: string, action: string, holdQueue = false) {
+    this.emit({
+      type: "runtime_notice",
+      notice: runtimeNoticeFromError({
+        domain: "protocol",
+        code,
+        message,
+        recoverable: true,
+        fatal: false,
+        holdQueue,
+        action,
+      }),
     });
   }
 
@@ -2564,10 +2543,6 @@ export class AcpBridge implements GrokBridge {
         mode: string(params.mode) === "plan" ? "plan" : "default",
       },
     });
-  }
-
-  private async sendRaw(message: JsonRpcMessage): Promise<void> {
-    await invoke("acp_send", { line: JSON.stringify(message), generation: this.acpGeneration });
   }
 
   private async requestRaw(

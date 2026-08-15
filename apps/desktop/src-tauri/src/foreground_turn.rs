@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use tauri::{Emitter, Manager, WebviewWindow};
 
 use crate::{
+    acp_inbound::AcpInbound,
     acp_host::AcpHostError,
     ensure_main_acp_owner, host_prefs,
     mcp_leases::McpLeaseStore,
@@ -265,12 +266,22 @@ impl ForegroundTurnRegistry {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn observe_inbound(
         &self,
         generation: u64,
         line: &str,
     ) -> Option<InvalidEffortAbort> {
-        let event = parse_inbound(line)?;
+        let inbound = AcpInbound::parse(line).ok()?;
+        self.observe_decoded_inbound(generation, &inbound)
+    }
+
+    pub(crate) fn observe_decoded_inbound(
+        &self,
+        generation: u64,
+        inbound: &AcpInbound,
+    ) -> Option<InvalidEffortAbort> {
+        let event = parse_inbound(inbound)?;
         let session_id = event.session_id?;
         let mut state = self.lock();
         if state.generation != generation {
@@ -1287,21 +1298,9 @@ struct ParsedInbound {
     update: Option<Value>,
 }
 
-fn parse_inbound(line: &str) -> Option<ParsedInbound> {
-    let message = serde_json::from_str::<Value>(line).ok()?;
-    let mut method = message.get("method")?.as_str()?;
-    let mut params = message.get("params").unwrap_or(&Value::Null);
-    if method.starts_with("_x.ai/") {
-        if let (Some(nested_method), Some(nested_params)) = (
-            params.get("method").and_then(Value::as_str),
-            params.get("params"),
-        ) {
-            method = nested_method;
-            params = nested_params;
-        } else {
-            method = method.strip_prefix('_').unwrap_or(method);
-        }
-    }
+fn parse_inbound(message: &AcpInbound) -> Option<ParsedInbound> {
+    let method = message.method()?;
+    let params = message.params();
     let session_id = params
         .get("sessionId")
         .and_then(Value::as_str)
@@ -1318,7 +1317,7 @@ fn parse_inbound(line: &str) -> Option<ParsedInbound> {
     );
     Some(ParsedInbound {
         session_id,
-        rpc_id: message.get("id").map(rpc_id_key),
+        rpc_id: message.id().map(rpc_id_key),
         is_gate,
         update,
     })

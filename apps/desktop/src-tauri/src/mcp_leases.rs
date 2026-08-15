@@ -1,7 +1,7 @@
 //! Holds Computer/Browser MCP endpoint credentials outside the WebView.
 //!
-//! Session create/load messages may only reference lease ids; `acp_send`
-//! injects the real Authorization headers before the line reaches the CLI.
+//! Session create/load messages may only reference lease ids; Host outbound channels
+//! inject the real Authorization headers before the line reaches the CLI.
 
 use serde_json::{json, Value};
 use std::{

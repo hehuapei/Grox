@@ -17,6 +17,7 @@ use std::{
 use serde_json::{json, Value};
 
 use crate::{
+    acp_inbound::AcpInbound,
     acp_read_file, acp_read_text_file, acp_write_text_file, path_sandbox::path_for_webview,
     terminal_host::{TerminalHost, TerminalMethod},
 };
@@ -229,17 +230,27 @@ impl ClientCallbackRegistry {
         self.terminals.len().await
     }
 
+    #[cfg(test)]
     pub(crate) fn observe_inbound(&self, generation: u64, line: &str) -> ClientCallbackInbound {
-        let Ok(message) = serde_json::from_str::<Value>(line) else {
+        let Ok(message) = AcpInbound::parse(line) else {
             return ClientCallbackInbound::NotCallback;
         };
-        let Some((method, params)) = normalized_request(&message) else {
+        self.observe_decoded_inbound(generation, &message)
+    }
+
+    pub(crate) fn observe_decoded_inbound(
+        &self,
+        generation: u64,
+        message: &AcpInbound,
+    ) -> ClientCallbackInbound {
+        let Some(method) = message.method() else {
             return ClientCallbackInbound::NotCallback;
         };
+        let params = message.params();
         let Some(method) = callback_method(method) else {
             return ClientCallbackInbound::NotCallback;
         };
-        let Some(rpc_id) = valid_rpc_id(message.get("id")) else {
+        let Some(rpc_id) = valid_rpc_id(message.id()) else {
             return ClientCallbackInbound::Invalid;
         };
         let rpc_key = rpc_id_key(&rpc_id);
@@ -520,23 +531,6 @@ fn optional_u32(
         .and_then(|value| u32::try_from(value).ok())
         .ok_or_else(|| CallbackFailure::params(format!("{} 必须是非负整数", names[0])))?;
     Ok(Some(value))
-}
-
-fn normalized_request(message: &Value) -> Option<(&str, &Value)> {
-    let method = message.get("method")?.as_str()?;
-    let params = message.get("params").unwrap_or(&Value::Null);
-    if method.starts_with("_x.ai/") {
-        if let (Some(nested_method), Some(nested_params)) = (
-            params.get("method").and_then(Value::as_str),
-            params.get("params"),
-        ) {
-            if nested_method.starts_with("x.ai/") {
-                return Some((nested_method, nested_params));
-            }
-        }
-        return Some((method.strip_prefix('_').unwrap_or(method), params));
-    }
-    Some((method, params))
 }
 
 fn callback_method(method: &str) -> Option<CallbackMethod> {
