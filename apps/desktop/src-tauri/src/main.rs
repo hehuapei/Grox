@@ -96,7 +96,7 @@ use prompt_queue_store::PromptQueueStore;
 use serde::{Deserialize, Serialize};
 use session_coordinator::{SessionCoordinator, SessionRuntimeOccupancy};
 use session_event_journal::{
-    HostSessionEventReplay, HostSessionEventStatus, SessionEventJournal,
+    HostSessionEvent, HostSessionEventReplay, HostSessionEventStatus, SessionEventJournal,
 };
 use session_journal_store::{SessionJournalStore, SessionJournalWriteError};
 use session_runtime::{
@@ -575,6 +575,12 @@ fn replay_session_events(
     Ok(state
         .session_events
         .replay(stream_id.as_deref(), after_sequence.unwrap_or(0), limit))
+}
+
+pub(crate) fn emit_host_session_event(app: &tauri::AppHandle, event: HostSessionEvent) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit("host-session-event", event);
+    }
 }
 
 #[tauri::command]
@@ -8814,9 +8820,7 @@ async fn spawn_acp_process(
                                 }
                                 // 只把已编号的 Host 事件投影给运行时所有者。页面
                                 // 重载期间即使无人监听，事件仍可由游标命令补放。
-                                if let Some(window) = stdout_app.get_webview_window("main") {
-                                    let _ = window.emit("host-session-event", event);
-                                }
+                                emit_host_session_event(&stdout_app, event);
                             }
                             InteractionInbound::Opened(interaction) => {
                                 // 反向 RPC 只投影给主窗口；rpc id 和 wire option

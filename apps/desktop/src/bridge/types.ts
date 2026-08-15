@@ -596,6 +596,7 @@ export type BridgeEvent =
   | { type: "plan_patch"; sessionId: string; blockId: string; steps: PlanStep[] }
   | { type: "assistant_append"; sessionId: string; blockId: string; delta: string }
   | { type: "thinking_append"; sessionId: string; blockId: string; delta: string }
+  | { type: "user_append"; sessionId: string; blockId: string; delta: string }
   | { type: "permission_request"; sessionId: string; blockId: string; req: PermissionRequest }
   | { type: "permission_resolved"; sessionId: string; blockId: string; option: PermissionOption }
   | { type: "question_request"; sessionId: string; blockId: string; req: QuestionRequest }

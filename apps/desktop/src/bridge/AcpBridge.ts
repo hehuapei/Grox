@@ -140,11 +140,21 @@ type HostSessionProjection =
       sessionId: string;
       updateType?: string;
       update: unknown;
+      blockOps: HostBlockOperation[];
     }
+  | { kind: "block_lifecycle"; sessionId: string; phase: "turn_started" | "turn_finished" | "session_reset" | "session_removed"; blockOps: HostBlockOperation[] }
   | { kind: "notification"; method: string; params: unknown }
   | { kind: "unsupported_request"; method: string }
   | { kind: "orphan_response" }
   | { kind: "protocol_error"; code: string; message: string };
+
+interface HostBlockOperation {
+  action: "open" | "update" | "close";
+  blockType: "user" | "assistant" | "thinking" | "tool" | "plan";
+  blockId: string;
+  sourceId?: string;
+  startedAt?: number;
+}
 
 interface HostSessionEventReplay {
   streamId: string;
@@ -208,7 +218,8 @@ function storedEffort(): Effort {
   return EFFORTS.find((effort) => effort === value) ?? "high";
 }
 
-interface ContentCursor {
+/** 仅供 rewind 的归档响应降级投影；实时块身份由 Host blockOps 决定。 */
+interface ReplayContentCursor {
   assistantId?: string;
   thinkingId?: string;
   thinkingStartedAt?: number;
@@ -923,7 +934,9 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
     case "session_meta":
       return { ...session, ...event.patch };
     case "block_add":
-      return { ...session, blocks: [...session.blocks, event.block] };
+      return session.blocks.some((block) => block.id === event.block.id)
+        ? session
+        : { ...session, blocks: [...session.blocks, event.block] };
     case "block_patch":
       return { ...session, blocks: patchBlock(event.blockId, event.patch) };
     case "assistant_append":
@@ -933,6 +946,15 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
         blocks: session.blocks.map((block) =>
           block.id === event.blockId &&
           (block.type === "assistant" || block.type === "thinking")
+            ? { ...block, text: block.text + event.delta }
+            : block,
+        ),
+      };
+    case "user_append":
+      return {
+        ...session,
+        blocks: session.blocks.map((block) =>
+          block.id === event.blockId && block.type === "user"
             ? { ...block, text: block.text + event.delta }
             : block,
         ),
@@ -1018,7 +1040,7 @@ export class AcpBridge implements GrokBridge {
   /** Host 门控的 UI 投影；不包含 rpc id 或 wire option。 */
   private hostInteractions = new Map<string, HostInteractionProjection>();
   private resolvingInteractions = new Set<string>();
-  private cursors = new Map<string, ContentCursor>();
+  private replayCursors = new Map<string, ReplayContentCursor>();
   private catalogue = new Map<string, SessionMeta>();
   private replaying = new Map<string, Session>();
   // `session/load` may replay the immutable pre-rewind journal before the
@@ -1248,11 +1270,11 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
-  private cursor(sessionId: string): ContentCursor {
-    let cursor = this.cursors.get(sessionId);
+  private replayCursor(sessionId: string): ReplayContentCursor {
+    let cursor = this.replayCursors.get(sessionId);
     if (!cursor) {
       cursor = { toolBlocks: new Map() };
-      this.cursors.set(sessionId, cursor);
+      this.replayCursors.set(sessionId, cursor);
     }
     return cursor;
   }
@@ -1572,7 +1594,7 @@ export class AcpBridge implements GrokBridge {
     this.emit({ type: "runtime_state", state: "starting" });
     this.flushStreamAppends();
     this.flushToolPatches();
-    this.cursors.clear();
+    this.replayCursors.clear();
     this.openToolCalls.clear();
     this.sessionOptions.clear();
     this.knownSessions.clear();
@@ -1648,7 +1670,7 @@ export class AcpBridge implements GrokBridge {
     this.reconcileHostInteractions([]);
     this.knownSessions.clear();
     this.loadPromises.clear();
-    this.cursors.clear();
+    this.replayCursors.clear();
     this.sessionOptions.clear();
     if (!this.reconnectProjection) {
       let resolve!: () => void;
@@ -1720,7 +1742,13 @@ export class AcpBridge implements GrokBridge {
         if (projection.channel === "notification") {
           this.handleXaiUpdate(projection.sessionId, projection.update);
         } else {
-          this.handleSessionUpdate(projection.sessionId, projection.update);
+          this.handleSessionUpdate(projection.sessionId, projection.update, projection.blockOps);
+        }
+        return;
+      case "block_lifecycle":
+        this.applyHostBlockCloses(projection.sessionId, projection.blockOps);
+        if (projection.phase === "session_reset" || projection.phase === "session_removed") {
+          this.replayCursors.delete(projection.sessionId);
         }
         return;
       case "notification":
@@ -1826,7 +1854,7 @@ export class AcpBridge implements GrokBridge {
             typeof value === "string" ? [[name.replace(/^\//, ""), value] as const] : []),
         );
         this.runtimeCommands = applyCommandTags(this.runtimeCommandBase, this.runtimeCommandTags);
-        for (const sessionId of this.cursors.keys()) {
+        for (const sessionId of this.knownSessions) {
           this.emit({ type: "available_commands", sessionId, commands: this.runtimeCommands });
         }
       }
@@ -1881,7 +1909,41 @@ export class AcpBridge implements GrokBridge {
     localStorage.setItem(REWOUND_SESSIONS_STORAGE_KEY, JSON.stringify([...this.rewoundSessions].slice(-500)));
   }
 
-  private handleSessionUpdate(sessionId: string, updateValue: unknown) {
+  private applyHostBlockCloses(sessionId: string, operations: HostBlockOperation[] = []) {
+    for (const operation of operations) {
+      if (operation.action !== "close") continue;
+      if (operation.blockType === "assistant") {
+        this.flushStreamAppends(sessionId);
+        this.emit({
+          type: "block_patch",
+          sessionId,
+          blockId: operation.blockId,
+          patch: { type: "assistant", streaming: false } as Partial<SessionBlock>,
+        });
+      } else if (operation.blockType === "thinking") {
+        this.flushStreamAppends(sessionId);
+        this.emit({
+          type: "block_patch",
+          sessionId,
+          blockId: operation.blockId,
+          patch: {
+            type: "thinking",
+            live: false,
+            elapsedMs: operation.startedAt ? Date.now() - operation.startedAt : undefined,
+          } as Partial<SessionBlock>,
+        });
+      }
+      for (const key of this.repeatedDeltas.keys()) {
+        if (key.includes(`:${sessionId}:${operation.blockId}`)) this.repeatedDeltas.delete(key);
+      }
+    }
+  }
+
+  private handleSessionUpdate(
+    sessionId: string,
+    updateValue: unknown,
+    hostBlockOps?: HostBlockOperation[],
+  ) {
     const update = record(updateValue);
     if (!update) return;
     const type = string(update.sessionUpdate);
@@ -1903,7 +1965,12 @@ export class AcpBridge implements GrokBridge {
       child.trace = applyWorkflowTraceUpdate(child.trace, update, Date.now());
       this.emit({ type: "workflow_trace_update", sessionId: child.sessionId, runId: child.runId, trace: child.trace });
     }
-    const cursor = this.cursor(sessionId);
+    const hostManaged = hostBlockOps !== undefined;
+    if (hostManaged) this.applyHostBlockCloses(sessionId, hostBlockOps);
+    const blockOperations = hostBlockOps?.filter((operation) => operation.action !== "close") ?? [];
+    const blockOperation = (blockType: HostBlockOperation["blockType"]) =>
+      blockOperations.find((operation) => operation.blockType === blockType);
+    const cursor = hostManaged ? undefined : this.replayCursor(sessionId);
 
     switch (type) {
       case "user_message_chunk": {
@@ -1914,29 +1981,64 @@ export class AcpBridge implements GrokBridge {
         if (!this.replaying.has(sessionId)) return;
         const combined = combinedDisplayTexts(update.content);
         if (combined) {
-          for (const text of combined) {
+          const userOperations = blockOperations.filter((operation) => operation.blockType === "user");
+          for (const [index, text] of combined.entries()) {
             if (isWorkflowControlCommand(text)) continue;
             const displayText = displayDeepResearchPrompt(text);
             if (!displayText || isWorkflowControlCommand(displayText)) continue;
-            const blockId = uid();
-            cursor.userId = blockId;
-            cursor.userText = displayText;
+            const blockId = userOperations[index]?.blockId ?? uid();
             this.emit({
               type: "block_add",
               sessionId,
-              block: { type: "user", id: blockId, text: displayText, ts: Date.now() },
+              block: {
+                type: "user",
+                id: blockId,
+                text: displayText,
+                ts: userOperations[index]?.startedAt ?? Date.now(),
+              },
             });
+            if (!hostManaged && cursor) {
+              cursor.userId = blockId;
+              cursor.userText = displayText;
+            }
           }
-          cursor.userOpen = true;
-          const promptIndex = number(record(update._meta)?.promptIndex);
-          if (promptIndex !== undefined) cursor.userPromptIndex = promptIndex;
-          cursor.assistantId = undefined;
-          cursor.thinkingId = undefined;
-          cursor.thinkingStartedAt = undefined;
+          if (cursor) {
+            cursor.userOpen = true;
+            const promptIndex = number(record(update._meta)?.promptIndex);
+            if (promptIndex !== undefined) cursor.userPromptIndex = promptIndex;
+            cursor.assistantId = undefined;
+            cursor.thinkingId = undefined;
+            cursor.thinkingStartedAt = undefined;
+          }
           return;
         }
         const delta = contentText(update.content);
         if (isWorkflowControlCommand(delta)) return;
+        const hostUser = blockOperation("user");
+        if (hostManaged) {
+          if (!hostUser) return;
+          const opened = hostUser.action === "open";
+          this.emit({
+            type: "block_add",
+            sessionId,
+            block: {
+              type: "user",
+              id: hostUser.blockId,
+              text: opened ? displayDeepResearchPrompt(delta) : "",
+              ts: hostUser.startedAt ?? Date.now(),
+            },
+          });
+          if (!opened) {
+            this.emit({
+              type: "user_append",
+              sessionId,
+              blockId: hostUser.blockId,
+              delta,
+            });
+          }
+          return;
+        }
+        if (!cursor) return;
         const promptIndex = number(record(update._meta)?.promptIndex);
         const userId = cursor.userId;
         const beginsNewPrompt =
@@ -1971,16 +2073,40 @@ export class AcpBridge implements GrokBridge {
         return;
       }
       case "agent_message_chunk": {
-        this.closeUser(sessionId);
-        this.closeThinking(sessionId);
         const delta = contentText(update.content);
+        const hostAssistant = blockOperation("assistant");
         // Starting the workflow is already represented by the live task card.
         // Do not manufacture a redundant assistant bubble for the CLI's
         // boilerplate acknowledgement; the eventual report remains visible.
         if (
-          (!cursor.assistantId && (isWorkflowLaunchAcknowledgement(delta) || isWorkflowControlAcknowledgement(delta)))
+          ((hostManaged ? hostAssistant?.action === "open" : !cursor?.assistantId)
+            && (isWorkflowLaunchAcknowledgement(delta) || isWorkflowControlAcknowledgement(delta)))
           || (workflowCompletionContinuation && cancelledWorkflowCompletion)
         ) return;
+        if (hostManaged) {
+          if (!hostAssistant) return;
+          this.emit({
+            type: "block_add",
+            sessionId,
+            block: {
+              type: "assistant",
+              id: hostAssistant.blockId,
+              text: "",
+              ts: hostAssistant.startedAt ?? Date.now(),
+              streaming: true,
+            },
+          });
+          this.queueStreamAppend({
+            type: "assistant_append",
+            sessionId,
+            blockId: hostAssistant.blockId,
+            delta,
+          });
+          return;
+        }
+        if (!cursor) return;
+        this.closeUser(sessionId);
+        this.closeThinking(sessionId);
         if (!cursor.assistantId) {
           cursor.assistantId = uid();
           this.emit({
@@ -2004,9 +2130,32 @@ export class AcpBridge implements GrokBridge {
         // final report remains in the chat and the auditable workflow trace
         // remains in the task panel.
         if (workflowCompletionContinuation) return;
+        const delta = contentText(update.content);
+        const hostThinking = blockOperation("thinking");
+        if (hostManaged) {
+          if (!hostThinking) return;
+          this.emit({
+            type: "block_add",
+            sessionId,
+            block: {
+              type: "thinking",
+              id: hostThinking.blockId,
+              text: "",
+              ts: hostThinking.startedAt ?? Date.now(),
+              live: true,
+            },
+          });
+          this.queueStreamAppend({
+            type: "thinking_append",
+            sessionId,
+            blockId: hostThinking.blockId,
+            delta,
+          });
+          return;
+        }
+        if (!cursor) return;
         this.closeUser(sessionId);
         this.closeAssistant(sessionId);
-        const delta = contentText(update.content);
         if (!cursor.thinkingId) {
           cursor.thinkingId = uid();
           cursor.thinkingStartedAt = Date.now();
@@ -2047,18 +2196,45 @@ export class AcpBridge implements GrokBridge {
         }
         return;
       }
-      case "tool_call":
+      case "tool_call": {
         if (workflowCompletionContinuation) return;
-        this.closeUser(sessionId);
-        this.addTool(sessionId, update);
+        const hostTool = blockOperation("tool");
+        if (hostManaged && !hostTool) return;
+        if (!hostManaged) this.closeUser(sessionId);
+        if (hostTool?.action === "update") {
+          this.patchTool(sessionId, update, hostTool);
+        } else {
+          this.addTool(sessionId, update, hostTool);
+        }
         return;
+      }
       case "tool_call_update":
         if (workflowCompletionContinuation) return;
-        this.patchTool(sessionId, update);
+        if (hostManaged && !blockOperation("tool")) return;
+        this.patchTool(sessionId, update, blockOperation("tool"));
         return;
       case "plan": {
-        this.closeUser(sessionId);
         const steps = mapPlanSteps(update.entries);
+        const hostPlan = blockOperation("plan");
+        if (hostManaged) {
+          if (!hostPlan) return;
+          this.emit({
+            type: "block_add",
+            sessionId,
+            block: {
+              type: "plan",
+              id: hostPlan.blockId,
+              steps,
+              ts: hostPlan.startedAt ?? Date.now(),
+            },
+          });
+          if (hostPlan.action === "update") {
+            this.emit({ type: "plan_patch", sessionId, blockId: hostPlan.blockId, steps });
+          }
+          return;
+        }
+        if (!cursor) return;
+        this.closeUser(sessionId);
         if (!cursor.planId) {
           cursor.planId = uid();
           this.emit({
@@ -2079,13 +2255,15 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
-  private addTool(sessionId: string, update: JsonObject) {
-    const cursor = this.cursor(sessionId);
-    this.closeThinking(sessionId);
-    this.closeAssistant(sessionId);
-    const toolCallId = string(update.toolCallId) ?? uid();
-    const blockId = cursor.toolBlocks.get(toolCallId) ?? uid();
-    cursor.toolBlocks.set(toolCallId, blockId);
+  private addTool(sessionId: string, update: JsonObject, hostBlock?: HostBlockOperation) {
+    const cursor = hostBlock ? undefined : this.replayCursor(sessionId);
+    if (!hostBlock) {
+      this.closeThinking(sessionId);
+      this.closeAssistant(sessionId);
+    }
+    const toolCallId = hostBlock?.sourceId ?? string(update.toolCallId) ?? uid();
+    const blockId = hostBlock?.blockId ?? cursor?.toolBlocks.get(toolCallId) ?? uid();
+    cursor?.toolBlocks.set(toolCallId, blockId);
     const content = array(update.content);
     const canonicalKind = toolCanonicalKind(update);
     const kind = mapToolKind(canonicalKind ?? update.kind, update.title);
@@ -2098,7 +2276,7 @@ export class AcpBridge implements GrokBridge {
       title: string(update.title) ?? "tool",
       detail: string(update.detail),
       status: mapToolStatus(update.status),
-      startedAt: Date.now(),
+      startedAt: hostBlock?.startedAt ?? Date.now(),
       input: jsonText(update.rawInput),
       output: toolOutputText(update.rawOutput, content),
       diff: extractDiffs([content, update.rawInput, update.rawOutput]),
@@ -2125,15 +2303,19 @@ export class AcpBridge implements GrokBridge {
     this.persistToolImages(sessionId, blockId, images);
   }
 
-  private patchTool(sessionId: string, update: JsonObject) {
-    const cursor = this.cursor(sessionId);
-    const toolCallId = string(update.toolCallId);
+  private patchTool(sessionId: string, update: JsonObject, hostBlock?: HostBlockOperation) {
+    const cursor = hostBlock ? undefined : this.replayCursor(sessionId);
+    const toolCallId = hostBlock?.sourceId ?? string(update.toolCallId);
     if (!toolCallId) return;
-    let blockId = cursor.toolBlocks.get(toolCallId);
+    let blockId = hostBlock?.blockId ?? cursor?.toolBlocks.get(toolCallId);
     if (!blockId) {
       this.addTool(sessionId, update);
-      blockId = cursor.toolBlocks.get(toolCallId);
+      blockId = cursor?.toolBlocks.get(toolCallId);
       if (!blockId) return;
+    } else if (hostBlock) {
+      // 页面可能在 tool_call 与 update 之间重载。稳定 ID + 幂等 block_add
+      // 可先补一个最小工具块，再用当前 update 完成投影。
+      this.addTool(sessionId, update, hostBlock);
     }
     const status = mapToolStatus(update.status);
     this.markOpenTool(sessionId, toolCallId, status);
@@ -2287,7 +2469,8 @@ export class AcpBridge implements GrokBridge {
   }
 
   private closeThinking(sessionId: string) {
-    const cursor = this.cursor(sessionId);
+    const cursor = this.replayCursors.get(sessionId);
+    if (!cursor) return;
     if (cursor.thinkingId) {
       this.flushStreamAppends(sessionId);
       this.emit({
@@ -2309,14 +2492,16 @@ export class AcpBridge implements GrokBridge {
   }
 
   private closeUser(sessionId: string) {
-    const cursor = this.cursor(sessionId);
+    const cursor = this.replayCursors.get(sessionId);
+    if (!cursor) return;
     cursor.userOpen = false;
     cursor.userId = undefined;
     cursor.userText = undefined;
   }
 
   private closeAssistant(sessionId: string) {
-    const cursor = this.cursor(sessionId);
+    const cursor = this.replayCursors.get(sessionId);
+    if (!cursor) return;
     if (cursor.assistantId) {
       this.flushStreamAppends(sessionId);
       this.emit({
@@ -2981,7 +3166,6 @@ export class AcpBridge implements GrokBridge {
       mode: automation.mode,
     });
     this.catalogue.set(started.sessionId, meta);
-    this.cursors.set(started.sessionId, { toolBlocks: new Map() });
     this.usage.set(started.sessionId, { ...EMPTY_USAGE });
     this.emit({
       type: "session_ready",
@@ -3044,7 +3228,6 @@ export class AcpBridge implements GrokBridge {
       mode: "agent",
     });
     this.catalogue.set(sessionId, meta);
-    this.cursors.set(sessionId, { toolBlocks: new Map() });
     this.usage.set(sessionId, { ...EMPTY_USAGE });
     this.emit({ type: "session_ready", session: emptySession(meta), background });
     this.emit({ type: "available_commands", sessionId, commands: this.runtimeCommands });
@@ -3104,7 +3287,6 @@ export class AcpBridge implements GrokBridge {
     }
 
     this.emit({ type: "status", sessionId: id, status: "connecting" });
-    this.cursors.set(id, { toolBlocks: new Map() });
     this.replaying.set(id, emptySession(meta));
     try {
       const opened = await invoke<OpenAgentSessionResult>("open_agent_session", {
@@ -3197,7 +3379,7 @@ export class AcpBridge implements GrokBridge {
       }
       this.flushStreamAppends(sessionId);
       this.flushToolPatches(sessionId);
-      this.cursors.set(sessionId, { toolBlocks: new Map() });
+      this.replayCursors.set(sessionId, { toolBlocks: new Map() });
       this.replaying.set(sessionId, emptySession(meta));
       const liveEnvelopes = marker >= 0 ? envelopes.slice(marker + 1) : envelopes;
       this.canonicalReplaySessions.add(sessionId);
@@ -3665,7 +3847,7 @@ export class AcpBridge implements GrokBridge {
     }
     this.knownSessions.delete(id);
     this.forgetToolImagePersistence(id);
-    this.cursors.delete(id);
+    this.replayCursors.delete(id);
     this.usage.delete(id);
   }
 
@@ -3674,7 +3856,7 @@ export class AcpBridge implements GrokBridge {
     await invoke("close_agent_session", { sessionId: id, generation: this.acpGeneration });
     this.knownSessions.delete(id);
     this.forgetToolImagePersistence(id);
-    this.cursors.delete(id);
+    this.replayCursors.delete(id);
     this.usage.delete(id);
   }
 

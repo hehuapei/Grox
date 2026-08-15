@@ -16,6 +16,7 @@ use crate::{
     acp_host::AcpHostError,
     automation_store::{AutomationCompletion, AutomationDispatch, AutomationStore},
     automations_path, ensure_agent_runtime_ready, host_prefs, host_prefs_dir_for_app,
+    foreground_turn::SessionProjectionTurn,
     mcp_leases::McpLeaseStore,
     request_acp_json,
     session_runtime::{open_agent_session_inner, OpenAgentSessionRequest},
@@ -466,6 +467,7 @@ async fn execute_claimed_automation(
     });
 
     let turn = run_claimed_turn(
+        app,
         state.inner(),
         leases.inner(),
         runner.inner(),
@@ -554,6 +556,7 @@ fn claimed_automation_config(automation: &Value) -> Result<ClaimedAutomationConf
 
 #[allow(clippy::too_many_arguments)]
 async fn run_claimed_turn(
+    app: &AppHandle,
     state: &AcpState,
     leases: &McpLeaseStore,
     runner: &AutomationRunner,
@@ -573,6 +576,8 @@ async fn run_claimed_turn(
         .sessions
         .acquire_turn(session_id.to_string(), generation)
         .await?;
+    let _projection_turn =
+        SessionProjectionTurn::begin(app, &state.session_events, session_id, generation);
     let gate_token = permit.token();
 
     renew_execution_claim(store, path, id, token)?;

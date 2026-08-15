@@ -1580,7 +1580,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
       case "block_add":
         if (isHiddenWorkflowControlPrompt(e.block)) break;
-        withSession(e.sessionId, (s) => ({ ...s, blocks: [...s.blocks, e.block] }));
+        withSession(e.sessionId, (s) => s.blocks.some((block) => block.id === e.block.id)
+          ? s
+          : { ...s, blocks: [...s.blocks, e.block] });
         // Tools must not keep a post-prompt continuation alive — a leftover
         // running LRC / cargo test would reset the settle timer forever.
         if (e.block.type === "thinking" || e.block.type === "assistant") {
@@ -1622,6 +1624,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
           ),
         }), false);
         applyPostPromptContinuation(e.sessionId);
+        break;
+      case "user_append":
+        withSession(e.sessionId, (s) => ({
+          ...s,
+          blocks: s.blocks.map((b) =>
+            b.id === e.blockId && b.type === "user"
+              ? { ...b, text: b.text + e.delta }
+              : b,
+          ),
+        }), false);
         break;
       case "permission_request":
         withSession(e.sessionId, (s) => ({

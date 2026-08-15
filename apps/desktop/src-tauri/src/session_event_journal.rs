@@ -6,7 +6,7 @@
 //! JSON-RPC 与 x.ai 扩展封装只在 Host 解码，页面不会收到原始 wire 行或 rpc id。
 
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -46,6 +46,12 @@ pub(crate) enum HostSessionProjection {
         session_id: String,
         update_type: Option<String>,
         update: Value,
+        block_ops: Vec<HostBlockOperation>,
+    },
+    BlockLifecycle {
+        session_id: String,
+        phase: &'static str,
+        block_ops: Vec<HostBlockOperation>,
     },
     Notification {
         method: String,
@@ -59,6 +65,19 @@ pub(crate) enum HostSessionProjection {
         code: &'static str,
         message: String,
     },
+}
+
+/// Host 只投影消息块的身份和生命周期；具体卡片内容仍由 WebView 渲染。
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HostBlockOperation {
+    action: &'static str,
+    block_type: &'static str,
+    block_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    started_at: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +109,24 @@ struct JournalState {
     dropped_through: u64,
     retained_bytes: usize,
     events: VecDeque<HostSessionEvent>,
+    projection_generation: u64,
+    projections: BTreeMap<(u64, String), SessionBlockState>,
+}
+
+#[derive(Clone)]
+struct OpenBlock {
+    id: String,
+    started_at: u64,
+}
+
+#[derive(Default)]
+struct SessionBlockState {
+    assistant: Option<OpenBlock>,
+    thinking: Option<OpenBlock>,
+    user: Option<OpenBlock>,
+    user_prompt_index: Option<u64>,
+    plan: Option<OpenBlock>,
+    tools: BTreeMap<String, OpenBlock>,
 }
 
 pub(crate) struct SessionEventJournal {
@@ -105,6 +142,8 @@ impl Default for SessionEventJournal {
                 dropped_through: 0,
                 retained_bytes: 0,
                 events: VecDeque::new(),
+                projection_generation: 0,
+                projections: BTreeMap::new(),
             }),
         }
     }
@@ -124,15 +163,17 @@ impl SessionEventJournal {
         wire_bytes: usize,
         inbound: Result<&AcpInbound, &AcpInboundError>,
     ) -> HostSessionEvent {
-        let decoded = decode_inbound(inbound);
+        let mut decoded = decode_inbound(inbound);
         let mut state = self.lock();
         let sequence = state.next_sequence;
         state.next_sequence = state.next_sequence.saturating_add(1);
+        let received_at = unix_time_ms();
+        project_block_identity(&mut state, generation, sequence, received_at, &mut decoded);
         let event = HostSessionEvent {
             stream_id: state.stream_id.clone(),
             sequence,
             generation,
-            received_at: unix_time_ms(),
+            received_at,
             session_id: decoded.session_id,
             method: decoded.method,
             update_type: decoded.update_type,
@@ -141,31 +182,75 @@ impl SessionEventJournal {
             unsupported_response: decoded.unsupported_response,
         };
 
-        let event_bytes = event.wire_bytes;
-        if event_bytes > MAX_RETAINED_EVENT_BYTES {
-            // 超大多模态消息仍实时投影，但不允许单条消息吃掉整个补放窗口。
-            state.dropped_through = sequence;
-            tracing::warn!(
-                target: "grox::session_events",
-                generation,
-                sequence,
-                session_id = ?event.session_id,
-                bytes = event_bytes,
-                "ACP event exceeds replay retention limit"
-            );
-            return event;
+        retain_event(&mut state, event)
+    }
+
+    pub(crate) fn begin_turn(&self, generation: u64, session_id: &str) -> HostSessionEvent {
+        self.append_lifecycle(generation, session_id, "turn_started", false)
+    }
+
+    pub(crate) fn finish_turn(&self, generation: u64, session_id: &str) -> HostSessionEvent {
+        self.append_lifecycle(generation, session_id, "turn_finished", false)
+    }
+
+    pub(crate) fn reset_session(&self, generation: u64, session_id: &str) -> HostSessionEvent {
+        self.append_lifecycle(generation, session_id, "session_reset", true)
+    }
+
+    pub(crate) fn remove_session(&self, generation: u64, session_id: &str) -> HostSessionEvent {
+        let mut state = self.lock();
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        let mut block_ops = Vec::new();
+        if prepare_projection_generation(&mut state, generation) {
+            for ((_, projected_session_id), projection) in state.projections.iter_mut() {
+                if projected_session_id == session_id {
+                    close_text_blocks(projection, &mut block_ops);
+                }
+            }
+            state
+                .projections
+                .retain(|(_, projected_session_id), _| projected_session_id != session_id);
         }
-        state.retained_bytes = state.retained_bytes.saturating_add(event_bytes);
-        state.events.push_back(event.clone());
-        while state.events.len() > MAX_RETAINED_EVENTS || state.retained_bytes > MAX_RETAINED_BYTES
-        {
-            let Some(dropped) = state.events.pop_front() else {
-                break;
-            };
-            state.retained_bytes = state.retained_bytes.saturating_sub(dropped.wire_bytes);
-            state.dropped_through = state.dropped_through.max(dropped.sequence);
+        let event = lifecycle_event(
+            &state.stream_id,
+            sequence,
+            generation,
+            session_id,
+            "session_removed",
+            block_ops,
+        );
+        retain_event(&mut state, event)
+    }
+
+    fn append_lifecycle(
+        &self,
+        generation: u64,
+        session_id: &str,
+        phase: &'static str,
+        reset: bool,
+    ) -> HostSessionEvent {
+        let mut state = self.lock();
+        let sequence = state.next_sequence;
+        state.next_sequence = state.next_sequence.saturating_add(1);
+        let key = (generation, session_id.to_string());
+        let mut block_ops = Vec::new();
+        if prepare_projection_generation(&mut state, generation) {
+            let projection = state.projections.entry(key.clone()).or_default();
+            close_text_blocks(projection, &mut block_ops);
+            if reset {
+                state.projections.remove(&key);
+            }
         }
-        event
+        let event = lifecycle_event(
+            &state.stream_id,
+            sequence,
+            generation,
+            session_id,
+            phase,
+            block_ops,
+        );
+        retain_event(&mut state, event)
     }
 
     pub(crate) fn replay(
@@ -236,6 +321,301 @@ impl SessionEventJournal {
     }
 }
 
+fn retain_event(state: &mut JournalState, event: HostSessionEvent) -> HostSessionEvent {
+    let event_bytes = event.wire_bytes;
+    if event_bytes > MAX_RETAINED_EVENT_BYTES {
+        // 超大多模态消息仍实时投影，但不允许单条消息吃掉整个补放窗口。
+        state.dropped_through = event.sequence;
+        tracing::warn!(
+            target: "grox::session_events",
+            generation = event.generation,
+            sequence = event.sequence,
+            session_id = ?event.session_id,
+            bytes = event_bytes,
+            "ACP event exceeds replay retention limit"
+        );
+        return event;
+    }
+    state.retained_bytes = state.retained_bytes.saturating_add(event_bytes);
+    state.events.push_back(event.clone());
+    while state.events.len() > MAX_RETAINED_EVENTS || state.retained_bytes > MAX_RETAINED_BYTES {
+        let Some(dropped) = state.events.pop_front() else {
+            break;
+        };
+        state.retained_bytes = state.retained_bytes.saturating_sub(dropped.wire_bytes);
+        state.dropped_through = state.dropped_through.max(dropped.sequence);
+    }
+    event
+}
+
+fn lifecycle_event(
+    stream_id: &str,
+    sequence: u64,
+    generation: u64,
+    session_id: &str,
+    phase: &'static str,
+    block_ops: Vec<HostBlockOperation>,
+) -> HostSessionEvent {
+    HostSessionEvent {
+        stream_id: stream_id.to_string(),
+        sequence,
+        generation,
+        received_at: unix_time_ms(),
+        session_id: Some(session_id.to_string()),
+        method: None,
+        update_type: None,
+        projection: HostSessionProjection::BlockLifecycle {
+            session_id: session_id.to_string(),
+            phase,
+            block_ops,
+        },
+        wire_bytes: 0,
+        unsupported_response: None,
+    }
+}
+
+fn project_block_identity(
+    state: &mut JournalState,
+    generation: u64,
+    sequence: u64,
+    received_at: u64,
+    decoded: &mut DecodedInbound,
+) {
+    if !prepare_projection_generation(state, generation) {
+        return;
+    }
+    let HostSessionProjection::SessionUpdate {
+        session_id,
+        update,
+        block_ops,
+        ..
+    } = &mut decoded.projection
+    else {
+        return;
+    };
+    let Some(update_type) = update.get("sessionUpdate").and_then(Value::as_str) else {
+        return;
+    };
+    let stream_id = state.stream_id.clone();
+    let projection = state
+        .projections
+        .entry((generation, session_id.clone()))
+        .or_default();
+
+    match update_type {
+        "user_message_chunk" => {
+            if update
+                .get("_meta")
+                .and_then(Value::as_object)
+                .and_then(|meta| meta.get("hideFromScrollback"))
+                .and_then(Value::as_bool)
+                == Some(true)
+            {
+                return;
+            }
+            close_block(&mut projection.assistant, "assistant", block_ops);
+            close_block(&mut projection.thinking, "thinking", block_ops);
+            let prompt_index = update
+                .get("_meta")
+                .and_then(Value::as_object)
+                .and_then(|meta| meta.get("promptIndex"))
+                .and_then(Value::as_u64);
+            let combined_count = update
+                .get("content")
+                .and_then(Value::as_object)
+                .and_then(|content| content.get("_meta"))
+                .and_then(Value::as_object)
+                .and_then(|meta| meta.get("combinedDisplayTexts"))
+                .and_then(Value::as_array)
+                .map(|items| items.iter().filter(|item| item.is_string()).count())
+                .filter(|count| *count >= 2)
+                .unwrap_or(0);
+            if combined_count > 0 {
+                projection.user = None;
+                for index in 0..combined_count {
+                    let block =
+                        new_block(&stream_id, sequence, &format!("user-{index}"), received_at);
+                    block_ops.push(open_operation("user", &block, None));
+                    projection.user = Some(block);
+                }
+                projection.user_prompt_index = prompt_index;
+                return;
+            }
+            let begins_new_prompt = projection.user.is_none()
+                || prompt_index.is_some_and(|index| {
+                    projection
+                        .user_prompt_index
+                        .is_some_and(|previous| previous != index)
+                });
+            if begins_new_prompt {
+                let block = new_block(&stream_id, sequence, "user", received_at);
+                block_ops.push(open_operation("user", &block, None));
+                projection.user = Some(block);
+            } else if let Some(block) = &projection.user {
+                block_ops.push(update_operation("user", block, None));
+            }
+            if prompt_index.is_some() {
+                projection.user_prompt_index = prompt_index;
+            }
+        }
+        "agent_message_chunk" => {
+            close_block(&mut projection.user, "user", block_ops);
+            close_block(&mut projection.thinking, "thinking", block_ops);
+            project_stream_block(
+                &stream_id,
+                sequence,
+                received_at,
+                "assistant",
+                &mut projection.assistant,
+                block_ops,
+            );
+        }
+        "agent_thought_chunk" => {
+            close_block(&mut projection.user, "user", block_ops);
+            close_block(&mut projection.assistant, "assistant", block_ops);
+            project_stream_block(
+                &stream_id,
+                sequence,
+                received_at,
+                "thinking",
+                &mut projection.thinking,
+                block_ops,
+            );
+        }
+        "tool_call" => {
+            close_text_blocks(projection, block_ops);
+            let source_id = update
+                .get("toolCallId")
+                .or_else(|| update.get("tool_call_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("host-tool-{sequence}"));
+            if let Some(block) = projection.tools.get(&source_id) {
+                block_ops.push(update_operation("tool", block, Some(source_id)));
+            } else {
+                let block = new_block(&stream_id, sequence, "tool", received_at);
+                block_ops.push(open_operation("tool", &block, Some(source_id.clone())));
+                projection.tools.insert(source_id, block);
+            }
+        }
+        "tool_call_update" => {
+            let Some(source_id) = update
+                .get("toolCallId")
+                .or_else(|| update.get("tool_call_id"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+            else {
+                return;
+            };
+            if let Some(block) = projection.tools.get(&source_id) {
+                block_ops.push(update_operation("tool", block, Some(source_id)));
+            } else {
+                let block = new_block(&stream_id, sequence, "tool", received_at);
+                block_ops.push(open_operation("tool", &block, Some(source_id.clone())));
+                projection.tools.insert(source_id, block);
+            }
+        }
+        "plan" => {
+            close_block(&mut projection.user, "user", block_ops);
+            if let Some(block) = &projection.plan {
+                block_ops.push(update_operation("plan", block, None));
+            } else {
+                let block = new_block(&stream_id, sequence, "plan", received_at);
+                block_ops.push(open_operation("plan", &block, None));
+                projection.plan = Some(block);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn prepare_projection_generation(state: &mut JournalState, generation: u64) -> bool {
+    if generation < state.projection_generation {
+        return false;
+    }
+    if generation > state.projection_generation {
+        state.projection_generation = generation;
+        state.projections.clear();
+    }
+    true
+}
+
+fn project_stream_block(
+    stream_id: &str,
+    sequence: u64,
+    received_at: u64,
+    block_type: &'static str,
+    slot: &mut Option<OpenBlock>,
+    block_ops: &mut Vec<HostBlockOperation>,
+) {
+    if let Some(block) = slot {
+        block_ops.push(update_operation(block_type, block, None));
+    } else {
+        let block = new_block(stream_id, sequence, block_type, received_at);
+        block_ops.push(open_operation(block_type, &block, None));
+        *slot = Some(block);
+    }
+}
+
+fn close_text_blocks(projection: &mut SessionBlockState, ops: &mut Vec<HostBlockOperation>) {
+    close_block(&mut projection.user, "user", ops);
+    close_block(&mut projection.thinking, "thinking", ops);
+    close_block(&mut projection.assistant, "assistant", ops);
+    projection.user_prompt_index = None;
+}
+
+fn close_block(
+    slot: &mut Option<OpenBlock>,
+    block_type: &'static str,
+    ops: &mut Vec<HostBlockOperation>,
+) {
+    let Some(block) = slot.take() else {
+        return;
+    };
+    ops.push(HostBlockOperation {
+        action: "close",
+        block_type,
+        block_id: block.id,
+        source_id: None,
+        started_at: Some(block.started_at),
+    });
+}
+
+fn new_block(stream_id: &str, sequence: u64, suffix: &str, started_at: u64) -> OpenBlock {
+    OpenBlock {
+        id: format!("host-block-{stream_id}-{sequence}-{suffix}"),
+        started_at,
+    }
+}
+
+fn open_operation(
+    block_type: &'static str,
+    block: &OpenBlock,
+    source_id: Option<String>,
+) -> HostBlockOperation {
+    HostBlockOperation {
+        action: "open",
+        block_type,
+        block_id: block.id.clone(),
+        source_id,
+        started_at: Some(block.started_at),
+    }
+}
+
+fn update_operation(
+    block_type: &'static str,
+    block: &OpenBlock,
+    source_id: Option<String>,
+) -> HostBlockOperation {
+    HostBlockOperation {
+        action: "update",
+        block_type,
+        block_id: block.id.clone(),
+        source_id,
+        started_at: None,
+    }
+}
+
 impl HostSessionEvent {
     pub(crate) fn unsupported_response(&self) -> Option<&str> {
         self.unsupported_response.as_deref()
@@ -256,9 +636,7 @@ fn decode(line: &str) -> DecodedInbound {
     decode_inbound(inbound.as_ref())
 }
 
-fn decode_inbound(
-    inbound: Result<&AcpInbound, &AcpInboundError>,
-) -> DecodedInbound {
+fn decode_inbound(inbound: Result<&AcpInbound, &AcpInboundError>) -> DecodedInbound {
     let inbound = match inbound {
         Ok(inbound) => inbound,
         Err(error) => return protocol_error(error.code(), error.message()),
@@ -357,6 +735,7 @@ fn decode_inbound(
                 session_id,
                 update_type,
                 update,
+                block_ops: Vec::new(),
             },
             unsupported_response: None,
         };
@@ -417,6 +796,14 @@ fn unix_time_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn block_ops(event: &HostSessionEvent) -> &[HostBlockOperation] {
+        match &event.projection {
+            HostSessionProjection::SessionUpdate { block_ops, .. }
+            | HostSessionProjection::BlockLifecycle { block_ops, .. } => block_ops,
+            _ => &[],
+        }
+    }
 
     #[test]
     fn assigns_monotonic_sequence_and_extracts_session_identity() {
@@ -523,5 +910,127 @@ mod tests {
         assert_eq!(status.retained_events, 1);
         assert!(status.retained_bytes > 0);
         assert_eq!(status.dropped_through, 0);
+    }
+
+    #[test]
+    fn keeps_stream_identity_stable_until_host_turn_finishes() {
+        let journal = SessionEventJournal::default();
+        journal.begin_turn(3, "s1");
+        let first = journal.append(
+            3,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"a"}}}}"#.into(),
+        );
+        let second = journal.append(
+            3,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"b"}}}}"#.into(),
+        );
+        assert_eq!(block_ops(&first)[0].action, "open");
+        assert_eq!(block_ops(&second)[0].action, "update");
+        assert_eq!(
+            block_ops(&first)[0].block_id,
+            block_ops(&second)[0].block_id
+        );
+
+        let finished = journal.finish_turn(3, "s1");
+        assert_eq!(block_ops(&finished)[0].action, "close");
+        assert_eq!(
+            block_ops(&finished)[0].block_id,
+            block_ops(&first)[0].block_id
+        );
+
+        journal.begin_turn(3, "s1");
+        let next = journal.append(
+            3,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"c"}}}}"#.into(),
+        );
+        assert_eq!(block_ops(&next)[0].action, "open");
+        assert_ne!(block_ops(&next)[0].block_id, block_ops(&first)[0].block_id);
+    }
+
+    #[test]
+    fn isolates_parallel_session_projection_state() {
+        let journal = SessionEventJournal::default();
+        let first = journal.append(
+            9,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_thought_chunk"}}}"#.into(),
+        );
+        let second = journal.append(
+            9,
+            r#"{"method":"session/update","params":{"sessionId":"s2","update":{"sessionUpdate":"agent_thought_chunk"}}}"#.into(),
+        );
+        assert_ne!(
+            block_ops(&first)[0].block_id,
+            block_ops(&second)[0].block_id
+        );
+
+        let finished = journal.finish_turn(9, "s1");
+        assert_eq!(block_ops(&finished).len(), 1);
+        assert_eq!(
+            block_ops(&finished)[0].block_id,
+            block_ops(&first)[0].block_id
+        );
+        let continued = journal.append(
+            9,
+            r#"{"method":"session/update","params":{"sessionId":"s2","update":{"sessionUpdate":"agent_thought_chunk"}}}"#.into(),
+        );
+        assert_eq!(block_ops(&continued)[0].action, "update");
+        assert_eq!(
+            block_ops(&continued)[0].block_id,
+            block_ops(&second)[0].block_id
+        );
+    }
+
+    #[test]
+    fn session_reset_prevents_tool_blocks_from_reviving() {
+        let journal = SessionEventJournal::default();
+        let opened = journal.append(
+            4,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call","toolCallId":"call-1"}}}"#.into(),
+        );
+        let updated = journal.append(
+            4,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1"}}}"#.into(),
+        );
+        assert_eq!(
+            block_ops(&opened)[0].block_id,
+            block_ops(&updated)[0].block_id
+        );
+
+        journal.reset_session(4, "s1");
+        let replayed = journal.append(
+            4,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"tool_call_update","toolCallId":"call-1"}}}"#.into(),
+        );
+        assert_eq!(block_ops(&replayed)[0].action, "open");
+        assert_ne!(
+            block_ops(&opened)[0].block_id,
+            block_ops(&replayed)[0].block_id
+        );
+    }
+
+    #[test]
+    fn stale_generation_lifecycle_cannot_close_new_runtime_blocks() {
+        let journal = SessionEventJournal::default();
+        journal.append(
+            5,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk"}}}"#.into(),
+        );
+        let current = journal.append(
+            6,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk"}}}"#.into(),
+        );
+        assert_eq!(block_ops(&current)[0].action, "open");
+
+        let stale_finish = journal.finish_turn(5, "s1");
+        assert!(block_ops(&stale_finish).is_empty());
+        let continued = journal.append(
+            6,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk"}}}"#.into(),
+        );
+        assert_eq!(block_ops(&continued)[0].action, "update");
+        assert_eq!(
+            block_ops(&continued)[0].block_id,
+            block_ops(&current)[0].block_id
+        );
     }
 }

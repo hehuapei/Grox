@@ -99,6 +99,41 @@ struct PreparedForegroundTurn {
     permission_mode: Option<String>,
 }
 
+/// 将 UI 可见的流式块边界绑定到同一个 Host turn lease。任何 `?`、取消或
+/// watchdog 退出都会经过 Drop，下一轮不会继续复用上一轮的 assistant/thinking。
+pub(crate) struct SessionProjectionTurn<'a> {
+    app: &'a tauri::AppHandle,
+    journal: &'a crate::session_event_journal::SessionEventJournal,
+    session_id: &'a str,
+    generation: u64,
+}
+
+impl<'a> SessionProjectionTurn<'a> {
+    pub(crate) fn begin(
+        app: &'a tauri::AppHandle,
+        journal: &'a crate::session_event_journal::SessionEventJournal,
+        session_id: &'a str,
+        generation: u64,
+    ) -> Self {
+        crate::emit_host_session_event(app, journal.begin_turn(generation, session_id));
+        Self {
+            app,
+            journal,
+            session_id,
+            generation,
+        }
+    }
+}
+
+impl Drop for SessionProjectionTurn<'_> {
+    fn drop(&mut self) {
+        crate::emit_host_session_event(
+            self.app,
+            self.journal.finish_turn(self.generation, self.session_id),
+        );
+    }
+}
+
 struct ActiveTurn {
     token: u64,
     turn_id: String,
@@ -623,6 +658,8 @@ async fn execute_prepared_foreground_turn(
     let turn = state
         .foreground_turns
         .begin(session_id.to_string(), turn_id, generation)?;
+    let _projection_turn =
+        SessionProjectionTurn::begin(app, &state.session_events, session_id, generation);
     {
         let _write_guard = state.interactions.lock_writes().await;
         state

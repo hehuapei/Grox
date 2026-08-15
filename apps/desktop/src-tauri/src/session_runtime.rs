@@ -517,6 +517,12 @@ pub(crate) async fn open_agent_session_inner(
     } else {
         30_000
     };
+    if let Some(session_id) = session_id.as_deref() {
+        crate::emit_host_session_event(
+            app,
+            state.session_events.reset_session(request.generation, session_id),
+        );
+    }
     let send = |attempt: &SessionExtensionAttempt| {
         request_acp_json(
             state,
@@ -876,6 +882,10 @@ pub(crate) async fn close_agent_session(
     }
     shutdown_session_resources(leases.inner(), &session_id);
     state.client_callbacks.unbind_session(&session_id).await;
+    crate::emit_host_session_event(
+        window.app_handle(),
+        state.session_events.remove_session(generation, &session_id),
+    );
     Ok(())
 }
 
@@ -916,6 +926,10 @@ pub(crate) async fn delete_agent_session(
     .await?;
     shutdown_session_resources(leases.inner(), &session_id);
     state.client_callbacks.unbind_session(&session_id).await;
+    crate::emit_host_session_event(
+        window.app_handle(),
+        state.session_events.remove_session(generation, &session_id),
+    );
     Ok(())
 }
 

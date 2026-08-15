@@ -18,11 +18,20 @@ interface HostSessionEvent {
   method?: string;
   updateType?: string;
   projection:
-    | { kind: "session_update"; channel: "session" | "notification"; sessionId: string; updateType?: string; update: unknown }
+    | { kind: "session_update"; channel: "session" | "notification"; sessionId: string; updateType?: string; update: unknown; blockOps: HostBlockOperation[] }
+    | { kind: "block_lifecycle"; sessionId: string; phase: "turn_started" | "turn_finished" | "session_reset" | "session_removed"; blockOps: HostBlockOperation[] }
     | { kind: "notification"; method: string; params: unknown }
     | { kind: "unsupported_request"; method: string }
     | { kind: "orphan_response" }
     | { kind: "protocol_error"; code: string; message: string };
+}
+
+interface HostBlockOperation {
+  action: "open" | "update" | "close";
+  blockType: "user" | "assistant" | "thinking" | "tool" | "plan";
+  blockId: string;
+  sourceId?: string;
+  startedAt?: number;
 }
 
 interface InteractionInternals {
@@ -179,6 +188,12 @@ describe("AcpBridge Host interaction projection", () => {
         sessionId: "session-a",
         updateType: "agent_message_chunk",
         update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } },
+        blockOps: [{
+          action: "open",
+          blockType: "assistant",
+          blockId: "host-block-replay-1",
+          startedAt: 42,
+        }],
       },
     };
 
@@ -190,6 +205,74 @@ describe("AcpBridge Host interaction projection", () => {
       streamId: "host-stream-a",
       sequence: 1,
     });
+  });
+
+  it("uses Host block identity and lifecycle closes across stream phases", () => {
+    localStorage.removeItem("grox.hostSessionEventCursor.v1");
+    const { events, internal } = bridgeHarness();
+    internal.projectHostSessionEvent({
+      streamId: "host-stream-blocks",
+      sequence: 1,
+      generation: 7,
+      receivedAt: 42,
+      sessionId: "session-a",
+      projection: {
+        kind: "session_update",
+        channel: "session",
+        sessionId: "session-a",
+        updateType: "agent_message_chunk",
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "hello" } },
+        blockOps: [{
+          action: "open",
+          blockType: "assistant",
+          blockId: "host-block-assistant-1",
+          startedAt: 42,
+        }],
+      },
+    });
+    internal.projectHostSessionEvent({
+      streamId: "host-stream-blocks",
+      sequence: 2,
+      generation: 7,
+      receivedAt: 43,
+      sessionId: "session-a",
+      projection: {
+        kind: "session_update",
+        channel: "session",
+        sessionId: "session-a",
+        updateType: "agent_thought_chunk",
+        update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "why" } },
+        blockOps: [
+          { action: "close", blockType: "assistant", blockId: "host-block-assistant-1", startedAt: 42 },
+          { action: "open", blockType: "thinking", blockId: "host-block-thinking-2", startedAt: 43 },
+        ],
+      },
+    });
+    internal.projectHostSessionEvent({
+      streamId: "host-stream-blocks",
+      sequence: 3,
+      generation: 7,
+      receivedAt: 44,
+      sessionId: "session-a",
+      projection: {
+        kind: "block_lifecycle",
+        sessionId: "session-a",
+        phase: "turn_finished",
+        blockOps: [{
+          action: "close",
+          blockType: "thinking",
+          blockId: "host-block-thinking-2",
+          startedAt: 43,
+        }],
+      },
+    });
+
+    expect(events.filter((entry) => entry.type === "block_add").map((entry) =>
+      entry.type === "block_add" ? entry.block.id : ""
+    )).toEqual(["host-block-assistant-1", "host-block-thinking-2"]);
+    expect(events.filter((entry) => entry.type === "block_patch").map((entry) =>
+      entry.type === "block_patch" ? entry.blockId : ""
+    )).toEqual(["host-block-assistant-1", "host-block-thinking-2"]);
   });
 
   it("surfaces a replay gap instead of silently accepting a sequence jump", () => {
