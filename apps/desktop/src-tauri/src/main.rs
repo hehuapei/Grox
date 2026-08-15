@@ -15,13 +15,17 @@ mod browser_mcp;
 mod client_callbacks;
 mod computer_mcp;
 mod draft_store;
+mod file_commands;
 mod foreground_turn;
 mod git_confirm;
 mod host_error;
+mod host_logging;
 mod host_prefs;
 mod interaction_service;
 mod mcp_leases;
 mod media_service;
+#[cfg(debug_assertions)]
+mod mock_acp_fixture;
 mod path_sandbox;
 mod permission_audit;
 mod permission_policy;
@@ -67,6 +71,7 @@ use client_callbacks::{ClientCallbackInbound, ClientCallbackRegistry};
 use draft_store::{
     DraftAttachment, DraftSnapshot, DraftStore, DraftStoreError, DRAFTS_MAX_BYTES,
 };
+use file_commands::{open_file_with_default, reveal_in_explorer};
 use git_confirm::GitConfirmStore;
 use foreground_turn::{
     cancel_foreground_turn, execute_foreground_turn, foreground_turn_status,
@@ -77,8 +82,9 @@ use interaction_service::{InteractionInbound, InteractionProjection, Interaction
 use mcp_leases::McpLeaseStore;
 use media_service::{
     cancel_media_generation, is_media_https_host_allowed, media_generation_capabilities,
-    media_generation_status, media_journal_status, release_media_reference,
-    restore_job_journal, save_media_reference, start_media_generation, MediaService,
+    media_generation_history, media_generation_status, media_journal_status, open_media_artifact,
+    release_media_reference, restore_job_journal, save_media_reference, start_media_generation,
+    MediaService,
 };
 use path_sandbox::{
     checked_workspace, checked_workspace_file, checked_workspace_target, path_for_webview,
@@ -543,6 +549,7 @@ struct AgentRuntimeStatus {
     worktree_session_bindings: usize,
     worktree_ownership_error: Option<String>,
     session_event_stream: HostSessionEventStatus,
+    host_logging: host_logging::HostLogStatus,
 }
 
 #[derive(Serialize)]
@@ -608,6 +615,7 @@ async fn agent_runtime_status(
         worktree_session_bindings,
         worktree_ownership_error,
         session_event_stream: state.session_events.status(),
+        host_logging: host_logging::status(),
     })
 }
 
@@ -3631,6 +3639,7 @@ async fn export_session_support_bundle(
         "worktreeOwnership": worktree_ownership,
         "sessionOccupancy": state.sessions.snapshot(),
         "sessionEventStream": state.session_events.status(),
+        "hostLogging": host_logging::status(),
         "automationRunner": automation_runner.status(state.inner()).await,
         "cli": {
             "path": support_path(&runtime_info.path),
@@ -3689,6 +3698,7 @@ async fn export_session_support_bundle(
             journal,
             permission_audit,
             client,
+            host_log: host_logging::recent_redacted_tail(),
             official_trace: trace_path.as_deref(),
         },
     )?;
@@ -4283,7 +4293,7 @@ fn desktop_environment(app: tauri::AppHandle) -> DesktopEnvironment {
     let runtime = configured_grok_command(&app);
     // Warm host prefs cache at first environment probe.
     if let Err(error) = host_prefs::load_prefs(&host_prefs_dir_for_app(&app)) {
-        eprintln!("grox: {error}");
+        tracing::error!(target: "grox::preferences", error = %error, "Host preferences warmup failed");
     }
     DesktopEnvironment {
         default_workspace: path_for_webview(&default_workspace()),
@@ -5539,58 +5549,6 @@ fn open_in_explorer(cwd: String, path: Option<String>) -> Result<(), String> {
         .arg(&target)
         .spawn()
         .map_err(|error| format!("无法打开文件管理器：{error}"))?;
-    Ok(())
-}
-
-/// Reveal one workspace file in the platform file manager. This is distinct
-/// from `open_in_explorer`, which intentionally opens the project root.
-#[tauri::command]
-fn reveal_in_explorer(cwd: String, path: String) -> Result<(), String> {
-    let root = checked_workspace(&cwd)?;
-    let file = checked_workspace_file(&root, &path)?;
-    #[cfg(windows)]
-    std::process::Command::new("explorer.exe")
-        .arg("/select,")
-        .arg(&file)
-        .spawn()
-        .map_err(|error| format!("无法打开资源管理器：{error}"))?;
-    #[cfg(target_os = "macos")]
-    std::process::Command::new("open")
-        .arg("-R")
-        .arg(&file)
-        .spawn()
-        .map_err(|error| format!("无法在 Finder 中显示文件：{error}"))?;
-    #[cfg(all(unix, not(target_os = "macos")))]
-    std::process::Command::new("xdg-open")
-        .arg(file.parent().unwrap_or(&file))
-        .spawn()
-        .map_err(|error| format!("无法打开文件管理器：{error}"))?;
-    Ok(())
-}
-
-/// Ask the platform to open a workspace file with its default application.
-#[tauri::command]
-fn open_file_with_default(cwd: String, path: String) -> Result<(), String> {
-    let root = checked_workspace(&cwd)?;
-    let file = checked_workspace_file(&root, &path)?;
-    if !file.is_file() {
-        return Err("只能使用默认应用打开文件".into());
-    }
-    #[cfg(windows)]
-    std::process::Command::new("explorer.exe")
-        .arg(&file)
-        .spawn()
-        .map_err(|error| format!("无法打开默认应用：{error}"))?;
-    #[cfg(target_os = "macos")]
-    std::process::Command::new("open")
-        .arg(&file)
-        .spawn()
-        .map_err(|error| format!("无法打开默认应用：{error}"))?;
-    #[cfg(all(unix, not(target_os = "macos")))]
-    std::process::Command::new("xdg-open")
-        .arg(&file)
-        .spawn()
-        .map_err(|error| format!("无法打开默认应用：{error}"))?;
     Ok(())
 }
 
@@ -8298,6 +8256,11 @@ pub(crate) async fn ensure_agent_runtime_ready(
     let _connect_guard = state.connect_lock.lock().await;
     if !force_reconnect {
         if let Some(connection) = state.ready_connection().await {
+            tracing::debug!(
+                target: "grox::runtime",
+                generation = connection.generation,
+                "reusing ready Agent runtime"
+            );
             return Ok(connection);
         }
         let paused_generation = state.paused_generation.load(Ordering::Acquire);
@@ -8324,6 +8287,11 @@ pub(crate) async fn ensure_agent_runtime_ready(
         cwd,
         reasoning_effort,
     };
+    tracing::info!(
+        target: "grox::runtime",
+        force_reconnect,
+        "starting Agent runtime connection"
+    );
 
     let (generation, client_version) = match spawn_acp_process(
         app,
@@ -8337,6 +8305,7 @@ pub(crate) async fn ensure_agent_runtime_ready(
         Ok(result) => result,
         Err(error) => {
             state.set_runtime_phase(RuntimePhase::Offline);
+            tracing::error!(target: "grox::runtime", error = %error, "Agent process spawn failed");
             return Err(AcpHostError::environment(
                 "ACP_SPAWN_FAILED",
                 error,
@@ -8358,6 +8327,12 @@ pub(crate) async fn ensure_agent_runtime_ready(
     {
         Ok(initialize) => initialize,
         Err(error) => {
+            tracing::warn!(
+                target: "grox::runtime",
+                generation,
+                code = %error.code,
+                "Agent initialize failed"
+            );
             discard_failed_runtime(state, leases, generation, error.clone()).await;
             return Err(error);
         }
@@ -8381,6 +8356,13 @@ pub(crate) async fn ensure_agent_runtime_ready(
         return Err(error);
     }
     state.remember_connect(connect_spec);
+    tracing::info!(
+        target: "grox::runtime",
+        generation,
+        auth_required = connection.auth.required,
+        auth_in_progress = connection.auth.in_progress,
+        "Agent runtime ready"
+    );
     Ok(connection)
 }
 
@@ -8617,6 +8599,7 @@ async fn spawn_acp_process(
     // or stderr lines after `kill`; those lines must not reach the new ACP
     // connection.
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::info!(target: "grox::runtime", generation, "spawning Grok Build ACP process");
     state.authentication.reset(AcpHostError::environment(
         "AUTH_RUNTIME_CHANGED",
         "Agent 重连取消了旧通道上的登录",
@@ -8723,13 +8706,13 @@ async fn spawn_acp_process(
             Ok(job) => {
                 if let Some(pid) = child.id() {
                     if let Err(error) = job.assign_pid(pid) {
-                        eprintln!("grox: AssignProcessToJobObject failed: {error}");
+                        tracing::warn!(target: "grox::runtime", generation, pid, error = %error, "AssignProcessToJobObject failed");
                     }
                 }
                 Some(job)
             }
             Err(error) => {
-                eprintln!("grox: CreateJobObject failed (orphan risk on cancel): {error}");
+                tracing::warn!(target: "grox::runtime", generation, error = %error, "CreateJobObject failed; descendant cleanup is degraded");
                 None
             }
         }
@@ -8877,6 +8860,14 @@ async fn spawn_acp_process(
                 Some(code) => format!("Grok Agent 已退出（代码 {code}）"),
                 None => "Grok Agent 已退出".to_string(),
             };
+            tracing::warn!(
+                target: "grox::runtime",
+                generation,
+                exit_code = ?code,
+                affected_sessions = affected_session_ids.len(),
+                interrupted_sessions = interrupted_session_ids.len(),
+                "Agent process exited"
+            );
             stdout_state
                 .requests
                 .reject_generation(
@@ -9152,7 +9143,13 @@ async fn resolve_interaction(
                 audit,
                 "delivery_unknown",
             ) {
-                eprintln!("grox: 权限回复与审计均未确认：{audit_error}");
+                tracing::error!(
+                    target: "grox::permission",
+                    session_id = %lease.session_id,
+                    block_id = %lease.block_id,
+                    error = %audit_error,
+                    "interaction delivery and audit both uncertain"
+                );
             }
         }
         let _ = window.emit(
@@ -9195,6 +9192,15 @@ async fn resolve_interaction(
             )
         })
     });
+    tracing::info!(
+        target: "grox::permission",
+        session_id = %lease.session_id,
+        block_id = %lease.block_id,
+        generation = lease.generation,
+        kind = lease.kind,
+        audit_warning = audit_warning.is_some(),
+        "Host interaction resolved"
+    );
     Ok(ResolveInteractionResult { audit_warning })
 }
 
@@ -9964,7 +9970,7 @@ fn main_window_close_keeps_host_alive(app: &tauri::AppHandle) -> bool {
         Ok(enabled) => enabled,
         Err(error) => {
             // 读不到权威排程时不能通过关闭窗口冒险杀掉可能存在的任务。
-            eprintln!("grox: 无法判断是否存在已启用自动化，将保留后台进程：{error}");
+            tracing::error!(target: "grox::automation", error = %error, "automation state unreadable; keeping Host alive");
             true
         }
     };
@@ -10029,7 +10035,7 @@ pub(crate) fn request_host_exit(app: tauri::AppHandle) {
         {
             // 显式退出不能因为损坏的子进程或 callback 永久卡住；所有 child
             // 都启用了 kill_on_drop，进程退出仍会完成最后的操作系统级回收。
-            eprintln!("grox: Host 退出清理超过 5 秒，将由进程退出完成最终回收");
+            tracing::warn!(target: "grox::host", "Host shutdown cleanup exceeded five seconds");
         }
         app.exit(0);
     });
@@ -10037,6 +10043,10 @@ pub(crate) fn request_host_exit(app: tauri::AppHandle) {
 
 fn main() {
     let process_args = std::env::args().collect::<Vec<_>>();
+    #[cfg(debug_assertions)]
+    if mock_acp_fixture::try_run(&process_args) {
+        return;
+    }
     if process_args
         .iter()
         .any(|argument| argument == "--computer-mcp")
@@ -10064,6 +10074,11 @@ fn main() {
         | tauri_plugin_window_state::StateFlags::SIZE
         | tauri_plugin_window_state::StateFlags::MAXIMIZED;
     tauri::Builder::default()
+        // 必须最先注册：第二次启动只唤醒主窗口，不能再创建一套会话、
+        // 自动化 runner 和进程内持久化锁去覆盖同一批 Host 文件。
+        .plugin(tauri_plugin_single_instance::init(|app, _arguments, _cwd| {
+            tray::show_main_window(app);
+        }))
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(window_state_flags)
@@ -10083,6 +10098,20 @@ fn main() {
         .manage(Arc::new(MediaService::default()))
         .manage(AppShutdown::default())
         .setup(|app| {
+            match app.path().app_log_dir() {
+                Ok(path) => {
+                    if let Err(error) = host_logging::init(path) {
+                        eprintln!("grox: {error}");
+                    }
+                }
+                Err(error) => eprintln!("grox: 无法定位 Host 日志目录：{error}"),
+            }
+            tracing::info!(
+                target: "grox::host",
+                version = CLIENT_VERSION,
+                pid = std::process::id(),
+                "Grox Host starting"
+            );
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?;
             if let Some(window) = app.get_webview_window("main") {
                 window.set_icon(icon)?;
@@ -10094,10 +10123,10 @@ fn main() {
                 app.handle(),
                 app.state::<Arc<MediaService>>().inner(),
             ) {
-                eprintln!("grox: 无法恢复媒体任务记录：{error}");
+                tracing::error!(target: "grox::media", error = %error, "media journal restore failed");
             }
             if let Err(error) = media_service::scrub_reference_cache(app.handle()) {
-                eprintln!("grox: 无法清理媒体参考图缓存：{error}");
+                tracing::warn!(target: "grox::media", error = %error, "media reference cache scrub failed");
             }
             let coordinator = app.state::<Arc<AcpState>>().sessions.clone();
             let mut occupancy = coordinator.subscribe();
@@ -10114,15 +10143,15 @@ fn main() {
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 if let Err(error) = provision_grox_deep_research_workflow() {
-                    eprintln!("grox: 无法安装完整 deep-research 工作流：{error}");
+                    tracing::warn!(target: "grox::workflow", error = %error, "workflow provisioning failed");
                 }
                 // Crash leftovers may live in either the v1 journal tree or the
                 // legacy flat cache while migration is still pending.
                 match scrub_session_journal_dirs(&handle, Duration::from_secs(30)) {
                     Ok(removed) if removed > 0 => {
-                        eprintln!("grox: scrubbed {removed} orphan session journal files");
+                        tracing::info!(target: "grox::persistence", removed, "orphan session journals scrubbed");
                     }
-                    Err(error) => eprintln!("grox: 无法清理应用会话 journal：{error}"),
+                    Err(error) => tracing::warn!(target: "grox::persistence", error = %error, "session journal scrub failed"),
                     _ => {}
                 }
             });
@@ -10224,7 +10253,9 @@ fn main() {
             start_media_generation,
             media_generation_capabilities,
             media_generation_status,
+            media_generation_history,
             cancel_media_generation,
+            open_media_artifact,
             agent_runtime_connect,
             agent_runtime_auth_status,
             agent_runtime_authenticate,

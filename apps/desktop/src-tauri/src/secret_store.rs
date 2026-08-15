@@ -110,7 +110,12 @@ impl SecretStore {
                     SecretBackendKind::Keychain
                 }
                 Err(error) => {
-                    eprintln!("grox: OS 凭据库不可用，密钥改存私有文件：{error}");
+                    tracing::warn!(
+                        target: "grox::secrets",
+                        reference,
+                        error = %error,
+                        "OS credential store unavailable; using private-file backend"
+                    );
                     file.present.insert(reference.to_string());
                     file.fallback_values
                         .insert(reference.to_string(), value.to_string());
@@ -122,7 +127,12 @@ impl SecretStore {
             Err(error) => {
                 // 无法读取旧值时不能安全覆盖凭据库，否则元数据写入失败后无从
                 // 回滚。直接使用明确可见的私有文件后备。
-                eprintln!("grox: OS 凭据库不可读，密钥改存私有文件：{error}");
+                tracing::warn!(
+                    target: "grox::secrets",
+                    reference,
+                    error = %error,
+                    "OS credential store unreadable; using private-file backend"
+                );
                 file.present.insert(reference.to_string());
                 file.fallback_values
                     .insert(reference.to_string(), value.to_string());
@@ -189,14 +199,24 @@ impl SecretStore {
             Ok(_) => match keychain_delete(reference) {
                 Ok(()) => true,
                 Err(error) => {
-                    eprintln!("grox: OS 凭据库暂不可用，密钥引用已写入删除墓碑：{error}");
+                    tracing::warn!(
+                        target: "grox::secrets",
+                        reference,
+                        error = %error,
+                        "credential deletion deferred behind tombstone"
+                    );
                     false
                 }
             },
             Err(error) => {
                 // 删除语义以 Grox 是否还能读到凭据为准。无法清理 OS 中的陈旧项时
                 // 写入墓碑，避免应用在凭据库恢复后把它“复活”。
-                eprintln!("grox: OS 凭据库暂不可用，密钥引用已写入删除墓碑：{error}");
+                tracing::warn!(
+                    target: "grox::secrets",
+                    reference,
+                    error = %error,
+                    "credential deletion deferred behind tombstone"
+                );
                 false
             }
         };

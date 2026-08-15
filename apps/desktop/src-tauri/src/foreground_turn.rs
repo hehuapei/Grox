@@ -486,7 +486,16 @@ pub(crate) async fn execute_foreground_turn(
         .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
     let session_id = checked_short_string(&request.session_id, "sessionId", 512)?;
     let turn_id = checked_short_string(&request.turn_id, "turnId", 128)?;
+    let correlation_turn_id = turn_id.clone();
     ensure_ready_generation(state.inner(), request.generation).await?;
+    tracing::info!(
+        target: "grox::turn",
+        session_id = %session_id,
+        turn_id = %turn_id,
+        generation = request.generation,
+        queued = request.queue_item_id.is_some(),
+        "foreground turn requested"
+    );
 
     let queue_path = request
         .queue_item_id
@@ -546,6 +555,26 @@ pub(crate) async fn execute_foreground_turn(
         prepared,
     )
     .await;
+
+    match &result {
+        Ok(value) => tracing::info!(
+            target: "grox::turn",
+            session_id = %session_id,
+            turn_id = %correlation_turn_id,
+            generation = request.generation,
+            effective_effort = %value.effective_effort,
+            "foreground turn settled"
+        ),
+        Err(error) => tracing::warn!(
+            target: "grox::turn",
+            session_id = %session_id,
+            turn_id = %correlation_turn_id,
+            generation = request.generation,
+            domain = %error.domain,
+            code = %error.code,
+            "foreground turn failed"
+        ),
+    }
 
     if let (Some(path), Some(claim)) = (queue_path.as_ref(), queue_claim.as_ref()) {
         let settlement = queue_settlement_for_result(&result);

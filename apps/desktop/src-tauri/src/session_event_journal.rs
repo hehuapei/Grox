@@ -103,6 +103,14 @@ impl SessionEventJournal {
         if event_bytes > MAX_RETAINED_EVENT_BYTES {
             // 超大多模态消息仍实时投影，但不允许单条消息吃掉整个补放窗口。
             state.dropped_through = sequence;
+            tracing::warn!(
+                target: "grox::session_events",
+                generation,
+                sequence,
+                session_id = ?event.session_id,
+                bytes = event_bytes,
+                "ACP event exceeds replay retention limit"
+            );
             return event;
         }
         state.retained_bytes = state.retained_bytes.saturating_add(event_bytes);
@@ -142,13 +150,23 @@ impl SessionEventJournal {
             .filter(|event| event.sequence > after_sequence);
         let events = matching.by_ref().take(limit).cloned().collect::<Vec<_>>();
         let has_more = matching.next().is_some();
+        let truncated = after_sequence < state.dropped_through;
+        if truncated {
+            tracing::warn!(
+                target: "grox::session_events",
+                requested_after = after_sequence,
+                dropped_through = state.dropped_through,
+                latest_sequence,
+                "ACP event replay requested beyond retained window"
+            );
+        }
 
         HostSessionEventReplay {
             stream_id: state.stream_id.clone(),
             events,
             earliest_sequence,
             latest_sequence,
-            truncated: after_sequence < state.dropped_through,
+            truncated,
             reset,
             has_more,
         }

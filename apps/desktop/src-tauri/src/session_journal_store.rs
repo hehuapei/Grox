@@ -74,7 +74,12 @@ impl SessionJournalStore {
         if legacy.is_file() {
             if let Err(error) = fs::remove_file(legacy) {
                 // 新版 journal 已经持久化；保留旧文件并通过状态诊断暴露即可。
-                eprintln!("grox: 新版 journal 已写入，但无法清理旧版会话缓存：{error}");
+                tracing::warn!(
+                    target: "grox::persistence",
+                    session_id = id,
+                    error = %error,
+                    "legacy session journal cleanup failed"
+                );
             }
         }
         Ok(())

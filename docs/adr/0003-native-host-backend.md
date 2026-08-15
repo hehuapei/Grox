@@ -152,9 +152,13 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - `draft_store::DraftStore` 按规范化工作区保存草稿、附件和单调 revision；删除保留 tombstone revision，晚到旧页面写入与旧 localStorage 迁移都不能让草稿复活。WebView 只做串行合并与投影，原生环境下 localStorage 不再是草稿权威；
 - prompt queue、automation、session journal、draft、worktree ownership、权限审计、媒体任务和支持包等敏感文件都在临时文件创建时即限制为 0600，再原子替换；不再出现“写完后再 chmod”的短暂泄露窗口；
 - 现有持久化文件为空、损坏或无法读取时按结构性错误处理：repository 拒绝覆盖，worktree 删除引用扫描也拒绝跳过坏 journal，避免坏数据被误当成“没有引用”；
-- `MediaService` 用独立原子 journal 保存最近任务，启动时将崩溃遗留的活动任务结算为 `MEDIA_JOB_INTERRUPTED`；媒体历史、journal 状态和 Host 自动重连状态都进入环境摘要或支持包诊断。
+- `MediaService` 用独立原子 journal 保存最近任务，启动时将崩溃遗留的活动任务结算为 `MEDIA_JOB_INTERRUPTED`；WebView 通过有界历史查询恢复最近 12 次同类生成，不再只看最后一次。打开/定位产物只提交 job id + artifact index，Host 从持久任务解析真实路径并重新验证当前工作区或 Grok 会话目录，恢复后的 session 产物可用且页面不能伪造任意路径；媒体历史、journal 状态和 Host 自动重连状态都进入环境摘要或支持包诊断。
 - `session_event_journal::SessionEventJournal` 为所有可投影 ACP 入站消息分配进程级 `streamId`、单调序号和 generation，并提取 session/method/update 元数据；Host 保留 8192 条且最多 16 MiB 的有界补放窗口，超大消息只实时投影并把缺口显式记录为 truncated，不能静默伪装成完整历史；
 - WebView 按“先监听、再分页补放、最后合并实时缓冲”的次序消费 `host-session-event`，并以 stream + sequence 去重。页面重载不再依赖不可重放的裸 `acp-event`；游标失配、窗口截断和持久化失败都有稳定错误代码。事件窗口健康状态进入 RuntimeStatus 与支持包；
+- Tauri single-instance 插件作为 Builder 的第一个插件注册；第二次启动只恢复并聚焦现有主窗口，不会再创建另一套 AgentRuntime、AutomationRunner 和进程内仓储锁。因此 draft、queue、automation、worktree ownership 等 Host RMW 不再暴露给两个 Grox 进程并发提交；
+- `host_logging` 将 Host 生命周期、runtime generation、session/turn/block/automation 身份和结构化错误代码写入 stderr 与按日滚动文件；日志目录限制为当前用户，最多保留 8 个文件/32 MiB，panic 另走同步落盘。支持包只收集最多 192 KiB 的脱敏日志尾部，不写入 ACP 正文、Prompt 或凭据值；
+- debug binary 提供在 Tauri 初始化前退出的 mock ACP fixture；集成测试以真实 OS 子进程和 stdin/stdout 驱动交错会话流、坏 JSON、权限反向 RPC、半截 JSON EOF 与门控中异常退出，验证响应关联、EOF 和“不得伪造成功”的边界，而不是只测内存函数；
+- `file_commands` 成为工作区文件打开/定位的领域门面，路径错误、用户操作错误和系统启动失败返回稳定 `HostError`；媒体服务复用其平台动作，但保留自己的 job capability 校验，不再让原始路径 IPC 同时承担授权和执行两种职责；
 
 本切片没有把完整 SessionManager 伪装成已经迁移：连接初始化、非交互认证、建会话/恢复、
 自动化完整生命周期、普通前台回合、持久化提示队列、权限/计划/提问交互和显式 OAuth 生命周期已属于 Host。
@@ -176,11 +180,11 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 认证 | WebView 曾持有 authenticate promise、URL 轮询和取消时序 | 单例认证事务、可取消子进程、硬超时、认证后淘汰旧 runtime | `agent_auth` 按 generation 持有 ACP OAuth；页面只 start/cancel/status 并消费事件 |
 | 工作树 | Host 已持久化 session 关联并拥有创建/fork/引用检查/删除事务；旧 localStorage 安全源已删除 | worktree 与 session metadata 绑定、原生复制会话上下文 | 已完成 Host 所有权索引、干净树门禁、失败回滚、目标绑定确认和同名仓库隔离 |
 | 权限/提问 | Host 已按 session + generation 持有反向 RPC、统一权限上限、偏好事务、原生提权确认、scoped option 映射和决定审计；持久 allow cache 仍由 Grok Build 原生 option 负责 | 每会话策略、allow cache、Host resolve | 权限裁决与审计已迁移；后续再扩展项目/会话分层策略，不复制 Agent 的持久规则库 |
-| 媒体 | Host 已持有生成任务、取消、参考图租约、结构化产物授权和跨进程任务 journal（ADR 0004） | token loopback + path scope | Host 恢复有界任务历史，崩溃遗留显式结算，WebView 只投影 |
+| 媒体 | Host 已持有生成任务、取消、参考图租约、结构化产物授权和跨进程任务 journal（ADR 0004） | token loopback + path scope | Host 恢复有界任务历史，按 job 身份重新授权产物动作，崩溃遗留显式结算，WebView 只投影 |
 | 密钥 | Host SecretStore 已接管供应商密钥，档案与 `.env` 只留非敏感路由元数据（ADR 0005） | OS keychain + 受限文件后备 | 后端类型显式投影，删除墓碑防复活，诊断永不带值 |
 | 错误 | ACP、持久化、权限、媒体与供应商高风险命令已共享 HostError 契约 | 稳定 AgentErrorCode | 前端已删除文案推断；继续把低风险旧命令迁入领域 facade |
-| 诊断 | support bundle 已有但依赖前端快照 | 日志、运行时、审计集中 | Host 快照为主，前端快照只作补充 |
-| 测试 | 工具函数测试多，跨层运行时少 | mock ACP、路由/停机/竞态测试 | 增加故障注入和 Host 集成测试 |
+| 诊断 | support bundle 已有但依赖前端快照 | 日志、运行时、审计集中 | Host runtime/event/log 快照为主，支持包含脱敏原生日志尾部，前端快照只作补充 |
+| 测试 | 工具函数测试多，跨层运行时少 | mock ACP、路由/停机/竞态测试 | 已增加真实 mock ACP 子进程故障注入；继续覆盖多 runtime 容量策略 |
 
 ## Consequences
 

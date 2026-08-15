@@ -129,7 +129,13 @@ impl TerminalHost {
         };
         for entry in entries {
             if let Err(error) = terminate_entry(&entry).await {
-                eprintln!("grox: terminal reset teardown failed: {error}");
+                tracing::warn!(
+                    target: "grox::terminal",
+                    generation = entry.generation,
+                    session_id = %entry.session_id,
+                    error = %error,
+                    "terminal reset teardown failed"
+                );
             }
         }
     }
@@ -140,7 +146,13 @@ impl TerminalHost {
             .await;
         for entry in entries {
             if let Err(error) = terminate_entry(&entry).await {
-                eprintln!("grox: terminal session teardown failed: {error}");
+                tracing::warn!(
+                    target: "grox::terminal",
+                    generation,
+                    session_id,
+                    error = %error,
+                    "terminal session teardown failed"
+                );
             }
         }
     }
@@ -151,7 +163,14 @@ impl TerminalHost {
             .await;
         for entry in entries {
             if let Err(error) = terminate_entry(&entry).await {
-                eprintln!("grox: provisional terminal teardown failed: {error}");
+                tracing::warn!(
+                    target: "grox::terminal",
+                    generation,
+                    owner_token,
+                    session_id = %entry.session_id,
+                    error = %error,
+                    "provisional terminal teardown failed"
+                );
             }
         }
     }

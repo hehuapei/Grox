@@ -125,6 +125,7 @@ pub struct SessionSupportBundle<'a> {
     pub journal: Value,
     pub permission_audit: Value,
     pub client: Value,
+    pub host_log: String,
     pub official_trace: Option<&'a Path>,
 }
 
@@ -187,6 +188,7 @@ pub fn write_session_support_bundle(input: SessionSupportBundle<'_>) -> Result<P
         &safe_json(input.permission_audit)?,
     )?;
     add_text(&mut zip, options, "client.json", &safe_json(input.client)?)?;
+    add_text(&mut zip, options, "host-log.txt", &input.host_log)?;
     add_text(
         &mut zip,
         options,
@@ -197,6 +199,7 @@ runtime.json  shared Agent process topology and connection state\n\
 journal.json  journal health and selected-session metadata (no transcript body)\n\
 permission-audit.json  selected-session decisions (no raw tool input)\n\
 client.json   redacted UI state, queue state and recent error notices\n\
+host-log.txt  redacted tail of native lifecycle/error logs\n\
 official/     optional official `grok trace --local` archive\n\n\
 The official trace may contain conversation and tool records. This package is\n\
 created locally and is never uploaded by Grox. Review it before sharing.\n",
@@ -261,6 +264,7 @@ mod tests {
             journal: serde_json::json!({ "count": 1 }),
             permission_audit: serde_json::json!({ "readable": true, "entries": [] }),
             client: serde_json::json!({ "status": "failed" }),
+            host_log: "host log unavailable".into(),
             official_trace: None,
         })
         .unwrap();
@@ -271,6 +275,7 @@ mod tests {
         assert!(archive.by_name("journal.json").is_ok());
         assert!(archive.by_name("permission-audit.json").is_ok());
         assert!(archive.by_name("client.json").is_ok());
+        assert!(archive.by_name("host-log.txt").is_ok());
         assert!(archive.by_name("official/grok-trace.zip").is_err());
         #[cfg(unix)]
         {

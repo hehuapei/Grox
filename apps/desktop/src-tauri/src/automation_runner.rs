@@ -106,7 +106,12 @@ impl AutomationRunner {
             tokio::time::sleep(std::time::Duration::from_millis(BOOT_DELAY_MS)).await;
             loop {
                 if let Err(error) = tick(&app).await {
-                    eprintln!("grox: 自动化 Host 调度失败：{}", error.message);
+                    tracing::error!(
+                        target: "grox::automation",
+                        domain = %error.domain,
+                        code = %error.code,
+                        "automation scheduler tick failed"
+                    );
                     let _ = app.emit("automation-runner-error", error);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(TICK_INTERVAL_MS)).await;
@@ -192,11 +197,26 @@ impl AutomationRunner {
             let reservation = DispatchReservation(app.clone());
             let settled = execute_claimed_automation(&app, dispatch).await;
             drop(reservation);
+            match settled.error.as_ref() {
+                Some(error) => tracing::warn!(
+                    target: "grox::automation",
+                    automation_id = %settled.automation_id,
+                    session_id = ?settled.session_id,
+                    domain = %error.domain,
+                    code = %error.code,
+                    "automation execution failed"
+                ),
+                None => tracing::info!(
+                    target: "grox::automation",
+                    automation_id = %settled.automation_id,
+                    session_id = ?settled.session_id,
+                    "automation execution settled"
+                ),
+            }
             if let Err(error) = app.emit("automation-session-settled", settled.clone()) {
-                eprintln!("grox: 无法投影自动化会话终态：{error}");
+                tracing::error!(target: "grox::automation", error = %error, "automation settlement projection failed");
             }
             if let Some(error) = settled.error {
-                eprintln!("grox: 自动化执行失败：{}", error.message);
                 let _ = app.emit("automation-runner-error", error);
             }
         });
@@ -403,11 +423,19 @@ async fn execute_claimed_automation(
         warnings: opened.warnings,
     };
     if let Err(error) = app.emit("automation-session-started", started) {
-        eprintln!("grox: 无法投影自动化会话启动：{error}");
+        tracing::error!(
+            target: "grox::automation",
+            automation_id = %config.id,
+            session_id = %session_id,
+            error = %error,
+            "automation start projection failed"
+        );
     }
     let rename_state = std::sync::Arc::clone(state.inner());
     let rename_leases = std::sync::Arc::clone(leases.inner());
     let rename_session_id = session_id.clone();
+    let log_session_id = session_id.clone();
+    let log_automation_id = config.id.clone();
     let rename_title = config.title.clone();
     let rename_cwd = config.cwd.clone();
     tauri::async_runtime::spawn(async move {
@@ -427,7 +455,13 @@ async fn execute_claimed_automation(
         )
         .await
         {
-            eprintln!("grox: 自动化会话标题同步失败：{}", error.message);
+            tracing::warn!(
+                target: "grox::automation",
+                automation_id = %log_automation_id,
+                session_id = %log_session_id,
+                code = %error.code,
+                "automation session title sync failed"
+            );
         }
     });
 
