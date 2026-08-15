@@ -156,6 +156,16 @@ interface HostBlockOperation {
   startedAt?: number;
 }
 
+interface HostActiveBlockSnapshot {
+  generation: number;
+  sessionId: string;
+  blockType: "user" | "assistant" | "thinking";
+  blockId: string;
+  startedAt: number;
+  text: string;
+  textComplete: boolean;
+}
+
 interface HostSessionEventReplay {
   streamId: string;
   events: HostSessionEvent[];
@@ -164,6 +174,7 @@ interface HostSessionEventReplay {
   truncated: boolean;
   reset: boolean;
   hasMore: boolean;
+  activeBlocks: HostActiveBlockSnapshot[];
 }
 
 interface HostSessionEventCursor {
@@ -1342,9 +1353,76 @@ export class AcpBridge implements GrokBridge {
     });
   }
 
+  private projectHostActiveBlockSnapshots(snapshots: HostActiveBlockSnapshot[]) {
+    for (const snapshot of snapshots) {
+      const recoveredText = snapshot.textComplete
+        ? snapshot.text
+        : `${snapshot.text}\n… [Grox 活动流快照已截断]`;
+      if (snapshot.blockType === "user") {
+        const text = displayDeepResearchPrompt(recoveredText);
+        this.emit({
+          type: "block_add",
+          sessionId: snapshot.sessionId,
+          block: { type: "user", id: snapshot.blockId, text, ts: snapshot.startedAt },
+        });
+        if (snapshot.textComplete) {
+          this.emit({
+            type: "block_patch",
+            sessionId: snapshot.sessionId,
+            blockId: snapshot.blockId,
+            patch: { type: "user", text } as Partial<SessionBlock>,
+          });
+        }
+        continue;
+      }
+      if (snapshot.blockType === "assistant") {
+        this.emit({
+          type: "block_add",
+          sessionId: snapshot.sessionId,
+          block: {
+            type: "assistant",
+            id: snapshot.blockId,
+            text: recoveredText,
+            ts: snapshot.startedAt,
+            streaming: true,
+          },
+        });
+        if (snapshot.textComplete) {
+          this.emit({
+            type: "block_patch",
+            sessionId: snapshot.sessionId,
+            blockId: snapshot.blockId,
+            patch: { type: "assistant", text: snapshot.text, streaming: true } as Partial<SessionBlock>,
+          });
+        }
+        continue;
+      }
+      this.emit({
+        type: "block_add",
+        sessionId: snapshot.sessionId,
+        block: {
+          type: "thinking",
+          id: snapshot.blockId,
+          text: recoveredText,
+          ts: snapshot.startedAt,
+          live: true,
+        },
+      });
+      if (snapshot.textComplete) {
+        this.emit({
+          type: "block_patch",
+          sessionId: snapshot.sessionId,
+          blockId: snapshot.blockId,
+          patch: { type: "thinking", text: snapshot.text, live: true } as Partial<SessionBlock>,
+        });
+      }
+    }
+  }
+
   private async catchUpHostSessionEvents() {
     let finalLatestSequence = this.hostSessionEventCursor.sequence;
     let replayTruncated = false;
+    let activeBlocks: HostActiveBlockSnapshot[] = [];
     try {
       for (let page = 0; page < 32; page += 1) {
         const replay = await invoke<HostSessionEventReplay>("replay_session_events", {
@@ -1358,6 +1436,7 @@ export class AcpBridge implements GrokBridge {
         } else {
           finalLatestSequence = Math.max(finalLatestSequence, replay.latestSequence);
         }
+        activeBlocks = replay.activeBlocks ?? [];
         replayTruncated ||= replay.truncated;
         for (const event of [...replay.events].sort((left, right) => left.sequence - right.sequence)) {
           this.projectHostSessionEvent(event);
@@ -1380,6 +1459,9 @@ export class AcpBridge implements GrokBridge {
       });
       throw error;
     }
+    // 快照与最后一页 replay 在同一把 Host journal 锁内读取。先恢复快照，
+    // 再打开实时闸门并消费缓冲事件，才能保证 N 的累计文本先于 N+1 增量。
+    this.projectHostActiveBlockSnapshots(activeBlocks);
     // 只有完整查询成功后才打开实时闸门。查询失败时继续缓冲，下一次
     // ensureReady 会从已提交游标重试，不能让较新的实时事件越过缺口。
     this.hostSessionEventCatchup = false;

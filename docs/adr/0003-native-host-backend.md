@@ -159,6 +159,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 - 同一 journal 内的 session 投影状态按 generation + session 隔离，为 user/assistant/thinking/tool/plan 分配稳定 block id，并输出 `open/update/close` 操作；前台回合与自动化回合都用自动释放的 Host lease 写入 `turn_started/turn_finished`，因此成功、取消、watchdog、协议失败和任意 `?` 退出都会关闭当前流，下一轮不能续写上一轮 block；
 - `session/load` 在请求前写入 `session_reset`，close/delete 写入 `session_removed`；旧进程代次的迟到事件不能清除新代次投影。AcpBridge 的 `ContentCursor` 已降为只服务 rewind 归档响应的 `ReplayContentCursor`，实时路径不再用 WebView UUID 或 Map 决定 tool/plan/text 身份；
 - Zustand 与 load replay 的 `block_add` 按 Host block id 幂等，Host 事件即使在页面重载后补放也不会追加重复卡片；assistant/thinking 的最终 streaming/live 状态由 Host close 操作收口，而不是依赖页面 Promise 的 finally 猜测当前块；
+- Host 为每个活动 user/assistant/thinking block 保存最多 1 MiB 的累计文本，只在 replay 最后一页返回同一锁截面的 active snapshot；WebView 严格按 `replay(N) → snapshot(N) → buffered(N+1...)` 恢复，游标已推进但应用 journal 尚未落盘时仍能补回正在生成的内容。截断快照只用于缺失块冷启动，不覆盖可能更完整的本地块；活动块数量与字节数进入 RuntimeStatus/支持包；
 - Host 保留 8192 条且最多 16 MiB 的类型化有界补放窗口，超大消息只实时投影并把缺口显式记录为 truncated，不能静默伪装成完整历史；保留预算仍按原 wire 字节计量，避免结构化序列化差异绕过内存上限；
 - WebView 按“先监听、再分页补放、最后合并实时缓冲”的次序消费 `host-session-event`，并以 stream + sequence 去重。页面重载不再依赖不可重放的裸 `acp-event`；游标失配、窗口截断和持久化失败都有稳定错误代码。事件窗口健康状态进入 RuntimeStatus 与支持包；
 - Tauri single-instance 插件作为 Builder 的第一个插件注册；第二次启动只恢复并聚焦现有主窗口，不会再创建另一套 AgentRuntime、AutomationRunner 和进程内仓储锁。因此 draft、queue、automation、worktree ownership 等 Host RMW 不再暴露给两个 Grox 进程并发提交；
@@ -176,7 +177,7 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 | 领域 | Grox 迁移前 | `grok-app` 可学习点 | Grox 决定 |
 | --- | --- | --- | --- |
 | 组合根 | 9k+ 行 `main.rs` 同时承担命令与业务 | `lib.rs` 组合状态，commands 为薄门面 | 随职责迁移拆模块，不做纯文件搬家 |
-| ACP | Rust 透传 stdio，Bridge 关联请求 | `AcpClient` 在 Host 维护 pending/退出 | 请求归属、退出清算、入站解码、事件补放和 UI block 身份/生命周期已由 Host 持有；后续补齐活动流累计快照 |
+| ACP | Rust 透传 stdio，Bridge 关联请求 | `AcpClient` 在 Host 维护 pending/退出 | 请求归属、退出清算、入站解码、事件补放、UI block 身份/生命周期和活动文本快照已由 Host 持有 |
 | Client callback | Bridge 用当前页面 catalogue 猜 FS cwd；terminal 未宣告 | 未实现能力就不宣告，避免 Agent 挂起 | 文件与完整 terminal 生命周期均由 Host binding epoch 应答，能力已设为 true |
 | 会话 | Bridge + Store 共同裁决 | Host SessionManager + FSM + snapshots | 建立单一 SessionCoordinator |
 | 多会话 | 单进程共享、生命周期门控在前端 | 每应用会话进程、后台 busy 不被抢占 | 先迁权威，再用容量策略决定进程池 |
@@ -196,6 +197,6 @@ WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁
 
 - WebView 刷新或隐藏不再决定任务是否创建、执行或结算，也不会丢失仍在 Host 等待的权限/提问、正在进行的 OAuth 或 Agent terminal；会话关闭和 Host 退出会清理终端进程树。已创建会话但未结算的自动化在租约过期后会标记结果未知并禁止自动重放。完全退出 Grox 进程后调度仍会暂停，这是明确限制。
 - 迁移期间仍保留一个共享 CLI 进程；这是真实限制，不伪装成进程池。
-- `AcpBridge` 不再解析 JSON-RPC、x.ai wrapper、回复 Agent 反向 RPC或为实时内容生成 block id；它仍负责把 Host 的类型化 update/operation 转换为具体 UI 卡片。Host 尚未保存活动文本的累计内容快照，所以极窄的“事件游标已提交但应用 journal 尚未落盘”崩溃窗口仍需后续消除。
+- `AcpBridge` 不再解析 JSON-RPC、x.ai wrapper、回复 Agent 反向 RPC或为实时内容生成 block id；它仍负责把 Host 的类型化 update/operation/snapshot 转换为具体 UI 卡片。活动流的落盘窗口已由 Host 累计快照覆盖；已经关闭的历史块若要获得同等级保证，仍需让应用 journal 的持久化确认推进 Host durable frontier，而不是无限扩大内存快照。
 - Host 模块会增加，但每次拆分必须伴随职责迁移、测试或不变量，禁止只为了缩短文件。
-- v0.3.2 完成标准不是“看起来像 grok-app”，而是上述十二条不变量可由 Host 测试证明。
+- v0.3.2 完成标准不是“看起来像 grok-app”，而是上述十三条不变量可由 Host 测试证明。

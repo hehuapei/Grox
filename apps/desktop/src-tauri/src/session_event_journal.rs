@@ -20,6 +20,8 @@ const MAX_RETAINED_EVENTS: usize = 8_192;
 const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
 const MAX_REPLAY_EVENTS: usize = 1_000;
 const MAX_RETAINED_EVENT_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ACTIVE_BLOCK_TEXT_BYTES: usize = 1024 * 1024;
+const MAX_CONTENT_DEPTH: usize = 16;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -80,6 +82,18 @@ pub(crate) struct HostBlockOperation {
     started_at: Option<u64>,
 }
 
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct HostActiveBlockSnapshot {
+    generation: u64,
+    session_id: String,
+    block_type: &'static str,
+    block_id: String,
+    started_at: u64,
+    text: String,
+    text_complete: bool,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct HostSessionEventReplay {
@@ -90,6 +104,7 @@ pub(crate) struct HostSessionEventReplay {
     truncated: bool,
     reset: bool,
     has_more: bool,
+    active_blocks: Vec<HostActiveBlockSnapshot>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -101,6 +116,8 @@ pub(crate) struct HostSessionEventStatus {
     retained_events: usize,
     retained_bytes: usize,
     dropped_through: u64,
+    active_blocks: usize,
+    active_block_bytes: usize,
 }
 
 struct JournalState {
@@ -117,6 +134,8 @@ struct JournalState {
 struct OpenBlock {
     id: String,
     started_at: u64,
+    text: String,
+    text_complete: bool,
 }
 
 #[derive(Default)]
@@ -288,6 +307,11 @@ impl SessionEventJournal {
             );
         }
 
+        let active_blocks = if has_more {
+            Vec::new()
+        } else {
+            active_block_snapshots(&state)
+        };
         HostSessionEventReplay {
             stream_id: state.stream_id.clone(),
             events,
@@ -296,6 +320,7 @@ impl SessionEventJournal {
             truncated,
             reset,
             has_more,
+            active_blocks,
         }
     }
 
@@ -313,6 +338,8 @@ impl SessionEventJournal {
             retained_events: state.events.len(),
             retained_bytes: state.retained_bytes,
             dropped_through: state.dropped_through,
+            active_blocks: active_block_count(&state),
+            active_block_bytes: active_block_bytes(&state),
         }
     }
 
@@ -346,6 +373,66 @@ fn retain_event(state: &mut JournalState, event: HostSessionEvent) -> HostSessio
         state.dropped_through = state.dropped_through.max(dropped.sequence);
     }
     event
+}
+
+fn active_block_snapshots(state: &JournalState) -> Vec<HostActiveBlockSnapshot> {
+    let mut snapshots = Vec::new();
+    for ((generation, session_id), projection) in &state.projections {
+        if *generation != state.projection_generation {
+            continue;
+        }
+        for (block_type, block) in [
+            ("user", projection.user.as_ref()),
+            ("thinking", projection.thinking.as_ref()),
+            ("assistant", projection.assistant.as_ref()),
+        ] {
+            let Some(block) = block else {
+                continue;
+            };
+            snapshots.push(HostActiveBlockSnapshot {
+                generation: *generation,
+                session_id: session_id.clone(),
+                block_type,
+                block_id: block.id.clone(),
+                started_at: block.started_at,
+                text: block.text.clone(),
+                text_complete: block.text_complete,
+            });
+        }
+    }
+    snapshots
+}
+
+fn active_block_count(state: &JournalState) -> usize {
+    state
+        .projections
+        .iter()
+        .filter(|((generation, _), _)| *generation == state.projection_generation)
+        .map(|(_, projection)| {
+            usize::from(projection.user.is_some())
+                + usize::from(projection.thinking.is_some())
+                + usize::from(projection.assistant.is_some())
+        })
+        .sum()
+}
+
+fn active_block_bytes(state: &JournalState) -> usize {
+    state
+        .projections
+        .iter()
+        .filter(|((generation, _), _)| *generation == state.projection_generation)
+        .map(|(_, projection)| {
+            projection.user.as_ref().map_or(0, |block| block.text.len())
+                + projection
+                    .thinking
+                    .as_ref()
+                    .map_or(0, |block| block.text.len())
+                + projection
+                    .assistant
+                    .as_ref()
+                    .map_or(0, |block| block.text.len())
+        })
+        .sum()
 }
 
 fn lifecycle_event(
@@ -420,21 +507,21 @@ fn project_block_identity(
                 .and_then(Value::as_object)
                 .and_then(|meta| meta.get("promptIndex"))
                 .and_then(Value::as_u64);
-            let combined_count = update
+            let combined = update
                 .get("content")
                 .and_then(Value::as_object)
                 .and_then(|content| content.get("_meta"))
                 .and_then(Value::as_object)
                 .and_then(|meta| meta.get("combinedDisplayTexts"))
                 .and_then(Value::as_array)
-                .map(|items| items.iter().filter(|item| item.is_string()).count())
-                .filter(|count| *count >= 2)
-                .unwrap_or(0);
-            if combined_count > 0 {
+                .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+                .filter(|items| items.len() >= 2);
+            if let Some(combined) = combined {
                 projection.user = None;
-                for index in 0..combined_count {
-                    let block =
+                for (index, text) in combined.into_iter().enumerate() {
+                    let mut block =
                         new_block(&stream_id, sequence, &format!("user-{index}"), received_at);
+                    append_block_text(&mut block, text, true);
                     block_ops.push(open_operation("user", &block, None));
                     projection.user = Some(block);
                 }
@@ -454,6 +541,10 @@ fn project_block_identity(
             } else if let Some(block) = &projection.user {
                 block_ops.push(update_operation("user", block, None));
             }
+            let (delta, complete) = content_text(update.get("content").unwrap_or(&Value::Null));
+            if let Some(block) = projection.user.as_mut() {
+                append_block_text(block, &delta, complete);
+            }
             if prompt_index.is_some() {
                 projection.user_prompt_index = prompt_index;
             }
@@ -461,24 +552,30 @@ fn project_block_identity(
         "agent_message_chunk" => {
             close_block(&mut projection.user, "user", block_ops);
             close_block(&mut projection.thinking, "thinking", block_ops);
+            let (delta, complete) = content_text(update.get("content").unwrap_or(&Value::Null));
             project_stream_block(
                 &stream_id,
                 sequence,
                 received_at,
                 "assistant",
                 &mut projection.assistant,
+                &delta,
+                complete,
                 block_ops,
             );
         }
         "agent_thought_chunk" => {
             close_block(&mut projection.user, "user", block_ops);
             close_block(&mut projection.assistant, "assistant", block_ops);
+            let (delta, complete) = content_text(update.get("content").unwrap_or(&Value::Null));
             project_stream_block(
                 &stream_id,
                 sequence,
                 received_at,
                 "thinking",
                 &mut projection.thinking,
+                &delta,
+                complete,
                 block_ops,
             );
         }
@@ -546,6 +643,8 @@ fn project_stream_block(
     received_at: u64,
     block_type: &'static str,
     slot: &mut Option<OpenBlock>,
+    delta: &str,
+    delta_complete: bool,
     block_ops: &mut Vec<HostBlockOperation>,
 ) {
     if let Some(block) = slot {
@@ -554,6 +653,9 @@ fn project_stream_block(
         let block = new_block(stream_id, sequence, block_type, received_at);
         block_ops.push(open_operation(block_type, &block, None));
         *slot = Some(block);
+    }
+    if let Some(block) = slot.as_mut() {
+        append_block_text(block, delta, delta_complete);
     }
 }
 
@@ -585,7 +687,73 @@ fn new_block(stream_id: &str, sequence: u64, suffix: &str, started_at: u64) -> O
     OpenBlock {
         id: format!("host-block-{stream_id}-{sequence}-{suffix}"),
         started_at,
+        text: String::new(),
+        text_complete: true,
     }
+}
+
+fn append_block_text(block: &mut OpenBlock, delta: &str, delta_complete: bool) {
+    let remaining = MAX_ACTIVE_BLOCK_TEXT_BYTES.saturating_sub(block.text.len());
+    let mut end = remaining.min(delta.len());
+    while end > 0 && !delta.is_char_boundary(end) {
+        end -= 1;
+    }
+    block.text.push_str(&delta[..end]);
+    if end < delta.len() || !delta_complete {
+        block.text_complete = false;
+    }
+}
+
+fn content_text(value: &Value) -> (String, bool) {
+    fn append_str(text: &str, output: &mut String, complete: &mut bool) {
+        let remaining = MAX_ACTIVE_BLOCK_TEXT_BYTES.saturating_sub(output.len());
+        let mut end = remaining.min(text.len());
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        output.push_str(&text[..end]);
+        if end < text.len() {
+            *complete = false;
+        }
+    }
+
+    fn append(value: &Value, depth: usize, output: &mut String, complete: &mut bool) {
+        if depth > MAX_CONTENT_DEPTH || output.len() >= MAX_ACTIVE_BLOCK_TEXT_BYTES {
+            *complete = false;
+            return;
+        }
+        match value {
+            Value::String(text) => append_str(text, output, complete),
+            Value::Array(items) => {
+                for (index, item) in items.iter().enumerate() {
+                    append(item, depth + 1, output, complete);
+                    if output.len() >= MAX_ACTIVE_BLOCK_TEXT_BYTES {
+                        if index + 1 < items.len() {
+                            *complete = false;
+                        }
+                        break;
+                    }
+                }
+            }
+            Value::Object(object) => {
+                if let Some(text) = object.get("text").and_then(Value::as_str) {
+                    if depth + 1 > MAX_CONTENT_DEPTH {
+                        *complete = false;
+                    } else {
+                        append_str(text, output, complete);
+                    }
+                } else if let Some(content) = object.get("content") {
+                    append(content, depth + 1, output, complete);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let mut output = String::new();
+    let mut complete = true;
+    append(value, 0, &mut output, &mut complete);
+    (output, complete)
 }
 
 fn open_operation(
@@ -910,6 +1078,8 @@ mod tests {
         assert_eq!(status.retained_events, 1);
         assert!(status.retained_bytes > 0);
         assert_eq!(status.dropped_through, 0);
+        assert_eq!(status.active_blocks, 0);
+        assert_eq!(status.active_block_bytes, 0);
     }
 
     #[test]
@@ -1032,5 +1202,99 @@ mod tests {
             block_ops(&continued)[0].block_id,
             block_ops(&current)[0].block_id
         );
+    }
+
+    #[test]
+    fn replay_includes_complete_active_text_snapshot_after_cursor() {
+        let journal = SessionEventJournal::default();
+        let first = journal.append(
+            8,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"hello "}}}}"#.into(),
+        );
+        let second = journal.append(
+            8,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":[{"type":"text","text":"world"}]}}}"#.into(),
+        );
+
+        let replay = journal.replay(Some(&second.stream_id), second.sequence, None);
+        assert!(replay.events.is_empty());
+        assert_eq!(replay.active_blocks.len(), 1);
+        let active = &replay.active_blocks[0];
+        assert_eq!(active.session_id, "s1");
+        assert_eq!(active.block_type, "assistant");
+        assert_eq!(active.block_id, block_ops(&first)[0].block_id);
+        assert_eq!(active.text, "hello world");
+        assert!(active.text_complete);
+        let status = journal.status();
+        assert_eq!(status.active_blocks, 1);
+        assert_eq!(status.active_block_bytes, "hello world".len());
+
+        journal.finish_turn(8, "s1");
+        assert!(journal
+            .replay(Some(&second.stream_id), second.sequence, None)
+            .active_blocks
+            .is_empty());
+        assert_eq!(journal.status().active_block_bytes, 0);
+    }
+
+    #[test]
+    fn replay_only_returns_active_snapshot_on_final_page() {
+        let journal = SessionEventJournal::default();
+        let first = journal.append(
+            9,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"first"}}}}"#.into(),
+        );
+        journal.append(
+            9,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"available_commands_update","availableCommands":[]}}}"#.into(),
+        );
+
+        let first_page = journal.replay(Some(&first.stream_id), 0, Some(1));
+        assert!(first_page.has_more);
+        assert!(first_page.active_blocks.is_empty());
+
+        let final_page = journal.replay(
+            Some(&first.stream_id),
+            first_page.events[0].sequence,
+            Some(1),
+        );
+        assert!(!final_page.has_more);
+        assert_eq!(final_page.active_blocks.len(), 1);
+        assert_eq!(final_page.active_blocks[0].text, "first");
+    }
+
+    #[test]
+    fn active_snapshots_are_isolated_by_session() {
+        let journal = SessionEventJournal::default();
+        let first = journal.append(
+            10,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"alpha"}}}}"#.into(),
+        );
+        journal.append(
+            10,
+            r#"{"method":"session/update","params":{"sessionId":"s2","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"beta"}}}}"#.into(),
+        );
+
+        let mut snapshots = journal
+            .replay(Some(&first.stream_id), u64::MAX, None)
+            .active_blocks;
+        snapshots.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].session_id, "s1");
+        assert_eq!(snapshots[0].block_type, "assistant");
+        assert_eq!(snapshots[0].text, "alpha");
+        assert_eq!(snapshots[1].session_id, "s2");
+        assert_eq!(snapshots[1].block_type, "thinking");
+        assert_eq!(snapshots[1].text, "beta");
+    }
+
+    #[test]
+    fn active_text_snapshot_is_bounded_without_splitting_utf8() {
+        let mut block = new_block("stream", 1, "assistant", 1);
+        let text = "好".repeat(MAX_ACTIVE_BLOCK_TEXT_BYTES);
+        append_block_text(&mut block, &text, true);
+        assert!(block.text.len() <= MAX_ACTIVE_BLOCK_TEXT_BYTES);
+        assert!(block.text.is_char_boundary(block.text.len()));
+        assert!(!block.text_complete);
     }
 }

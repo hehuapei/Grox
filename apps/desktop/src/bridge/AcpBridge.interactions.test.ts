@@ -34,11 +34,22 @@ interface HostBlockOperation {
   startedAt?: number;
 }
 
+interface HostActiveBlockSnapshot {
+  generation: number;
+  sessionId: string;
+  blockType: "user" | "assistant" | "thinking";
+  blockId: string;
+  startedAt: number;
+  text: string;
+  textComplete: boolean;
+}
+
 interface InteractionInternals {
   projectHostInteraction(interaction: HostInteraction): void;
   reconcileHostInteractions(interactions: HostInteraction[]): void;
   projectAutomationSessionStarted(started: AutomationSessionStarted): void;
   projectHostSessionEvent(event: HostSessionEvent): void;
+  projectHostActiveBlockSnapshots(snapshots: HostActiveBlockSnapshot[]): void;
 }
 
 function bridgeHarness() {
@@ -273,6 +284,64 @@ describe("AcpBridge Host interaction projection", () => {
     expect(events.filter((entry) => entry.type === "block_patch").map((entry) =>
       entry.type === "block_patch" ? entry.blockId : ""
     )).toEqual(["host-block-assistant-1", "host-block-thinking-2"]);
+  });
+
+  it("restores complete active text before later live deltas", () => {
+    const { events, internal } = bridgeHarness();
+    internal.projectHostActiveBlockSnapshots([{
+      generation: 7,
+      sessionId: "session-a",
+      blockType: "assistant",
+      blockId: "host-block-active-1",
+      startedAt: 42,
+      text: "complete so far",
+      textComplete: true,
+    }]);
+
+    expect(events).toEqual([
+      {
+        type: "block_add",
+        sessionId: "session-a",
+        block: {
+          type: "assistant",
+          id: "host-block-active-1",
+          text: "complete so far",
+          ts: 42,
+          streaming: true,
+        },
+      },
+      {
+        type: "block_patch",
+        sessionId: "session-a",
+        blockId: "host-block-active-1",
+        patch: { type: "assistant", text: "complete so far", streaming: true },
+      },
+    ]);
+  });
+
+  it("never overwrites a possibly fuller local block with a truncated Host snapshot", () => {
+    const { events, internal } = bridgeHarness();
+    internal.projectHostActiveBlockSnapshots([{
+      generation: 7,
+      sessionId: "session-a",
+      blockType: "thinking",
+      blockId: "host-block-active-2",
+      startedAt: 42,
+      text: "bounded prefix",
+      textComplete: false,
+    }]);
+
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      type: "block_add",
+      sessionId: "session-a",
+      block: {
+        type: "thinking",
+        id: "host-block-active-2",
+        text: "bounded prefix\n… [Grox 活动流快照已截断]",
+        live: true,
+      },
+    });
   });
 
   it("surfaces a replay gap instead of silently accepting a sequence jump", () => {
