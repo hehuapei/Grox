@@ -493,7 +493,7 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
     >
       <div className="flex items-center gap-2">
         <SessionStatusLight status={status} completionUnread={completionUnread} />
-        <span className={status === "idle" || status === "failed" ? "opacity-55" : ""}><BlackHole size={11} spin={status === "running" ? true : status === "idle" || status === "failed" || status === "disconnected" ? false : "slow"} /></span>
+        <span className={status === "idle" || status === "failed" || status === "cancelled" ? "opacity-55" : ""}><BlackHole size={11} spin={status === "running" ? true : status === "idle" || status === "failed" || status === "cancelled" || status === "disconnected" ? false : "slow"} /></span>
         {editing ? (
           <input autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={commit} onKeyDown={(event) => event.key === "Enter" && commit()} onClick={(event) => event.stopPropagation()} className="min-w-0 flex-1 border border-line3 bg-void px-1 text-[11px] text-fg outline-none" />
         ) : (
@@ -615,6 +615,8 @@ function SessionStatusLight({ status, completionUnread }: { status: SessionStatu
       ? { tone: "bg-status-blue animate-pulse-dot", label: language === "zh-CN" ? "正在恢复" : "Restoring" }
       : status === "stopping"
         ? { tone: "bg-gold animate-pulse-dot", label: language === "zh-CN" ? "正在停止" : "Stopping" }
+        : status === "cancelled"
+          ? { tone: "bg-gold", label: language === "zh-CN" ? "已停止" : "Stopped" }
         : status === "disconnected"
           ? { tone: "bg-red", label: language === "zh-CN" ? "连接已中断" : "Disconnected" }
     : status === "failed"

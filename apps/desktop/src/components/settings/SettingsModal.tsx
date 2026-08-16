@@ -49,6 +49,7 @@ export function SettingsModal() {
   const setOpen = useDesktop((state) => state.setSettingsOpen);
   const [section, setSection] = useState<SettingsSection>(() => settingsSectionFromHash(window.location.hash) ?? "general");
   const [query, setQuery] = useState("");
+  const wasOpen = useRef(false);
   const zh = language === "zh-CN";
   const catalog = useMemo(() => getSettingsCatalog(zh), [zh]);
   const results = useMemo(() => searchSettings(catalog, query), [catalog, query]);
@@ -80,8 +81,15 @@ export function SettingsModal() {
 
   useEffect(() => {
     if (!open) return;
+    wasOpen.current = true;
     window.history.replaceState(null, "", settingsHash(section));
   }, [open, section]);
+
+  useEffect(() => {
+    if (open || !wasOpen.current || !settingsSectionFromHash(window.location.hash)) return;
+    wasOpen.current = false;
+    window.history.replaceState(null, "", "#/");
+  }, [open]);
 
   if (!open) return null;
 
@@ -747,7 +755,7 @@ function ConfigDocumentsPanel() {
     return () => { live = false; window.clearInterval(timer); };
   }, [cwd, dirty]);
   const document = useMemo(() => documents.find((item) => item.id === active), [documents, active]);
-  const canApply = !activeId || !activeStatus || activeStatus === "idle" || activeStatus === "failed";
+  const canApply = !activeId || !activeStatus || activeStatus === "idle" || activeStatus === "failed" || activeStatus === "cancelled";
   const save = async () => {
     if (!document || !canApply || saving) return;
     setSaving(true);

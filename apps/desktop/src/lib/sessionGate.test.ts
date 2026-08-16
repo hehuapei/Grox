@@ -69,6 +69,10 @@ describe("reconcileIncomingStatus", () => {
     expect(reconcileIncomingStatus(blocks, "awaiting_permission", "idle")).toBe("idle");
   });
 
+  it("keeps an explicit user stop visible when a stale idle event follows", () => {
+    expect(reconcileIncomingStatus([], "cancelled", "idle")).toBe("cancelled");
+  });
+
   it("passes through running when no gates are open", () => {
     const blocks = [perm("p1", "allow_once")];
     expect(reconcileIncomingStatus(blocks, "awaiting_permission", "running")).toBe("running");

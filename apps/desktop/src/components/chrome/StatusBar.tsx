@@ -33,6 +33,8 @@ export function StatusBar() {
             ? { zh: "处理中", en: "Working", tone: "text-acc", spin: true as const }
             : status === "stopping"
               ? { zh: "正在停止", en: "Stopping", tone: "text-gold", spin: "slow" as const }
+              : status === "cancelled"
+                ? { zh: "已停止", en: "Stopped", tone: "text-gold", spin: false as const }
               : status === "disconnected"
                 ? { zh: "连接已中断", en: "Disconnected", tone: "text-red", spin: false as const }
                 : status === "failed"

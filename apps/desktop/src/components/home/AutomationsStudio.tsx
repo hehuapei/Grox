@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useDesktop } from "../../state/store";
 import { nextAutomationRun, type AutomationFrequency } from "../../lib/automations";
 import type { AutomationRunOutcome } from "../../lib/automationRunHistory";
@@ -8,6 +8,41 @@ import { useI18n } from "../../lib/i18n";
 
 function id() {
   return crypto.randomUUID?.() ?? `automation-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+}
+
+const AUTOMATION_DRAFT_PREFIX = "grox.automationDraft.v1";
+
+interface AutomationDraft {
+  title: string;
+  prompt: string;
+  frequency: AutomationFrequency;
+  time: string;
+  weekday: number;
+}
+
+function automationDraftKey(workspace: string) {
+  return `${AUTOMATION_DRAFT_PREFIX}:${workspace}`;
+}
+
+function loadAutomationDraft(workspace: string): AutomationDraft | null {
+  try {
+    const raw = localStorage.getItem(automationDraftKey(workspace));
+    if (!raw) return null;
+    const value = JSON.parse(raw) as Partial<AutomationDraft>;
+    if (typeof value.title !== "string" || typeof value.prompt !== "string") return null;
+    const frequency = ["once", "daily", "weekdays", "weekly"].includes(value.frequency ?? "")
+      ? value.frequency as AutomationFrequency
+      : "daily";
+    return {
+      title: value.title.slice(0, 500),
+      prompt: value.prompt.slice(0, 20_000),
+      frequency,
+      time: typeof value.time === "string" && /^\d{2}:\d{2}$/.test(value.time) ? value.time : "09:00",
+      weekday: Number.isInteger(value.weekday) ? Math.min(6, Math.max(0, value.weekday!)) : new Date().getDay(),
+    };
+  } catch {
+    return null;
+  }
 }
 
 export function AutomationsStudio() {
@@ -28,14 +63,25 @@ export function AutomationsStudio() {
   const run = useDesktop((state) => state.runAutomation);
   const clearRunHistory = useDesktop((state) => state.clearAutomationRunHistory);
   const openSession = useDesktop((state) => state.openSession);
-  const [title, setTitle] = useState("");
-  const [prompt, setPrompt] = useState("");
-  const [frequency, setFrequency] = useState<AutomationFrequency>("daily");
-  const [time, setTime] = useState("09:00");
-  const [weekday, setWeekday] = useState(new Date().getDay());
+  const initialDraft = useRef(loadAutomationDraft(workspace)).current;
+  const [title, setTitle] = useState(initialDraft?.title ?? "");
+  const [prompt, setPrompt] = useState(initialDraft?.prompt ?? "");
+  const [frequency, setFrequency] = useState<AutomationFrequency>(initialDraft?.frequency ?? "daily");
+  const [time, setTime] = useState(initialDraft?.time ?? "09:00");
+  const [weekday, setWeekday] = useState(initialDraft?.weekday ?? new Date().getDay());
   const [deleteId, setDeleteId] = useState<string | null>(null);
   const [section, setSection] = useState<"tasks" | "runs">("tasks");
   const [clearHistoryConfirm, setClearHistoryConfirm] = useState(false);
+
+  useEffect(() => {
+    localStorage.setItem(automationDraftKey(workspace), JSON.stringify({
+      title,
+      prompt,
+      frequency,
+      time,
+      weekday,
+    } satisfies AutomationDraft));
+  }, [frequency, prompt, time, title, weekday, workspace]);
 
   const sorted = useMemo(() => [...automations].sort((a, b) => a.nextRunAt - b.nextRunAt), [automations]);
   const create = () => {

@@ -1,6 +1,6 @@
 /* Home — a calm starting surface: choose a medium, describe the work, begin. */
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useDesktop } from "../../state/store";
 import type { PromptAttachment } from "../../bridge/types";
 import { fmtRelTime, fmtTokens } from "../../lib/format";
@@ -15,6 +15,8 @@ import { useI18n } from "../../lib/i18n";
 import { MediaStudio } from "./MediaStudio";
 import { AutomationsStudio } from "./AutomationsStudio";
 import { useImeGuard } from "../../lib/ime";
+import { clearDraftBuffer, loadDraftBuffer, saveDraftBuffer } from "../../lib/draftPersistence";
+import { cleanApiError } from "../../lib/runtimeNotice";
 
 export function Home() {
   const { language, t } = useI18n();
@@ -26,6 +28,8 @@ export function Home() {
   const [slashIndex, setSlashIndex] = useState(0);
   const fileRef = useRef<HTMLInputElement>(null);
   const promptRef = useRef<HTMLTextAreaElement>(null);
+  const draftScopeRef = useRef("");
+  const draftLoadedRef = useRef(false);
   const { onCompositionStart, onCompositionEnd, isImeBlocking } = useImeGuard();
   const sessionIndex = useDesktop((s) => s.sessionIndex);
   const sessions = useDesktop((s) => s.sessions);
@@ -47,7 +51,33 @@ export function Home() {
   const setMode = useDesktop((s) => s.setMode);
   const setSettingsOpen = useDesktop((s) => s.setSettingsOpen);
 
-  const recent = [...sessionIndex].sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 4);
+  const recent = sessionIndex.filter((session) => !session.archived).sort((a, b) => b.updatedAt - a.updatedAt).slice(0, 4);
+
+  useEffect(() => {
+    let disposed = false;
+    draftScopeRef.current = workspace;
+    draftLoadedRef.current = false;
+    setQ("");
+    setAttachments([]);
+    void loadDraftBuffer(workspace, "home")
+      .then((draft) => {
+        if (disposed || draftScopeRef.current !== workspace) return;
+        setQ(draft?.text ?? "");
+        setAttachments((draft?.attachments ?? []).map((item) => ({ ...item })));
+        draftLoadedRef.current = true;
+      })
+      .catch((cause) => {
+        if (disposed || draftScopeRef.current !== workspace) return;
+        draftLoadedRef.current = true;
+        setAttachmentError(cleanApiError(cause));
+      });
+    return () => { disposed = true; };
+  }, [workspace]);
+
+  useEffect(() => {
+    if (!draftLoadedRef.current || draftScopeRef.current !== workspace) return;
+    void saveDraftBuffer(workspace, q, attachments, "home").catch((cause) => setAttachmentError(cleanApiError(cause)));
+  }, [attachments, q, workspace]);
 
   const slashCommands = [
     { id: "/plan", hint: language === "zh-CN" ? "计划模式 — 操作前先规划" : "Plan mode — think before acting" },
@@ -97,6 +127,7 @@ export function Home() {
       const turnAttachments = await attachExplicitPromptImages(workspace, prompt, attachments);
       if (modeCommand) setMode(modeCommand[1].toLowerCase() as "plan" | "agent" | "ask");
       await newSession({ text: prompt, attachments: turnAttachments });
+      await clearDraftBuffer(workspace, "home");
       setQ("");
       setAttachments([]);
     } catch (cause) {
@@ -137,8 +168,8 @@ export function Home() {
         <WorkspaceTabs mode={workspaceMode} onChange={setWorkspaceMode} />
         <StageTransition stageKey={workspaceMode} variant="panel" className="relative z-[1]">
           {workspaceMode === "automations"
-            ? <AutomationsStudio />
-            : <MediaStudio mode={workspaceMode} />}
+            ? <AutomationsStudio key={`automations:${workspace}`} />
+            : <MediaStudio key={`${workspaceMode}:${workspace}`} mode={workspaceMode} />}
         </StageTransition>
       </div>
     );

@@ -61,6 +61,37 @@ interface MediaDiagnostic {
 }
 
 const ACTIVE_MEDIA_PHASES = new Set<MediaJobPhase>(["queued", "running", "cancelling"]);
+const MEDIA_DRAFT_PREFIX = "grox.mediaDraft.v1";
+
+interface MediaDraft {
+  prompt: string;
+  aspect: string;
+  count: number;
+  duration: number;
+  resolution: string;
+}
+
+function mediaDraftKey(mode: MediaMode, workspace: string) {
+  return `${MEDIA_DRAFT_PREFIX}:${mode}:${workspace}`;
+}
+
+function loadMediaDraft(mode: MediaMode, workspace: string): MediaDraft | null {
+  try {
+    const raw = localStorage.getItem(mediaDraftKey(mode, workspace));
+    if (!raw) return null;
+    const value = JSON.parse(raw) as Partial<MediaDraft>;
+    if (typeof value.prompt !== "string" || typeof value.aspect !== "string") return null;
+    return {
+      prompt: value.prompt.slice(0, 4000),
+      aspect: value.aspect,
+      count: Number(value.count) || 1,
+      duration: Number(value.duration) || 6,
+      resolution: typeof value.resolution === "string" ? value.resolution : "480p",
+    };
+  } catch {
+    return null;
+  }
+}
 
 function mediaErrorText(cause: unknown, domain: "operation" | "environment", code: string) {
   return formatGroxError(toGroxError(cause, { domain, code }));
@@ -70,17 +101,18 @@ export function MediaStudio({ mode }: { mode: MediaMode }) {
   const { language } = useI18n();
   const zh = language === "zh-CN";
   const workspace = useDesktop((state) => state.workspace);
+  const initialDraft = useRef(loadMediaDraft(mode, workspace)).current;
   const fileRef = useRef<HTMLInputElement>(null);
   const referenceLeaseRef = useRef<{ id: string; cwd: string } | null>(null);
   const referenceSelectionRef = useRef(0);
   const mediaScopeRef = useRef("");
   mediaScopeRef.current = `${mode}\0${workspace}`;
-  const [prompt, setPrompt] = useState("");
-  const [aspect, setAspect] = useState(mode === "image" ? "1:1" : "16:9");
+  const [prompt, setPrompt] = useState(initialDraft?.prompt ?? "");
+  const [aspect, setAspect] = useState(initialDraft?.aspect ?? (mode === "image" ? "1:1" : "16:9"));
   // 新工作区默认只生成一张，避免用户首次点击就无意消耗双份额度。
-  const [count, setCount] = useState(1);
-  const [duration, setDuration] = useState(6);
-  const [resolution, setResolution] = useState("480p");
+  const [count, setCount] = useState(initialDraft?.count ?? 1);
+  const [duration, setDuration] = useState(initialDraft?.duration ?? 6);
+  const [resolution, setResolution] = useState(initialDraft?.resolution ?? "480p");
   const [jobs, setJobs] = useState<MediaJobSnapshot[]>([]);
   const [selectedJobId, setSelectedJobId] = useState<string | null>(null);
   const [capabilities, setCapabilities] = useState<MediaGenerationCapabilities | null>(null);
@@ -95,6 +127,16 @@ export function MediaStudio({ mode }: { mode: MediaMode }) {
   const busy = activeJob !== null;
   const selected = selectedIndex === null ? undefined : results[selectedIndex];
   const failureText = error || (job?.error ? `${errorDomainLabel(job.error.domain)} · ${job.error.message}` : "");
+
+  useEffect(() => {
+    localStorage.setItem(mediaDraftKey(mode, workspace), JSON.stringify({
+      prompt,
+      aspect,
+      count,
+      duration,
+      resolution,
+    } satisfies MediaDraft));
+  }, [aspect, count, duration, mode, prompt, resolution, workspace]);
 
   useEffect(() => {
     let disposed = false;
@@ -125,7 +167,7 @@ export function MediaStudio({ mode }: { mode: MediaMode }) {
           const latest = history[0];
           setJobs(history);
           setCapabilities(contract);
-          if (latest) {
+          if (latest && !loadMediaDraft(mode, workspace)?.prompt.trim()) {
             setPrompt(latest.prompt);
             setAspect(latest.aspect);
             setCount(latest.count);

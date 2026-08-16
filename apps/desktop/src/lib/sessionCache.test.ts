@@ -33,6 +33,7 @@ describe("compactSession", () => {
     const result = compactSession(session([
       { type: "user", id: "internal", text: "<user_info>internal</user_info>", ts: 1 },
       { type: "user", id: "wrapped", text: "<user_query>duplicate</user_query>", ts: 2 },
+      { type: "user", id: "interrupted", text: "The user interrupted the previous turn:\n<user_query>duplicate</user_query>\nMake sure to complete any unfinished tasks from previous turns.", ts: 2 },
       { type: "user", id: "real", text: "真实请求", ts: 3 },
     ]));
     expect(result.blocks).toHaveLength(1);

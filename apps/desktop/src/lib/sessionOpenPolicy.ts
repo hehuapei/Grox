@@ -62,7 +62,7 @@ export function sanitizeSessionForOpen(_session: {
 
 /** 进程已重启时，上一进程的瞬时状态不可能仍然成立。 */
 export function sanitizeCatalogStatusOnColdStart(status?: SessionStatus): SessionStatus | undefined {
-  if (!status || status === "idle" || status === "failed") return status;
+  if (!status || status === "idle" || status === "failed" || status === "cancelled") return status;
   return "disconnected";
 }
 
@@ -77,6 +77,6 @@ export function shouldCloseDetachedSession(args: {
     && !args.currentId.startsWith("pending-")
     && !args.currentId.startsWith("draft-")
     && args.currentId !== args.nextId
-    && (args.status === "idle" || args.status === "failed"),
+    && (args.status === "idle" || args.status === "failed" || args.status === "cancelled"),
   );
 }

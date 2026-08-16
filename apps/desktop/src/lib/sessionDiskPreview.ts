@@ -1,6 +1,6 @@
 import type { Session, SessionBlock, SessionMeta, ToolStatus } from "../bridge/types";
 import { mapToolKind } from "./toolKind";
-import { displayReplayUserPrompt } from "./replayUserPrompt";
+import { displayDiskUserPrompt } from "./replayUserPrompt";
 
 export type SessionDiskPreviewEntry =
   | { type: "message"; role: "user" | "assistant"; text: string }
@@ -33,7 +33,7 @@ export function sessionFromDiskPreview(meta: SessionMeta, preview: SessionDiskPr
   const entries = preview.entries.flatMap((entry, index): SessionBlock[] => {
     const ts = meta.createdAt + index;
     if (entry.type === "message") {
-      const text = entry.role === "user" ? displayReplayUserPrompt(entry.text) : entry.text;
+      const text = entry.role === "user" ? displayDiskUserPrompt(entry.text) : entry.text;
       if (!text) return [];
       return [{
         type: entry.role,

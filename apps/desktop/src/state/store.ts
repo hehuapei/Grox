@@ -97,6 +97,7 @@ import {
 } from "../lib/promptQueuePersistence";
 import type { PersistedQueuedPrompt } from "../lib/promptQueuePersistence";
 import { formatGroxError, runtimeNoticeFromError, toGroxError } from "../lib/errorModel";
+import { cleanApiError } from "../lib/runtimeNotice";
 import type { ErrorFallback } from "../lib/errorModel";
 import { commitComposerSubmission } from "../lib/composerSubmission";
 import type { ComposerSubmission } from "../lib/composerSubmission";
@@ -390,6 +391,8 @@ interface DesktopState {
 
 const uid = () => crypto.randomUUID();
 const suppressedQueueDrain = new Set<string>();
+/** 用户主动停止的回合；下一次 Host idle 必须保留“已停止”而不是伪装完成。 */
+const userStoppedSessions = new Set<string>();
 /** Prompt RPC already returned; late thinking/tools are a continuation, not a new turn. */
 const promptReturnedSessions = new Set<string>();
 const continuationSettleTimers = new Map<string, number>();
@@ -784,6 +787,7 @@ function isPermissionMode(value: unknown): value is PermissionMode {
 }
 
 export const useDesktop = create<DesktopState>((set, get) => {
+  const errorText = (cause: unknown) => cleanApiError(cause);
   const formattedError = (cause: unknown, fallback: ErrorFallback) =>
     formatGroxError(toGroxError(cause, fallback));
 
@@ -888,8 +892,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
   };
 
   const parkInterruptedSession = (sessionId: string) => {
-    suppressedQueueDrain.add(sessionId);
     const state = get();
+    if ((state.promptQueues[sessionId] ?? []).length === 0) {
+      suppressedQueueDrain.delete(sessionId);
+      set({ queueDrainParked: nextQueueDrainParked(state.queueDrainParked, sessionId, false) });
+      return;
+    }
+    suppressedQueueDrain.add(sessionId);
     set({ queueDrainParked: nextQueueDrainParked(state.queueDrainParked, sessionId, true) });
     publishRuntimeError(new Error("应用在回合完成前退出"), {
       domain: "environment",
@@ -1733,10 +1742,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
       case "status":
         if (e.status === "idle") promptReturnedSessions.add(e.sessionId);
         if (e.status === "running") markPromptInFlight(e.sessionId);
+        const stoppedByUser = e.status === "idle" && userStoppedSessions.delete(e.sessionId);
         withSession(
           e.sessionId,
           (s) => {
-            const status = reconcileIncomingStatus(s.blocks, s.status, e.status);
+            const status = stoppedByUser ? "cancelled" : reconcileIncomingStatus(s.blocks, s.status, e.status);
             return {
               ...s,
               status,
@@ -1780,19 +1790,20 @@ export const useDesktop = create<DesktopState>((set, get) => {
           }
         }
         if (e.error.holdQueue) {
-          suppressedQueueDrain.add(e.sessionId);
           const state = get();
           const recoverable = (state.promptQueues[e.sessionId] ?? []).map((item) => ({
             ...item,
             state: item.state ?? ("queued" as const),
           }));
+          if (recoverable.length > 0) suppressedQueueDrain.add(e.sessionId);
+          else suppressedQueueDrain.delete(e.sessionId);
           const promptQueues = {
             ...state.promptQueues,
             [e.sessionId]: rehomeHeldQueueForRecovery(recoverable),
           };
           set({
             promptQueues,
-            queueDrainParked: nextQueueDrainParked(state.queueDrainParked, e.sessionId, true),
+            queueDrainParked: nextQueueDrainParked(state.queueDrainParked, e.sessionId, recoverable.length > 0),
           });
           savePromptQueues(promptQueues);
         }
@@ -1850,7 +1861,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         if (generation !== providerRestoreGeneration) return;
         set({
           restoringSessionId: null,
-          startupError: `模型服务已切换，但当前会话同步失败：${error instanceof Error ? error.message : String(error)}`,
+          startupError: `模型服务已切换，但当前会话同步失败：${errorText(error)}`,
         });
         resumePromptQueues();
       },
@@ -2126,7 +2137,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           } catch (error) {
             set({
               ready: true,
-              startupError: error instanceof Error ? error.message : String(error),
+              startupError: errorText(error),
             });
           }
         })();
@@ -2205,9 +2216,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (!existing && meta) {
         const shellStatus = meta.lastStatus && !isSessionTerminal(meta.lastStatus)
           ? "disconnected"
-          : meta.lastStatus === "failed"
-            ? "failed"
-            : "idle";
+          : meta.lastStatus ?? "idle";
         existing = sessionShellFromMeta(meta, shellStatus);
         set({
           activeId: id,
@@ -2280,7 +2289,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (needsHydrate) {
         if (forceRescan) upgradeForceRescanned.add(id);
         void bridge.loadSession(id, { background: true }).catch((error) => {
-          const message = error instanceof Error ? error.message : String(error);
+          const message = errorText(error);
           void (async () => {
             const hydration = openMeta ? await hydrateSessionOfflineDetailed(id, openMeta) : null;
             if (hydration?.journalError) publishJournalReadError(id, hydration.journalError);
@@ -2504,7 +2513,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           sessionComposers: restored.sessionComposers,
           activeId: restored.activeId,
           view: restored.view,
-          startupError: error instanceof Error ? error.message : String(error),
+          startupError: errorText(error),
         });
       }
     },
@@ -2517,7 +2526,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         await get().setWorkspace(cwd, { restoreProject: true });
         await get().newSession();
       } catch (error) {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
+        set({ startupError: errorText(error) });
       }
     },
 
@@ -2555,7 +2564,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         baseSessionIndex = mergeSessions(baseSessionIndex, discovered, target.path);
       } catch (error) {
         set({
-          startupError: `无法完整枚举项目会话，将只处理当前已加载会话：${error instanceof Error ? error.message : String(error)}`,
+          startupError: `无法完整枚举项目会话，将只处理当前已加载会话：${errorText(error)}`,
         });
       }
       const projectSessions = baseSessionIndex.filter((session) => samePath(session.cwd, target.path));
@@ -2617,7 +2626,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         try {
           await get().deleteSession(sessionId);
         } catch (error) {
-          errors.push(error instanceof Error ? error.message : String(error));
+          errors.push(errorText(error));
         }
       }
       try {
@@ -2633,7 +2642,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           }
         }
       } catch (error) {
-        errors.push(error instanceof Error ? error.message : String(error));
+        errors.push(errorText(error));
       }
       if (errors.length > 0) {
         set({ startupError: `项目已从侧栏删除，但部分磁盘会话清理失败：${errors.join("；")}` });
@@ -2656,7 +2665,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         // permanent-worktree action: create it, then reveal it in Finder.
         await invoke("open_in_explorer", { cwd: path, path: null });
       } catch (error) {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
+        set({ startupError: errorText(error) });
       }
     },
 
@@ -2715,7 +2724,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           auth: await bridge.getAuthState(),
           startupError: code === "AUTH_CANCELLED"
             ? null
-            : error instanceof Error ? error.message : String(error),
+            : errorText(error),
         });
       }
     },
@@ -2912,7 +2921,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       } catch (error) {
         set({
           runtimeBusy: false,
-          startupError: error instanceof Error ? error.message : String(error),
+          startupError: errorText(error),
         });
       }
     },
@@ -3018,7 +3027,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         });
         set({ workspaceFiles });
       } catch (error) {
-        set({ previewError: error instanceof Error ? error.message : String(error) });
+        set({ previewError: errorText(error) });
       }
     },
 
@@ -3059,7 +3068,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({
           projectPreview: {
             status: "error",
-            error: error instanceof Error ? error.message : String(error),
+            error: errorText(error),
           },
         });
       }
@@ -3088,7 +3097,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({
           previewFile: null,
           previewLoading: false,
-          previewError: error instanceof Error ? error.message : String(error),
+          previewError: errorText(error),
         });
       }
     },
@@ -3135,7 +3144,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       try {
         if ("__TAURI_INTERNALS__" in window) await invoke("delete_session_data", { id });
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = errorText(error);
         set({ startupError: `会话已从侧栏删除，但本地历史清理失败：${message}` });
         diskError = new Error(message);
       }
@@ -3213,7 +3222,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
               })();
         await navigator.clipboard.writeText(text);
       } catch (error) {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
+        set({ startupError: errorText(error) });
       }
     },
 
@@ -3234,7 +3243,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         if (!samePath(meta.cwd, get().workspace)) await get().setWorkspace(meta.cwd);
         await get().newSession({ text });
       } catch (error) {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
+        set({ startupError: errorText(error) });
       }
     },
 
@@ -3248,7 +3257,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         await get().setWorkspace(forked.cwd);
         await bridge.loadSession(forked.sessionId);
       } catch (error) {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
+        set({ startupError: errorText(error) });
       }
     },
 
@@ -3323,6 +3332,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         savePromptQueues(promptQueues);
         return true;
       }
+      userStoppedSessions.delete(session.id);
       markPromptInFlight(session.id);
       const internalWorkflowControl = /^\/workflow\s+(?:pause|resume|stop)\s+\S+(?:\s|$)/i.test(trimmed);
       const titleText = trimmed || attachments.map((attachment) => attachment.name).join(", ");
@@ -3435,7 +3445,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({ sessionComposers: nextComposers });
         return true;
       } catch (error) {
-        set({ startupError: `插话失败：${error instanceof Error ? error.message : String(error)}` });
+        set({ startupError: `插话失败：${errorText(error)}` });
         return false;
       }
     },
@@ -3508,10 +3518,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     stop() {
-      const { activeId, queueDrainParked, sessions } = get();
+      const { activeId, promptQueues, queueDrainParked, sessions } = get();
       if (activeId) {
-        suppressedQueueDrain.add(activeId);
-        set({ queueDrainParked: nextQueueDrainParked(queueDrainParked, activeId, true) });
+        const hasQueuedPrompts = (promptQueues[activeId] ?? []).length > 0;
+        if (hasQueuedPrompts) suppressedQueueDrain.add(activeId);
+        else suppressedQueueDrain.delete(activeId);
+        userStoppedSessions.add(activeId);
+        set({ queueDrainParked: nextQueueDrainParked(queueDrainParked, activeId, hasQueuedPrompts) });
         bridge.cancel(activeId);
         const session = sessions[activeId];
         if (session) {
@@ -3654,7 +3667,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       persistSessionComposers(next);
       set({ mode, sessionComposers: next });
       void bridge.setSessionMode(activeId, mode).catch((error) => {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
+        set({ startupError: errorText(error) });
       });
     },
     setPermissionMode: (permissionMode) => {
@@ -3794,7 +3807,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         } catch (error) {
           set({
             historySyncing: false,
-            historyError: error instanceof Error ? error.message : String(error),
+            historyError: errorText(error),
           });
         }
       })();

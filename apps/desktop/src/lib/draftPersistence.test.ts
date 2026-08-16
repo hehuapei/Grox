@@ -28,6 +28,13 @@ describe("draftPersistence browser fallback", () => {
     expect(loaded?.text).toBe("未发送的提示词");
   });
 
+  it("keeps scoped home drafts separate from session composer drafts", async () => {
+    await saveDraftBuffer("C:\\Work\\Repo", "session draft");
+    await saveDraftBuffer("C:\\Work\\Repo", "home draft", [], "home");
+    expect((await loadDraftBuffer("C:/Work/Repo"))?.text).toBe("session draft");
+    expect((await loadDraftBuffer("C:/Work/Repo", "home"))?.text).toBe("home draft");
+  });
+
   it("persists attachments for first-send crash recovery", async () => {
     await saveDraftBuffer("C:\\Work\\Repo", "with file", [{
       id: "a1",
@@ -96,6 +103,19 @@ describe("draftPersistence Host authority", () => {
     expect(await loadDraftBuffer("/repo")).toBeNull();
     expect(invokeMock).toHaveBeenCalledTimes(1);
     expect(localStorage.getItem("grox.draftBuffer.v1")).toBe("{}");
+  });
+
+  it("passes a validated scope to the Host draft commands", async () => {
+    invokeMock
+      .mockResolvedValueOnce({ revision: 0, draft: null })
+      .mockResolvedValueOnce({ revision: 1, draft: { cwd: "/repo", text: "home", attachments: [], updatedAt: 1 } });
+    await saveDraftBuffer("/repo", "home", [], "home");
+    expect(invokeMock).toHaveBeenNthCalledWith(1, "read_draft", { cwd: "/repo", scope: "home" });
+    expect(invokeMock).toHaveBeenNthCalledWith(2, "write_draft", expect.objectContaining({
+      cwd: "/repo",
+      scope: "home",
+      expectedRevision: 0,
+    }));
   });
 
   it("does not retry a stale write after a revision conflict", async () => {

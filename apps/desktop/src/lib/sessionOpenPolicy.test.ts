@@ -109,6 +109,7 @@ describe("sanitizeCatalogStatusOnColdStart", () => {
   it("preserves terminal catalogue status", () => {
     expect(sanitizeCatalogStatusOnColdStart("idle")).toBe("idle");
     expect(sanitizeCatalogStatusOnColdStart("failed")).toBe("failed");
+    expect(sanitizeCatalogStatusOnColdStart("cancelled")).toBe("cancelled");
   });
 });
 

@@ -264,11 +264,12 @@ export type SessionStatus =
   | "awaiting_permission"
   | "awaiting_input"
   | "stopping"
+  | "cancelled"
   | "disconnected"
   | "failed";
 
-/** A terminal turn accepts a new prompt; `failed` remains visible until then. */
-export const isSessionTerminal = (status: SessionStatus) => status === "idle" || status === "failed";
+/** A terminal turn accepts a new prompt; failure/cancellation remain visible until then. */
+export const isSessionTerminal = (status: SessionStatus) => status === "idle" || status === "failed" || status === "cancelled";
 
 /** ACP 进程连接状态。它与单个会话的一轮是否结束是两条独立事实。 */
 export type RuntimeConnectionState = "starting" | "ready" | "reconnecting" | "offline";

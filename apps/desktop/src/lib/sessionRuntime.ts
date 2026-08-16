@@ -17,6 +17,7 @@ export type SessionPhase =
   | "waiting_permission"
   | "waiting_input"
   | "stopping"
+  | "cancelled"
   | "disconnected"
   | "failed";
 
@@ -88,6 +89,7 @@ export function reconcileIncomingStatus(
   if (incoming === "running" && blocks.some(isUnresolvedGate)) {
     return statusAfterGateResolve(blocks, previous);
   }
+  if (previous === "cancelled" && incoming === "idle") return "cancelled";
   return incoming;
 }
 
@@ -105,6 +107,8 @@ export function deriveSessionSnapshot(args: {
     ? "connecting"
     : status === "stopping"
       ? "stopping"
+      : status === "cancelled"
+        ? "cancelled"
       : status === "disconnected"
         ? "disconnected"
         : status === "failed"
@@ -191,7 +195,7 @@ export type TurnKind = "idle" | "running" | "gated";
 
 export function classifyTurnStatus(status: SessionStatus): TurnKind {
   const phase = deriveSessionSnapshot({ status }).phase;
-  if (phase === "idle" || phase === "failed") return "idle";
+  if (phase === "idle" || phase === "failed" || phase === "cancelled") return "idle";
   if (phase === "waiting_permission" || phase === "waiting_input") return "gated";
   return "running";
 }

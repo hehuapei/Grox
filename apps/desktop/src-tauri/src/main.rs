@@ -2390,10 +2390,24 @@ fn drafts_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
         .map_err(|error| format!("无法定位草稿文件：{error}"))
 }
 
-fn draft_workspace(cwd: &str) -> Result<String, HostError> {
-    checked_workspace(cwd)
+fn draft_workspace(cwd: &str, scope: Option<&str>) -> Result<String, HostError> {
+    let workspace = checked_workspace(cwd)
         .map(|path| path_for_webview(&path))
-        .map_err(|error| HostError::operation("DRAFT_WORKSPACE_INVALID", error))
+        .map_err(|error| HostError::operation("DRAFT_WORKSPACE_INVALID", error))?;
+    let Some(scope) = scope.filter(|value| !value.is_empty()) else {
+        return Ok(workspace);
+    };
+    if scope.len() > 32
+        || !scope
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return Err(HostError::operation(
+            "DRAFT_SCOPE_INVALID",
+            "草稿作用域无效",
+        ));
+    }
+    Ok(format!("scope:{scope}:{workspace}"))
 }
 
 fn draft_storage_error(error: String) -> HostError {
@@ -2419,8 +2433,9 @@ fn read_draft(
     app: tauri::AppHandle,
     drafts: tauri::State<'_, DraftStore>,
     cwd: String,
+    scope: Option<String>,
 ) -> Result<DraftSnapshot, HostError> {
-    let workspace = draft_workspace(&cwd)?;
+    let workspace = draft_workspace(&cwd, scope.as_deref())?;
     let path = drafts_path(&app).map_err(draft_storage_error)?;
     drafts
         .read(&path, &workspace)
@@ -2432,11 +2447,12 @@ fn write_draft(
     app: tauri::AppHandle,
     drafts: tauri::State<'_, DraftStore>,
     cwd: String,
+    scope: Option<String>,
     expected_revision: u64,
     text: String,
     attachments: Vec<DraftAttachment>,
 ) -> Result<DraftSnapshot, HostError> {
-    let workspace = draft_workspace(&cwd)?;
+    let workspace = draft_workspace(&cwd, scope.as_deref())?;
     let path = drafts_path(&app).map_err(draft_storage_error)?;
     drafts
         .write(
@@ -2454,9 +2470,10 @@ fn delete_draft(
     app: tauri::AppHandle,
     drafts: tauri::State<'_, DraftStore>,
     cwd: String,
+    scope: Option<String>,
     expected_revision: u64,
 ) -> Result<DraftSnapshot, HostError> {
-    let workspace = draft_workspace(&cwd)?;
+    let workspace = draft_workspace(&cwd, scope.as_deref())?;
     let path = drafts_path(&app).map_err(draft_storage_error)?;
     drafts
         .delete(&path, &workspace, expected_revision)
@@ -11749,5 +11766,16 @@ UNRELATED=value
         assert!(parse_browser_url("https://169.254.169.254/latest/meta-data/").is_err());
         assert!(parse_browser_url("https://metadata.google.internal/").is_err());
         assert!(parse_browser_url("https://100.100.100.200/").is_err());
+    }
+
+    #[test]
+    fn draft_workspace_scopes_are_isolated_and_validated() {
+        let cwd = std::env::temp_dir();
+        let cwd = cwd.to_string_lossy();
+        let unscoped = draft_workspace(&cwd, None).expect("temp directory is a valid workspace");
+        let scoped = draft_workspace(&cwd, Some("home")).expect("home is a valid draft scope");
+        assert_ne!(scoped, unscoped);
+        assert!(scoped.ends_with(&unscoped));
+        assert!(draft_workspace(&cwd, Some("../escape")).is_err());
     }
 }

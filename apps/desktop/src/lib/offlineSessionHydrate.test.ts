@@ -42,7 +42,7 @@ describe("preferRicherSession", () => {
 });
 
 describe("sessionFromDiskPreview", () => {
-  it("filters transport envelopes before painting offline history", () => {
+  it("restores real disk prompts while filtering non-user transport envelopes", () => {
     const session = sessionFromDiskPreview(base([]), {
       entries: [
         { type: "message", role: "user", text: "<user_info>internal</user_info>" },
@@ -52,8 +52,9 @@ describe("sessionFromDiskPreview", () => {
       truncated: false,
     });
 
-    expect(session.blocks).toHaveLength(1);
-    expect(session.blocks[0]).toMatchObject({ type: "user", text: "真实请求" });
+    expect(session.blocks).toHaveLength(2);
+    expect(session.blocks[0]).toMatchObject({ type: "user", text: "duplicate" });
+    expect(session.blocks[1]).toMatchObject({ type: "user", text: "真实请求" });
   });
 
   it("restores durable tool calls with their real identity and result", () => {

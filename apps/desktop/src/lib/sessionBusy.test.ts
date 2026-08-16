@@ -60,6 +60,11 @@ describe("deriveSessionSnapshot", () => {
       busy: true,
       sendable: false,
     });
+    expect(deriveSessionSnapshot({ status: "cancelled", blocks: [] })).toMatchObject({
+      phase: "cancelled",
+      busy: false,
+      sendable: true,
+    });
     expect(deriveSessionSnapshot({ status: "disconnected", blocks: [] })).toMatchObject({
       phase: "disconnected",
       busy: true,
@@ -76,6 +81,7 @@ describe("sessionAcceptsNewPrimaryPrompt", () => {
   it("allows a new primary on a finished conversation even if a thought stayed live", () => {
     expect(sessionAcceptsNewPrimaryPrompt({ status: "idle", blocks: [liveThought] })).toBe(true);
     expect(sessionAcceptsNewPrimaryPrompt({ status: "failed", blocks: [doneThought] })).toBe(true);
+    expect(sessionAcceptsNewPrimaryPrompt({ status: "cancelled", blocks: [doneThought] })).toBe(true);
   });
 });
 
