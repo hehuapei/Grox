@@ -31,6 +31,8 @@ import type {
   RewindMode,
   RewindPoint,
   RewindResult,
+  SessionForkResult,
+  WorktreeForkResult,
 } from "./types";
 
 export interface GrokBridge {
@@ -51,10 +53,13 @@ export interface GrokBridge {
   /** Active workspace used by new sessions and the catalogue. */
   getWorkspace(): Promise<string>;
   setWorkspace(cwd: string): Promise<void>;
+  /** Supersede any pending async workspace selection without starting I/O. */
+  invalidateWorkspaceSelection(): void;
 
   /** Authentication state and interactive browser login. */
   getAuthState(): Promise<AuthState>;
   authenticate(): Promise<void>;
+  cancelAuthentication(): Promise<void>;
   logout(): Promise<void>;
   getAccountInfo(): Promise<AccountInfo>;
   getBillingInfo(): Promise<BillingInfo>;
@@ -69,7 +74,7 @@ export interface GrokBridge {
 
   /** Local Grok configuration documents kept in two-way sync by the shell. */
   readConfigDocuments(cwd: string): Promise<ConfigDocument[]>;
-  writeConfigDocument(document: ConfigDocument): Promise<ConfigDocument>;
+  writeConfigDocument(document: ConfigDocument, cwd: string): Promise<ConfigDocument>;
 
   /** Typed access to Grok Build x.ai extensions used by visual settings. */
   callExtension<T>(method: string, params?: unknown): Promise<T>;
@@ -77,7 +82,7 @@ export interface GrokBridge {
   /** Models currently offered by the connected agent. */
   getModelState(): Promise<ModelState>;
 
-  /** Change permission policy for existing and future sessions. */
+  /** Project the Host-approved permission policy used by future requests. */
   setPermissionMode(mode: PermissionMode): void;
 
   /** Arm or disarm Computer Use MCP injection for new/restored sessions. */
@@ -93,6 +98,15 @@ export interface GrokBridge {
 
   /** ACP: session/new — emits session_ready. */
   newSession(cwd: string): Promise<void>;
+
+  /** 为自动化创建不抢占当前视图的会话，并返回 Agent 会话 ID。 */
+  newBackgroundSession(cwd: string): Promise<string>;
+
+  /** 在同一工作区复制完整 Agent 会话；复制后保持空闲，不自动发送提示。 */
+  forkSession(sessionId: string, cwd: string, title?: string): Promise<SessionForkResult>;
+
+  /** 在干净 linked worktree 中复制完整 Agent 会话，并返回新的 sessionId。 */
+  forkSessionInNewWorktree(sessionId: string, cwd: string): Promise<WorktreeForkResult>;
 
   /** ACP: session/load — emits session_ready with the restored transcript. */
   loadSession(id: string, options?: { background?: boolean }): Promise<void>;

@@ -8,6 +8,7 @@ export function TerminalPanel({ embedded = false }: { embedded?: boolean }) {
   const session = useDesktop((state) => (state.activeId ? state.sessions[state.activeId] : null));
   const toggleTerminal = useDesktop((state) => state.toggleTerminal);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const followOutputRef = useRef(true);
   const calls = useMemo(
     () => (session?.blocks ?? []).flatMap((block) =>
       block.type === "tool" && block.call.terminal ? [block.call] : [],
@@ -17,12 +18,24 @@ export function TerminalPanel({ embedded = false }: { embedded?: boolean }) {
   const lineCount = calls.reduce((count, call) => count + (call.terminal?.lines.length ?? 0), 0);
 
   useEffect(() => {
+    followOutputRef.current = true;
+  }, [session?.id]);
+
+  useEffect(() => {
     const viewport = scrollRef.current;
-    if (viewport) viewport.scrollTop = viewport.scrollHeight;
+    if (viewport && followOutputRef.current) viewport.scrollTop = viewport.scrollHeight;
   }, [calls, lineCount]);
 
   const body = (
-      <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-3 py-2 font-mono text-[10.5px] leading-[1.65] select-text">
+      <div
+        ref={scrollRef}
+        onScroll={() => {
+          const viewport = scrollRef.current;
+          if (!viewport) return;
+          followOutputRef.current = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight <= 24;
+        }}
+        className="min-h-0 flex-1 overflow-y-auto px-3 py-2 font-mono text-[10.5px] leading-[1.65] select-text"
+      >
         {calls.length === 0 ? (
           <div className="flex h-full items-center justify-center">
             <span className="lbl !text-[9.5px]">{t("noTerminal").toUpperCase()}</span>

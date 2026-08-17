@@ -2,7 +2,12 @@ import type { Session, SessionBlock, SessionStatus } from "../bridge/types";
 
 /** True when the live session must not be forced idle by a disk merge. */
 export function isLiveBusyStatus(status: SessionStatus | undefined): boolean {
-  return status === "running" || status === "awaiting_permission" || status === "awaiting_input";
+  return status === "connecting"
+    || status === "running"
+    || status === "awaiting_permission"
+    || status === "awaiting_input"
+    || status === "stopping"
+    || status === "disconnected";
 }
 
 /**
@@ -117,8 +122,8 @@ export function insertLiveOnlyIntoOffline(
   // shift after earlier inserts at that index.
   for (let li = 0; li < liveBlocks.length; li += 1) {
     const block = liveBlocks[li];
-    // chat_history preview tools use disk-tool-* ids / kind "other"; updates scan
-    // uses real ACP call ids. Treating them as live-only duplicates every tool card.
+    // Older preview journals used disk-tool-* ids while canonical ACP replay has
+    // real call ids. Treating those legacy rows as live-only duplicates cards.
     if (block.type === "tool" && isSyntheticToolCallId(block.call?.id)) {
       continue;
     }

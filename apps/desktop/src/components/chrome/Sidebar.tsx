@@ -41,6 +41,7 @@ export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) 
   const [sessionQuery, setSessionQuery] = useState("");
   const [historyMatches, setHistoryMatches] = useState<Set<string>>(() => new Set());
   const [historySearching, setHistorySearching] = useState(false);
+  const [historySearchError, setHistorySearchError] = useState("");
   const accountRef = useRef<HTMLDivElement>(null);
   const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(
     () => new Set(activeProjectId ? [activeProjectId] : []),
@@ -88,18 +89,23 @@ export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) 
     if (!normalizedQuery) {
       setHistoryMatches(new Set());
       setHistorySearching(false);
+      setHistorySearchError("");
       return;
     }
     let cancelled = false;
     setHistorySearching(true);
+    setHistorySearchError("");
     const timeout = window.setTimeout(() => {
       void invoke<string[]>("search_session_history", {
         query: normalizedQuery,
         sessionIds: sessionIndex.map((session) => session.id),
       }).then((ids) => {
         if (!cancelled) setHistoryMatches(new Set(ids));
-      }).catch(() => {
-        if (!cancelled) setHistoryMatches(new Set());
+      }).catch((cause) => {
+        if (!cancelled) {
+          setHistoryMatches(new Set());
+          setHistorySearchError(cause instanceof Error ? cause.message : String(cause));
+        }
       }).finally(() => {
         if (!cancelled) setHistorySearching(false);
       });
@@ -130,20 +136,20 @@ export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) 
       <div className="p-2.5">
         <button
           onClick={() => void newProject()}
-          className="flex h-8 w-full items-center gap-2 rounded-[4px] border border-line2 bg-raise px-2.5 text-[11px] text-fg2 hover:border-line3 hover:text-fg"
+          className="flex h-9 w-full items-center gap-2 rounded-[5px] border border-line2 bg-raise px-2.5 text-[12px] text-fg2 hover:border-line3 hover:text-fg"
         >
           <Icon name="plus" size={12} className="text-acc" />
           {t("newProject")}
-          <span className="ml-auto font-mono text-[9.5px] text-faint">Ctrl N</span>
+          <span className="ml-auto font-mono text-[10px] text-faint">Ctrl N</span>
         </button>
-        <div className="mt-1.5 flex h-8 items-center gap-2 rounded-[4px] border border-line2 bg-void px-2.5 focus-within:border-line3">
+        <div className="mt-1.5 flex h-9 items-center gap-2 rounded-[5px] border border-line2 bg-void px-2.5 focus-within:border-line3">
           <Icon name="search" size={11} className={historySearching ? "animate-pulse text-acc" : "text-dim"} />
           <input
             value={sessionQuery}
             onChange={(event) => setSessionQuery(event.target.value)}
             placeholder={language === "zh-CN" ? "搜索会话标题与内容" : "Search titles and content"}
             aria-label={language === "zh-CN" ? "搜索会话标题与内容" : "Search session titles and content"}
-            className="min-w-0 flex-1 bg-transparent text-[10.5px] text-fg outline-none placeholder:text-faint"
+            className="min-w-0 flex-1 bg-transparent text-[12px] text-fg outline-none placeholder:text-faint"
           />
           {sessionQuery && (
             <button type="button" onClick={() => setSessionQuery("")} className="text-faint hover:text-fg" aria-label={language === "zh-CN" ? "清除搜索" : "Clear search"}>
@@ -155,7 +161,7 @@ export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) 
           onClick={() => void refreshHistory()}
           disabled={historySyncing}
           title={historyError ?? (language === "zh-CN" ? "重新扫描 ~/.grok/sessions" : "Rescan ~/.grok/sessions")}
-          className="mt-1.5 flex h-7 w-full items-center gap-2 rounded-[4px] px-2.5 font-mono text-[9.5px] text-dim hover:bg-high hover:text-fg2 disabled:cursor-wait disabled:opacity-60"
+          className="mt-1.5 flex h-8 w-full items-center gap-2 rounded-[4px] px-2.5 text-[11px] text-dim hover:bg-high hover:text-fg2 disabled:cursor-wait disabled:opacity-60"
         >
           <Icon name="refresh" size={10} className={historySyncing ? "animate-orbit" : ""} />
           {historySyncing
@@ -163,6 +169,11 @@ export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) 
             : (language === "zh-CN" ? "导入 CLI 历史" : "IMPORT CLI HISTORY")}
           {historyCount > 0 && <span className="ml-auto text-faint">{historyCount}</span>}
         </button>
+        {historyError && (
+          <p role="alert" className="px-2 pt-1.5 font-mono text-[9px] leading-relaxed text-red">
+            {language === "zh-CN" ? `CLI 历史导入失败：${historyError}` : `CLI history import failed: ${historyError}`}
+          </p>
+        )}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
@@ -185,9 +196,14 @@ export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) 
             })}
           />
         ))}
-        {normalizedQuery && !historySearching && matchedSessions.length === 0 && (
+        {normalizedQuery && !historySearching && !historySearchError && matchedSessions.length === 0 && (
           <p className="px-2 py-6 text-center font-mono text-[9.5px] text-faint">
             {language === "zh-CN" ? "没有匹配的历史会话" : "NO MATCHING SESSIONS"}
+          </p>
+        )}
+        {normalizedQuery && historySearchError && (
+          <p role="alert" className="px-2 pb-3 text-center font-mono text-[9.5px] leading-relaxed text-red">
+            {language === "zh-CN" ? `历史内容搜索失败：${historySearchError}` : `History search failed: ${historySearchError}`}
           </p>
         )}
       </div>
@@ -210,7 +226,7 @@ export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) 
           onClick={() => setAccountOpen((open) => !open)}
           className="min-w-0 flex-1 text-left"
         >
-          <p className="truncate text-[10.5px] text-fg2">{account?.email ?? t("account")}</p>
+          <p className="truncate text-[12px] text-fg2">{account?.email ?? t("account")}</p>
           <p className="lbl truncate !text-[9.5px]">
             {billing?.subscriptionTier ?? account?.subscriptionTier ?? (account?.authenticated ? "GROK" : t("login"))}
           </p>
@@ -330,8 +346,8 @@ function ProjectGroup({
 function SectionTitle({ label, count }: { label: string; count: number }) {
   return (
     <div className="flex h-7 items-center justify-between px-2">
-      <span className="lbl !text-[9.5px]">{label}</span>
-      <span className="tnum text-[9.5px] text-faint">{String(count).padStart(2, "0")}</span>
+      <span className="text-[11px] font-medium text-dim">{label}</span>
+      <span className="tnum text-[10px] text-faint">{String(count).padStart(2, "0")}</span>
     </div>
   );
 }
@@ -375,22 +391,26 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
       <button onClick={onToggle} className="flex h-6 w-5 shrink-0 items-center justify-center text-faint hover:text-fg" title={expanded ? "Collapse" : "Expand"}>
         <Icon name="chevronRight" size={9} className={`transition-transform ${expanded ? "rotate-90" : ""}`} />
       </button>
-      <button onClick={() => void openProject(project.id)} className="flex min-w-0 flex-1 items-center gap-2 text-left">
-        <Icon name={project.pinned ? "pin" : "folder"} size={11} className={project.pinned ? "text-acc" : "text-dim"} />
-        {editing ? (
+      {editing ? (
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <Icon name={project.pinned ? "pin" : "folder"} size={11} className={project.pinned ? "text-acc" : "text-dim"} />
           <input
             autoFocus
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             onBlur={commit}
-            onKeyDown={(event) => event.key === "Enter" && commit()}
-            onClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur();
+            }}
             className="min-w-0 flex-1 border border-line3 bg-void px-1 text-[10.5px] outline-none"
           />
-        ) : (
-          <span className="truncate text-[10.5px]">{project.name}</span>
-        )}
-      </button>
+        </div>
+      ) : (
+        <button onClick={() => void openProject(project.id).catch(() => {})} className="flex min-w-0 flex-1 items-center gap-2 text-left">
+          <Icon name={project.pinned ? "pin" : "folder"} size={11} className={project.pinned ? "text-acc" : "text-dim"} />
+          <span className="truncate text-[12px]">{project.name}</span>
+        </button>
+      )}
       {count > 0 && <span className="tnum text-[9px] text-faint">{count}</span>}
       <button
         onClick={(event) => {
@@ -398,7 +418,7 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
           void (async () => {
             if (activeProjectId !== project.id) await openProject(project.id);
             await newSession();
-          })();
+          })().catch(() => {});
         }}
         className="flex h-5 w-5 shrink-0 items-center justify-center rounded-[3px] text-acc transition-colors hover:bg-acc/10 hover:text-fg"
         title={language === "zh-CN" ? "在此项目中新建会话" : "New session in this project"}
@@ -419,7 +439,16 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
           <MenuButton icon="pin" label={project.pinned ? t("unpin") : t("pin")} onClick={() => pinProject(project.id)} />
           <MenuButton icon="external" label={t("openExplorer")} onClick={() => void openExplorer(project.id)} />
           <MenuButton icon="branch" label={language === "zh-CN" ? "创建永久工作树" : "Create permanent worktree"} onClick={() => void createWorktree(project.id)} />
-          <MenuButton icon="gear" label={language === "zh-CN" ? "编辑项目" : "Edit project"} onClick={() => setEditing(true)} />
+          <MenuButton
+            icon="gear"
+            label={language === "zh-CN" ? "编辑项目" : "Edit project"}
+            onClick={() => {
+              setDraft(project.name);
+              setMenu(false);
+              // 等菜单点击完成后再聚焦，避免菜单卸载把输入框立即 blur。
+              window.setTimeout(() => setEditing(true), 0);
+            }}
+          />
           <MenuDivider />
           <MenuButton icon="archive" label={allArchived ? (language === "zh-CN" ? "恢复项目会话" : "Restore project sessions") : (language === "zh-CN" ? "归档项目内全部会话" : "Archive all project sessions")} onClick={() => void archiveProject(project.id)} />
           <MenuButton
@@ -468,11 +497,11 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
   const removeFromSidebar = useDesktop((state) => state.removeSessionFromSidebar);
   const continueInNewChat = useDesktop((state) => state.continueSessionInNewChat);
   const continueInWorktree = useDesktop((state) => state.continueSessionInNewWorktree);
-  const openInNewWindow = useDesktop((state) => state.openSessionInNewWindow);
   const copySessionValue = useDesktop((state) => state.copySessionValue);
   const [editing, setEditing] = useState(false);
   const [menu, setMenu] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmExport, setConfirmExport] = useState(false);
   const displayTitle = missionTitle(meta, language);
   const [draft, setDraft] = useState(displayTitle);
   const commit = () => {
@@ -493,11 +522,11 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
     >
       <div className="flex items-center gap-2">
         <SessionStatusLight status={status} completionUnread={completionUnread} />
-        <span className={status === "running" || status.startsWith("awaiting_") ? "" : "opacity-55"}><BlackHole size={11} spin={status === "running" ? true : status.startsWith("awaiting_") ? "slow" : false} /></span>
+        <span className={status === "idle" || status === "failed" || status === "cancelled" ? "opacity-55" : ""}><BlackHole size={11} spin={status === "running" ? true : status === "idle" || status === "failed" || status === "cancelled" || status === "disconnected" ? false : "slow"} /></span>
         {editing ? (
           <input autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={commit} onKeyDown={(event) => event.key === "Enter" && commit()} onClick={(event) => event.stopPropagation()} className="min-w-0 flex-1 border border-line3 bg-void px-1 text-[11px] text-fg outline-none" />
         ) : (
-          <span className={`min-w-0 flex-1 truncate text-[11px] ${meta.title?.trim() ? "text-fg2" : "text-faint italic"}`} title={meta.id}>
+          <span className={`min-w-0 flex-1 truncate text-[12px] ${meta.title?.trim() ? "text-fg2" : "text-faint italic"}`} title={meta.id}>
             {displayTitle}
           </span>
         )}
@@ -511,11 +540,11 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
         </button>
       </div>
       {meta.summary && meta.summary !== meta.title && (
-        <p className="mt-0.5 truncate pl-3.5 text-[9.5px] leading-tight text-mute" title={meta.summary}>{meta.summary}</p>
+        <p className="mt-0.5 truncate pl-3.5 text-[10.5px] leading-tight text-mute" title={meta.summary}>{meta.summary}</p>
       )}
       <div className="mt-0.5 flex items-center justify-between pl-3.5">
-        <span className="font-mono text-[9.5px] text-faint">{fmtRelTime(meta.updatedAt)}</span>
-        {tokens > 0 && <span className="tnum text-[9.5px] text-faint">{fmtTokens(tokens)} TOK</span>}
+        <span className="text-[10.5px] text-faint">{fmtRelTime(meta.updatedAt)}</span>
+        {tokens > 0 && <span className="tnum text-[10px] text-faint">{fmtTokens(tokens)} tokens</span>}
       </div>
       {menu && (
         <ContextMenu close={() => setMenu(false)}>
@@ -528,12 +557,10 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
           <MenuButton icon="folder" label={language === "zh-CN" ? "复制工作目录" : "Copy working directory"} onClick={() => void copySessionValue(meta.id, "cwd")} />
           <MenuButton icon="copy" label={language === "zh-CN" ? "复制会话 ID" : "Copy session ID"} onClick={() => void copySessionValue(meta.id, "id")} />
           <MenuButton icon="external" label={language === "zh-CN" ? "复制深度链接" : "Copy deep link"} onClick={() => void copySessionValue(meta.id, "link")} />
-          <MenuButton icon="summary" label={language === "zh-CN" ? "导出会话诊断" : "Export session trace"} onClick={() => void invoke<string>("export_session_trace", { sessionId: meta.id }).then((path) => navigator.clipboard.writeText(path))} />
+          <MenuButton icon="summary" label={language === "zh-CN" ? "导出本地支持包" : "Export local support package"} onClick={() => setConfirmExport(true)} />
           <MenuDivider />
           <MenuButton icon="arrowRight" label={language === "zh-CN" ? "在新聊天中继续" : "Continue in new chat"} onClick={() => void continueInNewChat(meta.id)} />
           <MenuButton icon="branch" label={language === "zh-CN" ? "在新工作树中继续" : "Continue in new worktree"} onClick={() => void continueInWorktree(meta.id)} />
-          <MenuDivider />
-          <MenuButton icon="external" label={language === "zh-CN" ? "在新窗口中打开" : "Open in new window"} onClick={() => void openInNewWindow(meta.id)} />
           <MenuDivider />
           <MenuButton
             icon="trash"
@@ -559,6 +586,52 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
           }}
         />
       )}
+      {confirmExport && (
+        <ConfirmDialog
+          title={language === "zh-CN" ? "导出本地会话支持包？" : "Export local session support package?"}
+          description={language === "zh-CN"
+            ? "支持包包含应用/CLI 版本、运行时拓扑、journal 健康、队列与错误状态；若官方 trace 可用，还会包含完整对话和工具记录。文件仅写入本机临时目录，Grox 不会上传。分享前请自行检查。"
+            : "The package contains app/CLI versions, runtime topology, journal health, queue and error state. When available, the official trace also contains the full conversation and tool records. Grox writes it only to your local temp folder and never uploads it. Review before sharing."}
+          confirmLabel={language === "zh-CN" ? "导出到本机" : "Export locally"}
+          cancelLabel={language === "zh-CN" ? "取消" : "Cancel"}
+          workingLabel={language === "zh-CN" ? "正在收集" : "Collecting"}
+          tone="primary"
+          onCancel={() => setConfirmExport(false)}
+          onConfirm={async () => {
+            const state = useDesktop.getState();
+            const session = state.sessions[meta.id];
+            const blockCounts = (session?.blocks ?? []).reduce<Record<string, number>>((counts, block) => {
+              counts[block.type] = (counts[block.type] ?? 0) + 1;
+              return counts;
+            }, {});
+            const clientSnapshot = JSON.stringify({
+              generatedAt: Date.now(),
+              runtimeConnection: state.runtimeConnection,
+              providerSwitching: state.providerSwitching,
+              restoring: state.restoringSessionId === meta.id,
+              session: {
+                id: meta.id,
+                status: session?.status ?? status,
+                updatedAt: session?.updatedAt ?? meta.updatedAt,
+                preview: Boolean(session?.preview),
+                blockCounts,
+              },
+              queue: {
+                length: state.promptQueues[meta.id]?.length ?? 0,
+                parked: Boolean(state.queueDrainParked[meta.id]),
+              },
+              recentNotices: state.runtimeNotices.slice(-20),
+            });
+            const result = await invoke<{ path: string; officialTraceIncluded: boolean; officialTraceError?: string }>(
+              "export_session_support_bundle",
+              { sessionId: meta.id, clientSnapshot },
+            );
+            await navigator.clipboard.writeText(result.path).catch(() => {});
+            await invoke("reveal_support_bundle", { path: result.path });
+            setConfirmExport(false);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -567,6 +640,14 @@ function SessionStatusLight({ status, completionUnread }: { status: SessionStatu
   const { language } = useI18n();
   const presentation = status === "running"
     ? { tone: "bg-acc animate-pulse-dot", label: language === "zh-CN" ? "运行中" : "Running" }
+    : status === "connecting"
+      ? { tone: "bg-status-blue animate-pulse-dot", label: language === "zh-CN" ? "正在恢复" : "Restoring" }
+      : status === "stopping"
+        ? { tone: "bg-gold animate-pulse-dot", label: language === "zh-CN" ? "正在停止" : "Stopping" }
+        : status === "cancelled"
+          ? { tone: "bg-gold", label: language === "zh-CN" ? "已停止" : "Stopped" }
+        : status === "disconnected"
+          ? { tone: "bg-red", label: language === "zh-CN" ? "连接已中断" : "Disconnected" }
     : status === "failed"
       ? { tone: "bg-red", label: language === "zh-CN" ? "失败" : "Failed" }
       : status === "awaiting_permission" || status === "awaiting_input"
@@ -594,7 +675,7 @@ function ContextMenu({ children, close }: { children: React.ReactNode; close(): 
     };
   }, []);
   return (
-    <div ref={ref} className="absolute right-1 top-7 z-40 w-[min(192px,calc(100vw-24px))] overflow-hidden rounded-[5px] border border-line2 bg-raise p-1 shadow-2xl" onClick={(event) => { event.stopPropagation(); close(); }}>
+    <div ref={ref} role="menu" className="absolute right-1 top-7 z-40 w-[min(192px,calc(100vw-24px))] overflow-hidden rounded-[5px] border border-line2 bg-raise p-1 shadow-2xl" onClick={(event) => { event.stopPropagation(); close(); }}>
       {children}
     </div>
   );
@@ -606,7 +687,7 @@ function MenuDivider() {
 
 function MenuButton({ icon, label, onClick, tone = "text-fg2" }: { icon: React.ComponentProps<typeof Icon>["name"]; label: string; onClick(): void; tone?: string }) {
   return (
-    <button onClick={onClick} className={`flex h-7 w-full items-center gap-2 rounded-[3px] px-2 text-left text-[10px] hover:bg-high ${tone}`}>
+    <button role="menuitem" onClick={onClick} className={`flex h-7 w-full items-center gap-2 rounded-[3px] px-2 text-left text-[10px] hover:bg-high ${tone}`}>
       <Icon name={icon} size={11} className="text-dim" />
       {label}
     </button>

@@ -1,9 +1,18 @@
 import { createInterface } from "node:readline";
 import { spawn, spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const command = process.env.GROK_COMMAND || "grok";
-const expectedVersion = process.env.GROK_EXPECTED_VERSION || "1.0.0";
+const integrationState = JSON.parse(readFileSync(
+  new URL("../.grox/official-cli.json", import.meta.url),
+  "utf8",
+));
+const expectedVersion = process.env.GROK_EXPECTED_VERSION
+  || integrationState.integrationTarget?.publicVersion;
+if (typeof expectedVersion !== "string" || !expectedVersion) {
+  throw new Error(".grox/official-cli.json 缺少 integrationTarget.publicVersion");
+}
 const versionRun = spawnSync(command, ["--version"], { encoding: "utf8", shell: process.platform === "win32" });
 const versionText = `${versionRun.stdout ?? ""}${versionRun.stderr ?? ""}`.trim();
 if (!new RegExp(`\\bgrok ${expectedVersion.replaceAll(".", "\\.")}\\b`).test(versionText)) {
@@ -82,6 +91,18 @@ try {
     _meta: { clientIdentifier: "grok-shell", clientType: "shell", clientVersion: "1.0.0" },
   }, 45_000);
   if (!initialized || typeof initialized !== "object") throw new Error("initialize 未返回对象");
+  const authMethods = Array.isArray(initialized.authMethods) ? initialized.authMethods : [];
+  const firstAuthId = authMethods[0]?.id;
+  if (firstAuthId === "grok.com" || firstAuthId === "oidc") {
+    throw new Error("在线 smoke 需要先在 Grox 中完成显式登录；脚本不会擅自打开 OAuth");
+  }
+  const defaultAuthId = initialized?._meta?.defaultAuthMethodId;
+  const authMethodId = authMethods.some((method) => method?.id === defaultAuthId)
+    ? defaultAuthId
+    : firstAuthId;
+  if (typeof authMethodId === "string" && authMethodId) {
+    await request("authenticate", { methodId: authMethodId }, 30_000);
+  }
 
   const listed = unwrapExtension(await request("x.ai/session/list", { cwd: workspace, limit: 5 }));
   if (!listed || typeof listed !== "object" || !Array.isArray(listed.sessions)) throw new Error("x.ai/session/list 返回结构不正确");
@@ -99,8 +120,13 @@ try {
 
   const infoBefore = unwrapExtension(await request("x.ai/session/info", { sessionId }, 30_000));
   if (infoBefore?.sessionId !== sessionId) throw new Error("x.ai/session/info 未返回当前会话");
+  await request("session/set_model", {
+    sessionId,
+    modelId: process.env.GROK_SMOKE_MODEL || "grok-build",
+    _meta: { reasoningEffort: "low" },
+  });
   await request("session/set_mode", { sessionId, modeId: "plan" });
-  await request("session/set_mode", { sessionId, modeId: "agent" });
+  await request("session/set_mode", { sessionId, modeId: "default" });
 
   let mcp = unwrapExtension(await request("x.ai/mcp/list", { sessionId, cache: true }, 45_000));
   if (!mcp || !Array.isArray(mcp.servers)) throw new Error("x.ai/mcp/list 返回结构不正确");
@@ -154,9 +180,11 @@ try {
     ok: true,
     version: versionText,
     initialize: true,
+    authenticate: authMethodId || "not_required",
     sessionList: true,
     sessionNew: true,
     sessionInfo: true,
+    modelEffortBound: true,
     modePlanAgent: true,
     mcpList: true,
     skillsList: true,

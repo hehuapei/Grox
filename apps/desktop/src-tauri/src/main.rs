@@ -6,45 +6,116 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod acp_host;
+mod acp_inbound;
+mod agent_auth;
+mod agent_runtime;
+mod automation_runner;
+mod automation_store;
 mod browser_mcp;
+mod client_callbacks;
 mod computer_mcp;
+mod draft_store;
+mod file_commands;
+mod foreground_turn;
 mod git_confirm;
+mod host_error;
+mod host_logging;
 mod host_prefs;
+mod interaction_service;
 mod mcp_leases;
+mod media_service;
+#[cfg(debug_assertions)]
+mod mock_acp_fixture;
 mod path_sandbox;
+mod permission_audit;
+mod permission_policy;
 #[cfg(windows)]
 mod process_job;
+mod prompt_queue_store;
+mod process_env;
+mod session_coordinator;
+mod session_event_journal;
+mod session_journal_store;
+mod session_runtime;
+mod session_storage;
+mod secret_store;
+mod support_bundle;
+mod terminal_host;
+mod tray;
+mod turn_runtime;
+mod worktree_ownership;
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
-    io::{Read as _, Write as _},
+    io::{Read as _, SeekFrom, Write as _},
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering},
+        Arc, RwLock,
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use acp_host::{AcpHostError, AcpRequestBroker};
+use acp_inbound::AcpInbound;
+use agent_auth::{
+    agent_runtime_auth_cancel, agent_runtime_auth_status, agent_runtime_authenticate,
+    AgentAuthenticationLifecycle,
+};
+use agent_runtime::{AgentAuthenticationState, AgentRuntimeConnection};
+use automation_runner::{storage_error as automation_storage_error, AutomationRunner};
+use automation_store::AutomationStore;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use client_callbacks::{ClientCallbackInbound, ClientCallbackRegistry};
+use draft_store::{
+    DraftAttachment, DraftSnapshot, DraftStore, DraftStoreError, DRAFTS_MAX_BYTES,
+};
+use file_commands::{open_file_with_default, reveal_in_explorer};
 use git_confirm::GitConfirmStore;
+use foreground_turn::{
+    cancel_foreground_turn, execute_foreground_turn, foreground_turn_status,
+    ForegroundTurnRegistry,
+};
+use host_error::HostError;
+use interaction_service::{InteractionInbound, InteractionProjection, InteractionRegistry};
 use mcp_leases::McpLeaseStore;
+use media_service::{
+    cancel_media_generation, is_media_https_host_allowed, media_generation_capabilities,
+    media_generation_history, media_generation_status, media_journal_status, open_media_artifact,
+    release_media_reference, restore_job_journal, save_media_reference, start_media_generation,
+    MediaService,
+};
 use path_sandbox::{
-    checked_workspace, checked_workspace_file, checked_workspace_target, is_workspace_file,
-    path_for_webview,
+    checked_workspace, checked_workspace_file, checked_workspace_target, path_for_webview,
 };
 use percent_encoding::percent_decode_str;
+use prompt_queue_store::PromptQueueStore;
 use serde::{Deserialize, Serialize};
+use session_coordinator::{SessionCoordinator, SessionRuntimeOccupancy};
+use session_event_journal::{
+    HostSessionEvent, HostSessionEventReplay, HostSessionEventStatus, SessionEventJournal,
+};
+use session_journal_store::{SessionJournalStore, SessionJournalWriteError};
+use session_runtime::{
+    browser_shutdown_all_leases, close_agent_session, computer_emergency_stop_session,
+    computer_shutdown_all_leases, delete_agent_session, fork_agent_session,
+    fork_agent_session_in_worktree, open_agent_session,
+    shutdown_all_mcp_resources,
+};
+use session_storage::SessionStorageState;
+use secret_store::{SecretBackendKind, SecretStore, StoredSecret};
 use tauri::{Emitter, Manager};
-use toml_edit::{value as toml_value, Document, Item, Table, TableLike};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, BufReader},
     net::{TcpListener, TcpStream},
     process::{Child, ChildStdin, Command},
     sync::Mutex,
 };
+use toml_edit::{value as toml_value, Document, Item, Table, TableLike};
+use worktree_ownership::WorktreeOwnershipStore;
 
 const CLIENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const GROX_BUILD_COMMIT: &str = env!("GROX_BUILD_COMMIT");
@@ -64,6 +135,10 @@ const GROX_DEEP_RESEARCH_WORKFLOW: &str = include_str!("../resources/grox-deep-r
 const UPSTREAM_CLI_CLIENT_NAME: &str = "grok-shell";
 const GROX_MANAGED_PROVIDER_START: &str = "# >>> Grox managed provider";
 const GROX_MANAGED_PROVIDER_END: &str = "# <<< Grox managed provider";
+const GROX_PROVIDER_KIND_KEY: &str = "GROX_PROVIDER_KIND";
+const GROX_PROVIDER_PROFILE_ID_KEY: &str = "GROX_PROVIDER_PROFILE_ID";
+const SECRET_REF_OFFICIAL_PROVIDER: &str = "provider:official";
+const SECRET_REF_DIRECT_COMPATIBLE: &str = "provider:direct-compatible";
 const GROX_PROVIDER_AUTH_OVERRIDES_FILE: &str = "grox-provider-auth-overrides.json";
 const GROX_PROVIDER_BACKEND_OVERRIDES_FILE: &str = "grox-provider-backend-overrides.json";
 // These are the three documented Grok Build custom-endpoint environment
@@ -77,16 +152,9 @@ const PROVIDER_ENV_KEYS: [&str; 3] = [
 const MAX_PROMPT_IMAGE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PROMPT_IMAGE_TOTAL_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_PROVIDER_MODELS_BODY_BYTES: usize = 4 * 1024 * 1024;
-const MAX_MEDIA_REFERENCE_BYTES: usize = 24 * 1024 * 1024;
-const MEDIA_HTTPS_HOST_ALLOWLIST: &[&str] = &[
-    "x.ai",
-    "grok.com",
-    "grok.x.ai",
-    "cdn.x.ai",
-    "assets.x.ai",
-    "imagine.x.ai",
-];
 const MAX_SESSION_PREVIEW_MESSAGES: usize = 200;
+const MAX_SESSION_PREVIEW_TEXT_CHARS: usize = 64 * 1024;
+const MAX_SESSION_PREVIEW_TOOL_INPUT_CHARS: usize = 16 * 1024;
 const MAX_SESSION_SEARCH_IDS: usize = 2_000;
 const MAX_SESSION_SEARCH_HITS: usize = 500;
 const MAX_SESSION_SEARCH_FILE_BYTES: u64 = 4 * 1024 * 1024;
@@ -104,7 +172,320 @@ struct AgentProcess {
 #[derive(Default)]
 struct AcpState {
     process: Mutex<Option<AgentProcess>>,
+    connect_lock: Mutex<()>,
+    connection: RwLock<Option<AgentRuntimeConnection>>,
     next_generation: AtomicU64,
+    next_host_request_id: AtomicU64,
+    ready_generation: AtomicU64,
+    paused_generation: AtomicU64,
+    runtime_phase: AtomicU8,
+    last_connect: RwLock<Option<RuntimeConnectSpec>>,
+    automatic_reconnect_owner: AtomicU64,
+    next_reconnect_owner: AtomicU64,
+    reconnect_epoch: AtomicU64,
+    requests: AcpRequestBroker,
+    authentication: AgentAuthenticationLifecycle,
+    sessions: Arc<SessionCoordinator>,
+    foreground_turns: Arc<ForegroundTurnRegistry>,
+    interactions: Arc<InteractionRegistry>,
+    client_callbacks: Arc<ClientCallbackRegistry>,
+    session_events: SessionEventJournal,
+}
+
+#[derive(Clone)]
+struct RuntimeConnectSpec {
+    cwd: String,
+    reasoning_effort: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct RuntimeReconnectClaim {
+    owner: u64,
+    epoch: u64,
+}
+
+impl AcpState {
+    fn issue_host_request_id(&self) -> u64 {
+        // Grok Build 的 ACP 适配器可能由 JavaScript 实现；请求 id 必须保持
+        // Number-safe，同时与从 1 递增的 WebView 请求留出不可实际跨越的空间。
+        const HOST_REQUEST_NAMESPACE: u64 = 1 << 52;
+        const HOST_REQUEST_SEQUENCE_MASK: u64 = HOST_REQUEST_NAMESPACE - 1;
+        let sequence = self
+            .next_host_request_id
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_add(1)
+            & HOST_REQUEST_SEQUENCE_MASK;
+        HOST_REQUEST_NAMESPACE | sequence.max(1)
+    }
+
+    fn set_runtime_phase(&self, phase: RuntimePhase) {
+        self.runtime_phase.store(phase as u8, Ordering::Release);
+    }
+
+    fn remember_connect(&self, spec: RuntimeConnectSpec) {
+        *self
+            .last_connect
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(spec);
+    }
+
+    fn last_connect(&self) -> Option<RuntimeConnectSpec> {
+        self.last_connect
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    fn claim_automatic_reconnect(&self) -> Option<RuntimeReconnectClaim> {
+        let owner = self.next_reconnect_owner.fetch_add(1, Ordering::Relaxed) + 1;
+        let claim = RuntimeReconnectClaim {
+            owner,
+            epoch: self.reconnect_epoch.load(Ordering::Acquire),
+        };
+        self.automatic_reconnect_owner
+            .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| claim)
+    }
+
+    fn automatic_reconnect_cancelled(&self, claim: RuntimeReconnectClaim) -> bool {
+        self.reconnect_epoch.load(Ordering::Acquire) != claim.epoch
+            || self.automatic_reconnect_owner.load(Ordering::Acquire) != claim.owner
+    }
+
+    fn finish_automatic_reconnect(&self, claim: RuntimeReconnectClaim) {
+        let _ = self.automatic_reconnect_owner.compare_exchange(
+            claim.owner,
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
+    fn cancel_automatic_reconnect(&self) {
+        self.reconnect_epoch.fetch_add(1, Ordering::AcqRel);
+        self.automatic_reconnect_owner.store(0, Ordering::Release);
+    }
+
+    fn cached_connection(&self, generation: u64) -> Option<AgentRuntimeConnection> {
+        self.connection
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .filter(|connection| connection.generation == generation)
+            .cloned()
+    }
+
+    fn clear_cached_connection(&self, generation: Option<u64>) {
+        let mut connection = self
+            .connection
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let should_clear = match generation {
+            None => true,
+            Some(generation) => connection
+                .as_ref()
+                .is_some_and(|connection| connection.generation == generation),
+        };
+        if should_clear {
+            *connection = None;
+        }
+    }
+
+    async fn ready_connection(&self) -> Option<AgentRuntimeConnection> {
+        let generation = self.ready_generation.load(Ordering::Acquire);
+        if generation == 0
+            || !self
+                .process
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|process| process.generation == generation)
+        {
+            return None;
+        }
+        self.cached_connection(generation)
+    }
+
+    fn set_authentication_state(
+        &self,
+        generation: u64,
+        auth: AgentAuthenticationState,
+    ) -> bool {
+        let mut cached = self
+            .connection
+            .write()
+            .unwrap_or_else(|error| error.into_inner());
+        let Some(connection) = cached
+            .as_mut()
+            .filter(|connection| connection.generation == generation)
+        else {
+            return false;
+        };
+        connection.auth = auth;
+        true
+    }
+
+    async fn pause_runtime(&self) -> Result<(), AcpHostError> {
+        let generation = self.ready_generation.load(Ordering::Acquire);
+        let process = self.process.lock().await;
+        if generation == 0
+            || !process
+                .as_ref()
+                .is_some_and(|process| process.generation == generation)
+        {
+            return Err(AcpHostError::operation(
+                "ACP_RUNTIME_NOT_READY",
+                "只有已完成握手的运行时才能暂停",
+            ));
+        }
+        self.paused_generation.store(generation, Ordering::Release);
+        if self
+            .ready_generation
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            self.paused_generation.store(0, Ordering::Release);
+            return Err(AcpHostError::operation(
+                "ACP_RUNTIME_STATE_CHANGED",
+                "运行时状态已变化，请重新执行当前操作",
+            ));
+        }
+        self.set_runtime_phase(RuntimePhase::Paused);
+        drop(process);
+        Ok(())
+    }
+
+    async fn mark_runtime_ready(
+        &self,
+        connection: &AgentRuntimeConnection,
+    ) -> Result<(), AcpHostError> {
+        let generation = connection.generation;
+        let process = self.process.lock().await;
+        if !process
+            .as_ref()
+            .is_some_and(|process| process.generation == generation)
+        {
+            return Err(AcpHostError::environment(
+                "ACP_RUNTIME_GENERATION_STALE",
+                "运行时就绪信号属于已替换的 ACP 通道",
+                false,
+                false,
+                "等待 Agent 重连完成后重试",
+            ));
+        }
+        *self
+            .connection
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(connection.clone());
+        self.paused_generation.store(0, Ordering::Release);
+        self.ready_generation.store(generation, Ordering::Release);
+        self.set_runtime_phase(RuntimePhase::Ready);
+        drop(process);
+        Ok(())
+    }
+
+    async fn resume_runtime(&self, generation: u64) -> Result<(), AcpHostError> {
+        if self.paused_generation.load(Ordering::Acquire) != generation {
+            return Err(AcpHostError::operation(
+                "ACP_RUNTIME_RESUME_NOT_ALLOWED",
+                "运行时没有可恢复的已就绪代次",
+            ));
+        }
+        let process = self.process.lock().await;
+        if !process
+            .as_ref()
+            .is_some_and(|process| process.generation == generation)
+        {
+            self.paused_generation.store(0, Ordering::Release);
+            self.set_runtime_phase(RuntimePhase::Offline);
+            return Err(AcpHostError::environment(
+                "ACP_RUNTIME_GENERATION_STALE",
+                "待恢复的 ACP 通道已退出或被替换",
+                false,
+                false,
+                "等待 Agent 重连完成后重试",
+            ));
+        }
+        if self
+            .paused_generation
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(AcpHostError::operation(
+                "ACP_RUNTIME_RESUME_NOT_ALLOWED",
+                "运行时恢复凭据已被消费",
+            ));
+        }
+        self.ready_generation.store(generation, Ordering::Release);
+        self.set_runtime_phase(RuntimePhase::Ready);
+        drop(process);
+        Ok(())
+    }
+
+    fn mark_generation_unready(&self, generation: u64, phase: RuntimePhase) {
+        let was_ready = self
+            .ready_generation
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        let was_paused = self
+            .paused_generation
+            .compare_exchange(generation, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok();
+        if was_ready
+            || was_paused
+            || (self.ready_generation.load(Ordering::Acquire) == 0
+                && self.paused_generation.load(Ordering::Acquire) == 0)
+        {
+            self.authentication.reset(AcpHostError::environment(
+                "AUTH_RUNTIME_CHANGED",
+                "认证期间 Agent 运行时已退出或被替换",
+                false,
+                false,
+                "重新连接 Agent 后再次登录",
+            ));
+            self.clear_cached_connection(Some(generation));
+            self.set_runtime_phase(phase);
+        }
+    }
+}
+
+#[repr(u8)]
+#[derive(Clone, Copy)]
+enum RuntimePhase {
+    Stopped = 0,
+    Starting = 1,
+    Initializing = 2,
+    Authenticating = 3,
+    Ready = 4,
+    Paused = 5,
+    Offline = 6,
+}
+
+impl RuntimePhase {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            1 => Self::Starting,
+            2 => Self::Initializing,
+            3 => Self::Authenticating,
+            4 => Self::Ready,
+            5 => Self::Paused,
+            6 => Self::Offline,
+            _ => Self::Stopped,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stopped => "stopped",
+            Self::Starting => "starting",
+            Self::Initializing => "initializing",
+            Self::Authenticating => "authenticating",
+            Self::Ready => "ready",
+            Self::Paused => "paused",
+            Self::Offline => "offline",
+        }
+    }
 }
 
 struct PreviewProcess {
@@ -123,11 +504,54 @@ struct FilePreviewState {
     roots: Arc<Mutex<BTreeMap<String, PathBuf>>>,
 }
 
+#[derive(Default)]
+struct AppShutdown {
+    started: AtomicBool,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AcpExitPayload {
     code: Option<i32>,
     reason: &'static str,
+    affected_session_ids: Vec<String>,
+    interrupted_session_ids: Vec<String>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeReconnectPayload {
+    state: &'static str,
+    attempt: u8,
+    affected_session_ids: Vec<String>,
+    interrupted_session_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    connection: Option<AgentRuntimeConnection>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<AcpHostError>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct AgentRuntimeStatus {
+    topology: &'static str,
+    process_capacity: u8,
+    running: bool,
+    ready: bool,
+    phase: &'static str,
+    generation: Option<u64>,
+    pid: Option<u32>,
+    pending_requests: usize,
+    pending_interactions: usize,
+    pending_client_callbacks: usize,
+    bound_client_sessions: usize,
+    active_terminals: usize,
+    automatic_reconnect_active: bool,
+    last_connect_configured: bool,
+    worktree_session_bindings: usize,
+    worktree_ownership_error: Option<String>,
+    session_event_stream: HostSessionEventStatus,
+    host_logging: host_logging::HostLogStatus,
 }
 
 #[derive(Serialize)]
@@ -136,6 +560,124 @@ struct DesktopEnvironment {
     default_workspace: String,
     grok_command: String,
     app_version: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct HostSessionBinding {
+    session_id: String,
+    cwd: String,
+}
+
+#[tauri::command]
+fn replay_session_events(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    stream_id: Option<String>,
+    after_sequence: Option<u64>,
+    limit: Option<usize>,
+) -> Result<HostSessionEventReplay, HostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| HostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    Ok(state
+        .session_events
+        .replay(stream_id.as_deref(), after_sequence.unwrap_or(0), limit))
+}
+
+#[tauri::command]
+fn host_session_bindings(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+) -> Result<Vec<HostSessionBinding>, HostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| HostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    Ok(state
+        .client_callbacks
+        .bound_session_workspaces()
+        .into_iter()
+        .map(|(session_id, workspace)| HostSessionBinding {
+            session_id,
+            cwd: path_for_webview(&workspace),
+        })
+        .collect())
+}
+
+pub(crate) fn emit_host_session_event(app: &tauri::AppHandle, event: HostSessionEvent) {
+    if let Some(window) = app.get_webview_window("main") {
+        let _ = window.emit("host-session-event", event);
+    }
+}
+
+#[tauri::command]
+async fn agent_runtime_status(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AcpState>>,
+    worktrees: tauri::State<'_, WorktreeOwnershipStore>,
+) -> Result<AgentRuntimeStatus, HostError> {
+    let (running, generation, pid) = {
+        let process = state.process.lock().await;
+        (
+            process.is_some(),
+            process.as_ref().map(|process| process.generation),
+            process.as_ref().and_then(|process| process.child.id()),
+        )
+    };
+    let (worktree_session_bindings, worktree_ownership_error) = match worktree_bindings_path(&app)
+        .and_then(|path| worktrees.count(&path))
+    {
+        Ok(count) => (count, None),
+        Err(error) => (0, Some(error)),
+    };
+    Ok(AgentRuntimeStatus {
+        topology: "shared_process",
+        process_capacity: 1,
+        running,
+        ready: generation.is_some_and(|generation| {
+            state.ready_generation.load(Ordering::Acquire) == generation
+        }),
+        phase: RuntimePhase::from_raw(state.runtime_phase.load(Ordering::Acquire)).as_str(),
+        generation,
+        pid,
+        pending_requests: state.requests.len().await,
+        pending_interactions: state.interactions.snapshots().len(),
+        pending_client_callbacks: state.client_callbacks.pending_len(),
+        bound_client_sessions: state.client_callbacks.bound_len(),
+        active_terminals: state.client_callbacks.terminal_len().await,
+        automatic_reconnect_active: state.automatic_reconnect_owner.load(Ordering::Acquire) != 0,
+        last_connect_configured: state.last_connect().is_some(),
+        worktree_session_bindings,
+        worktree_ownership_error,
+        session_event_stream: state.session_events.status(),
+        host_logging: host_logging::status(),
+    })
+}
+
+#[tauri::command]
+fn session_runtime_status(state: tauri::State<'_, Arc<AcpState>>) -> SessionRuntimeOccupancy {
+    state.sessions.snapshot()
+}
+
+#[tauri::command]
+async fn session_gate_enter_lifecycle(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    generation: u64,
+) -> Result<u64, AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    state.sessions.enter_lifecycle(generation).await
+}
+
+#[tauri::command]
+fn session_gate_release(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    token: u64,
+    generation: u64,
+) -> Result<bool, AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    Ok(state.sessions.release(token, generation))
 }
 
 #[derive(Clone, Serialize)]
@@ -225,33 +767,6 @@ struct GrokRuntimeInfo {
     grox_commit: &'static str,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MediaGenerationRequest {
-    kind: String,
-    prompt: String,
-    aspect: String,
-    count: u8,
-    duration: u16,
-    resolution: String,
-    reference_path: Option<String>,
-    cwd: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MediaArtifact {
-    path: Option<String>,
-    url: Option<String>,
-    mime: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MediaGenerationResult {
-    artifacts: Vec<MediaArtifact>,
-    summary: String,
-}
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -262,24 +777,6 @@ struct OpenApplicationOption {
     launch_target: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     icon_data_url: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ComputerSessionExtensions {
-    /// Intentionally empty: bearer tokens stay in native `McpLeaseStore` and
-    /// are injected by `acp_send` when `_meta.groxComputerLeaseId` is set.
-    mcp_servers: Vec<serde_json::Value>,
-    plugin_dirs: Vec<String>,
-    lease_id: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BrowserSessionExtensions {
-    /// Intentionally empty — see `ComputerSessionExtensions`.
-    mcp_servers: Vec<serde_json::Value>,
-    lease_id: String,
 }
 
 #[derive(Clone, Deserialize)]
@@ -387,6 +884,7 @@ struct ProviderStatus {
     kind: &'static str,
     has_api_key: bool,
     base_url: Option<String>,
+    secret_backend: SecretBackendKind,
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
@@ -399,27 +897,13 @@ enum ProviderApiBackend {
 }
 
 impl ProviderApiBackend {
-    fn config_value(self, provider_name: &str, base_url: &str) -> &'static str {
+    fn config_value(self, _provider_name: &str, _base_url: &str) -> &'static str {
         match self {
             Self::Responses => "responses",
             Self::ChatCompletions => "chat_completions",
-            Self::Auto => {
-                let identity = format!("{provider_name} {base_url}").to_ascii_lowercase();
-                if [
-                    "grok2api",
-                    "cliproxyapi",
-                    "cli-proxy-api",
-                    "router-for-me",
-                    "newapi",
-                ]
-                .iter()
-                .any(|marker| identity.contains(marker))
-                {
-                    "responses"
-                } else {
-                    "chat_completions"
-                }
-            }
+            // 供应商名称不是协议证据。兼容服务默认走 Chat Completions；
+            // 仅在用户明确选择时启用 Responses。
+            Self::Auto => "chat_completions",
         }
     }
 }
@@ -429,7 +913,9 @@ impl ProviderApiBackend {
 struct StoredProviderProfile {
     id: String,
     name: String,
-    api_key: String,
+    /// v0.3.1 及更早版本写在供应商档案里的明文密钥。只读迁移，永不再序列化。
+    #[serde(default, rename = "apiKey", skip_serializing)]
+    legacy_api_key: Option<String>,
     base_url: String,
     #[serde(default)]
     allow_insecure_http: bool,
@@ -510,6 +996,7 @@ struct ProviderProfileSummary {
     name: String,
     api_key: String,
     has_api_key: bool,
+    secret_backend: SecretBackendKind,
     base_url: String,
     allow_insecure_http: bool,
     api_backend: ProviderApiBackend,
@@ -551,6 +1038,8 @@ struct OpenAiModelsResponse {
 
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PREVIEW_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_IMAGE_PREVIEW_BYTES: u64 = 40 * 1024 * 1024;
+const MAX_STREAMABLE_PREVIEW_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 const MAX_ACP_TEXT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_WORKSPACE_ENTRIES: usize = 2_000;
 static CONFIG_WRITE_NONCE: AtomicU64 = AtomicU64::new(0);
@@ -580,17 +1069,101 @@ fn grok_home() -> Result<PathBuf, String> {
 }
 
 #[derive(Debug, PartialEq, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionPreviewMessage {
-    role: String,
-    text: String,
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SessionPreviewEntry {
+    Message {
+        role: String,
+        text: String,
+    },
+    Tool {
+        id: String,
+        name: String,
+        title: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        input: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output: Option<String>,
+        status: SessionPreviewToolStatus,
+    },
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionPreviewToolStatus {
+    Done,
+    Cancelled,
 }
 
 #[derive(Debug, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SessionDiskPreview {
-    messages: Vec<SessionPreviewMessage>,
+    entries: Vec<SessionPreviewEntry>,
     truncated: bool,
+}
+
+fn capped_session_preview_text(text: &str, limit: usize, truncated: &mut bool) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    *truncated = true;
+    let mut output = text.chars().take(limit).collect::<String>();
+    output.push_str("\n… [Grox 已截断过长的磁盘预览内容]");
+    output
+}
+
+fn push_session_preview_entry(
+    entries: &mut VecDeque<SessionPreviewEntry>,
+    limit: usize,
+    entry: SessionPreviewEntry,
+    truncated: &mut bool,
+) {
+    if limit == 0 {
+        return;
+    }
+    if entries.len() == limit {
+        entries.pop_front();
+        *truncated = true;
+    }
+    entries.push_back(entry);
+}
+
+fn session_preview_tool_call(
+    call: &serde_json::Value,
+    truncated: &mut bool,
+) -> Option<SessionPreviewEntry> {
+    let id = call
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
+    let name = call
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("tool")
+        .to_string();
+    let input = call
+        .get("arguments")
+        .and_then(session_history_text)
+        .filter(|input| !input.trim().is_empty())
+        .map(|input| {
+            capped_session_preview_text(
+                &input,
+                MAX_SESSION_PREVIEW_TOOL_INPUT_CHARS,
+                truncated,
+            )
+        });
+    Some(SessionPreviewEntry::Tool {
+        id: id.to_string(),
+        title: name.clone(),
+        name,
+        input,
+        output: None,
+        // No result in durable history means the call was interrupted or is
+        // still active; the preview must never imply success.
+        status: SessionPreviewToolStatus::Cancelled,
+    })
 }
 
 fn session_history_text(content: &serde_json::Value) -> Option<String> {
@@ -617,18 +1190,15 @@ fn parse_session_disk_preview(
     reader: impl std::io::BufRead,
     limit: usize,
 ) -> Result<SessionDiskPreview, String> {
-    let mut messages = VecDeque::with_capacity(limit.min(MAX_SESSION_PREVIEW_MESSAGES));
+    let limit = limit.min(MAX_SESSION_PREVIEW_MESSAGES);
+    let mut entries = VecDeque::with_capacity(limit);
     let mut truncated = false;
     for line in reader.lines() {
         let line = line.map_err(|error| format!("无法读取会话预览：{error}"))?;
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
-        let Some(role @ ("user" | "assistant")) =
-            value.get("type").and_then(serde_json::Value::as_str)
-        else {
-            continue;
-        };
+        let role = value.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
         if role == "user"
             && value
                 .get("synthetic_reason")
@@ -637,23 +1207,120 @@ fn parse_session_disk_preview(
         {
             continue;
         }
-        let Some(text) = value.get("content").and_then(session_history_text) else {
+        if matches!(role, "user" | "assistant") {
+            if let Some(text) = value.get("content").and_then(session_history_text) {
+                if !text.trim().is_empty() && limit > 0 {
+                    let text = capped_session_preview_text(
+                        &text,
+                        MAX_SESSION_PREVIEW_TEXT_CHARS,
+                        &mut truncated,
+                    );
+                    push_session_preview_entry(
+                        &mut entries,
+                        limit,
+                        SessionPreviewEntry::Message {
+                            role: role.to_string(),
+                            text,
+                        },
+                        &mut truncated,
+                    );
+                }
+            }
+
+            // Current Grok Build stores calls on assistant rows, then writes a
+            // separate tool_result row. Preserve those public events so an
+            // offline restore still explains what the agent executed.
+            if role == "assistant" && limit > 0 {
+                for call in value
+                    .get("tool_calls")
+                    .and_then(serde_json::Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let Some(entry) = session_preview_tool_call(call, &mut truncated) else {
+                        continue;
+                    };
+                    let id = match &entry {
+                        SessionPreviewEntry::Tool { id, .. } => id.clone(),
+                        SessionPreviewEntry::Message { .. } => unreachable!(),
+                    };
+                    if let Some(SessionPreviewEntry::Tool {
+                        name,
+                        title,
+                        input,
+                        ..
+                    }) = entries.iter_mut().find(|known| {
+                        matches!(known, SessionPreviewEntry::Tool { id: known_id, .. } if known_id == &id)
+                    }) {
+                        if let SessionPreviewEntry::Tool {
+                            name: new_name,
+                            title: new_title,
+                            input: new_input,
+                            ..
+                        } = entry
+                        {
+                            *name = new_name;
+                            *title = new_title;
+                            *input = new_input;
+                        }
+                        continue;
+                    }
+                    push_session_preview_entry(&mut entries, limit, entry, &mut truncated);
+                }
+            }
+            continue;
+        }
+
+        if role != "tool_result" || limit == 0 {
+            continue;
+        }
+        let Some(id) = value
+            .get("tool_call_id")
+            .or_else(|| value.get("toolCallId"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
             continue;
         };
-        if text.trim().is_empty() || limit == 0 {
+        let output = value
+            .get("content")
+            .and_then(session_history_text)
+            .filter(|output| !output.trim().is_empty())
+            .map(|output| {
+                capped_session_preview_text(
+                    &output,
+                    MAX_SESSION_PREVIEW_TEXT_CHARS,
+                    &mut truncated,
+                )
+            });
+        if let Some(SessionPreviewEntry::Tool {
+            output: known_output,
+            status,
+            ..
+        }) = entries.iter_mut().find(|entry| {
+            matches!(entry, SessionPreviewEntry::Tool { id: known_id, .. } if known_id == id)
+        }) {
+            *known_output = output;
+            *status = SessionPreviewToolStatus::Done;
             continue;
         }
-        if messages.len() == limit {
-            messages.pop_front();
-            truncated = true;
-        }
-        messages.push_back(SessionPreviewMessage {
-            role: role.to_string(),
-            text,
-        });
+        push_session_preview_entry(
+            &mut entries,
+            limit,
+            SessionPreviewEntry::Tool {
+                id: id.to_string(),
+                name: "tool".into(),
+                title: "工具调用".into(),
+                input: None,
+                output,
+                status: SessionPreviewToolStatus::Done,
+            },
+            &mut truncated,
+        );
     }
     Ok(SessionDiskPreview {
-        messages: messages.into(),
+        entries: entries.into(),
         truncated,
     })
 }
@@ -788,14 +1455,18 @@ fn workspace_paths_match(left: &str, right: &str) -> bool {
     }
 }
 
-fn collect_session_directory_ids(directory: &Path, depth: usize, ids: &mut BTreeSet<String>) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
+fn collect_session_directory_ids(
+    directory: &Path,
+    depth: usize,
+    ids: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("无法枚举 Grok 会话目录 {}：{error}", directory.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("无法枚举 Grok 会话目录项：{error}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("无法读取 Grok 会话目录项：{error}"))?;
         if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
@@ -807,30 +1478,36 @@ fn collect_session_directory_ids(directory: &Path, depth: usize, ids: &mut BTree
             continue;
         }
         if depth < 2 {
-            collect_session_directory_ids(&path, depth + 1, ids);
+            collect_session_directory_ids(&path, depth + 1, ids)?;
         }
     }
+    Ok(())
 }
 
-fn delete_project_session_history_data(grok: &Path, cwd: &str) -> Result<Vec<String>, String> {
+fn project_session_history_data(
+    grok: &Path,
+    cwd: &str,
+) -> Result<(Vec<String>, Vec<PathBuf>), String> {
     let wanted = workspace_identity(cwd);
     if wanted.is_empty() {
         return Err("工作目录不能为空".into());
     }
     let sessions = grok.join("sessions");
     if !sessions.is_dir() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let root = sessions
         .canonicalize()
         .map_err(|error| format!("无法读取 Grok 会话目录：{error}"))?;
     let mut ids = BTreeSet::new();
+    let mut directories = Vec::new();
     let entries =
         fs::read_dir(&root).map_err(|error| format!("无法枚举 Grok 会话目录：{error}"))?;
-    for entry in entries.filter_map(Result::ok) {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("无法枚举 Grok 会话目录项：{error}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("无法读取 Grok 会话目录项：{error}"))?;
         if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
@@ -850,11 +1527,20 @@ fn delete_project_session_history_data(grok: &Path, cwd: &str) -> Result<Vec<Str
         if directory.parent() != Some(root.as_path()) {
             return Err("拒绝删除会话根目录之外的路径".into());
         }
-        collect_session_directory_ids(&directory, 0, &mut ids);
+        collect_session_directory_ids(&directory, 0, &mut ids)?;
+        directories.push(directory);
+    }
+    Ok((ids.into_iter().collect(), directories))
+}
+
+#[cfg(test)]
+fn delete_project_session_history_data(grok: &Path, cwd: &str) -> Result<Vec<String>, String> {
+    let (ids, directories) = project_session_history_data(grok, cwd)?;
+    for directory in directories {
         fs::remove_dir_all(&directory)
             .map_err(|error| format!("无法删除项目会话历史 {}：{error}", directory.display()))?;
     }
-    Ok(ids.into_iter().collect())
+    Ok(ids)
 }
 
 fn history_file_in_session_dir(dir: &Path) -> Option<PathBuf> {
@@ -1188,8 +1874,34 @@ fn atomic_orphan_writer_pid(orphan_name: &str) -> Option<u32> {
 }
 
 fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
-    if content.len() as u64 > MAX_CONFIG_BYTES {
-        return Err("配置文档不能超过 4 MB".into());
+    atomic_write_bounded_with_privacy(path, content, MAX_CONFIG_BYTES, false)
+}
+
+fn atomic_write_private(path: &Path, content: &str) -> Result<(), String> {
+    atomic_write_bounded_private(path, content, MAX_CONFIG_BYTES)
+}
+
+fn atomic_write_bounded_private(
+    path: &Path,
+    content: &str,
+    max_bytes: u64,
+) -> Result<(), String> {
+    atomic_write_bounded_with_privacy(path, content, max_bytes, true)?;
+    #[cfg(not(unix))]
+    restrict_private_file(path)?;
+    Ok(())
+}
+
+fn atomic_write_bounded_with_privacy(
+    path: &Path,
+    content: &str,
+    max_bytes: u64,
+    private: bool,
+) -> Result<(), String> {
+    #[cfg(not(unix))]
+    let _ = private;
+    if content.len() as u64 > max_bytes {
+        return Err(format!("文档不能超过 {} MB", max_bytes / 1024 / 1024));
     }
     let parent = path
         .parent()
@@ -1208,9 +1920,14 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
         nonce,
     ));
     {
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        if private {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = options
             .open(&temp)
             .map_err(|error| format!("无法创建临时配置 {}：{error}", temp.display()))?;
         if let Err(error) = file
@@ -1312,112 +2029,772 @@ fn scrub_atomic_write_orphans(dir: &Path, max_age: std::time::Duration) -> u32 {
     removed
 }
 
-fn scrub_session_cache_dir(app: &tauri::AppHandle) {
-    let Ok(dir) = app.path().app_config_dir().map(|d| d.join("session-cache")) else {
-        return;
-    };
-    if !dir.is_dir() {
-        return;
-    }
-    // Temps older than 30s are safe leftovers; immediate cleanup of all .tmp
-    // is fine because live writers hold exclusive create_new names.
-    let removed = scrub_atomic_write_orphans(&dir, std::time::Duration::from_secs(30));
-    if removed > 0 {
-        eprintln!("grox: scrubbed {removed} orphan session-cache temp/bak files");
-    }
-}
+const SESSION_JOURNAL_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const PROMPT_QUEUES_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const AUTOMATIONS_MAX_BYTES: u64 = 4 * 1024 * 1024;
+const TOOL_IMAGE_MAX_BYTES: usize = 8 * 1024 * 1024;
+const TOOL_IMAGES_MAX_BYTES: usize = 16 * 1024 * 1024;
 
-const SESSION_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024;
-
-fn session_cache_path(app: &tauri::AppHandle, id: &str) -> Result<PathBuf, String> {
-    let safe = id
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-        .take(80)
-        .collect::<String>();
-    if safe.is_empty() {
+fn safe_session_storage_id(id: &str) -> Result<&str, String> {
+    if id.is_empty()
+        || id.len() > 80
+        || !id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
+    {
         return Err("无效的会话 ID".into());
     }
+    Ok(id)
+}
+
+fn legacy_session_cache_path(app: &tauri::AppHandle, id: &str) -> Result<PathBuf, String> {
+    let safe = safe_session_storage_id(id)?;
     app.path()
         .app_config_dir()
         .map(|directory| directory.join("session-cache").join(format!("{safe}.json")))
         .map_err(|error| format!("无法定位会话缓存目录：{error}"))
 }
 
-#[tauri::command]
-fn read_session_cache(app: tauri::AppHandle, id: String) -> Result<Option<String>, String> {
-    let path = session_cache_path(&app, &id)?;
-    if !path.is_file() {
-        return Ok(None);
-    }
-    read_bounded_text(&path, SESSION_CACHE_MAX_BYTES)
-        .map(|content| if content.trim().is_empty() { None } else { Some(content) })
-        .or(Ok(None))
+fn session_journal_dir(app: &tauri::AppHandle, id: &str) -> Result<PathBuf, String> {
+    let safe = safe_session_storage_id(id)?;
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("sessions").join(safe))
+        .map_err(|error| format!("无法定位应用会话目录：{error}"))
 }
 
-#[tauri::command]
-fn write_session_cache(app: tauri::AppHandle, id: String, content: String) -> Result<(), String> {
-    if content.len() as u64 > SESSION_CACHE_MAX_BYTES {
-        return Err("会话缓存不能超过 4 MB".into());
-    }
-    let value: serde_json::Value = serde_json::from_str(&content)
-        .map_err(|error| format!("会话缓存必须是 JSON：{error}"))?;
-    if !value.is_object() {
-        return Err("会话缓存必须是 JSON 对象".into());
-    }
-    let path = session_cache_path(&app, &id)?;
-    atomic_write(&path, &content)?;
-    restrict_private_file(&path)
+fn session_journal_path(app: &tauri::AppHandle, id: &str) -> Result<PathBuf, String> {
+    Ok(session_journal_dir(app, id)?.join("journal.json"))
 }
 
-#[tauri::command]
-fn delete_session_cache(app: tauri::AppHandle, id: String) -> Result<(), String> {
-    let path = session_cache_path(&app, &id)?;
+#[derive(Deserialize)]
+struct ToolImagePayload {
+    mime: String,
+    data: String,
+}
+
+#[derive(Serialize)]
+struct ToolImageReference {
+    mime: String,
+    path: String,
+}
+
+fn checked_tool_image(image: ToolImagePayload) -> Result<(String, Vec<u8>, String), String> {
+    if image.data.len() > TOOL_IMAGE_MAX_BYTES.saturating_mul(4) / 3 + 4 {
+        return Err("单张工具图片不能超过 8 MB".into());
+    }
+    let bytes = BASE64
+        .decode(image.data.as_bytes())
+        .map_err(|error| format!("工具图片不是有效 Base64：{error}"))?;
+    if bytes.len() > TOOL_IMAGE_MAX_BYTES {
+        return Err("单张工具图片不能超过 8 MB".into());
+    }
+    let detected = prompt_image_mime(&bytes)
+        .ok_or("工具图片只支持 PNG、JPEG、GIF、WebP 或 BMP")?;
+    let declared_mime = image.mime.trim().to_ascii_lowercase();
+    let declared = match declared_mime.as_str() {
+        "image/jpg" => "image/jpeg",
+        value => value,
+    };
+    if declared != detected {
+        return Err(format!(
+            "工具图片声明类型 {declared} 与实际类型 {detected} 不一致"
+        ));
+    }
+    let extension = match detected {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        _ => return Err("不支持的工具图片类型".into()),
+    };
+    use sha2::{Digest as _, Sha256};
+    let name = format!("{:x}.{extension}", Sha256::digest(&bytes));
+    Ok((detected.to_string(), bytes, name))
+}
+
+fn write_tool_image(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if path.is_file() {
-        fs::remove_file(&path).map_err(|error| format!("无法删除会话缓存：{error}"))?;
+        let existing = fs::read(path).map_err(|error| format!("无法校验工具图片：{error}"))?;
+        if existing == bytes {
+            return Ok(());
+        }
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| "工具图片路径缺少父目录".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("无法创建工具图片目录：{error}"))?;
+    let nonce = CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let temp = parent.join(format!(".tool-media-{}-{nonce}.tmp", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&temp)
+        .map_err(|error| format!("无法创建工具图片临时文件：{error}"))?;
+    #[cfg(not(unix))]
+    restrict_private_file(&temp)?;
+    if let Err(error) = file.write_all(bytes).and_then(|_| file.sync_all()) {
+        drop(file);
+        let _ = fs::remove_file(&temp);
+        return Err(format!("无法写入工具图片：{error}"));
+    }
+    drop(file);
+    if let Err(error) = replace_file_atomic(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
+    }
+    #[cfg(not(unix))]
+    restrict_private_file(path)?;
+    Ok(())
+}
+
+#[tauri::command]
+fn persist_session_tool_images(
+    app: tauri::AppHandle,
+    storage: tauri::State<'_, SessionStorageState>,
+    session_id: String,
+    images: Vec<ToolImagePayload>,
+) -> Result<Vec<ToolImageReference>, String> {
+    safe_session_storage_id(&session_id)?;
+    let _write = storage.begin_write(&session_id)?;
+    if images.len() > 16 {
+        return Err("单次最多保存 16 张工具图片".into());
+    }
+    let media_dir = session_journal_dir(&app, &session_id)?.join("media");
+    let mut total = 0usize;
+    let mut references = Vec::with_capacity(images.len());
+    for image in images {
+        let (mime, bytes, name) = checked_tool_image(image)?;
+        total = total.saturating_add(bytes.len());
+        if total > TOOL_IMAGES_MAX_BYTES {
+            return Err("单次工具图片总大小不能超过 16 MB".into());
+        }
+        let path = media_dir.join(name);
+        write_tool_image(&path, &bytes)?;
+        app.asset_protocol_scope()
+            .allow_file(&path)
+            .map_err(|error| format!("无法授权工具图片预览：{error}"))?;
+        references.push(ToolImageReference {
+            mime,
+            path: path_for_webview(&path),
+        });
+    }
+    Ok(references)
+}
+
+#[tauri::command]
+fn read_session_journal(
+    app: tauri::AppHandle,
+    id: String,
+) -> Result<Option<String>, HostError> {
+    safe_session_storage_id(&id)
+        .map_err(|error| HostError::operation("SESSION_ID_INVALID", error))?;
+    let media_dir = session_journal_dir(&app, &id)
+        .map_err(|error| session_persistence_error("SESSION_JOURNAL_READ_FAILED", error))?
+        .join("media");
+    if media_dir.is_dir() {
+        app.asset_protocol_scope()
+            .allow_directory(&media_dir, false)
+            .map_err(|error| {
+                session_persistence_error(
+                    "SESSION_MEDIA_SCOPE_FAILED",
+                    format!("无法授权会话工具图片预览：{error}"),
+                )
+            })?;
+    }
+    let path = session_journal_path(&app, &id)
+        .map_err(|error| session_persistence_error("SESSION_JOURNAL_READ_FAILED", error))?;
+    let source = if path.is_file() {
+        path
+    } else {
+        let legacy = legacy_session_cache_path(&app, &id)
+            .map_err(|error| session_persistence_error("SESSION_JOURNAL_READ_FAILED", error))?;
+        if !legacy.is_file() {
+            return Ok(None);
+        }
+        legacy
+    };
+    SessionJournalStore
+        .read(&source, &id, SESSION_JOURNAL_MAX_BYTES)
+        .map_err(|error| session_persistence_error("SESSION_JOURNAL_READ_FAILED", error))
+}
+
+fn session_persistence_error(code: &'static str, error: String) -> HostError {
+    HostError::recoverable_environment(
+        code,
+        error,
+        "检查应用数据目录权限、可用空间和磁盘健康后重试；Host 不会覆盖损坏数据",
+    )
+}
+
+#[tauri::command]
+fn write_session_journal(
+    app: tauri::AppHandle,
+    storage: tauri::State<'_, SessionStorageState>,
+    state: tauri::State<'_, Arc<AcpState>>,
+    id: String,
+    content: String,
+) -> Result<(), HostError> {
+    safe_session_storage_id(&id)
+        .map_err(|error| HostError::operation("SESSION_ID_INVALID", error))?;
+    let _write = storage
+        .begin_write(&id)
+        .map_err(|error| HostError::operation("SESSION_STORAGE_REJECTED", error))?;
+    let path = session_journal_path(&app, &id)
+        .map_err(|error| session_persistence_error("SESSION_JOURNAL_WRITE_FAILED", error))?;
+    let legacy = legacy_session_cache_path(&app, &id)
+        .map_err(|error| session_persistence_error("SESSION_JOURNAL_WRITE_FAILED", error))?;
+    let metadata = SessionJournalStore.write(
+        &path,
+        &legacy,
+        &id,
+        &content,
+        SESSION_JOURNAL_MAX_BYTES,
+    )
+    .map_err(|error| match error {
+        SessionJournalWriteError::InvalidIncoming(message) => {
+            HostError::protocol("SESSION_JOURNAL_INVALID", message)
+        }
+        SessionJournalWriteError::Conflict(message) => {
+            HostError::operation("SESSION_JOURNAL_CONFLICT", message)
+        }
+        SessionJournalWriteError::Storage(message) => {
+            session_persistence_error("SESSION_JOURNAL_WRITE_FAILED", message)
+        }
+    })?;
+    if let Some(host_events) = metadata.host_events {
+        let acknowledged = state.session_events.acknowledge_session_events(
+            &host_events.stream_id,
+            &id,
+            &host_events.sequences,
+        );
+        tracing::debug!(
+            target: "grox::session_events",
+            session_id = %id,
+            saved_at = metadata.saved_at,
+            requested = host_events.sequences.len(),
+            acknowledged,
+            "application journal advanced Host event durability"
+        );
+    }
+    Ok(())
+}
+
+fn delete_session_journal_files(app: &tauri::AppHandle, id: &str) -> Result<(), String> {
+    let dir = session_journal_dir(app, id)?;
+    if dir.is_dir() {
+        fs::remove_dir_all(&dir).map_err(|error| format!("无法删除应用会话目录：{error}"))?;
+    }
+    let legacy = legacy_session_cache_path(app, id)?;
+    if legacy.is_file() {
+        fs::remove_file(&legacy).map_err(|error| format!("无法删除旧版会话缓存：{error}"))?;
     }
     Ok(())
 }
 
 #[tauri::command]
-fn delete_session_data(app: tauri::AppHandle, id: String) -> Result<bool, String> {
+fn delete_session_journal(
+    app: tauri::AppHandle,
+    storage: tauri::State<'_, SessionStorageState>,
+    id: String,
+) -> Result<(), HostError> {
+    safe_session_storage_id(&id)
+        .map_err(|error| HostError::operation("SESSION_ID_INVALID", error))?;
+    let _delete = storage
+        .begin_delete(&id)
+        .map_err(|error| HostError::operation("SESSION_STORAGE_REJECTED", error))?;
+    delete_session_journal_files(&app, &id)
+        .map_err(|error| session_persistence_error("SESSION_JOURNAL_DELETE_FAILED", error))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionJournalStatus {
+    count: u32,
+    total_bytes: u64,
+    latest_saved_at: Option<u64>,
+    migration_pending: u32,
+    unreadable_count: u32,
+}
+
+fn add_journal_status(path: &Path, status: &mut SessionJournalStatus) {
+    if !path.is_file() {
+        return;
+    }
+    status.count += 1;
+    if let Ok(metadata) = path.metadata() {
+        status.total_bytes = status.total_bytes.saturating_add(metadata.len());
+    }
+    let saved_at = read_bounded_text(path, SESSION_JOURNAL_MAX_BYTES)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .and_then(|value| {
+            value
+                .get("savedAt")
+                .or_else(|| value.get("updatedAt"))
+                .and_then(serde_json::Value::as_u64)
+        });
+    match saved_at {
+        Some(saved_at) => {
+            status.latest_saved_at = Some(status.latest_saved_at.unwrap_or(0).max(saved_at));
+        }
+        None => status.unreadable_count += 1,
+    }
+}
+
+fn session_journal_status_inner(app: tauri::AppHandle) -> Result<SessionJournalStatus, String> {
+    let config = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("无法定位应用会话目录：{error}"))?;
+    let mut status = SessionJournalStatus {
+        count: 0,
+        total_bytes: 0,
+        latest_saved_at: None,
+        migration_pending: 0,
+        unreadable_count: 0,
+    };
+    let sessions = config.join("sessions");
+    if sessions.is_dir() {
+        for entry in fs::read_dir(&sessions)
+            .map_err(|error| format!("无法读取应用会话目录 {}：{error}", sessions.display()))?
+            .filter_map(Result::ok)
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                add_journal_status(&path.join("journal.json"), &mut status);
+            }
+        }
+    }
+    let legacy = config.join("session-cache");
+    if legacy.is_dir() {
+        for entry in fs::read_dir(&legacy)
+            .map_err(|error| format!("无法读取旧版会话缓存目录 {}：{error}", legacy.display()))?
+            .filter_map(Result::ok)
+        {
+            let path = entry.path();
+            if path.extension().and_then(|extension| extension.to_str()) == Some("json") {
+                status.migration_pending += 1;
+                add_journal_status(&path, &mut status);
+            }
+        }
+    }
+    Ok(status)
+}
+
+#[tauri::command]
+fn session_journal_status(app: tauri::AppHandle) -> Result<SessionJournalStatus, HostError> {
+    session_journal_status_inner(app)
+        .map_err(|error| session_persistence_error("SESSION_JOURNAL_STATUS_FAILED", error))
+}
+
+fn prompt_queues_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("prompt-queues.json"))
+        .map_err(|error| format!("无法定位提示队列文件：{error}"))
+}
+
+fn drafts_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("drafts.json"))
+        .map_err(|error| format!("无法定位草稿文件：{error}"))
+}
+
+fn draft_workspace(cwd: &str, scope: Option<&str>) -> Result<String, HostError> {
+    let workspace = checked_workspace(cwd)
+        .map(|path| path_for_webview(&path))
+        .map_err(|error| HostError::operation("DRAFT_WORKSPACE_INVALID", error))?;
+    let Some(scope) = scope.filter(|value| !value.is_empty()) else {
+        return Ok(workspace);
+    };
+    if scope.len() > 32
+        || !scope
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+    {
+        return Err(HostError::operation(
+            "DRAFT_SCOPE_INVALID",
+            "草稿作用域无效",
+        ));
+    }
+    Ok(format!("scope:{scope}:{workspace}"))
+}
+
+fn draft_storage_error(error: String) -> HostError {
+    HostError::recoverable_environment(
+        "DRAFT_STORAGE_FAILED",
+        error,
+        "检查应用数据目录权限；不要关闭当前页面，以免丢失尚未发送的内容",
+    )
+}
+
+fn draft_store_error(error: DraftStoreError) -> HostError {
+    match error {
+        DraftStoreError::Conflict(message) => {
+            HostError::operation("DRAFT_WRITE_CONFLICT", message)
+        }
+        DraftStoreError::Invalid(message) => HostError::operation("DRAFT_INVALID", message),
+        DraftStoreError::Storage(message) => draft_storage_error(message),
+    }
+}
+
+#[tauri::command]
+fn read_draft(
+    app: tauri::AppHandle,
+    drafts: tauri::State<'_, DraftStore>,
+    cwd: String,
+    scope: Option<String>,
+) -> Result<DraftSnapshot, HostError> {
+    let workspace = draft_workspace(&cwd, scope.as_deref())?;
+    let path = drafts_path(&app).map_err(draft_storage_error)?;
+    drafts
+        .read(&path, &workspace)
+        .map_err(draft_store_error)
+}
+
+#[tauri::command]
+fn write_draft(
+    app: tauri::AppHandle,
+    drafts: tauri::State<'_, DraftStore>,
+    cwd: String,
+    scope: Option<String>,
+    expected_revision: u64,
+    text: String,
+    attachments: Vec<DraftAttachment>,
+) -> Result<DraftSnapshot, HostError> {
+    let workspace = draft_workspace(&cwd, scope.as_deref())?;
+    let path = drafts_path(&app).map_err(draft_storage_error)?;
+    drafts
+        .write(
+            &path,
+            &workspace,
+            expected_revision,
+            text,
+            attachments,
+        )
+        .map_err(draft_store_error)
+}
+
+#[tauri::command]
+fn delete_draft(
+    app: tauri::AppHandle,
+    drafts: tauri::State<'_, DraftStore>,
+    cwd: String,
+    scope: Option<String>,
+    expected_revision: u64,
+) -> Result<DraftSnapshot, HostError> {
+    let workspace = draft_workspace(&cwd, scope.as_deref())?;
+    let path = drafts_path(&app).map_err(draft_storage_error)?;
+    drafts
+        .delete(&path, &workspace, expected_revision)
+        .map_err(draft_store_error)
+}
+
+#[tauri::command]
+fn read_prompt_queues(
+    app: tauri::AppHandle,
+    queues: tauri::State<'_, PromptQueueStore>,
+) -> Result<Option<String>, HostError> {
+    let path = prompt_queues_path(&app)
+        .map_err(|error| session_persistence_error("PROMPT_QUEUE_READ_FAILED", error))?;
+    queues
+        .read(&path, PROMPT_QUEUES_MAX_BYTES)
+        .map_err(|error| session_persistence_error("PROMPT_QUEUE_READ_FAILED", error))
+}
+
+#[tauri::command]
+fn patch_prompt_queues(
+    app: tauri::AppHandle,
+    queues: tauri::State<'_, PromptQueueStore>,
+    storage: tauri::State<'_, SessionStorageState>,
+    upserts: BTreeMap<String, serde_json::Value>,
+    deletes: Vec<String>,
+) -> Result<(), HostError> {
+    let upsert_ids = upserts.keys().cloned().collect::<Vec<_>>();
+    let patch_ids = upsert_ids
+        .iter()
+        .chain(deletes.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    for id in &patch_ids {
+        safe_session_storage_id(id)
+            .map_err(|error| HostError::operation("SESSION_ID_INVALID", error))?;
+    }
+    // 与删除命令采用相同锁序：先 tombstone，再队列事务，防止延迟 patch 复活。
+    let _write = storage
+        .begin_write_ids(&patch_ids)
+        .map_err(|error| HostError::operation("PROMPT_QUEUE_PATCH_REJECTED", error))?;
+    let path = prompt_queues_path(&app)
+        .map_err(|error| session_persistence_error("PROMPT_QUEUE_WRITE_FAILED", error))?;
+    queues
+        .patch(&path, upserts, deletes, PROMPT_QUEUES_MAX_BYTES)
+        .map_err(|error| session_persistence_error("PROMPT_QUEUE_WRITE_FAILED", error))
+}
+
+fn automations_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("automations.json"))
+        .map_err(|error| format!("无法定位自动化文件：{error}"))
+}
+
+fn worktree_bindings_path(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    app.path()
+        .app_config_dir()
+        .map(|directory| directory.join("worktree-bindings.json"))
+        .map_err(|error| format!("无法定位 worktree 会话索引：{error}"))
+}
+
+#[tauri::command]
+fn read_automations(
+    app: tauri::AppHandle,
+    automations: tauri::State<'_, AutomationStore>,
+) -> Result<Option<String>, HostError> {
+    let path = automations_path(&app)
+        .map_err(|error| session_persistence_error("AUTOMATION_READ_FAILED", error))?;
+    automations
+        .read(&path, AUTOMATIONS_MAX_BYTES)
+        .map_err(|error| session_persistence_error("AUTOMATION_READ_FAILED", error))
+}
+
+#[tauri::command]
+fn patch_automations(
+    app: tauri::AppHandle,
+    automations: tauri::State<'_, AutomationStore>,
+    worktrees: tauri::State<'_, WorktreeOwnershipStore>,
+    upserts: Vec<serde_json::Value>,
+    deletes: Vec<String>,
+) -> Result<(), HostError> {
+    // cwd 变更与 worktree 删除串行；否则删除检查完成后，一个页面 patch
+    // 可能把自动化重新指向即将消失的目录。
+    let _worktree_lifecycle = worktrees.lock_lifecycle();
+    let path = automations_path(&app)
+        .map_err(|error| session_persistence_error("AUTOMATION_WRITE_FAILED", error))?;
+    automations
+        .patch(&path, upserts, deletes, AUTOMATIONS_MAX_BYTES)
+        .map_err(|error| session_persistence_error("AUTOMATION_WRITE_FAILED", error))
+}
+
+fn automation_claim_error(message: String) -> AcpHostError {
+    if message.contains("token 无效")
+        || message.contains("无效会话 ID")
+        || message.contains("错误详情不能超过")
+    {
+        AcpHostError::protocol("AUTOMATION_INVALID_RESULT", message)
+    } else if message.contains("认领")
+        || message.contains("正在执行")
+        || message.contains("不存在")
+        || message.contains("id 无效")
+    {
+        AcpHostError::operation("AUTOMATION_CLAIM_STALE", message)
+    } else {
+        automation_storage_error(message)
+    }
+}
+
+#[tauri::command]
+async fn agent_runtime_resume(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    generation: u64,
+) -> Result<(), AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    state.resume_runtime(generation).await
+}
+
+#[tauri::command]
+async fn agent_runtime_pause(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+) -> Result<(), AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    state.pause_runtime().await
+}
+
+#[tauri::command]
+async fn automation_runner_status(
+    state: tauri::State<'_, Arc<AcpState>>,
+    runner: tauri::State<'_, AutomationRunner>,
+) -> Result<automation_runner::AutomationRunnerStatus, AcpHostError> {
+    Ok(runner.status(state.inner()).await)
+}
+
+#[tauri::command]
+async fn run_automation_now(
+    app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    runner: tauri::State<'_, AutomationRunner>,
+    automations: tauri::State<'_, AutomationStore>,
+    id: String,
+) -> Result<(), AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    runner.reserve_dispatch(state.inner()).await?;
+    let now_ms = automation_runner::unix_time_ms();
+    let path = match automations_path(&app).map_err(automation_storage_error) {
+        Ok(path) => path,
+        Err(error) => {
+            runner.release_dispatch();
+            return Err(error);
+        }
+    };
+    let dispatch = match automations
+        .claim_now(&path, &id, now_ms, AUTOMATIONS_MAX_BYTES)
+        .map_err(automation_claim_error)
+    {
+        Ok(dispatch) => dispatch,
+        Err(error) => {
+            runner.release_dispatch();
+            return Err(error);
+        }
+    };
+    runner.launch_reserved(app, dispatch);
+    Ok(())
+}
+
+#[tauri::command]
+fn delete_session_data(
+    app: tauri::AppHandle,
+    storage: tauri::State<'_, SessionStorageState>,
+    queues: tauri::State<'_, PromptQueueStore>,
+    worktrees: tauri::State<'_, WorktreeOwnershipStore>,
+    id: String,
+) -> Result<bool, String> {
     if !valid_session_id(&id) {
         return Err("无效会话 ID".into());
     }
+    let _delete = storage.begin_delete(&id)?;
     let history = grok_home().and_then(|home| delete_session_history_data(&home, &id));
-    let cache = delete_session_cache(app, id);
-    match (history, cache) {
-        (Ok(removed), Ok(())) => Ok(removed),
-        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
-        (Err(history_error), Err(cache_error)) => {
-            Err(format!("{history_error}；同时无法删除会话缓存：{cache_error}"))
+    let journal = delete_session_journal_files(&app, &id);
+    let queue = prompt_queues_path(&app).and_then(|path| {
+        queues.delete_sessions(&path, std::slice::from_ref(&id), PROMPT_QUEUES_MAX_BYTES)
+    });
+    let removed = history.as_ref().copied().unwrap_or(false);
+    let mut errors = Vec::new();
+    if let Err(error) = history {
+        errors.push(error);
+    }
+    if let Err(error) = journal {
+        errors.push(format!("无法删除应用会话 journal：{error}"));
+    }
+    if let Err(error) = queue {
+        errors.push(format!("无法删除会话提示队列：{error}"));
+    }
+    if errors.is_empty() {
+        let binding_path = worktree_bindings_path(&app)?;
+        if let Err(error) = worktrees.delete_sessions(&binding_path, std::slice::from_ref(&id)) {
+            errors.push(format!("无法解除会话 worktree 关联：{error}"));
         }
     }
-}
-
-#[tauri::command]
-fn delete_project_session_data(app: tauri::AppHandle, cwd: String) -> Result<Vec<String>, String> {
-    let ids = delete_project_session_history_data(&grok_home()?, &cwd)?;
-    for id in &ids {
-        delete_session_cache(app.clone(), id.clone())?;
+    if errors.is_empty() {
+        Ok(removed)
+    } else {
+        Err(errors.join("；"))
     }
-    Ok(ids)
 }
 
 #[tauri::command]
-fn scrub_session_cache_orphans(app: tauri::AppHandle) -> Result<u32, String> {
-    let dir = app
+fn delete_project_session_data(
+    app: tauri::AppHandle,
+    storage: tauri::State<'_, SessionStorageState>,
+    queues: tauri::State<'_, PromptQueueStore>,
+    worktrees: tauri::State<'_, WorktreeOwnershipStore>,
+    cwd: String,
+) -> Result<Vec<String>, String> {
+    let (history_ids, directories) = project_session_history_data(&grok_home()?, &cwd)?;
+    let config = app
         .path()
         .app_config_dir()
-        .map(|directory| directory.join("session-cache"))
-        .map_err(|error| format!("无法定位会话缓存目录：{error}"))?;
-    if !dir.is_dir() {
-        return Ok(0);
+        .map_err(|error| format!("无法定位应用会话目录：{error}"))?;
+    let mut ids = history_ids.into_iter().collect::<BTreeSet<_>>();
+    // CLI 历史可能已被外部清理，但 Grox journal 仍能在冷启动时恢复侧栏。
+    // 这些孤儿会话必须和 CLI 会话进入同一 tombstone 事务。
+    ids.extend(worktree_ownership::journal_session_references(
+        &config,
+        Path::new(&cwd),
+    )?);
+    let ids = ids.into_iter().collect::<Vec<_>>();
+    // 先写 tombstone 并等待所有旧 writer 退出，再删任何目录。否则 journal
+    // 可在项目目录被删除后、门禁建立前重建会话，导致“删除后复活”。
+    let _delete = storage.begin_delete_ids(&ids)?;
+    let mut errors = Vec::new();
+    for directory in directories {
+        if let Err(error) = fs::remove_dir_all(&directory) {
+            errors.push(format!("无法删除项目会话历史 {}：{error}", directory.display()));
+        }
     }
-    Ok(scrub_atomic_write_orphans(
-        &dir,
-        std::time::Duration::from_secs(0),
-    ))
+    for id in &ids {
+        if let Err(error) = delete_session_journal_files(&app, id) {
+            errors.push(format!("无法删除会话 {id} 的应用 journal：{error}"));
+        }
+    }
+    match prompt_queues_path(&app) {
+        Ok(path) => {
+            if let Err(error) = queues.delete_sessions(&path, &ids, PROMPT_QUEUES_MAX_BYTES) {
+                errors.push(format!("无法删除项目会话提示队列：{error}"));
+            }
+        }
+        Err(error) => errors.push(format!("无法定位项目会话提示队列：{error}")),
+    }
+    // 任意存储清理失败时保留 worktree 引用，防止用户继续删除可能
+    // 仍含会话数据的工作树。
+    if errors.is_empty() {
+        match worktree_bindings_path(&app) {
+            Ok(path) => {
+                if let Err(error) = worktrees.delete_sessions(&path, &ids) {
+                    errors.push(format!("无法解除项目会话 worktree 关联：{error}"));
+                }
+            }
+            Err(error) => errors.push(format!("无法定位 worktree 会话索引：{error}")),
+        }
+    }
+    if errors.is_empty() {
+        Ok(ids)
+    } else {
+        Err(errors.join("；"))
+    }
+}
+
+fn scrub_session_journal_dirs(app: &tauri::AppHandle, minimum_age: Duration) -> Result<u32, String> {
+    let config = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("无法定位应用会话目录：{error}"))?;
+    let mut removed = 0;
+    let legacy = config.join("session-cache");
+    if legacy.is_dir() {
+        removed += scrub_atomic_write_orphans(&legacy, minimum_age);
+    }
+    let sessions = config.join("sessions");
+    if sessions.is_dir() {
+        for entry in fs::read_dir(&sessions)
+            .map_err(|error| format!("无法读取应用会话目录 {}：{error}", sessions.display()))?
+            .filter_map(Result::ok)
+        {
+            let path = entry.path();
+            if path.is_dir() {
+                removed += scrub_atomic_write_orphans(&path, minimum_age);
+            }
+        }
+    }
+    Ok(removed)
+}
+
+#[tauri::command]
+fn scrub_session_journal_orphans(app: tauri::AppHandle) -> Result<u32, String> {
+    scrub_session_journal_dirs(&app, Duration::from_secs(0))
 }
 
 #[cfg(unix)]
@@ -1568,19 +2945,38 @@ fn parse_grox_managed_provider_env(path: &Path) -> BTreeMap<String, String> {
 /// provider explicitly selected in Grox. This prevents an OAuth login from
 /// inheriting API gateway variables from the desktop app, a parent shell, or
 /// unmarked lines in `~/.grok/.env`.
-fn apply_grox_provider_environment(command: &mut Command) {
+fn apply_grox_provider_environment(command: &mut Command) -> Result<(), String> {
     for key in PROVIDER_ENV_KEYS {
         command.env_remove(key);
     }
-    let Ok(home) = grok_home() else {
-        return;
-    };
+    migrate_legacy_provider_secrets()?;
+    let home = grok_home()?;
     let values = parse_grox_managed_provider_env(&home.join(".env"));
-    for key in PROVIDER_ENV_KEYS {
-        if let Some(value) = values.get(key) {
-            command.env(key, value);
+    let kind = values
+        .get(GROX_PROVIDER_KIND_KEY)
+        .map(String::as_str)
+        .unwrap_or("oauth");
+    let secret = match kind {
+        "oauth" => None,
+        "official" => Some(require_provider_secret(SECRET_REF_OFFICIAL_PROVIDER)?),
+        "compatible" => {
+            for key in ["GROK_MODELS_BASE_URL", "GROK_MODELS_LIST_URL"] {
+                let value = values
+                    .get(key)
+                    .filter(|value| !value.trim().is_empty())
+                    .ok_or_else(|| format!("兼容服务缺少运行时元数据 {key}"))?;
+                command.env(key, value);
+            }
+            let profiles = read_provider_profiles_file()?;
+            let reference = compatible_secret_reference(&profiles, &values)?;
+            Some(require_provider_secret(&reference)?)
         }
+        _ => return Err(format!("未知的 Host 供应商模式：{kind}")),
+    };
+    if let Some(secret) = secret {
+        command.env("XAI_API_KEY", secret.expose());
     }
+    Ok(())
 }
 
 /// ACP has a text-only filesystem contract. Keep writes in the workspace, but
@@ -1854,6 +3250,15 @@ fn preview_type(path: &Path) -> (&'static str, &'static str) {
         "webp" => ("image", "image/webp"),
         "svg" => ("image", "image/svg+xml"),
         "bmp" => ("image", "image/bmp"),
+        "mp4" | "m4v" => ("video", "video/mp4"),
+        "webm" => ("video", "video/webm"),
+        "mov" => ("video", "video/quicktime"),
+        "mp3" => ("audio", "audio/mpeg"),
+        "m4a" => ("audio", "audio/mp4"),
+        "wav" => ("audio", "audio/wav"),
+        "ogg" | "oga" => ("audio", "audio/ogg"),
+        "flac" => ("audio", "audio/flac"),
+        "pdf" => ("pdf", "application/pdf"),
         "txt" | "log" | "json" | "jsonl" | "toml" | "yaml" | "yml" | "xml" | "css" | "js"
         | "jsx" | "ts" | "tsx" | "rs" | "py" | "go" | "java" | "c" | "h" | "cpp" | "hpp" | "sh"
         | "ps1" => ("text", "text/plain"),
@@ -2039,7 +3444,6 @@ fn configured_grok_command(_app: &tauri::AppHandle) -> GrokRuntimeInfo {
     runtime_info(executable.to_string(), "missing", None, true)
 }
 
-#[tauri::command]
 fn acp_read_text_file(
     cwd: String,
     path: String,
@@ -2105,11 +3509,10 @@ fn build_acp_read_file(bytes: Vec<u8>, line: Option<u32>, limit: Option<u32>) ->
     }
 }
 
-/// Read the TUI-compatible, binary-safe file response.  Unlike
-/// `acp_read_text_file`, this command deliberately never calls
+/// Build the TUI-compatible, binary-safe Host callback response. Unlike
+/// `acp_read_text_file`, this helper deliberately never calls
 /// `read_to_string` for an image: PNG/JPEG/etc. are returned as base64 bytes
 /// so the model can receive them as a multimodal tool result.
-#[tauri::command]
 fn acp_read_file(
     cwd: String,
     path: String,
@@ -2178,7 +3581,6 @@ fn read_prompt_image_paths(cwd: String, paths: Vec<String>) -> Result<Vec<Prompt
     Ok(images)
 }
 
-#[tauri::command]
 fn acp_write_text_file(cwd: String, path: String, content: String) -> Result<(), String> {
     if content.len() as u64 > MAX_ACP_TEXT_BYTES {
         return Err("单个文本文件不能超过 16 MB".into());
@@ -2211,11 +3613,18 @@ fn grok_runtime_info(app: tauri::AppHandle) -> GrokRuntimeInfo {
 
 #[tauri::command]
 async fn export_session_trace(app: tauri::AppHandle, session_id: String) -> Result<String, String> {
+    export_official_session_trace(&app, &session_id)
+        .await
+        .map(|path| path_for_webview(&path))
+}
+
+async fn export_official_session_trace(
+    app: &tauri::AppHandle,
+    session_id: &str,
+) -> Result<PathBuf, String> {
     let session_id = session_id.trim();
-    if session_id.is_empty() || session_id.len() > 128 || !session_id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-') {
-        return Err("会话 ID 格式无效".into());
-    }
-    let runtime = configured_grok_command(&app);
+    safe_session_storage_id(session_id)?;
+    let runtime = configured_grok_command(app);
     let mut command = Command::new(&runtime.path);
     command.args(["trace", session_id, "--local", "--json"])
         .stdin(Stdio::null())
@@ -2227,7 +3636,10 @@ async fn export_session_trace(app: tauri::AppHandle, session_id: String) -> Resu
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
-    let output = command.output().await.map_err(|error| format!("无法启动会话诊断导出：{error}"))?;
+    let output = tokio::time::timeout(Duration::from_secs(30), command.output())
+        .await
+        .map_err(|_| "官方会话 trace 导出超过 30 秒".to_string())?
+        .map_err(|error| format!("无法启动会话诊断导出：{error}"))?;
     if !output.status.success() {
         return Err(format!("会话诊断导出失败：{}", String::from_utf8_lossy(&output.stderr).trim()));
     }
@@ -2239,7 +3651,211 @@ async fn export_session_trace(app: tauri::AppHandle, session_id: String) -> Resu
         .or_else(|| value.get("local_path"))
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "会话诊断已导出，但官方 CLI 未返回文件路径".to_string())?;
-    Ok(path.to_string())
+    let path = PathBuf::from(path);
+    if !path.is_file() {
+        return Err(format!("官方 CLI 返回的会话诊断不存在：{}", path.display()));
+    }
+    Ok(path)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SessionSupportExport {
+    path: String,
+    official_trace_included: bool,
+    official_trace_error: Option<String>,
+}
+
+fn support_path(value: &str) -> String {
+    let path = Path::new(value);
+    if let Ok(home) = user_home() {
+        if let Ok(relative) = path.strip_prefix(home) {
+            return format!("$HOME/{}", relative.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    value.replace('\\', "/")
+}
+
+fn selected_session_journal_diagnostic(app: &tauri::AppHandle, id: &str) -> serde_json::Value {
+    match read_session_journal(app.clone(), id.to_string()) {
+        Ok(Some(raw)) => match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => {
+                let session = value.get("session").unwrap_or(&value);
+                serde_json::json!({
+                    "readable": true,
+                    "version": value.get("version").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                    "appSessionId": value.get("appSessionId").and_then(serde_json::Value::as_str).unwrap_or(id),
+                    "agentSessionId": value.get("agentSessionId").and_then(serde_json::Value::as_str).unwrap_or(id),
+                    "savedAt": value.get("savedAt").or_else(|| value.get("updatedAt")),
+                    "turnState": value.get("turnState").and_then(serde_json::Value::as_str).unwrap_or("legacy-settled"),
+                    "sessionStatus": session.get("status"),
+                    "blockCount": session.get("blocks").and_then(serde_json::Value::as_array).map(Vec::len),
+                })
+            }
+            Err(error) => serde_json::json!({ "readable": false, "error": error.to_string() }),
+        },
+        Ok(None) => serde_json::json!({ "readable": true, "missing": true }),
+        Err(error) => serde_json::json!({ "readable": false, "error": error }),
+    }
+}
+
+#[tauri::command]
+async fn export_session_support_bundle(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AcpState>>,
+    automation_runner: tauri::State<'_, AutomationRunner>,
+    drafts: tauri::State<'_, DraftStore>,
+    session_id: String,
+    client_snapshot: String,
+) -> Result<SessionSupportExport, String> {
+    let session_id = session_id.trim().to_string();
+    safe_session_storage_id(&session_id)?;
+    if client_snapshot.len() > 256 * 1024 {
+        return Err("客户端诊断快照不能超过 256 KB".into());
+    }
+    let client = serde_json::from_str::<serde_json::Value>(&client_snapshot)
+        .map_err(|error| format!("客户端诊断快照必须是 JSON：{error}"))?;
+    if !client.is_object() {
+        return Err("客户端诊断快照必须是 JSON 对象".into());
+    }
+
+    let runtime_info = configured_grok_command(&app);
+    let worktree_ownership = match worktree_bindings_path(&app).and_then(|path| {
+        app.state::<WorktreeOwnershipStore>().count(&path)
+    }) {
+        Ok(count) => serde_json::json!({ "readable": true, "sessionBindings": count }),
+        Err(error) => serde_json::json!({ "readable": false, "error": error }),
+    };
+    let process = {
+        let guard = state.process.lock().await;
+        guard.as_ref().map(|process| {
+            serde_json::json!({
+                "running": true,
+                "generation": process.generation,
+                "pid": process.child.id(),
+            })
+        })
+    };
+    let runtime = serde_json::json!({
+        "topology": "shared_process",
+        "processCapacity": 1,
+        "sessionCapacity": "shared_unbounded",
+        "process": process.unwrap_or_else(|| serde_json::json!({ "running": false })),
+        "nextGeneration": state.next_generation.load(Ordering::Relaxed),
+        "pendingRequests": state.requests.len().await,
+        "pendingInteractions": state.interactions.snapshots().len(),
+        "pendingClientCallbacks": state.client_callbacks.pending_len(),
+        "boundClientSessions": state.client_callbacks.bound_len(),
+        "activeTerminals": state.client_callbacks.terminal_len().await,
+        "automaticReconnectActive": state.automatic_reconnect_owner.load(Ordering::Acquire) != 0,
+        "lastConnectConfigured": state.last_connect().is_some(),
+        "worktreeOwnership": worktree_ownership,
+        "sessionOccupancy": state.sessions.snapshot(),
+        "sessionEventStream": state.session_events.status(),
+        "hostLogging": host_logging::status(),
+        "automationRunner": automation_runner.status(state.inner()).await,
+        "cli": {
+            "path": support_path(&runtime_info.path),
+            "source": runtime_info.source,
+            "version": runtime_info.version,
+            "selectionRequired": runtime_info.selection_required,
+        },
+    });
+    let journal = serde_json::json!({
+        "selected": selected_session_journal_diagnostic(&app, &session_id),
+        "summary": session_journal_status_inner(app.clone())?,
+    });
+    let draft_storage = match drafts_path(&app).and_then(|path| {
+        drafts
+            .status(&path)
+            .map(|(active, tracked, bytes)| (active, tracked, bytes))
+            .map_err(DraftStoreError::into_message)
+    }) {
+        Ok((active, tracked, bytes)) => serde_json::json!({
+            "readable": true,
+            "activeDrafts": active,
+            "trackedWorkspaces": tracked,
+            "bytes": bytes,
+            "maxBytes": DRAFTS_MAX_BYTES,
+        }),
+        Err(error) => serde_json::json!({ "readable": false, "error": error }),
+    };
+    let permission_audit =
+        match permission_audit::read_session(&host_prefs_dir_for_app(&app), &session_id) {
+            Ok(entries) => serde_json::json!({ "readable": true, "entries": entries }),
+            Err(error) => serde_json::json!({ "readable": false, "error": error }),
+        };
+
+    let trace = export_official_session_trace(&app, &session_id).await;
+    let (trace_path, trace_error) = match trace {
+        Ok(path) => (Some(path), None),
+        Err(error) => (None, Some(error)),
+    };
+    let meta = serde_json::json!({
+        "kind": "grox_session_support_bundle",
+        "appVersion": CLIENT_VERSION,
+        "generatedAtUnixMs": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
+        "os": std::env::consts::OS,
+        "arch": std::env::consts::ARCH,
+        "sessionId": session_id,
+        "draftStorage": draft_storage,
+        "mediaJobStorage": media_journal_status(app.state::<Arc<MediaService>>().inner()),
+        "officialTraceIncluded": trace_path.is_some(),
+        "officialTraceError": trace_error,
+    });
+    let path = support_bundle::write_session_support_bundle(
+        support_bundle::SessionSupportBundle {
+            session_id: &session_id,
+            meta,
+            runtime,
+            journal,
+            permission_audit,
+            client,
+            host_log: host_logging::recent_redacted_tail(),
+            official_trace: trace_path.as_deref(),
+        },
+    )?;
+    Ok(SessionSupportExport {
+        path: path_for_webview(&path),
+        official_trace_included: trace_path.is_some(),
+        official_trace_error: trace_error,
+    })
+}
+
+#[tauri::command]
+fn reveal_support_bundle(path: String) -> Result<(), String> {
+    let file = PathBuf::from(path)
+        .canonicalize()
+        .map_err(|error| format!("无法定位支持包：{error}"))?;
+    let temp = std::env::temp_dir()
+        .canonicalize()
+        .map_err(|error| format!("无法定位临时目录：{error}"))?;
+    let name = file.file_name().and_then(|value| value.to_str()).unwrap_or_default();
+    if !file.starts_with(&temp)
+        || !file.is_file()
+        || !name.starts_with("Grox-session-support-")
+        || file.extension().and_then(|value| value.to_str()) != Some("zip")
+    {
+        return Err("拒绝显示非 Grox 会话支持包".into());
+    }
+    #[cfg(windows)]
+    std::process::Command::new("explorer.exe")
+        .arg("/select,")
+        .arg(&file)
+        .spawn()
+        .map_err(|error| format!("无法打开资源管理器：{error}"))?;
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open")
+        .arg("-R")
+        .arg(&file)
+        .spawn()
+        .map_err(|error| format!("无法在 Finder 中显示支持包：{error}"))?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    std::process::Command::new("xdg-open")
+        .arg(file.parent().unwrap_or(&file))
+        .spawn()
+        .map_err(|error| format!("无法打开文件管理器：{error}"))?;
+    Ok(())
 }
 
 fn is_trusted_cli_install_host(host: Option<&str>) -> bool {
@@ -2315,6 +3931,28 @@ async fn install_official_grok_cli(
     // Windows cannot replace a running executable. Stop the official CLI
     // child before invoking its official updater; the webview reload below
     // starts the freshly installed binary again.
+    let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    state.authentication.reset(AcpHostError::environment(
+        "AUTH_RUNTIME_CHANGED",
+        "CLI 更新取消了正在进行的登录",
+        false,
+        false,
+        "CLI 更新完成后重新登录",
+    ));
+    state.foreground_turns.reset(generation);
+    state.interactions.reset(generation);
+    state.client_callbacks.reset(generation).await;
+    state.sessions.reset(generation);
+    state
+        .requests
+        .reject_all(AcpHostError::environment(
+            "ACP_CLI_UPDATING",
+            "Grok CLI 正在更新，当前 ACP 请求已停止",
+            true,
+            true,
+            "更新结束后重新连接 Agent，并检查最后一轮结果",
+        ))
+        .await;
     if let Some(process) = state.process.lock().await.take() {
         terminate_process(process).await;
     }
@@ -2650,7 +4288,7 @@ async fn terminate_process(mut process: AgentProcess) {
     // Job Object first: kills grandchildren that child.kill() alone orphans on Windows.
     #[cfg(windows)]
     if let Some(job) = process.job.take() {
-        job.terminate_tree();
+        let _ = job.terminate_tree();
         drop(job);
     }
     let _ = process.child.kill().await;
@@ -2689,50 +4327,87 @@ fn computer_use_env_enabled() -> bool {
 }
 
 #[tauri::command]
-fn host_prefs_get(app: tauri::AppHandle) -> host_prefs::HostPrefs {
-    host_prefs::load_prefs(&host_prefs_dir_for_app(&app))
+fn host_prefs_get(app: tauri::AppHandle) -> Result<host_prefs::HostPrefs, HostError> {
+    host_prefs::load_prefs(&host_prefs_dir_for_app(&app)).map_err(host_prefs_storage_error)
+}
+
+fn host_prefs_storage_error(error: String) -> HostError {
+    HostError::recoverable_environment(
+        "HOST_PREFS_STORAGE_FAILED",
+        error,
+        "检查应用数据目录的文件权限和可用空间后重试；Host 不会采用未保存的设置",
+    )
 }
 
 #[tauri::command]
 fn host_prefs_migrate_computer_use(
     app: tauri::AppHandle,
     fe_enabled: bool,
-) -> Result<host_prefs::HostPrefs, String> {
+) -> Result<host_prefs::HostPrefs, HostError> {
     host_prefs::migrate_computer_use_from_fe(&host_prefs_dir_for_app(&app), fe_enabled)
+        .map_err(host_prefs_storage_error)
+}
+
+#[tauri::command]
+fn host_prefs_migrate_browser_use(
+    app: tauri::AppHandle,
+    fe_enabled: bool,
+) -> Result<host_prefs::HostPrefs, HostError> {
+    host_prefs::migrate_browser_use_from_fe(&host_prefs_dir_for_app(&app), fe_enabled)
+        .map_err(host_prefs_storage_error)
 }
 
 #[tauri::command]
 fn host_prefs_set_computer_use(
     app: tauri::AppHandle,
     enabled: bool,
-) -> Result<host_prefs::HostPrefs, String> {
+) -> Result<host_prefs::HostPrefs, HostError> {
     let dir = host_prefs_dir_for_app(&app);
-    let mut prefs = host_prefs::load_prefs(&dir);
-    prefs.computer_use_enabled = enabled;
-    prefs.computer_use_fe_migrated = true;
-    host_prefs::save_prefs(&dir, &prefs)?;
-    Ok(prefs)
+    host_prefs::set_computer_use(&dir, enabled).map_err(host_prefs_storage_error)
+}
+
+#[tauri::command]
+fn host_prefs_set_browser_use(
+    app: tauri::AppHandle,
+    enabled: bool,
+) -> Result<host_prefs::HostPrefs, HostError> {
+    let dir = host_prefs_dir_for_app(&app);
+    host_prefs::set_browser_use(&dir, enabled).map_err(host_prefs_storage_error)
 }
 
 #[tauri::command]
 fn host_prefs_set_permission_mode(
     app: tauri::AppHandle,
     mode: String,
-) -> Result<host_prefs::HostPrefs, String> {
-    let mode = host_prefs::normalize_permission_mode(&mode)
-        .ok_or_else(|| "无效的权限模式".to_string())?;
+) -> Result<host_prefs::HostPrefs, HostError> {
+    let mode = permission_policy::PermissionMode::parse(&mode)
+        .ok_or_else(|| HostError::operation("PERMISSION_MODE_INVALID", "无效的权限模式"))?;
     let dir = host_prefs_dir_for_app(&app);
-    let mut prefs = host_prefs::load_prefs(&dir);
-    prefs.permission_mode = mode.to_string();
-    host_prefs::save_prefs(&dir, &prefs)?;
-    Ok(prefs)
+    host_prefs::set_permission_mode(&dir, mode, confirm_bypass_permission_mode)
+        .map_err(host_prefs_storage_error)
+}
+
+fn confirm_bypass_permission_mode() -> bool {
+    matches!(
+        rfd::MessageDialog::new()
+            .set_title("启用 Bypass / YOLO？")
+            .set_description(
+                "这会跳过工具审批，并同时关闭 Computer Use。仅应在完全可信的项目中启用。",
+            )
+            .set_level(rfd::MessageLevel::Warning)
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .show(),
+        rfd::MessageDialogResult::Ok
+    )
 }
 
 #[tauri::command]
 fn desktop_environment(app: tauri::AppHandle) -> DesktopEnvironment {
     let runtime = configured_grok_command(&app);
     // Warm host prefs cache at first environment probe.
-    let _ = host_prefs::load_prefs(&host_prefs_dir_for_app(&app));
+    if let Err(error) = host_prefs::load_prefs(&host_prefs_dir_for_app(&app)) {
+        tracing::error!(target: "grox::preferences", error = %error, "Host preferences warmup failed");
+    }
     DesktopEnvironment {
         default_workspace: path_for_webview(&default_workspace()),
         grok_command: path_for_webview(Path::new(&runtime.path)),
@@ -2932,7 +4607,9 @@ fn git_worktrees(cwd: String) -> Result<Vec<GitWorktree>, String> {
     if !is_repository {
         return Ok(Vec::new());
     }
-    let porcelain = optional_git_text(&root, &["worktree", "list", "--porcelain"]).unwrap_or_default();
+    // 即使没有附加 worktree，Git 仍会返回主工作树。这里若降级为空数组，
+    // 只会把 Git/进程错误伪装成“没有工作树”，让后续操作基于假状态执行。
+    let porcelain = git_text(&root, &["worktree", "list", "--porcelain"])?;
     let mut items = Vec::new();
     let mut current: Option<GitWorktree> = None;
     for line in porcelain.lines() {
@@ -2950,7 +4627,9 @@ fn git_worktrees(cwd: String) -> Result<Vec<GitWorktree>, String> {
             });
             continue;
         }
-        let Some(item) = current.as_mut() else { continue };
+        let Some(item) = current.as_mut() else {
+            continue;
+        };
         if let Some(branch) = line.strip_prefix("branch refs/heads/") {
             item.branch = Some(branch.to_string());
         } else if line == "bare" {
@@ -2974,6 +4653,7 @@ fn git_worktree_add(cwd: String, name: String, branch: Option<String>) -> Result
     let root = checked_workspace(&cwd)?;
     let name = name.trim();
     if name.is_empty()
+        || matches!(name, "." | "..")
         || name.len() > 64
         || name.chars().any(|character| {
             character.is_control()
@@ -2982,12 +4662,8 @@ fn git_worktree_add(cwd: String, name: String, branch: Option<String>) -> Result
     {
         return Err("Worktree 名称需为 1–64 个安全字符".into());
     }
-    let home = grok_home()?;
-    let project = root
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("project");
-    let target = home.join("worktrees").join(project).join(name);
+    let primary = primary_worktree(&root)?;
+    let target = managed_worktree_project_dir(&primary)?.join(name);
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent).map_err(|error| format!("无法创建 worktree 目录：{error}"))?;
     }
@@ -3018,15 +4694,28 @@ fn git_worktree_add(cwd: String, name: String, branch: Option<String>) -> Result
 
 #[tauri::command]
 fn git_worktree_remove(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AcpState>>,
     confirms: tauri::State<'_, Arc<GitConfirmStore>>,
-    cwd: String,
-    path: String,
-    confirm_token: String,
+    automations: tauri::State<'_, AutomationStore>,
+    worktrees: tauri::State<'_, WorktreeOwnershipStore>,
+    request: GitWorktreeRemoveRequest,
 ) -> Result<String, String> {
-    let root = checked_workspace(&cwd)?;
+    let root = checked_workspace(&request.cwd)?;
     let root_key = path_for_webview(&root);
-    confirms.consume_worktree_remove(&root_key, &confirm_token)?;
-    let target = checked_removable_worktree(&root, &path)?;
+    let target = checked_removable_worktree(&root, &request.path)?;
+    let target_key = path_for_webview(&target);
+    // 与 session/new|load 绑定、会话本机删除和自动化 cwd patch 串行，关闭
+    // “确认后新引用出现”的 TOCTOU 窗口。
+    let _lifecycle = worktrees.lock_lifecycle();
+    ensure_worktree_unreferenced(
+        &app,
+        state.inner(),
+        worktrees.inner(),
+        automations.inner(),
+        &target,
+    )?;
+    confirms.consume_worktree_remove(&root_key, &target_key, &request.confirm_token)?;
     let target_text = target.to_string_lossy().to_string();
     git_text(&root, &["worktree", "remove", "--force", &target_text])?;
     Ok("Worktree 已移除".into())
@@ -3197,9 +4886,86 @@ fn confirm_destructive_git_action(title: &str, description: &str) -> Result<(), 
     }
 }
 
-/// Media generation must never widen beyond this closed allowlist without a
-/// real permission path — `--always-approve` is intentional only for these tools.
-const MEDIA_GENERATION_TOOLS: &str = "image_gen,video_gen,image_to_video,reference_to_video";
+#[derive(Debug)]
+struct ListedWorktree {
+    path: PathBuf,
+    branch: Option<String>,
+}
+
+fn parse_worktree_list(porcelain: &str) -> Vec<ListedWorktree> {
+    let mut entries = Vec::new();
+    let mut current: Option<ListedWorktree> = None;
+    for line in porcelain.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            if let Some(entry) = current.take() {
+                entries.push(entry);
+            }
+            current = Some(ListedWorktree {
+                path: PathBuf::from(path),
+                branch: None,
+            });
+        } else if let Some(branch) = line.strip_prefix("branch ") {
+            if let Some(entry) = current.as_mut() {
+                entry.branch = Some(branch.to_string());
+            }
+        }
+    }
+    if let Some(entry) = current {
+        entries.push(entry);
+    }
+    entries
+}
+
+fn primary_worktree(root: &Path) -> Result<PathBuf, String> {
+    let listed = git_text(root, &["worktree", "list", "--porcelain"])?;
+    parse_worktree_list(&listed)
+        .into_iter()
+        .next()
+        .map(|entry| entry.path)
+        .ok_or_else(|| "无法确定仓库主工作树".to_string())?
+        .canonicalize()
+        .map_err(|error| format!("无法解析仓库主工作树：{error}"))
+}
+
+/// 同名仓库不能共享一个 `~/.grok/worktrees/<basename>` 命名空间；否则两个
+/// 项目创建同名 worktree 时会互相碰撞。可读项目名后附主工作树身份摘要，
+/// 旧目录仍保留在删除允许范围内。
+fn managed_worktree_project_dir(primary: &Path) -> Result<PathBuf, String> {
+    use sha2::{Digest as _, Sha256};
+
+    let primary = primary
+        .canonicalize()
+        .map_err(|error| format!("无法解析仓库主工作树：{error}"))?;
+    let project = primary
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("grox-project");
+    let digest = format!("{:x}", Sha256::digest(path_for_webview(&primary).as_bytes()));
+    Ok(grok_home()?
+        .join("worktrees")
+        .join(format!("{project}-{}", &digest[..12])))
+}
+
+fn is_legacy_grox_worktree(primary: &Path, target: &Path, branch: Option<&str>) -> bool {
+    let Some(primary_name) = primary.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    if primary.parent() != target.parent() {
+        return false;
+    }
+    let Some(target_name) = target.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let base = format!("{primary_name}-worktree");
+    let valid_name = target_name == base
+        || target_name
+            .strip_prefix(&format!("{base}-"))
+            .is_some_and(|suffix| {
+                !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            });
+    valid_name && branch.is_some_and(|name| name.starts_with("refs/heads/grox/worktree-"))
+}
 
 fn checked_removable_worktree(root: &Path, requested: &str) -> Result<PathBuf, String> {
     let requested = requested.trim();
@@ -3209,37 +4975,127 @@ fn checked_removable_worktree(root: &Path, requested: &str) -> Result<PathBuf, S
     let canonical = PathBuf::from(requested)
         .canonicalize()
         .map_err(|error| format!("无法解析 Worktree 路径：{error}"))?;
-    let primary = root
+    let current = root
         .canonicalize()
         .map_err(|error| format!("无法解析仓库根目录：{error}"))?;
+    if canonical == current {
+        return Err("不能移除当前正在使用的工作树".into());
+    }
+    let listed = git_text(root, &["worktree", "list", "--porcelain"])?;
+    let entries = parse_worktree_list(&listed);
+    let primary = entries
+        .first()
+        .and_then(|entry| entry.path.canonicalize().ok())
+        .ok_or_else(|| "无法确定仓库主工作树".to_string())?;
     if canonical == primary {
         return Err("不能移除仓库主工作树".into());
     }
+    let entry = entries
+        .iter()
+        .find(|entry| entry.path.canonicalize().ok().as_ref() == Some(&canonical))
+        .ok_or_else(|| "只能移除当前仓库已登记的 worktree".to_string())?;
     let managed_ok = grok_home()?
         .join("worktrees")
         .canonicalize()
         .ok()
         .is_some_and(|managed| canonical.starts_with(&managed));
-    let listed = git_text(root, &["worktree", "list", "--porcelain"])?;
-    let mut known = false;
-    for line in listed.lines() {
-        if let Some(path) = line.strip_prefix("worktree ") {
-            let Ok(entry) = PathBuf::from(path).canonicalize() else {
-                continue;
-            };
-            if entry == canonical {
-                known = true;
-                break;
-            }
-        }
-    }
-    if !known {
-        return Err("只能移除当前仓库已登记的 worktree".into());
-    }
-    if !managed_ok {
+    let legacy_ok = is_legacy_grox_worktree(&primary, &canonical, entry.branch.as_deref());
+    if !managed_ok && !legacy_ok {
         return Err("只能移除 Grox 管理目录下的 worktree".into());
     }
     Ok(canonical)
+}
+
+struct WorktreeRemovalReferences {
+    sessions: BTreeSet<String>,
+    automations: BTreeSet<String>,
+    opening_sessions: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GitWorktreeRemoveRequest {
+    cwd: String,
+    path: String,
+    confirm_token: String,
+}
+
+fn worktree_removal_references(
+    app: &tauri::AppHandle,
+    state: &AcpState,
+    worktrees: &WorktreeOwnershipStore,
+    automations: &AutomationStore,
+    target: &Path,
+) -> Result<WorktreeRemovalReferences, String> {
+    let binding_path = worktree_bindings_path(app)?;
+    let mut sessions = worktrees.session_references(&binding_path, target)?;
+    sessions.extend(state.client_callbacks.sessions_within(target));
+    let config = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("无法定位应用会话目录：{error}"))?;
+    sessions.extend(worktree_ownership::journal_session_references(&config, target)?);
+    let automations = automations.worktree_references(
+        &automations_path(app)?,
+        target,
+        AUTOMATIONS_MAX_BYTES,
+    )?;
+    Ok(WorktreeRemovalReferences {
+        sessions,
+        automations,
+        opening_sessions: worktrees.opening_references(target),
+    })
+}
+
+fn ensure_worktree_unreferenced(
+    app: &tauri::AppHandle,
+    state: &AcpState,
+    worktrees: &WorktreeOwnershipStore,
+    automations: &AutomationStore,
+    target: &Path,
+) -> Result<(), String> {
+    let references = worktree_removal_references(app, state, worktrees, automations, target)?;
+    let session_count = references
+        .sessions
+        .len()
+        .saturating_add(references.opening_sessions);
+    if session_count == 0 && references.automations.is_empty() {
+        return Ok(());
+    }
+    let session_examples = references
+        .sessions
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let automation_examples = references
+        .automations
+        .iter()
+        .take(3)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut owners = Vec::new();
+    if session_count > 0 {
+        let suffix = if session_examples.is_empty() {
+            "正在创建或恢复".to_string()
+        } else {
+            session_examples
+        };
+        owners.push(format!("{session_count} 个会话（{suffix}）"));
+    }
+    if !references.automations.is_empty() {
+        owners.push(format!(
+            "{} 个自动化（{}）",
+            references.automations.len(),
+            automation_examples
+        ));
+    }
+    Err(format!(
+        "该 worktree 仍被 {} 引用；请先迁移或删除这些记录",
+        owners.join("、")
+    ))
 }
 
 #[tauri::command]
@@ -3265,19 +5121,42 @@ fn prepare_git_push(
     confirms.issue_push(&path_for_webview(&root))
 }
 
+fn worktree_remove_confirmation(target: &Path, dirty: bool) -> String {
+    let path = path_for_webview(target);
+    if dirty {
+        format!(
+            "该 worktree 包含未提交变更，强制移除会使这些变更永久丢失。\n确认继续？\n{path}"
+        )
+    } else {
+        format!("确认强制移除 worktree？\n{path}")
+    }
+}
+
 #[tauri::command]
 fn prepare_git_worktree_remove(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, Arc<AcpState>>,
     confirms: tauri::State<'_, Arc<GitConfirmStore>>,
+    automations: tauri::State<'_, AutomationStore>,
+    worktrees: tauri::State<'_, WorktreeOwnershipStore>,
     cwd: String,
     path: String,
 ) -> Result<String, String> {
     let root = checked_workspace(&cwd)?;
     let target = checked_removable_worktree(&root, &path)?;
+    ensure_worktree_unreferenced(
+        &app,
+        state.inner(),
+        worktrees.inner(),
+        automations.inner(),
+        &target,
+    )?;
+    let dirty = !git_text(&target, &["status", "--porcelain"])?.is_empty();
     confirm_destructive_git_action(
         "Grox",
-        &format!("确认强制移除 worktree？\n{}", path_for_webview(&target)),
+        &worktree_remove_confirmation(&target, dirty),
     )?;
-    confirms.issue_worktree_remove(&path_for_webview(&root))
+    confirms.issue_worktree_remove(&path_for_webview(&root), &path_for_webview(&target))
 }
 
 #[tauri::command]
@@ -3343,8 +5222,108 @@ fn static_preview_mime(path: &Path) -> &'static str {
         "otf" => "font/otf",
         "wasm" => "application/wasm",
         "pdf" => "application/pdf",
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mp3" => "audio/mpeg",
+        "m4a" => "audio/mp4",
+        "wav" => "audio/wav",
+        "ogg" | "oga" => "audio/ogg",
+        "flac" => "audio/flac",
         _ => "application/octet-stream",
     }
+}
+
+fn preview_byte_range(request: &str, length: u64) -> Result<Option<(u64, u64)>, ()> {
+    let Some(value) = request.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("range").then(|| value.trim())
+    }) else {
+        return Ok(None);
+    };
+    let value = value.strip_prefix("bytes=").ok_or(())?;
+    if value.contains(',') || length == 0 {
+        return Err(());
+    }
+    let (start, end) = value.split_once('-').ok_or(())?;
+    if start.is_empty() {
+        let suffix = end.parse::<u64>().map_err(|_| ())?;
+        if suffix == 0 {
+            return Err(());
+        }
+        let start = length.saturating_sub(suffix.min(length));
+        return Ok(Some((start, length - 1)));
+    }
+    let start = start.parse::<u64>().map_err(|_| ())?;
+    if start >= length {
+        return Err(());
+    }
+    let end = if end.is_empty() {
+        length - 1
+    } else {
+        end.parse::<u64>().map_err(|_| ())?.min(length - 1)
+    };
+    if end < start {
+        return Err(());
+    }
+    Ok(Some((start, end)))
+}
+
+fn static_preview_csp(mime: &str) -> &'static str {
+    // 预览 URL 自带不可猜测的文档令牌；仅允许 Grox 的生产协议和本地开发
+    // Origin 嵌入，避免 frame-ancestors 'none' 把 HTML/PDF 自己挡在 iframe 外。
+    if mime.starts_with("text/html") {
+        "default-src 'none'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'none'; font-src 'self' data:; media-src 'self' data: blob:; connect-src 'none'; frame-ancestors tauri: http://tauri.localhost https://tauri.localhost http://localhost:* http://127.0.0.1:*; form-action 'none'; base-uri 'none'; object-src 'none'"
+    } else {
+        "default-src 'none'; frame-ancestors tauri: http://tauri.localhost https://tauri.localhost http://localhost:* http://127.0.0.1:*"
+    }
+}
+
+async fn send_static_preview_file(
+    stream: &mut TcpStream,
+    path: &Path,
+    mime: &str,
+    length: u64,
+    range: Option<(u64, u64)>,
+    head_only: bool,
+) {
+    let (status, start, end) = match range {
+        Some((start, end)) => ("206 Partial Content", start, end),
+        None => ("200 OK", 0, length.saturating_sub(1)),
+    };
+    let body_length = if length == 0 { 0 } else { end - start + 1 };
+    let csp = static_preview_csp(mime);
+    let content_range = range
+        .map(|_| format!("Content-Range: bytes {start}-{end}/{length}\r\n"))
+        .unwrap_or_default();
+    let header = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {body_length}\r\nAccept-Ranges: bytes\r\n{content_range}Cache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: {csp}\r\nConnection: close\r\n\r\n"
+    );
+    if stream.write_all(header.as_bytes()).await.is_err() || head_only || body_length == 0 {
+        let _ = stream.shutdown().await;
+        return;
+    }
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
+        let _ = stream.shutdown().await;
+        return;
+    };
+    if file.seek(SeekFrom::Start(start)).await.is_err() {
+        let _ = stream.shutdown().await;
+        return;
+    }
+    let mut remaining = body_length;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buffer.len() as u64) as usize;
+        let Ok(read) = file.read(&mut buffer[..want]).await else {
+            break;
+        };
+        if read == 0 || stream.write_all(&buffer[..read]).await.is_err() {
+            break;
+        }
+        remaining -= read as u64;
+    }
+    let _ = stream.shutdown().await;
 }
 
 async fn send_static_preview_response(
@@ -3354,11 +5333,7 @@ async fn send_static_preview_response(
     body: &[u8],
     head_only: bool,
 ) {
-    let csp = if mime.starts_with("text/html") {
-        "default-src 'none'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'none'; font-src 'self' data:; media-src 'self' data: blob:; connect-src 'none'; frame-ancestors 'none'; form-action 'none'; base-uri 'none'; object-src 'none'"
-    } else {
-        "default-src 'none'; frame-ancestors 'none'"
-    };
+    let csp = static_preview_csp(mime);
     let header = format!(
         "HTTP/1.1 {status}\r\nContent-Type: {mime}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nReferrer-Policy: no-referrer\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: {csp}\r\nConnection: close\r\n\r\n",
         body.len()
@@ -3500,7 +5475,18 @@ async fn handle_static_preview_request(
         .await;
         return;
     };
-    if metadata.len() > MAX_PREVIEW_BYTES {
+    let mime = static_preview_mime(&candidate);
+    let streamable = mime.starts_with("video/")
+        || mime.starts_with("audio/")
+        || mime == "application/pdf";
+    let max_bytes = if streamable {
+        MAX_STREAMABLE_PREVIEW_BYTES
+    } else if mime.starts_with("image/") {
+        MAX_IMAGE_PREVIEW_BYTES
+    } else {
+        MAX_PREVIEW_BYTES
+    };
+    if metadata.len() > max_bytes {
         send_static_preview_response(
             &mut stream,
             "413 Content Too Large",
@@ -3511,22 +5497,24 @@ async fn handle_static_preview_request(
         .await;
         return;
     }
-    let Ok(body) = fs::read(&candidate) else {
-        send_static_preview_response(
-            &mut stream,
-            "500 Internal Server Error",
-            "text/plain",
-            b"Read failed",
-            head_only,
-        )
-        .await;
-        return;
+    let range = match preview_byte_range(&request, metadata.len()) {
+        Ok(range) => range,
+        Err(()) => {
+            let header = format!(
+                "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */{}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                metadata.len(),
+            );
+            let _ = stream.write_all(header.as_bytes()).await;
+            let _ = stream.shutdown().await;
+            return;
+        }
     };
-    send_static_preview_response(
+    send_static_preview_file(
         &mut stream,
-        "200 OK",
-        static_preview_mime(&candidate),
-        &body,
+        &candidate,
+        mime,
+        metadata.len(),
+        range,
         head_only,
     )
     .await;
@@ -3540,8 +5528,13 @@ async fn start_file_preview(
 ) -> Result<String, String> {
     let root = checked_workspace(&cwd)?;
     let file = checked_workspace_file(&root, &path)?;
-    if !file.is_file() || !matches!(preview_type(&file).0, "html") {
-        return Err("只能在浏览器预览 HTML 文件".into());
+    if !file.is_file()
+        || !matches!(
+            preview_type(&file).0,
+            "html" | "image" | "video" | "audio" | "pdf"
+        )
+    {
+        return Err("只能通过安全回环地址预览 HTML、图片、视频、音频或 PDF 文件".into());
     }
     // Scope the static server to the HTML file's directory so a hostile page
     // cannot read unrelated workspace paths via the preview token.
@@ -3615,17 +5608,32 @@ fn read_preview_file(cwd: String, path: String) -> Result<PreviewFile, String> {
     if !metadata.is_file() {
         return Err("只能预览文件".into());
     }
-    if metadata.len() > MAX_PREVIEW_BYTES {
-        return Err("预览文件不能超过 16 MB".into());
-    }
     let (kind, mime) = preview_type(&file);
     if kind == "unsupported" {
         return Err("暂不支持预览该文件类型".into());
     }
-    let bytes = fs::read(&file).map_err(|error| format!("无法读取 {}：{error}", file.display()))?;
-    let content = if kind == "image" {
-        BASE64.encode(bytes)
+    let delivered_by_url = matches!(kind, "image" | "video" | "audio" | "pdf");
+    let max_bytes = if matches!(kind, "video" | "audio" | "pdf") {
+        MAX_STREAMABLE_PREVIEW_BYTES
+    } else if kind == "image" {
+        MAX_IMAGE_PREVIEW_BYTES
     } else {
+        MAX_PREVIEW_BYTES
+    };
+    if metadata.len() > max_bytes {
+        return Err(if matches!(kind, "video" | "audio" | "pdf") {
+            "媒体预览文件不能超过 4 GB".into()
+        } else if kind == "image" {
+            "图片预览文件不能超过 40 MB".into()
+        } else {
+            "预览文件不能超过 16 MB".into()
+        });
+    }
+    let content = if delivered_by_url {
+        String::new()
+    } else {
+        let bytes = fs::read(&file)
+            .map_err(|error| format!("无法读取 {}：{error}", file.display()))?;
         String::from_utf8(bytes).map_err(|_| "文件不是有效的 UTF-8 文本".to_string())?
     };
     Ok(PreviewFile {
@@ -3672,58 +5680,6 @@ fn open_in_explorer(cwd: String, path: Option<String>) -> Result<(), String> {
     Ok(())
 }
 
-/// Reveal one workspace file in the platform file manager. This is distinct
-/// from `open_in_explorer`, which intentionally opens the project root.
-#[tauri::command]
-fn reveal_in_explorer(cwd: String, path: String) -> Result<(), String> {
-    let root = checked_workspace(&cwd)?;
-    let file = checked_workspace_file(&root, &path)?;
-    #[cfg(windows)]
-    std::process::Command::new("explorer.exe")
-        .arg("/select,")
-        .arg(&file)
-        .spawn()
-        .map_err(|error| format!("无法打开资源管理器：{error}"))?;
-    #[cfg(target_os = "macos")]
-    std::process::Command::new("open")
-        .arg("-R")
-        .arg(&file)
-        .spawn()
-        .map_err(|error| format!("无法在 Finder 中显示文件：{error}"))?;
-    #[cfg(all(unix, not(target_os = "macos")))]
-    std::process::Command::new("xdg-open")
-        .arg(file.parent().unwrap_or(&file))
-        .spawn()
-        .map_err(|error| format!("无法打开文件管理器：{error}"))?;
-    Ok(())
-}
-
-/// Ask the platform to open a workspace file with its default application.
-#[tauri::command]
-fn open_file_with_default(cwd: String, path: String) -> Result<(), String> {
-    let root = checked_workspace(&cwd)?;
-    let file = checked_workspace_file(&root, &path)?;
-    if !file.is_file() {
-        return Err("只能使用默认应用打开文件".into());
-    }
-    #[cfg(windows)]
-    std::process::Command::new("explorer.exe")
-        .arg(&file)
-        .spawn()
-        .map_err(|error| format!("无法打开默认应用：{error}"))?;
-    #[cfg(target_os = "macos")]
-    std::process::Command::new("open")
-        .arg(&file)
-        .spawn()
-        .map_err(|error| format!("无法打开默认应用：{error}"))?;
-    #[cfg(all(unix, not(target_os = "macos")))]
-    std::process::Command::new("xdg-open")
-        .arg(&file)
-        .spawn()
-        .map_err(|error| format!("无法打开默认应用：{error}"))?;
-    Ok(())
-}
-
 #[cfg(target_os = "macos")]
 fn application_search_roots() -> Vec<PathBuf> {
     let mut roots = vec![
@@ -3739,7 +5695,9 @@ fn application_search_roots() -> Vec<PathBuf> {
 #[cfg(target_os = "macos")]
 fn discovered_application_paths() -> Vec<PathBuf> {
     fn collect_bundles(root: &Path, depth: u8, paths: &mut BTreeSet<PathBuf>) {
-        let Ok(entries) = fs::read_dir(root) else { return };
+        let Ok(entries) = fs::read_dir(root) else {
+            return;
+        };
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
             if path.extension().is_some_and(|value| value == "app") && path.is_dir() {
@@ -3878,7 +5836,11 @@ fn inspect_application(path: &Path) -> Option<OpenApplicationOption> {
     let bundle_id = plist_string(&plist, "CFBundleIdentifier")?;
     let name = plist_string(&plist, "CFBundleDisplayName")
         .or_else(|| plist_string(&plist, "CFBundleName"))
-        .or_else(|| path.file_stem().and_then(|value| value.to_str()).map(str::to_string))?;
+        .or_else(|| {
+            path.file_stem()
+                .and_then(|value| value.to_str())
+                .map(str::to_string)
+        })?;
     let lower = format!("{} {}", bundle_id, name).to_ascii_lowercase();
     let is_finder = bundle_id == "com.apple.finder" || lower.contains("finder");
     let is_terminal = [
@@ -4049,7 +6011,11 @@ fn list_windows_open_applications() -> Result<Vec<OpenApplicationOption>, String
     let mut applications = values
         .into_iter()
         .filter_map(|value| serde_json::from_value::<OpenApplicationOption>(value).ok())
-        .filter(|item| item.launch_target.as_deref().is_some_and(|target| Path::new(target).is_absolute()))
+        .filter(|item| {
+            item.launch_target
+                .as_deref()
+                .is_some_and(|target| Path::new(target).is_absolute())
+        })
         .collect::<Vec<_>>();
     applications.sort_by_cached_key(|item| item.name.to_ascii_lowercase());
     let mut seen = BTreeSet::new();
@@ -4269,7 +6235,11 @@ fn inspect_desktop_application(path: &Path) -> Option<OpenApplicationOption> {
         || lower.contains("pcmanfm");
     let source_mime = fields
         .get("MimeType")
-        .map(|value| value.split(';').any(|mime| mime.starts_with("text/x-") || mime.contains("javascript") || mime.contains("json")))
+        .map(|value| {
+            value.split(';').any(|mime| {
+                mime.starts_with("text/x-") || mime.contains("javascript") || mime.contains("json")
+            })
+        })
         .unwrap_or(false);
     if !terminal && !editor && !file_manager && !source_mime {
         return None;
@@ -4287,7 +6257,9 @@ fn inspect_desktop_application(path: &Path) -> Option<OpenApplicationOption> {
 fn list_linux_open_applications() -> Vec<OpenApplicationOption> {
     let mut applications = Vec::new();
     for root in linux_application_dirs() {
-        let Ok(entries) = fs::read_dir(root) else { continue };
+        let Ok(entries) = fs::read_dir(root) else {
+            continue;
+        };
         for entry in entries.filter_map(Result::ok) {
             let path = entry.path();
             if path.extension().and_then(|value| value.to_str()) == Some("desktop") {
@@ -4497,37 +6469,59 @@ fn open_file_with_application(cwd: String, path: String, application: String) ->
     }
 }
 
-/// Create a sibling Git worktree for the Codex-style “permanent worktree”
-/// actions. The target is never inside the current project, and an available
-/// suffix is chosen instead of overwriting an existing directory.
-#[tauri::command]
-fn create_permanent_worktree(cwd: String) -> Result<String, String> {
-    let root = checked_workspace(&cwd)?;
-    if !root.join(".git").exists() {
-        return Err("当前项目不是 Git 仓库，无法创建永久工作树".into());
+#[derive(Clone, Debug)]
+struct CreatedManagedWorktree {
+    source_root: PathBuf,
+    path: PathBuf,
+    branch: String,
+}
+
+fn ensure_clean_worktree(root: &Path) -> Result<(), String> {
+    let status = git_text(
+        root,
+        &["status", "--porcelain=v1", "--untracked-files=all"],
+    )?;
+    if status.is_empty() {
+        Ok(())
+    } else {
+        Err("源工作树存在未提交改动；请先提交或暂存处理后再分叉，避免新 worktree 与当前代码状态不一致".into())
     }
-    let parent = root
-        .parent()
-        .ok_or_else(|| "无法确定工作树所在目录".to_string())?;
-    let base = root
-        .file_name()
-        .and_then(|name| name.to_str())
-        .filter(|name| !name.is_empty())
-        .unwrap_or("grox-project");
-    let mut target = parent.join(format!("{base}-worktree"));
-    let mut suffix = 2u32;
-    while target.exists() {
-        target = parent.join(format!("{base}-worktree-{suffix}"));
-        suffix = suffix.saturating_add(1);
-        if suffix > 10_000 {
-            return Err("可用的工作树目录过多".into());
-        }
+}
+
+fn create_managed_worktree(
+    cwd: &str,
+    directory_prefix: &str,
+    require_clean: bool,
+) -> Result<CreatedManagedWorktree, String> {
+    let requested = checked_workspace(cwd)?;
+    let top_level = git_text(&requested, &["rev-parse", "--show-toplevel"])
+        .map_err(|_| "当前项目不是 Git 仓库，无法创建 worktree".to_string())?;
+    let root = PathBuf::from(top_level)
+        .canonicalize()
+        .map_err(|error| format!("无法解析 Git 仓库根目录：{error}"))?;
+    let listed = git_text(&root, &["worktree", "list", "--porcelain"])?;
+    let primary = parse_worktree_list(&listed)
+        .into_iter()
+        .next()
+        .map(|entry| entry.path)
+        .unwrap_or_else(|| root.clone());
+    if require_clean {
+        ensure_clean_worktree(&root)?;
     }
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis();
-    let branch = format!("grox/worktree-{timestamp}");
+    let nonce = CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
+    let unique = format!("{timestamp}-{nonce}");
+    let target = managed_worktree_project_dir(&primary)?
+        .join(format!("{directory_prefix}-{unique}"));
+    let parent = target
+        .parent()
+        .ok_or_else(|| "无法确定工作树管理目录".to_string())?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("无法创建 worktree 目录：{error}"))?;
+    let branch = format!("grox/worktree-{unique}");
     let mut command = std::process::Command::new("git");
     command
         .current_dir(&root)
@@ -4544,12 +6538,45 @@ fn create_permanent_worktree(cwd: String) -> Result<String, String> {
     if !output.status.success() {
         let message = String::from_utf8_lossy(&output.stderr).trim().to_string();
         return Err(if message.is_empty() {
-            "创建永久工作树失败".into()
+            "创建 worktree 失败".into()
         } else {
-            format!("创建永久工作树失败：{message}")
+            format!("创建 worktree 失败：{message}")
         });
     }
-    Ok(path_for_webview(&target))
+    Ok(CreatedManagedWorktree {
+        source_root: root,
+        path: target,
+        branch,
+    })
+}
+
+fn rollback_managed_worktree(created: &CreatedManagedWorktree) -> Result<(), String> {
+    let target = created.path.to_string_lossy().to_string();
+    let mut errors = Vec::new();
+    if let Err(error) = git_text(
+        &created.source_root,
+        &["worktree", "remove", "--force", &target],
+    ) {
+        errors.push(format!("无法移除 worktree：{error}"));
+    }
+    if let Err(error) = git_text(
+        &created.source_root,
+        &["branch", "-D", &created.branch],
+    ) {
+        errors.push(format!("无法删除分叉分支：{error}"));
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("；"))
+    }
+}
+
+/// 永久工作树与手动工作树共用同一管理目录和删除边界。
+#[tauri::command]
+fn create_permanent_worktree(cwd: String) -> Result<String, String> {
+    create_managed_worktree(&cwd, "permanent", false)
+        .map(|created| path_for_webview(&created.path))
 }
 
 /// Let the operating system present its application chooser for a workspace
@@ -4829,9 +6856,10 @@ fn write_config_document(request: WriteConfigDocument) -> Result<ConfigDocument,
         // never silently leave the CLI with an unreadable global config.
         parse_grok_config_document(&content)?;
     }
-    atomic_write(&path, &content)?;
     if matches!(request.id.as_str(), "config" | "system-prompt") {
-        restrict_private_file(&path)?;
+        atomic_write_private(&path, &content)?;
+    } else {
+        atomic_write(&path, &content)?;
     }
     let id: &'static str = match request.id.as_str() {
         "config" => "config",
@@ -4857,41 +6885,119 @@ fn provider_profiles_path() -> Result<PathBuf, String> {
     Ok(grok_home()?.join("grox-providers.json"))
 }
 
+fn provider_secret_store() -> Result<SecretStore, String> {
+    Ok(SecretStore::new(&grok_home()?))
+}
+
+fn provider_profile_secret_ref(id: &str) -> String {
+    format!("provider:{id}")
+}
+
+fn provider_secret_backend(
+    reference: &str,
+    legacy_value: Option<&str>,
+) -> Result<SecretBackendKind, String> {
+    if legacy_value.is_some_and(|value| !value.trim().is_empty()) {
+        Ok(SecretBackendKind::LegacyFile)
+    } else {
+        provider_secret_store()?.backend(reference)
+    }
+}
+
+fn require_provider_secret(reference: &str) -> Result<StoredSecret, String> {
+    let secret = provider_secret_store()?
+        .get(reference)?
+        .ok_or_else(|| "API Key 为空或已从系统凭据库删除".to_string())?;
+    debug_assert_ne!(secret.backend(), SecretBackendKind::Missing);
+    Ok(secret)
+}
+
 fn read_provider_profiles_file() -> Result<ProviderProfilesFile, String> {
     let path = provider_profiles_path()?;
     if !path.exists() {
         return Ok(ProviderProfilesFile::default());
     }
     let content = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
-    match serde_json::from_str(&content) {
-        Ok(value) => Ok(value),
-        Err(error) => {
-            // A corrupt profiles file must not brick every profile command
-            // (it survives app reinstalls because it lives in ~/.grok).
-            // Quarantine it and start from an empty file so the user can
-            // re-save their profiles instead of hitting a dead end.
-            let millis = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            let backup = path.with_extension(format!("corrupt-{millis}.bak"));
-            if let Err(rename_error) = fs::rename(&path, &backup) {
-                return Err(format!(
-                    "无法解析供应商档案 {}：{error}；备份失败：{rename_error}",
-                    path.display()
-                ));
-            }
-            Ok(ProviderProfilesFile::default())
-        }
-    }
+    serde_json::from_str(&content).map_err(|error| {
+        // 损坏的持久化数据不是“没有档案”。保留原文件并显式失败，避免一次读取
+        // 错误被写回成空列表，造成不可逆的数据消失。
+        format!(
+            "无法解析供应商档案 {}，已保留原文件且拒绝覆盖：{error}",
+            path.display()
+        )
+    })
 }
 
 fn write_provider_profiles_file(value: &ProviderProfilesFile) -> Result<(), String> {
     let path = provider_profiles_path()?;
     let content = serde_json::to_string_pretty(value)
         .map_err(|error| format!("无法序列化供应商档案：{error}"))?;
-    atomic_write(&path, &content)?;
-    restrict_private_file(&path)
+    atomic_write_private(&path, &content)
+}
+
+/// 把旧版散落在供应商档案和 `.env` 中的明文密钥先写入 SecretStore，再删除
+/// 旧副本。任一后续元数据写入失败都会保留旧明文，因此迁移不会造成凭据丢失。
+fn migrate_legacy_provider_secrets() -> Result<(), String> {
+    let store = provider_secret_store()?;
+    let mut profiles = read_provider_profiles_file()?;
+    let mut profiles_changed = false;
+    for profile in &mut profiles.profiles {
+        let Some(key) = profile
+            .legacy_api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        else {
+            profile.legacy_api_key = None;
+            continue;
+        };
+        checked_api_key(key)?;
+        store.set(&provider_profile_secret_ref(&profile.id), key)?;
+        profile.legacy_api_key = None;
+        profiles_changed = true;
+    }
+    if profiles_changed {
+        write_provider_profiles_file(&profiles)?;
+    }
+
+    let env_path = grok_home()?.join(".env");
+    let current = read_bounded_text(&env_path, MAX_CONFIG_BYTES)?;
+    let values = parse_grox_managed_provider_env(&env_path);
+    let Some(key) = values
+        .get("XAI_API_KEY")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    else {
+        return Ok(());
+    };
+    checked_api_key(key)?;
+    let base_url = values
+        .get("GROK_MODELS_BASE_URL")
+        .filter(|value| !value.trim().is_empty());
+    let (reference, kind, profile_id) = if let Some(base_url) = base_url {
+        let active = profiles.active_id.as_deref().and_then(|id| {
+            profiles.profiles.iter().find(|profile| {
+                profile.id == id
+                    && profile.base_url.trim_end_matches('/') == base_url.trim_end_matches('/')
+            })
+        });
+        (
+            active
+                .map(|profile| provider_profile_secret_ref(&profile.id))
+                .unwrap_or_else(|| SECRET_REF_DIRECT_COMPATIBLE.to_string()),
+            "compatible",
+            active.map(|profile| profile.id.as_str()),
+        )
+    } else {
+        (SECRET_REF_OFFICIAL_PROVIDER.to_string(), "official", None)
+    };
+    store.set(&reference, key)?;
+    let replacement = provider_metadata_from_values(kind, &values, profile_id);
+    atomic_write_private(
+        &env_path,
+        &replace_managed_env_block(&current, &replacement),
+    )
 }
 
 fn provider_auth_overrides_path() -> Result<PathBuf, String> {
@@ -4923,8 +7029,7 @@ fn write_provider_auth_overrides(value: &ProviderAuthOverridesFile) -> Result<()
     }
     let content = serde_json::to_string_pretty(value)
         .map_err(|error| format!("无法序列化 Grox 兼容服务认证还原信息：{error}"))?;
-    atomic_write(&path, &content)?;
-    restrict_private_file(&path)
+    atomic_write_private(&path, &content)
 }
 
 fn parse_grok_config_document(content: &str) -> Result<Document, String> {
@@ -4953,7 +7058,9 @@ fn model_table_mut<'a>(document: &'a mut Document, model_id: &str) -> Result<(&'
     let models = root
         .get_mut("model")
         .and_then(Item::as_table_like_mut)
-        .ok_or_else(|| "Grok config.toml 中的 [model] 不是 TOML 表，无法安全写入兼容服务认证".to_string())?;
+        .ok_or_else(|| {
+            "Grok config.toml 中的 [model] 不是 TOML 表，无法安全写入兼容服务认证".to_string()
+        })?;
     let existed = models.contains_key(model_id);
     if !existed {
         models.insert(model_id, Item::Table(Table::new()));
@@ -5048,8 +7155,7 @@ fn restore_grox_provider_auth_overrides() -> Result<(), String> {
         root.remove("model");
     }
 
-    atomic_write(&path, &document.to_string())?;
-    restrict_private_file(&path)?;
+    atomic_write_private(&path, &document.to_string())?;
     write_provider_auth_overrides(&ProviderAuthOverridesFile::default())
 }
 
@@ -5082,8 +7188,7 @@ fn write_provider_backend_overrides(value: &ProviderBackendOverridesFile) -> Res
     }
     let content = serde_json::to_string_pretty(value)
         .map_err(|error| format!("无法序列化 Grox 兼容服务协议还原信息：{error}"))?;
-    atomic_write(&path, &content)?;
-    restrict_private_file(&path)
+    atomic_write_private(&path, &content)
 }
 
 fn restore_grox_provider_backend_overrides() -> Result<(), String> {
@@ -5160,8 +7265,7 @@ fn restore_grox_provider_backend_overrides() -> Result<(), String> {
     if models.is_empty() {
         root.remove("model");
     }
-    atomic_write(&path, &document.to_string())?;
-    restrict_private_file(&path)?;
+    atomic_write_private(&path, &document.to_string())?;
     write_provider_backend_overrides(&ProviderBackendOverridesFile::default())
 }
 
@@ -5224,9 +7328,11 @@ fn apply_grox_provider_backend_overrides(
             model.remove("model");
         }
     }
-    atomic_write(&path, &document.to_string())?;
-    restrict_private_file(&path)?;
-    write_provider_backend_overrides(&ProviderBackendOverridesFile { models: backups })
+    // Recovery data must become durable before config.toml changes. If the
+    // process exits or the config write fails afterwards, the next restore can
+    // still reconstruct the exact user-owned fields.
+    write_provider_backend_overrides(&ProviderBackendOverridesFile { models: backups })?;
+    atomic_write_private(&path, &document.to_string())
 }
 
 fn canonical_model_id(model: &str, available_models: &[String]) -> String {
@@ -5268,7 +7374,9 @@ fn compatible_profile_backend_model_ids(profile: &StoredProviderProfile) -> Vec<
     models
 }
 
-fn provider_profile_summary(profile: &StoredProviderProfile) -> ProviderProfileSummary {
+fn provider_profile_summary(
+    profile: &StoredProviderProfile,
+) -> Result<ProviderProfileSummary, String> {
     let mut resident_models = profile.resident_models.clone();
     if resident_models.is_empty() {
         if let Some(model) = profile.model.as_ref().filter(|model| !model.is_empty()) {
@@ -5279,19 +7387,24 @@ fn provider_profile_summary(profile: &StoredProviderProfile) -> ProviderProfileS
     // gateway. A case-only mismatch is enough for many gateways to return a
     // misleading 503 "model unavailable" response.
     canonicalize_resident_models(&mut resident_models, &profile.available_models);
-    ProviderProfileSummary {
+    let secret_backend = provider_secret_backend(
+        &provider_profile_secret_ref(&profile.id),
+        profile.legacy_api_key.as_deref(),
+    )?;
+    Ok(ProviderProfileSummary {
         id: profile.id.clone(),
         name: profile.name.clone(),
         // Never return the raw key to the WebView. The renderer only needs a
         // presence bit; updates use empty-key-means-keep semantics.
         api_key: String::new(),
-        has_api_key: !profile.api_key.is_empty(),
+        has_api_key: secret_backend != SecretBackendKind::Missing,
+        secret_backend,
         base_url: profile.base_url.clone(),
         allow_insecure_http: profile.allow_insecure_http,
         api_backend: profile.api_backend,
         available_models: profile.available_models.clone(),
         resident_models,
-    }
+    })
 }
 
 fn compatible_models_url(base_url: &str, allow_insecure_http: bool) -> Result<String, String> {
@@ -5330,40 +7443,112 @@ fn checked_model_ids(models: Vec<String>) -> Result<Vec<String>, String> {
     Ok(result)
 }
 
-fn compatible_provider_env(
-    api_key: &str,
+fn provider_metadata_from_values(
+    kind: &str,
+    values: &BTreeMap<String, String>,
+    profile_id: Option<&str>,
+) -> String {
+    let mut lines = vec![format!("{GROX_PROVIDER_KIND_KEY}={}", env_value(kind))];
+    for key in ["GROK_MODELS_BASE_URL", "GROK_MODELS_LIST_URL"] {
+        if let Some(value) = values.get(key).filter(|value| !value.trim().is_empty()) {
+            lines.push(format!("{key}={}", env_value(value)));
+        }
+    }
+    if let Some(profile_id) = profile_id.or_else(|| {
+        values
+            .get(GROX_PROVIDER_PROFILE_ID_KEY)
+            .map(String::as_str)
+    }) {
+        lines.push(format!(
+            "{GROX_PROVIDER_PROFILE_ID_KEY}={}",
+            env_value(profile_id)
+        ));
+    }
+    lines.join("\n")
+}
+
+fn official_provider_metadata() -> String {
+    format!(
+        "{GROX_PROVIDER_KIND_KEY}={}",
+        env_value("official")
+    )
+}
+
+fn compatible_provider_metadata(
     base_url: &str,
     allow_insecure_http: bool,
+    profile_id: Option<&str>,
 ) -> Result<String, String> {
-    let key = checked_api_key(api_key.trim())?;
-    if key.is_empty() {
-        return Err("API Key 不能为空".into());
-    }
     let base = checked_service_url_with_policy(
         base_url.trim(),
         "服务地址",
         allow_insecure_http,
     )?;
-    let lines = vec![
-        format!("XAI_API_KEY={}", env_value(key)),
+    let mut lines = vec![
+        format!(
+            "{GROX_PROVIDER_KIND_KEY}={}",
+            env_value("compatible")
+        ),
         format!("GROK_MODELS_BASE_URL={}", env_value(&base)),
         format!(
             "GROK_MODELS_LIST_URL={}",
             env_value(&compatible_models_url(&base, allow_insecure_http)?)
         ),
     ];
+    if let Some(profile_id) = profile_id {
+        lines.push(format!(
+            "{GROX_PROVIDER_PROFILE_ID_KEY}={}",
+            env_value(profile_id)
+        ));
+    }
     Ok(lines.join("\n"))
 }
 
-fn active_profile_for_managed_environment(value: &ProviderProfilesFile) -> Option<StoredProviderProfile> {
-    let managed = parse_grox_managed_provider_env(&grok_home().ok()?.join(".env"));
+fn profile_for_managed_provider_values(
+    value: &ProviderProfilesFile,
+    managed: &BTreeMap<String, String>,
+) -> Option<StoredProviderProfile> {
     let base = managed.get("GROK_MODELS_BASE_URL")?.trim_end_matches('/');
-    let id = value.active_id.as_deref()?;
+    // v0.3.2 records the profile reference beside the endpoint metadata, so
+    // process injection never depends on a second mutable `activeId` source.
+    // The file field is read only for a one-release migration window.
+    let id = managed
+        .get(GROX_PROVIDER_PROFILE_ID_KEY)
+        .map(String::as_str)
+        .or_else(|| {
+            // Only marker-less v0.3.1 metadata may consult the legacy field.
+            // A v0.3.2 direct-compatible block intentionally has no profile id.
+            (!managed.contains_key(GROX_PROVIDER_KIND_KEY))
+                .then_some(value.active_id.as_deref())
+                .flatten()
+        })?;
     value
         .profiles
         .iter()
         .find(|profile| profile.id == id && profile.base_url.trim_end_matches('/') == base)
         .cloned()
+}
+
+fn active_profile_for_managed_environment(
+    value: &ProviderProfilesFile,
+) -> Option<StoredProviderProfile> {
+    let managed = parse_grox_managed_provider_env(&grok_home().ok()?.join(".env"));
+    profile_for_managed_provider_values(value, &managed)
+}
+
+fn compatible_secret_reference(
+    profiles: &ProviderProfilesFile,
+    values: &BTreeMap<String, String>,
+) -> Result<String, String> {
+    if let Some(profile) = profile_for_managed_provider_values(profiles, values) {
+        return Ok(provider_profile_secret_ref(&profile.id));
+    }
+    if let Some(id) = values.get(GROX_PROVIDER_PROFILE_ID_KEY) {
+        return Err(format!(
+            "活动供应商档案 {id} 不存在，或服务地址与活动元数据不一致"
+        ));
+    }
+    Ok(SECRET_REF_DIRECT_COMPATIBLE.to_string())
 }
 
 fn synchronize_active_provider_backend() -> Result<(), String> {
@@ -5382,9 +7567,29 @@ fn synchronize_active_provider_backend() -> Result<(), String> {
     }
 }
 
+fn restore_provider_secret(
+    store: &SecretStore,
+    reference: &str,
+    previous: Option<&str>,
+) -> Result<(), String> {
+    match previous {
+        Some(value) => store.set(reference, value).map(|_| ()),
+        None => store.delete(reference),
+    }
+}
+
+fn provider_storage_error(code: &'static str, error: String) -> HostError {
+    HostError::recoverable_environment(
+        code,
+        error,
+        "检查系统凭据库和 ~/.grok 的访问权限后重试",
+    )
+}
+
 #[tauri::command]
-fn list_provider_profiles() -> Result<ProviderProfilesResponse, String> {
-    let value = read_provider_profiles_file()?;
+fn list_provider_profiles() -> Result<ProviderProfilesResponse, HostError> {
+    let value = read_provider_profiles_file()
+        .map_err(|error| provider_storage_error("PROVIDER_PROFILES_READ_FAILED", error))?;
     // A profile is active only when the process environment actually points
     // at it. This avoids a stale persisted id briefly labelling OAuth as an
     // OpenAI-compatible provider while the ACP child is being replaced.
@@ -5395,40 +7600,31 @@ fn list_provider_profiles() -> Result<ProviderProfilesResponse, String> {
             .profiles
             .iter()
             .map(provider_profile_summary)
-            .collect(),
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?,
     })
 }
 
 #[tauri::command]
-fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfileSummary, String> {
+fn save_provider_profile(
+    request: SaveProviderProfile,
+) -> Result<ProviderProfileSummary, HostError> {
+    migrate_legacy_provider_secrets()
+        .map_err(|error| provider_storage_error("SECRET_MIGRATION_FAILED", error))?;
     let name = request.name.trim();
     if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
-        return Err("供应商名称必须为 1–80 个可见字符".into());
+        return Err(HostError::operation(
+            "PROVIDER_NAME_INVALID",
+            "供应商名称必须为 1–80 个可见字符",
+        ));
     }
-    let mut value = read_provider_profiles_file()?;
+    let mut value = read_provider_profiles_file()
+        .map_err(|error| provider_storage_error("PROVIDER_PROFILES_READ_FAILED", error))?;
     let existing = request
         .id
         .as_deref()
-        .and_then(|id| value.profiles.iter().find(|profile| profile.id == id));
-    let key = request
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|key| !key.is_empty())
-        .or_else(|| existing.map(|profile| profile.api_key.as_str()))
-        .ok_or("API Key 不能为空")?;
-    compatible_provider_env(key, &request.base_url, request.allow_insecure_http)?;
-    let mut resident_models = checked_model_ids(request.resident_models)?;
-    let base_url = checked_service_url_with_policy(
-        &request.base_url,
-        "服务地址",
-        request.allow_insecure_http,
-    )?;
-    let available_models = existing
-        .filter(|profile| profile.base_url == base_url && profile.api_key == key)
-        .map(|profile| profile.available_models.clone())
-        .unwrap_or_default();
-    canonicalize_resident_models(&mut resident_models, &available_models);
+        .and_then(|id| value.profiles.iter().find(|profile| profile.id == id))
+        .cloned();
     let id = request.id.unwrap_or_else(|| {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -5442,12 +7638,51 @@ fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfile
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
     {
-        return Err("无效的供应商档案 ID".into());
+        return Err(HostError::operation(
+            "PROVIDER_PROFILE_ID_INVALID",
+            "无效的供应商档案 ID",
+        ));
     }
+    let reference = provider_profile_secret_ref(&id);
+    let store = provider_secret_store()
+        .map_err(|error| provider_storage_error("SECRET_STORE_OPEN_FAILED", error))?;
+    let previous_secret = store
+        .get(&reference)
+        .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
+    let requested_key = request
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|key| !key.is_empty());
+    let key = requested_key
+        .or_else(|| previous_secret.as_ref().map(StoredSecret::expose))
+        .ok_or_else(|| HostError::operation("PROVIDER_API_KEY_REQUIRED", "API Key 不能为空"))?;
+    checked_api_key(key)
+        .map_err(|error| HostError::operation("PROVIDER_API_KEY_INVALID", error))?;
+    let secret_changed = requested_key.is_some_and(|requested| {
+        previous_secret
+            .as_ref()
+            .is_none_or(|previous| previous.expose() != requested)
+    });
+    let mut resident_models = checked_model_ids(request.resident_models)
+        .map_err(|error| HostError::operation("PROVIDER_MODEL_ID_INVALID", error))?;
+    let base_url = checked_service_url_with_policy(
+        &request.base_url,
+        "服务地址",
+        request.allow_insecure_http,
+    )
+    .map_err(|error| HostError::operation("PROVIDER_URL_INVALID", error))?;
+    compatible_provider_metadata(&base_url, request.allow_insecure_http, Some(&id))
+        .map_err(|error| HostError::operation("PROVIDER_URL_INVALID", error))?;
+    let available_models = existing
+        .filter(|profile| profile.base_url == base_url && !secret_changed)
+        .map(|profile| profile.available_models.clone())
+        .unwrap_or_default();
+    canonicalize_resident_models(&mut resident_models, &available_models);
     let profile = StoredProviderProfile {
         id: id.clone(),
         name: name.to_owned(),
-        api_key: checked_api_key(key)?.to_owned(),
+        legacy_api_key: None,
         base_url: base_url.clone(),
         allow_insecure_http: request.allow_insecure_http,
         api_backend: request.api_backend,
@@ -5461,20 +7696,49 @@ fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfile
     } else {
         value.profiles.push(profile.clone());
     }
-    write_provider_profiles_file(&value)?;
-    Ok(provider_profile_summary(&profile))
+    if secret_changed {
+        store
+            .set(&reference, key)
+            .map_err(|error| provider_storage_error("SECRET_STORE_WRITE_FAILED", error))?;
+    }
+    let summary = provider_profile_summary(&profile)
+        .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
+    if let Err(error) = write_provider_profiles_file(&value) {
+        if secret_changed {
+            if let Err(rollback) = restore_provider_secret(
+                &store,
+                &reference,
+                previous_secret.as_ref().map(StoredSecret::expose),
+            ) {
+                return Err(provider_storage_error(
+                    "PROVIDER_PROFILE_ROLLBACK_FAILED",
+                    format!("{error}；密钥回滚也失败：{rollback}"),
+                ));
+            }
+        }
+        return Err(provider_storage_error(
+            "PROVIDER_PROFILE_WRITE_FAILED",
+            error,
+        ));
+    }
+    Ok(summary)
 }
 
 async fn fetch_compatible_models(
     api_key: &str,
     base_url: &str,
     allow_insecure_http: bool,
-) -> Result<Vec<String>, String> {
-    let key = checked_api_key(api_key.trim())?;
+) -> Result<Vec<String>, HostError> {
+    let key = checked_api_key(api_key.trim())
+        .map_err(|error| HostError::operation("PROVIDER_API_KEY_INVALID", error))?;
     if key.is_empty() {
-        return Err("API Key 不能为空".into());
+        return Err(HostError::operation(
+            "PROVIDER_API_KEY_REQUIRED",
+            "API Key 不能为空",
+        ));
     }
-    let endpoint = compatible_models_url(base_url, allow_insecure_http)?;
+    let endpoint = compatible_models_url(base_url, allow_insecure_http)
+        .map_err(|error| HostError::operation("PROVIDER_URL_INVALID", error))?;
     let mut response = reqwest::Client::builder()
         .user_agent(format!("Grox/{CLIENT_VERSION}"))
         .timeout(Duration::from_secs(15))
@@ -5498,40 +7762,75 @@ async fn fetch_compatible_models(
             }
         }))
         .build()
-        .map_err(|error| format!("无法创建模型目录客户端：{error}"))?
+        .map_err(|error| {
+            HostError::recoverable_environment(
+                "PROVIDER_HTTP_CLIENT_FAILED",
+                format!("无法创建模型目录客户端：{error}"),
+                "检查系统网络与 TLS 配置后重试",
+            )
+        })?
         .get(endpoint)
         .bearer_auth(key)
         .header("Accept", "application/json")
         .send()
         .await
-        .map_err(|error| format!("无法获取模型列表：{error}"))?
+        .map_err(|error| {
+            HostError::recoverable_environment(
+                "PROVIDER_MODELS_REQUEST_FAILED",
+                format!("无法获取模型列表：{error}"),
+                "检查服务地址、网络与代理配置后重试",
+            )
+        })?
         .error_for_status()
-        .map_err(|error| format!("模型服务返回错误：{error}"))?;
+        .map_err(|error| {
+            HostError::protocol_with_action(
+                "PROVIDER_MODELS_HTTP_ERROR",
+                format!("模型服务返回错误：{error}"),
+                "检查 API Key、服务地址和网关的 /models 路由",
+            )
+        })?;
     if response
         .content_length()
         .is_some_and(|length| length > MAX_PROVIDER_MODELS_BODY_BYTES as u64)
     {
-        return Err(format!(
-            "模型列表响应超过 {} MB 上限",
-            MAX_PROVIDER_MODELS_BODY_BYTES / 1024 / 1024
+        return Err(HostError::protocol(
+            "PROVIDER_MODELS_RESPONSE_TOO_LARGE",
+            format!(
+                "模型列表响应超过 {} MB 上限",
+                MAX_PROVIDER_MODELS_BODY_BYTES / 1024 / 1024
+            ),
         ));
     }
     let mut body = Vec::new();
     while let Some(chunk) = response
         .chunk()
         .await
-        .map_err(|error| format!("无法读取模型列表：{error}"))?
+        .map_err(|error| {
+            HostError::recoverable_environment(
+                "PROVIDER_MODELS_READ_FAILED",
+                format!("无法读取模型列表：{error}"),
+                "检查网络稳定性后重试",
+            )
+        })?
     {
         if body.len().saturating_add(chunk.len()) > MAX_PROVIDER_MODELS_BODY_BYTES {
-            return Err(format!(
-                "模型列表响应超过 {} MB 上限",
-                MAX_PROVIDER_MODELS_BODY_BYTES / 1024 / 1024
+            return Err(HostError::protocol(
+                "PROVIDER_MODELS_RESPONSE_TOO_LARGE",
+                format!(
+                    "模型列表响应超过 {} MB 上限",
+                    MAX_PROVIDER_MODELS_BODY_BYTES / 1024 / 1024
+                ),
             ));
         }
         body.extend_from_slice(&chunk);
     }
-    let response: OpenAiModelsResponse = serde_json::from_slice(&body)
-        .map_err(|error| format!("模型列表不是 OpenAI 兼容格式：{error}"))?;
+    let response: OpenAiModelsResponse = serde_json::from_slice(&body).map_err(|error| {
+        HostError::protocol_with_action(
+            "PROVIDER_MODELS_INVALID_RESPONSE",
+            format!("模型列表不是 OpenAI 兼容格式：{error}"),
+            "确认网关的 /models 返回 OpenAI 兼容 JSON",
+        )
+    })?;
     let mut models = response
         .data
         .into_iter()
@@ -5547,7 +7846,7 @@ async fn fetch_compatible_models(
 }
 
 #[tauri::command]
-async fn fetch_provider_models(request: FetchProviderModels) -> Result<Vec<String>, String> {
+async fn fetch_provider_models(request: FetchProviderModels) -> Result<Vec<String>, HostError> {
     fetch_compatible_models(
         &request.api_key,
         &request.base_url,
@@ -5557,25 +7856,33 @@ async fn fetch_provider_models(request: FetchProviderModels) -> Result<Vec<Strin
 }
 
 #[tauri::command]
-async fn refresh_provider_models(id: String) -> Result<ProviderProfileSummary, String> {
-    let profile = read_provider_profiles_file()?
+async fn refresh_provider_models(id: String) -> Result<ProviderProfileSummary, HostError> {
+    migrate_legacy_provider_secrets()
+        .map_err(|error| provider_storage_error("SECRET_MIGRATION_FAILED", error))?;
+    let profile = read_provider_profiles_file()
+        .map_err(|error| provider_storage_error("PROVIDER_PROFILES_READ_FAILED", error))?
         .profiles
         .into_iter()
         .find(|profile| profile.id == id)
-        .ok_or("供应商档案不存在")?;
+        .ok_or_else(|| HostError::operation("PROVIDER_PROFILE_NOT_FOUND", "供应商档案不存在"))?;
+    let secret = require_provider_secret(&provider_profile_secret_ref(&profile.id))
+        .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
     let models = fetch_compatible_models(
-        &profile.api_key,
+        secret.expose(),
         &profile.base_url,
         profile.allow_insecure_http,
     )
     .await?;
 
-    let mut value = read_provider_profiles_file()?;
+    let mut value = read_provider_profiles_file()
+        .map_err(|error| provider_storage_error("PROVIDER_PROFILES_READ_FAILED", error))?;
     let stored = value
         .profiles
         .iter_mut()
         .find(|stored| stored.id == profile.id)
-        .ok_or("供应商档案已被删除")?;
+        .ok_or_else(|| {
+            HostError::operation("PROVIDER_PROFILE_DELETED", "供应商档案已被删除")
+        })?;
     stored.available_models = models;
     canonicalize_resident_models(&mut stored.resident_models, &stored.available_models);
     if stored.resident_models.is_empty() {
@@ -5584,132 +7891,305 @@ async fn refresh_provider_models(id: String) -> Result<ProviderProfileSummary, S
         }
     }
     stored.model = stored.resident_models.first().cloned();
-    let summary = provider_profile_summary(stored);
-    write_provider_profiles_file(&value)?;
+    let summary = provider_profile_summary(stored)
+        .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
+    write_provider_profiles_file(&value)
+        .map_err(|error| provider_storage_error("PROVIDER_PROFILE_WRITE_FAILED", error))?;
     Ok(summary)
 }
 
 #[tauri::command]
-fn activate_provider_profile(id: String) -> Result<(), String> {
-    let mut value = read_provider_profiles_file()?;
+fn activate_provider_profile(id: String) -> Result<(), HostError> {
+    migrate_legacy_provider_secrets()
+        .map_err(|error| provider_storage_error("SECRET_MIGRATION_FAILED", error))?;
+    let value = read_provider_profiles_file()
+        .map_err(|error| provider_storage_error("PROVIDER_PROFILES_READ_FAILED", error))?;
     let profile = value
         .profiles
         .iter()
         .find(|profile| profile.id == id)
         .cloned()
-        .ok_or("供应商档案不存在")?;
-    // Custom-model endpoints are configured exclusively through Grok Build's
-    // documented process environment. Older Grox versions wrote a generated
-    // `[model.*]` block for every built-in model; restore those tracked edits
-    // once, then leave the user's config.toml entirely under their control.
-    restore_grox_provider_auth_overrides()?;
+        .ok_or_else(|| HostError::operation("PROVIDER_PROFILE_NOT_FOUND", "供应商档案不存在"))?;
+    require_provider_secret(&provider_profile_secret_ref(&profile.id))
+        .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
     let model_ids = compatible_profile_backend_model_ids(&profile);
     let primary_model = model_ids
         .first()
-        .ok_or("供应商没有可用模型；请先获取模型目录并选择一个模型")?;
+        .ok_or_else(|| {
+            HostError::operation(
+                "PROVIDER_MODEL_REQUIRED",
+                "供应商没有可用模型；请先获取模型目录并选择一个模型",
+            )
+        })?;
     let backend = profile.api_backend.config_value(&profile.name, &profile.base_url);
-    apply_grox_provider_backend_overrides(&model_ids, &profile.base_url, primary_model, backend)?;
-    let replacement = compatible_provider_env(
-        &profile.api_key,
+    let replacement = compatible_provider_metadata(
         &profile.base_url,
         profile.allow_insecure_http,
-    )?;
-    let path = grok_home()?.join(".env");
-    let current = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
-    atomic_write(&path, &replace_managed_env_block(&current, &replacement))?;
-    restrict_private_file(&path)?;
-    value.active_id = Some(profile.id);
-    write_provider_profiles_file(&value)
+        Some(&profile.id),
+    )
+    .map_err(|error| HostError::operation("PROVIDER_URL_INVALID", error))?;
+    let path = grok_home()
+        .map_err(|error| provider_storage_error("PROVIDER_HOME_UNAVAILABLE", error))?
+        .join(".env");
+    let current = read_bounded_text(&path, MAX_CONFIG_BYTES)
+        .map_err(|error| provider_storage_error("PROVIDER_METADATA_READ_FAILED", error))?;
+    let transition = (|| {
+        // Custom-model endpoints are configured exclusively through Grok
+        // Build's documented process environment. Restore legacy generated
+        // auth edits, then apply only the current transport override.
+        restore_grox_provider_auth_overrides()?;
+        apply_grox_provider_backend_overrides(
+            &model_ids,
+            &profile.base_url,
+            primary_model,
+            backend,
+        )?;
+        atomic_write_private(&path, &replace_managed_env_block(&current, &replacement))
+    })();
+    if let Err(error) = transition {
+        // The old managed environment is still the runtime authority. Reapply
+        // its backend after any partial config mutation, so a failed switch
+        // cannot poison the next restart.
+        let rollback = atomic_write_private(&path, &current)
+            .and_then(|_| synchronize_active_provider_backend());
+        return Err(provider_storage_error(
+            "PROVIDER_ACTIVATION_FAILED",
+            match rollback {
+                Ok(()) => error,
+                Err(rollback) => format!("{error}；旧供应商回滚也失败：{rollback}"),
+            },
+        ));
+    }
+    Ok(())
 }
 
 #[tauri::command]
-fn delete_provider_profile(id: String) -> Result<(), String> {
-    let mut value = read_provider_profiles_file()?;
-    let before = value.profiles.len();
+fn delete_provider_profile(id: String) -> Result<(), HostError> {
+    migrate_legacy_provider_secrets()
+        .map_err(|error| provider_storage_error("SECRET_MIGRATION_FAILED", error))?;
+    let mut value = read_provider_profiles_file()
+        .map_err(|error| provider_storage_error("PROVIDER_PROFILES_READ_FAILED", error))?;
+    let profile = value
+        .profiles
+        .iter()
+        .find(|profile| profile.id == id)
+        .cloned()
+        .ok_or_else(|| HostError::operation("PROVIDER_PROFILE_NOT_FOUND", "供应商档案不存在"))?;
+    let was_active = active_profile_for_managed_environment(&value)
+        .is_some_and(|active| active.id == id);
+    let active_environment = if was_active {
+        let path = grok_home()
+            .map_err(|error| provider_storage_error("PROVIDER_HOME_UNAVAILABLE", error))?
+            .join(".env");
+        let current = read_bounded_text(&path, MAX_CONFIG_BYTES)
+            .map_err(|error| provider_storage_error("PROVIDER_METADATA_READ_FAILED", error))?;
+        Some((path, current))
+    } else {
+        None
+    };
+    let reference = provider_profile_secret_ref(&profile.id);
+    let store = provider_secret_store()
+        .map_err(|error| provider_storage_error("SECRET_STORE_OPEN_FAILED", error))?;
+    let previous_secret = store
+        .get(&reference)
+        .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
+    store
+        .delete(&reference)
+        .map_err(|error| provider_storage_error("SECRET_STORE_DELETE_FAILED", error))?;
     value.profiles.retain(|profile| profile.id != id);
-    if before == value.profiles.len() {
-        return Err("供应商档案不存在".into());
-    }
     if value.active_id.as_deref() == Some(id.as_str()) {
-        restore_grox_provider_auth_overrides()?;
-        restore_grox_provider_backend_overrides()?;
-        let path = grok_home()?.join(".env");
-        let current = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
-        atomic_write(&path, &replace_managed_env_block(&current, ""))?;
-        restrict_private_file(&path)?;
         value.active_id = None;
     }
-    write_provider_profiles_file(&value)
+    let result = (|| {
+        if was_active {
+            restore_grox_provider_auth_overrides()?;
+            restore_grox_provider_backend_overrides()?;
+            let (path, current) = active_environment
+                .as_ref()
+                .ok_or_else(|| "活动供应商缺少回滚元数据".to_string())?;
+            atomic_write_private(&path, &replace_managed_env_block(&current, ""))?;
+        }
+        write_provider_profiles_file(&value)
+    })();
+    if let Err(error) = result {
+        let mut failure = error;
+        if let Some((path, current)) = active_environment.as_ref() {
+            if let Err(rollback) = atomic_write_private(path, current)
+                .and_then(|_| synchronize_active_provider_backend())
+            {
+                failure = format!("{failure}；活动供应商回滚也失败：{rollback}");
+            }
+        }
+        if let Err(rollback) = restore_provider_secret(
+            &store,
+            &reference,
+            previous_secret.as_ref().map(StoredSecret::expose),
+        ) {
+            return Err(provider_storage_error(
+                "PROVIDER_PROFILE_ROLLBACK_FAILED",
+                format!("{failure}；密钥回滚也失败：{rollback}"),
+            ));
+        }
+        return Err(provider_storage_error(
+            "PROVIDER_PROFILE_DELETE_FAILED",
+            failure,
+        ));
+    }
+    Ok(())
 }
 
 #[tauri::command]
-fn read_provider_status() -> Result<ProviderStatus, String> {
-    let values = parse_grox_managed_provider_env(&grok_home()?.join(".env"));
-    let api_key = values
+fn read_provider_status() -> Result<ProviderStatus, HostError> {
+    let values = parse_grox_managed_provider_env(
+        &grok_home()
+            .map_err(|error| provider_storage_error("PROVIDER_HOME_UNAVAILABLE", error))?
+            .join(".env"),
+    );
+    let legacy_key = values
         .get("XAI_API_KEY")
         .filter(|value| !value.trim().is_empty());
     let base_url = values
         .get("GROK_MODELS_BASE_URL")
         .filter(|value| !value.trim().is_empty())
         .cloned();
-    let kind = if base_url.is_some() {
-        "compatible"
-    } else if api_key.is_some() {
-        "official"
+    let kind = match values.get(GROX_PROVIDER_KIND_KEY).map(String::as_str) {
+        Some("oauth") => "oauth",
+        Some("official") => "official",
+        Some("compatible") => "compatible",
+        Some(kind) => {
+            return Err(HostError::protocol(
+                "PROVIDER_METADATA_INVALID",
+                format!("未知的 Host 供应商模式：{kind}"),
+            ))
+        }
+        None if base_url.is_some() => "compatible",
+        None if legacy_key.is_some() => "official",
+        None => "oauth",
+    };
+    let secret_backend = if legacy_key.is_some() {
+        SecretBackendKind::LegacyFile
     } else {
-        "oauth"
+        let reference = match kind {
+            "official" => Some(SECRET_REF_OFFICIAL_PROVIDER.to_string()),
+            "compatible" => {
+                let profiles = read_provider_profiles_file().map_err(|error| {
+                    provider_storage_error("PROVIDER_PROFILES_READ_FAILED", error)
+                })?;
+                Some(compatible_secret_reference(&profiles, &values).map_err(|error| {
+                    HostError::protocol_with_action(
+                        "PROVIDER_PROFILE_REFERENCE_INVALID",
+                        error,
+                        "重新选择供应商档案，或切回 OAuth 后重试",
+                    )
+                })?)
+            }
+            _ => None,
+        };
+        match reference {
+            Some(reference) => provider_secret_backend(&reference, None)
+                .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?,
+            None => SecretBackendKind::Missing,
+        }
     };
     Ok(ProviderStatus {
         kind,
-        has_api_key: api_key.is_some(),
+        has_api_key: secret_backend != SecretBackendKind::Missing,
         base_url,
+        secret_backend,
     })
 }
 
 #[tauri::command]
-fn configure_provider(request: ProviderConfig) -> Result<(), String> {
-    let home = grok_home()?;
+fn configure_provider(request: ProviderConfig) -> Result<(), HostError> {
+    migrate_legacy_provider_secrets()
+        .map_err(|error| provider_storage_error("SECRET_MIGRATION_FAILED", error))?;
+    let home = grok_home()
+        .map_err(|error| provider_storage_error("PROVIDER_HOME_UNAVAILABLE", error))?;
     let path = home.join(".env");
-    let current = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
-    let current_values = parse_grox_managed_provider_env(&path);
+    let current = read_bounded_text(&path, MAX_CONFIG_BYTES)
+        .map_err(|error| provider_storage_error("PROVIDER_METADATA_READ_FAILED", error))?;
     let requested_key = request
         .api_key
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty());
-    let saved_key = current_values
-        .get("XAI_API_KEY")
-        .map(String::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
+    let mut secret_change: Option<(&str, &str)> = None;
     let replacement = match request.kind.as_str() {
         "oauth" => {
-            restore_grox_provider_auth_overrides()?;
-            restore_grox_provider_backend_overrides()?;
             String::new()
         }
         "official" => {
-            restore_grox_provider_auth_overrides()?;
-            restore_grox_provider_backend_overrides()?;
-            let key = requested_key.or(saved_key).ok_or("API Key 不能为空")?;
-            let key = checked_api_key(key)?;
-            format!("XAI_API_KEY={}", env_value(key))
+            if let Some(key) = requested_key {
+                checked_api_key(key)
+                    .map_err(|error| HostError::operation("PROVIDER_API_KEY_INVALID", error))?;
+                secret_change = Some((SECRET_REF_OFFICIAL_PROVIDER, key));
+            } else {
+                require_provider_secret(SECRET_REF_OFFICIAL_PROVIDER)
+                    .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
+            }
+            official_provider_metadata()
         }
         "compatible" => {
             let base_url = request.base_url.as_deref().unwrap_or_default();
-            let key = requested_key.or(saved_key).ok_or("API Key 不能为空")?;
-            let replacement = compatible_provider_env(key, base_url, false)?;
-            restore_grox_provider_auth_overrides()?;
-            restore_grox_provider_backend_overrides()?;
-            replacement
+            if let Some(key) = requested_key {
+                checked_api_key(key)
+                    .map_err(|error| HostError::operation("PROVIDER_API_KEY_INVALID", error))?;
+                secret_change = Some((SECRET_REF_DIRECT_COMPATIBLE, key));
+            } else {
+                require_provider_secret(SECRET_REF_DIRECT_COMPATIBLE)
+                    .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
+            }
+            compatible_provider_metadata(base_url, false, None)
+                .map_err(|error| HostError::operation("PROVIDER_URL_INVALID", error))?
         }
-        _ => return Err("未知账户接入类型".into()),
+        _ => {
+            return Err(HostError::operation(
+                "PROVIDER_KIND_INVALID",
+                "未知账户接入类型",
+            ))
+        }
     };
-    atomic_write(&path, &replace_managed_env_block(&current, &replacement))?;
-    restrict_private_file(&path)?;
-    let mut profiles = read_provider_profiles_file()?;
-    if profiles.active_id.take().is_some() {
-        write_provider_profiles_file(&profiles)?;
+    let store = provider_secret_store()
+        .map_err(|error| provider_storage_error("SECRET_STORE_OPEN_FAILED", error))?;
+    let previous_secret = if let Some((reference, key)) = secret_change {
+        let previous = store
+            .get(reference)
+            .map_err(|error| provider_storage_error("SECRET_STORE_READ_FAILED", error))?;
+        store
+            .set(reference, key)
+            .map_err(|error| provider_storage_error("SECRET_STORE_WRITE_FAILED", error))?;
+        Some((reference, previous))
+    } else {
+        None
+    };
+    let result = (|| {
+        restore_grox_provider_auth_overrides()?;
+        restore_grox_provider_backend_overrides()?;
+        atomic_write_private(&path, &replace_managed_env_block(&current, &replacement))
+    })();
+    if let Err(error) = result {
+        let mut failure = error;
+        if let Err(rollback) = atomic_write_private(&path, &current)
+            .and_then(|_| synchronize_active_provider_backend())
+        {
+            failure = format!("{failure}；旧供应商回滚也失败：{rollback}");
+        }
+        if let Some((reference, previous)) = previous_secret {
+            if let Err(rollback) = restore_provider_secret(
+                &store,
+                reference,
+                previous.as_ref().map(StoredSecret::expose),
+            ) {
+                return Err(provider_storage_error(
+                    "PROVIDER_CONFIG_ROLLBACK_FAILED",
+                    format!("{failure}；密钥回滚也失败：{rollback}"),
+                ));
+            }
+        }
+        return Err(provider_storage_error(
+            "PROVIDER_CONFIG_WRITE_FAILED",
+            failure,
+        ));
     }
     Ok(())
 }
@@ -5777,15 +8257,6 @@ fn open_external(url: String) -> Result<(), String> {
     spawn_system_browser(&parsed)
 }
 
-fn is_media_https_host_allowed(host: Option<&str>) -> bool {
-    let Some(host) = host.map(|value| value.trim().trim_end_matches('.').to_ascii_lowercase()) else {
-        return false;
-    };
-    MEDIA_HTTPS_HOST_ALLOWLIST
-        .iter()
-        .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")))
-}
-
 #[tauri::command]
 fn open_media_external(url: String) -> Result<(), String> {
     let parsed = parse_browser_url(&url).map_err(|error| format!("无效媒体链接：{error}"))?;
@@ -5820,93 +8291,6 @@ Use only the grox_desktop_computer MCP tools for an explicit `/computer` or `@Co
     Ok(root)
 }
 
-#[tauri::command]
-fn computer_session_extensions(
-    leases: tauri::State<'_, Arc<McpLeaseStore>>,
-) -> Result<ComputerSessionExtensions, String> {
-    // Soft-fail when host gate closed: empty lists, no lease (FE must not cache control).
-    if !computer_use_gate_open() {
-        return Ok(ComputerSessionExtensions {
-            mcp_servers: Vec::new(),
-            plugin_dirs: Vec::new(),
-            lease_id: String::new(),
-        });
-    }
-    let mut lease_bytes = [0_u8; 16];
-    getrandom::fill(&mut lease_bytes)
-        .map_err(|error| format!("无法创建 Computer Use 租约：{error}"))?;
-    let lease_id = lease_bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    computer_mcp::clear_emergency_stop(&lease_id)?;
-    // Prefer a real desktop harness wherever we can observe the screen.
-    // Windows keeps the full UIA controller; macOS/Linux expose the same MCP
-    // surface with platform-limited executors so agents degrade gracefully.
-    let plugin = ensure_computer_plugin()?;
-    let endpoint = computer_mcp::serve_http(lease_id.clone())?;
-    leases.put_computer(
-        lease_id.clone(),
-        mcp_leases::computer_server_config(&endpoint.url, &endpoint.token),
-    )?;
-    Ok(ComputerSessionExtensions {
-        mcp_servers: Vec::new(),
-        plugin_dirs: vec![path_for_webview(&plugin)],
-        lease_id,
-    })
-}
-
-#[tauri::command]
-fn computer_shutdown_lease(
-    leases: tauri::State<'_, Arc<McpLeaseStore>>,
-    lease_id: String,
-) -> Result<(), String> {
-    leases.remove_computer(&lease_id);
-    computer_mcp::shutdown_http(&lease_id);
-    Ok(())
-}
-
-#[tauri::command]
-fn computer_emergency_stop(lease_id: String) -> Result<(), String> {
-    computer_mcp::mark_emergency_stop(&lease_id)
-}
-
-#[tauri::command]
-fn computer_clear_emergency_stop(lease_id: String) -> Result<(), String> {
-    computer_mcp::clear_emergency_stop(&lease_id)
-}
-
-#[tauri::command]
-fn browser_session_extensions(
-    leases: tauri::State<'_, Arc<McpLeaseStore>>,
-) -> Result<BrowserSessionExtensions, String> {
-    let mut lease_bytes = [0_u8; 16];
-    getrandom::fill(&mut lease_bytes)
-        .map_err(|error| format!("无法创建 Browser Use 租约：{error}"))?;
-    let lease_id = lease_bytes
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    let endpoint = browser_mcp::serve_http(lease_id.clone())?;
-    leases.put_browser(
-        lease_id.clone(),
-        mcp_leases::browser_server_config(&endpoint.url, &endpoint.token),
-    )?;
-    Ok(BrowserSessionExtensions {
-        mcp_servers: Vec::new(),
-        lease_id,
-    })
-}
-
-#[tauri::command]
-fn browser_shutdown_lease(
-    leases: tauri::State<'_, Arc<McpLeaseStore>>,
-    lease_id: String,
-) -> Result<(), String> {
-    leases.remove_browser(&lease_id);
-    browser_mcp::shutdown_http(&lease_id);
-    Ok(())
-}
 
 #[cfg(windows)]
 fn register_computer_emergency_shortcut(app: tauri::AppHandle) {
@@ -5942,256 +8326,6 @@ fn register_computer_emergency_shortcut(app: tauri::AppHandle) {
     let _ = app.emit("computer-emergency-shortcut-status", false);
 }
 
-#[tauri::command]
-fn save_media_reference(cwd: String, name: String, data: String) -> Result<String, String> {
-    let cwd = checked_workspace(&cwd)?;
-    let extension = Path::new(&name)
-        .extension()
-        .and_then(|value| value.to_str())
-        .map(str::to_ascii_lowercase)
-        .ok_or("参考图片缺少扩展名")?;
-    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp") {
-        return Err("参考图片仅支持 PNG、JPEG 或 WebP".into());
-    }
-    // Base64 约为原文件的 4/3；同时限制编码前后大小，不能只信任 WebView 字符数。
-    if data.len() > MAX_MEDIA_REFERENCE_BYTES.saturating_mul(4) / 3 + 1024 {
-        return Err("参考图片不能超过 24 MB".into());
-    }
-    let payload = data
-        .rsplit_once(',')
-        .map(|(_, value)| value)
-        .unwrap_or(&data);
-    let bytes = BASE64
-        .decode(payload)
-        .map_err(|error| format!("参考图片编码无效：{error}"))?;
-    if bytes.len() > MAX_MEDIA_REFERENCE_BYTES {
-        return Err("参考图片不能超过 24 MB".into());
-    }
-    let detected = prompt_image_mime(&bytes).ok_or("参考图片内容不是有效的 PNG、JPEG 或 WebP")?;
-    let expected = match extension.as_str() {
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "webp" => "image/webp",
-        _ => unreachable!(),
-    };
-    if detected != expected {
-        return Err(format!(
-            "参考图片内容与扩展名不符（内容 {detected}，扩展名 .{extension}）"
-        ));
-    }
-    let directory = cwd.join(".grox").join("media-input");
-    fs::create_dir_all(&directory).map_err(|error| format!("无法创建媒体输入目录：{error}"))?;
-    let path = directory.join(format!(
-        "reference-{}-{}.{}",
-        std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis(),
-        extension
-    ));
-    fs::write(&path, bytes).map_err(|error| format!("无法保存参考图片：{error}"))?;
-    Ok(path_for_webview(&path))
-}
-
-#[tauri::command]
-async fn generate_media(
-    app: tauri::AppHandle,
-    request: MediaGenerationRequest,
-) -> Result<MediaGenerationResult, String> {
-    let cwd = checked_workspace(&request.cwd)?;
-    let prompt = checked_media_prompt(&request)?;
-    let runtime = configured_grok_command(&app);
-    let mut command = Command::new(&runtime.path);
-    command
-        .arg("--single")
-        .arg(&prompt)
-        .args(["--output-format", "streaming-json", "--always-approve"])
-        .args(["--tools", MEDIA_GENERATION_TOOLS])
-        .current_dir(&cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    // Keep media generation on the same authentication path as a terminal
-    // invocation. API variables are added only for the provider explicitly
-    // managed by Grox; OAuth gets a clean official CLI environment.
-    command.env("GROK_CLIENT_NAME", UPSTREAM_CLI_CLIENT_NAME);
-    apply_grox_provider_environment(&mut command);
-    #[cfg(windows)]
-    {
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    let output = tokio::time::timeout(Duration::from_secs(600), command.output())
-        .await
-        .map_err(|_| "媒体生成超过 10 分钟，任务已终止".to_string())?
-        .map_err(|error| format!("无法启动 Grok Build 媒体生成：{error}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let detail = if stderr.trim().is_empty() {
-            stdout.as_ref()
-        } else {
-            stderr.as_ref()
-        };
-        return Err(format!(
-            "Grok Build 媒体生成失败：{}",
-            detail.trim().chars().take(4_000).collect::<String>()
-        ));
-    }
-    let artifacts = extract_media_artifacts(&stdout, &cwd)?;
-    if artifacts.is_empty() {
-        return Err(format!(
-            "Grok Build 已结束，但未返回媒体产物：{}",
-            stdout
-                .trim()
-                .chars()
-                .rev()
-                .take(2_000)
-                .collect::<String>()
-                .chars()
-                .rev()
-                .collect::<String>()
-        ));
-    }
-    for artifact in &artifacts {
-        if let Some(path) = artifact.path.as_deref() {
-            app.asset_protocol_scope()
-                .allow_file(PathBuf::from(path))
-                .map_err(|error| format!("无法授权媒体预览：{error}"))?;
-        }
-    }
-    Ok(MediaGenerationResult {
-        artifacts,
-        summary: format!("Grok Build 已生成 {} 个媒体产物", request.count),
-    })
-}
-
-fn checked_media_prompt(request: &MediaGenerationRequest) -> Result<String, String> {
-    let cwd = checked_workspace(&request.cwd)?;
-    let prompt = request.prompt.trim();
-    if prompt.is_empty() || prompt.chars().count() > 4_000 {
-        return Err("媒体提示词必须为 1–4000 个字符".into());
-    }
-    let aspect = match request.aspect.as_str() {
-        "1:1" | "16:9" | "9:16" | "4:3" => request.aspect.as_str(),
-        _ => return Err("不支持的画面比例".into()),
-    };
-    let instruction = match request.kind.as_str() {
-        "image" => format!(
-            "必须调用内置 image_gen 工具真实生成 {count} 张图片。画面比例 {aspect}。生成完成后仅列出每个实际输出文件的绝对路径或 URL。用户提示：{prompt}",
-            count = request.count.clamp(1, 4)
-        ),
-        "video" => {
-            let reference = if let Some(path) = request.reference_path.as_deref() {
-                let file = checked_workspace_file(&cwd, path)?;
-                if !file.is_file() {
-                    return Err("参考图片不存在".into());
-                }
-                format!(
-                    "参考图片绝对路径：{}。必须使用 image_to_video 或 reference_to_video。",
-                    path_for_webview(&file)
-                )
-            } else {
-                "必须使用 video_gen。".to_string()
-            };
-            format!(
-                "{reference}真实生成视频，画面比例 {aspect}，时长 {duration} 秒，分辨率 {resolution}。生成完成后仅列出实际输出文件的绝对路径或 URL。用户提示：{prompt}",
-                duration = request.duration.clamp(1, 30),
-                resolution = request.resolution
-            )
-        }
-        _ => return Err("不支持的媒体类型".into()),
-    };
-    Ok(instruction)
-}
-
-fn extract_media_artifacts(output: &str, cwd: &Path) -> Result<Vec<MediaArtifact>, String> {
-    let mut candidates = Vec::new();
-    for line in output.lines() {
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
-            collect_media_strings(&value, &mut candidates);
-        } else {
-            candidates.extend(line.split_whitespace().map(|value| {
-                value
-                    .trim_matches(|c| matches!(c, '"' | '\'' | ',' | ')' | '('))
-                    .to_string()
-            }));
-        }
-    }
-    let mut artifacts = Vec::new();
-    for candidate in candidates {
-        let clean = candidate.trim().trim_matches('"');
-        let lower = clean.to_ascii_lowercase();
-        let mime = if lower.contains(".png") {
-            "image/png"
-        } else if lower.contains(".jpg") || lower.contains(".jpeg") {
-            "image/jpeg"
-        } else if lower.contains(".webp") {
-            "image/webp"
-        } else if lower.contains(".mp4") {
-            "video/mp4"
-        } else if lower.contains(".webm") {
-            "video/webm"
-        } else {
-            continue;
-        };
-        if let Ok(parsed) = url::Url::parse(clean) {
-            let allowed = match parsed.scheme() {
-                "https" => is_media_https_host_allowed(parsed.host_str()),
-                "http" => is_loopback_host(parsed.host_str()),
-                _ => false,
-            };
-            if allowed && parsed.username().is_empty() && parsed.password().is_none() {
-                artifacts.push(MediaArtifact {
-                    path: None,
-                    url: Some(parsed.to_string()),
-                    mime: mime.into(),
-                });
-                continue;
-            }
-        }
-        let path = PathBuf::from(clean);
-        let path = if path.is_absolute() {
-            path
-        } else {
-            cwd.join(path)
-        };
-        if !is_workspace_file(cwd, &path) {
-            continue;
-        }
-        let Ok(canonical) = path.canonicalize() else {
-            continue;
-        };
-        let display = path_for_webview(&canonical);
-        if !artifacts
-            .iter()
-            .any(|item| item.path.as_deref() == Some(&display))
-        {
-            artifacts.push(MediaArtifact {
-                path: Some(display),
-                url: None,
-                mime: mime.into(),
-            });
-        }
-    }
-    Ok(artifacts)
-}
-
-fn collect_media_strings(value: &serde_json::Value, output: &mut Vec<String>) {
-    match value {
-        serde_json::Value::String(value) => output.push(value.clone()),
-        serde_json::Value::Array(values) => values
-            .iter()
-            .for_each(|value| collect_media_strings(value, output)),
-        serde_json::Value::Object(values) => values
-            .values()
-            .for_each(|value| collect_media_strings(value, output)),
-        _ => {}
-    }
-}
-
 fn checked_reasoning_effort(effort: Option<String>) -> Result<Option<String>, String> {
     match effort {
         Some(value) if matches!(value.as_str(), "low" | "medium" | "high" | "xhigh" | "max") => {
@@ -6202,17 +8336,392 @@ fn checked_reasoning_effort(effort: Option<String>) -> Result<Option<String>, St
     }
 }
 
-/// Start a fresh ACP child and stream each stdout JSON-RPC line to the webview.
-/// A repeated call intentionally replaces the old child so a webview reload
-/// cannot initialize the same agent process twice.
+fn ensure_main_acp_owner(window_label: &str) -> Result<(), String> {
+    if window_label == "main" {
+        Ok(())
+    } else {
+        Err("当前窗口不是 ACP 运行时所有者，请回到主窗口继续会话".into())
+    }
+}
+
 #[tauri::command]
-async fn acp_spawn(
+async fn agent_runtime_connect(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<AcpState>>,
+    leases: tauri::State<'_, Arc<McpLeaseStore>>,
     cwd: String,
-    computer_use_enabled: Option<bool>,
     reasoning_effort: Option<String>,
-) -> Result<u64, String> {
+    force_reconnect: Option<bool>,
+) -> Result<AgentRuntimeConnection, AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    let force_reconnect = force_reconnect.unwrap_or(false);
+    if force_reconnect {
+        state.cancel_automatic_reconnect();
+    }
+    ensure_agent_runtime_ready(
+        &app,
+        state.inner(),
+        leases.inner(),
+        cwd,
+        reasoning_effort,
+        force_reconnect,
+    )
+    .await
+}
+
+/// Host 内唯一的 ACP 启动事务。页面首次加载、崩溃重连与自动化调度都从这里
+/// 取得同一个已握手代次；只有显式配置切换可以要求替换健康进程。
+pub(crate) async fn ensure_agent_runtime_ready(
+    app: &tauri::AppHandle,
+    state: &Arc<AcpState>,
+    leases: &Arc<McpLeaseStore>,
+    cwd: String,
+    reasoning_effort: Option<String>,
+    force_reconnect: bool,
+) -> Result<AgentRuntimeConnection, AcpHostError> {
+    let _connect_guard = state.connect_lock.lock().await;
+    if !force_reconnect {
+        if let Some(connection) = state.ready_connection().await {
+            tracing::debug!(
+                target: "grox::runtime",
+                generation = connection.generation,
+                "reusing ready Agent runtime"
+            );
+            return Ok(connection);
+        }
+        let paused_generation = state.paused_generation.load(Ordering::Acquire);
+        if paused_generation != 0
+            && state
+                .process
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|process| process.generation == paused_generation)
+        {
+            return Err(AcpHostError::operation(
+                "ACP_RUNTIME_PAUSED",
+                "Agent 运行时正在执行配置切换，暂不能启动新任务",
+            ));
+        }
+    }
+    state.ready_generation.store(0, Ordering::Release);
+    state.paused_generation.store(0, Ordering::Release);
+    state.clear_cached_connection(None);
+    state.set_runtime_phase(RuntimePhase::Starting);
+
+    let connect_spec = RuntimeConnectSpec {
+        cwd,
+        reasoning_effort,
+    };
+    tracing::info!(
+        target: "grox::runtime",
+        force_reconnect,
+        "starting Agent runtime connection"
+    );
+
+    let (generation, client_version) = match spawn_acp_process(
+        app,
+        state,
+        leases,
+        connect_spec.cwd.clone(),
+        connect_spec.reasoning_effort.clone(),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            state.set_runtime_phase(RuntimePhase::Offline);
+            tracing::error!(target: "grox::runtime", error = %error, "Agent process spawn failed");
+            return Err(AcpHostError::environment(
+                "ACP_SPAWN_FAILED",
+                error,
+                true,
+                true,
+                "请检查 CLI 安装、权限与当前工作目录后重试",
+            ));
+        }
+    };
+
+    state.set_runtime_phase(RuntimePhase::Initializing);
+    let initialize = match agent_runtime::initialize(
+        state,
+        leases,
+        generation,
+        client_version.as_deref(),
+    )
+    .await
+    {
+        Ok(initialize) => initialize,
+        Err(error) => {
+            tracing::warn!(
+                target: "grox::runtime",
+                generation,
+                code = %error.code,
+                "Agent initialize failed"
+            );
+            discard_failed_runtime(state, leases, generation, error.clone()).await;
+            return Err(error);
+        }
+    };
+
+    state.set_runtime_phase(RuntimePhase::Authenticating);
+    let auth = agent_runtime::authenticate(
+        state,
+        leases,
+        generation,
+        &initialize,
+    )
+    .await;
+    let connection = AgentRuntimeConnection {
+        generation,
+        initialize,
+        auth,
+    };
+    if let Err(error) = state.mark_runtime_ready(&connection).await {
+        discard_failed_runtime(state, leases, generation, error.clone()).await;
+        return Err(error);
+    }
+    state.remember_connect(connect_spec);
+    tracing::info!(
+        target: "grox::runtime",
+        generation,
+        auth_required = connection.auth.required,
+        auth_in_progress = connection.auth.in_progress,
+        "Agent runtime ready"
+    );
+    Ok(connection)
+}
+
+async fn discard_failed_runtime(
+    state: &AcpState,
+    leases: &McpLeaseStore,
+    generation: u64,
+    failure: AcpHostError,
+) {
+    state.mark_generation_unready(generation, RuntimePhase::Offline);
+    state.requests.reject_generation(generation, failure).await;
+    shutdown_all_mcp_resources(leases);
+    let process = {
+        let mut process = state.process.lock().await;
+        if process
+            .as_ref()
+            .is_some_and(|process| process.generation == generation)
+        {
+            process.take()
+        } else {
+            None
+        }
+    };
+    if let Some(process) = process {
+        let next_generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        state.foreground_turns.reset(next_generation);
+        state.interactions.reset(next_generation);
+        state.client_callbacks.reset(next_generation).await;
+        state.sessions.reset(next_generation);
+        terminate_process(process).await;
+    }
+}
+
+fn schedule_automatic_runtime_reconnect(
+    app: tauri::AppHandle,
+    state: Arc<AcpState>,
+    leases: Arc<McpLeaseStore>,
+    affected_session_ids: Vec<String>,
+    interrupted_session_ids: Vec<String>,
+) {
+    let Some(spec) = state.last_connect() else {
+        return;
+    };
+    let Some(claim) = state.claim_automatic_reconnect() else {
+        return;
+    };
+    tauri::async_runtime::spawn(async move {
+        let _ = app.emit(
+            "agent-runtime-reconnect",
+            RuntimeReconnectPayload {
+                state: "reconnecting",
+                attempt: 0,
+                affected_session_ids: affected_session_ids.clone(),
+                interrupted_session_ids: interrupted_session_ids.clone(),
+                connection: None,
+                error: None,
+            },
+        );
+        let mut last_error = None;
+        for attempt in 1..=2u8 {
+            if app.state::<AppShutdown>().started.load(Ordering::Acquire)
+                || state.automatic_reconnect_cancelled(claim)
+            {
+                state.finish_automatic_reconnect(claim);
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(u64::from(attempt) * 800)).await;
+            if app.state::<AppShutdown>().started.load(Ordering::Acquire)
+                || state.automatic_reconnect_cancelled(claim)
+            {
+                state.finish_automatic_reconnect(claim);
+                return;
+            }
+            match ensure_agent_runtime_ready(
+                &app,
+                &state,
+                &leases,
+                spec.cwd.clone(),
+                spec.reasoning_effort.clone(),
+                false,
+            )
+            .await
+            {
+                Ok(connection) => {
+                    if state.automatic_reconnect_cancelled(claim) {
+                        state.finish_automatic_reconnect(claim);
+                        return;
+                    }
+                    let _ = app.emit(
+                        "agent-runtime-reconnect",
+                        RuntimeReconnectPayload {
+                            state: "ready",
+                            attempt,
+                            affected_session_ids: affected_session_ids.clone(),
+                            interrupted_session_ids: interrupted_session_ids.clone(),
+                            connection: Some(connection),
+                            error: None,
+                        },
+                    );
+                    state.finish_automatic_reconnect(claim);
+                    return;
+                }
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if state.automatic_reconnect_cancelled(claim) {
+            state.finish_automatic_reconnect(claim);
+            return;
+        }
+        let detail = last_error
+            .as_ref()
+            .map(|error| error.message.as_str())
+            .unwrap_or("未知运行时错误");
+        let error = AcpHostError::environment(
+            "ACP_RECONNECT_FAILED",
+            format!("Agent 自动重连失败：{detail}"),
+            true,
+            true,
+            "检查 Grok Build CLI、认证与网络后重新连接；重发前先检查最后一轮结果",
+        );
+        let _ = app.emit(
+            "agent-runtime-reconnect",
+            RuntimeReconnectPayload {
+                state: "offline",
+                attempt: 2,
+                affected_session_ids,
+                interrupted_session_ids,
+                connection: None,
+                error: Some(error),
+            },
+        );
+        state.finish_automatic_reconnect(claim);
+    });
+}
+
+async fn handle_client_callback_inbound(
+    app: &tauri::AppHandle,
+    state: &Arc<AcpState>,
+    generation: u64,
+    message: &AcpInbound,
+) -> bool {
+    // 短锁只保护 callback 登记与 reset 的先后关系。实际文件操作会重新取得该锁；
+    // terminal/wait_for_exit 则必须脱离 stdout reader 独立等待。
+    let inbound = {
+        let _operation_guard = state.client_callbacks.lock_operations().await;
+        state
+            .client_callbacks
+            .observe_decoded_inbound(generation, message)
+    };
+    match inbound {
+        ClientCallbackInbound::NotCallback => false,
+        ClientCallbackInbound::Request(lease) => {
+            if ClientCallbackRegistry::waits_for_terminal_exit(&lease) {
+                let callback_app = app.clone();
+                let callback_state = Arc::clone(state);
+                tauri::async_runtime::spawn(async move {
+                    settle_client_callback(
+                        &callback_app,
+                        callback_state.as_ref(),
+                        generation,
+                        lease,
+                    )
+                    .await;
+                });
+            } else {
+                // 文件写入和短终端操作保持 wire 到达顺序；只有可能无限
+                // 等待的 wait_for_exit 脱离 stdout reader。
+                settle_client_callback(app, state.as_ref(), generation, lease).await;
+            }
+            true
+        }
+        ClientCallbackInbound::AutoReply(response) => {
+            state
+                .foreground_turns
+                .observe_outbound(generation, &response);
+            if let Err(error) = write_acp_line(state.as_ref(), &response, generation).await {
+                let _ = app.emit(
+                    "acp-stderr",
+                    format!("Client callback 自动拒绝回复失败：{error}"),
+                );
+            }
+            true
+        }
+        ClientCallbackInbound::Duplicate => {
+            let _ = app.emit(
+                "acp-stderr",
+                "Agent 复用了仍在处理的 Client callback rpc id；已拒绝覆盖原请求",
+            );
+            true
+        }
+        ClientCallbackInbound::Invalid => {
+            let _ = app.emit(
+                "acp-stderr",
+                "Agent 发送了没有合法 rpc id 的 Client callback；无法安全回复",
+            );
+            true
+        }
+    }
+}
+
+async fn settle_client_callback(
+    app: &tauri::AppHandle,
+    state: &AcpState,
+    generation: u64,
+    lease: client_callbacks::ClientCallbackLease,
+) {
+    let response = state.client_callbacks.render_response(&lease).await;
+    state
+        .foreground_turns
+        .observe_outbound(generation, &response);
+    let write_result = write_acp_line(state, &response, generation).await;
+    state.client_callbacks.settle(&lease);
+    if let Err(error) = write_result {
+        let (session_id, method) = ClientCallbackRegistry::describe(&lease);
+        let _ = app.emit(
+            "acp-stderr",
+            format!("Client callback 回复失败（{method}，session={session_id}）：{error}"),
+        );
+    }
+}
+
+/// Start a fresh ACP child and stream each stdout JSON-RPC line to the webview.
+/// Only the Host connection transaction calls this helper, so a spawned child
+/// can never be mistaken for an initialized runtime.
+async fn spawn_acp_process(
+    app: &tauri::AppHandle,
+    state: &Arc<AcpState>,
+    leases: &Arc<McpLeaseStore>,
+    cwd: String,
+    reasoning_effort: Option<String>,
+) -> Result<(u64, Option<String>), String> {
     let cwd = checked_workspace(&cwd)?;
 
     // Invalidate the previous readers before terminating their process. On a
@@ -6220,14 +8729,41 @@ async fn acp_spawn(
     // or stderr lines after `kill`; those lines must not reach the new ACP
     // connection.
     let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    tracing::info!(target: "grox::runtime", generation, "spawning Grok Build ACP process");
+    state.authentication.reset(AcpHostError::environment(
+        "AUTH_RUNTIME_CHANGED",
+        "Agent 重连取消了旧通道上的登录",
+        false,
+        false,
+        "连接稳定后重新登录",
+    ));
+    state.foreground_turns.reset(generation);
+    state.interactions.reset(generation);
+    state.client_callbacks.reset(generation).await;
+    state.sessions.reset(generation);
+    state
+        .requests
+        .reject_all(AcpHostError::environment(
+            "ACP_CHANNEL_REPLACED",
+            "ACP 通道已切换，请在新通道上重试",
+            true,
+            true,
+            "Agent 重连后检查最后一轮结果，再决定是否重新发送",
+        ))
+        .await;
+    shutdown_all_mcp_resources(leases);
 
     if let Some(old) = state.process.lock().await.take() {
         terminate_process(old).await;
     }
 
-    let runtime = configured_grok_command(&app);
-    // Host gate only (env | host_prefs). FE `computer_use_enabled` is not authority.
-    let _ = computer_use_enabled;
+    let runtime = configured_grok_command(app);
+    let client_version = runtime
+        .version
+        .as_deref()
+        .and_then(cli_version_number)
+        .map(|version| version.to_string());
+    // Host gate only (env | host_prefs); WebView state is not authorization.
     let computer_plugin = if computer_use_gate_open() {
         Some(
             ensure_computer_plugin()
@@ -6238,6 +8774,9 @@ async fn acp_spawn(
     };
     let command_path = PathBuf::from(&runtime.path);
     let mut command = Command::new(&command_path);
+    if let Some(path) = process_env::enriched_path_env() {
+        command.env("PATH", path);
+    }
     command.arg("agent");
     if let Some(effort) = checked_reasoning_effort(reasoning_effort)? {
         command.arg("--reasoning-effort").arg(effort);
@@ -6264,7 +8803,7 @@ async fn acp_spawn(
     // client marker here causes OAuth requests to hit a different upstream
     // eligibility gate. Preserve official CLI identity end to end.
     command.env("GROK_CLIENT_NAME", UPSTREAM_CLI_CLIENT_NAME);
-    apply_grox_provider_environment(&mut command);
+    apply_grox_provider_environment(&mut command)?;
 
     #[cfg(windows)]
     {
@@ -6297,13 +8836,13 @@ async fn acp_spawn(
             Ok(job) => {
                 if let Some(pid) = child.id() {
                     if let Err(error) = job.assign_pid(pid) {
-                        eprintln!("grox: AssignProcessToJobObject failed: {error}");
+                        tracing::warn!(target: "grox::runtime", generation, pid, error = %error, "AssignProcessToJobObject failed");
                     }
                 }
                 Some(job)
             }
             Err(error) => {
-                eprintln!("grox: CreateJobObject failed (orphan risk on cancel): {error}");
+                tracing::warn!(target: "grox::runtime", generation, error = %error, "CreateJobObject failed; descendant cleanup is degraded");
                 None
             }
         }
@@ -6317,7 +8856,7 @@ async fn acp_spawn(
     });
 
     let stdout_app = app.clone();
-    let stdout_state = state.inner().clone();
+    let stdout_state = state.clone();
     tauri::async_runtime::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         loop {
@@ -6327,7 +8866,109 @@ async fn acp_spawn(
                         break;
                     }
                     if !line.trim().is_empty() {
-                        let _ = stdout_app.emit("acp-event", line);
+                        let inbound = AcpInbound::parse(&line);
+                        if let Ok(message) = &inbound {
+                            if stdout_state
+                                .requests
+                                .resolve_decoded_response(generation, &line, message)
+                                .await
+                            {
+                                continue;
+                            }
+                        }
+                        if let Some(abort) = inbound.as_ref().ok().and_then(|message| {
+                            stdout_state
+                                .foreground_turns
+                                .observe_decoded_inbound(generation, message)
+                        }) {
+                            stdout_state
+                                .requests
+                                .reject(
+                                    abort.request_id,
+                                    abort.generation,
+                                    AcpHostError::protocol(
+                                        "ACP_INVALID_REASONING_EFFORT",
+                                        abort.message,
+                                    ),
+                                )
+                                .await;
+                        }
+                        if let Ok(message) = &inbound {
+                            if handle_client_callback_inbound(
+                                &stdout_app,
+                                &stdout_state,
+                                generation,
+                                message,
+                            )
+                            .await
+                            {
+                                continue;
+                            }
+                        }
+                        let interaction = inbound
+                            .as_ref()
+                            .ok()
+                            .map(|message| {
+                                stdout_state
+                                    .interactions
+                                    .observe_decoded_inbound(generation, message)
+                            })
+                            .unwrap_or(InteractionInbound::NotInteraction);
+                        match interaction {
+                            InteractionInbound::NotInteraction => {
+                                let event = stdout_state.session_events.append_inbound(
+                                    generation,
+                                    line.len(),
+                                    inbound.as_ref(),
+                                );
+                                if let Some(response) = event.unsupported_response() {
+                                    stdout_state
+                                        .foreground_turns
+                                        .observe_outbound(generation, response);
+                                    if let Err(error) = write_acp_line(
+                                        stdout_state.as_ref(),
+                                        response,
+                                        generation,
+                                    )
+                                    .await
+                                    {
+                                        let _ = stdout_app.emit(
+                                            "acp-stderr",
+                                            format!("Host 拒绝未知 Agent 回调失败：{error}"),
+                                        );
+                                    }
+                                }
+                                // 只把已编号的 Host 事件投影给运行时所有者。页面
+                                // 重载期间即使无人监听，事件仍可由游标命令补放。
+                                emit_host_session_event(&stdout_app, event);
+                            }
+                            InteractionInbound::Opened(interaction) => {
+                                // 反向 RPC 只投影给主窗口；rpc id 和 wire option
+                                // 留在 Host，辅助窗口不能窃取或回复门控。
+                                if let Some(window) = stdout_app.get_webview_window("main") {
+                                    let _ = window.emit("interaction-opened", interaction);
+                                }
+                            }
+                            InteractionInbound::AutoReply(response) => {
+                                stdout_state
+                                    .foreground_turns
+                                    .observe_outbound(generation, &response);
+                                if let Err(error) =
+                                    write_acp_line(stdout_state.as_ref(), &response, generation).await
+                                {
+                                    let _ = stdout_app.emit(
+                                        "acp-stderr",
+                                        format!("自动取消无效交互请求失败：{error}"),
+                                    );
+                                }
+                            }
+                            InteractionInbound::Duplicate => {
+                                let _ = stdout_app.emit(
+                                    "acp-stderr",
+                                    "Agent 在同一进程代次复用了仍待回复的交互 rpc id；已拒绝覆盖原门控",
+                                );
+                            }
+                        }
                     }
                 }
                 Ok(None) => break,
@@ -6350,6 +8991,28 @@ async fn acp_spawn(
             }
         };
         if let Some(mut process) = process {
+            let occupancy = stdout_state.sessions.snapshot();
+            let mut affected_session_ids = stdout_state.client_callbacks.bound_session_ids();
+            affected_session_ids.extend(occupancy.active_turn_session_ids.iter().cloned());
+            affected_session_ids.sort();
+            affected_session_ids.dedup();
+            let interrupted_session_ids = occupancy.active_turn_session_ids;
+            stdout_state.mark_generation_unready(generation, RuntimePhase::Offline);
+            shutdown_all_mcp_resources(stdout_app.state::<Arc<McpLeaseStore>>().inner());
+            let next_generation = stdout_state
+                .next_generation
+                .compare_exchange(
+                    generation,
+                    generation + 1,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .map(|_| generation + 1)
+                .unwrap_or_else(|current| current);
+            stdout_state.foreground_turns.reset(next_generation);
+            stdout_state.interactions.reset(next_generation);
+            stdout_state.client_callbacks.reset(next_generation).await;
+            stdout_state.sessions.reset(next_generation);
             drop(process.stdin);
             let code = process
                 .child
@@ -6357,18 +9020,52 @@ async fn acp_spawn(
                 .await
                 .ok()
                 .and_then(|status| status.code());
+            let exit_message = match code {
+                Some(code) => format!("Grok Agent 已退出（代码 {code}）"),
+                None => "Grok Agent 已退出".to_string(),
+            };
+            tracing::warn!(
+                target: "grox::runtime",
+                generation,
+                exit_code = ?code,
+                affected_sessions = affected_session_ids.len(),
+                interrupted_sessions = interrupted_session_ids.len(),
+                "Agent process exited"
+            );
+            stdout_state
+                .requests
+                .reject_generation(
+                    generation,
+                    AcpHostError::environment(
+                        "ACP_PROCESS_EXITED",
+                        exit_message,
+                        true,
+                        true,
+                        "Agent 重连后检查最后一轮结果，再决定是否重新发送",
+                    ),
+                )
+                .await;
             let _ = stdout_app.emit(
                 "acp-exit",
                 AcpExitPayload {
                     code,
                     reason: "exited",
+                    affected_session_ids: affected_session_ids.clone(),
+                    interrupted_session_ids: interrupted_session_ids.clone(),
                 },
+            );
+            schedule_automatic_runtime_reconnect(
+                stdout_app.clone(),
+                Arc::clone(&stdout_state),
+                Arc::clone(stdout_app.state::<Arc<McpLeaseStore>>().inner()),
+                affected_session_ids,
+                interrupted_session_ids,
             );
         }
     });
 
     let stderr_app = app.clone();
-    let stderr_state = state.inner().clone();
+    let stderr_state = state.clone();
     tauri::async_runtime::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
@@ -6384,7 +9081,7 @@ async fn acp_spawn(
         }
     });
 
-    Ok(generation)
+    Ok((generation, client_version))
 }
 
 /// Methods the desktop shell may write on the ACP stdin channel.
@@ -6407,12 +9104,15 @@ fn acp_method_allowed(method: &str) -> bool {
     }
     // Only x.ai extension notifications use the optional wire-level `_` prefix.
     // Do not let the prefix turn arbitrary standard namespaces into aliases.
-    let m = method.strip_prefix("_x.ai/").map(|suffix| format!("x.ai/{suffix}"));
+    let m = method
+        .strip_prefix("_x.ai/")
+        .map(|suffix| format!("x.ai/{suffix}"));
     let m = m.as_deref().unwrap_or(method);
     matches!(
         m,
         "session/new"
             | "session/load"
+            | "session/close"
             | "session/prompt"
             | "session/cancel"
             | "session/delete"
@@ -6427,13 +9127,6 @@ fn acp_method_allowed(method: &str) -> bool {
             | "session/update"
             | "initialize"
             | "authenticate"
-            | "terminal/create"
-            | "terminal/output"
-            | "terminal/release"
-            | "terminal/wait_for_exit"
-            | "terminal/kill"
-            | "fs/read_text_file"
-            | "fs/write_text_file"
             | "x.ai/interject"
             | "x.ai/session/list"
             | "x.ai/session/delete"
@@ -6455,17 +9148,11 @@ fn acp_method_allowed(method: &str) -> bool {
     ) || m.starts_with("x.ai/")
 }
 
-#[tauri::command]
-async fn acp_send(
-    state: tauri::State<'_, Arc<AcpState>>,
-    leases: tauri::State<'_, Arc<McpLeaseStore>>,
-    line: String,
-    generation: u64,
-) -> Result<(), String> {
+fn prepare_acp_line(line: String, leases: &McpLeaseStore) -> Result<String, String> {
     if line.contains('\n') || line.contains('\r') {
         return Err("ACP 消息必须是单行 JSON".into());
     }
-    // Bound stdin payload size (multimodal base64 still fits under 8 MiB).
+    // 多模态 base64 需要较大上限，但不能允许 WebView 无界占用 Host 内存。
     const MAX_ACP_LINE_BYTES: usize = 8 * 1024 * 1024;
     if line.len() > MAX_ACP_LINE_BYTES {
         return Err(format!(
@@ -6474,18 +9161,31 @@ async fn acp_send(
             MAX_ACP_LINE_BYTES
         ));
     }
-    // Method allowlist before lease inject / stdin write.
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-        if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
-            if !acp_method_allowed(method) {
-                return Err(format!("不允许的 ACP 方法：{method}"));
-            }
+    let message = serde_json::from_str::<serde_json::Value>(&line)
+        .map_err(|error| format!("ACP 消息不是合法 JSON：{error}"))?;
+    if !message.is_object() {
+        return Err("ACP 消息必须是 JSON 对象".into());
+    }
+    if message.get("jsonrpc").and_then(serde_json::Value::as_str) != Some("2.0") {
+        return Err("ACP 消息必须声明 jsonrpc 2.0".into());
+    }
+    if let Some(method) = message.get("method").and_then(serde_json::Value::as_str) {
+        if !acp_method_allowed(method) {
+            return Err(format!("不允许的 ACP 方法：{method}"));
         }
     }
-    let line = mcp_leases::inject_mcp_servers(&line, leases.inner())?;
+    let line = mcp_leases::inject_mcp_servers(&line, leases)?;
     if line.contains('\n') || line.contains('\r') {
         return Err("ACP 消息必须是单行 JSON".into());
     }
+    Ok(line)
+}
+
+async fn write_acp_line(
+    state: &AcpState,
+    line: &str,
+    generation: u64,
+) -> Result<(), String> {
     let mut guard = state.process.lock().await;
     let process = guard
         .as_mut()
@@ -6510,12 +9210,423 @@ async fn acp_send(
         .map_err(|error| format!("刷新 Grok Agent 输入失败：{error}"))
 }
 
+/// 返回当前 Host 代次仍待用户处理的交互门控。WebView 重载后用它恢复
+/// 界面投影，但拿不到 rpc id，因此旧页面状态不能伪造协议回复。
+#[tauri::command]
+fn interaction_status(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+) -> Result<Vec<InteractionProjection>, AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    Ok(state.interactions.snapshots())
+}
+
+/// 原子领取并回复一个 Host 持有的交互门控。调用方只能提供不透明 block id
+/// 和用户决定；session、rpc id、wire option 与代次都从 Host 状态取回。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ResolveInteractionResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audit_warning: Option<AcpHostError>,
+}
+
+#[tauri::command]
+async fn resolve_interaction(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    leases: tauri::State<'_, Arc<McpLeaseStore>>,
+    session_id: String,
+    block_id: String,
+    decision: serde_json::Value,
+) -> Result<ResolveInteractionResult, AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    let _write_guard = state.interactions.lock_writes().await;
+    let lease = state
+        .interactions
+        .claim_resolution(&session_id, &block_id, &decision)?;
+    let line = match prepare_acp_line(lease.line.clone(), leases.inner()) {
+        Ok(line) => line,
+        Err(error) => {
+            state.interactions.release_claim(&lease);
+            return Err(AcpHostError::protocol(
+                "INTERACTION_RESPONSE_INVALID",
+                error,
+            ));
+        }
+    };
+    state
+        .foreground_turns
+        .observe_outbound(lease.generation, &line);
+    if let Err(error) = write_acp_line(state.inner(), &line, lease.generation).await {
+        // stdin 写失败后无法证明回复是否到达，绝不自动重发批准决定。
+        state.interactions.settle(&lease);
+        if let Some(audit) = lease.permission_audit.as_ref() {
+            if let Err(audit_error) = permission_audit::append(
+                &host_prefs_dir_for_app(window.app_handle()),
+                audit,
+                "delivery_unknown",
+            ) {
+                tracing::error!(
+                    target: "grox::permission",
+                    session_id = %lease.session_id,
+                    block_id = %lease.block_id,
+                    error = %audit_error,
+                    "interaction delivery and audit both uncertain"
+                );
+            }
+        }
+        let _ = window.emit(
+            "interaction-closed",
+            serde_json::json!({
+                "sessionId": lease.session_id,
+                "blockId": lease.block_id,
+                "kind": lease.kind,
+                "reason": "write_failed",
+            }),
+        );
+        return Err(AcpHostError::environment(
+            "INTERACTION_RESPONSE_FAILED",
+            error,
+            false,
+            true,
+            "重新连接 Agent；等待它发出新的权限或提问请求",
+        ));
+    }
+    if !state.interactions.settle(&lease) {
+        return Err(AcpHostError::operation(
+            "INTERACTION_EXPIRED",
+            "交互请求在回复期间已失效",
+        ));
+    }
+    let audit_warning = lease.permission_audit.as_ref().and_then(|audit| {
+        permission_audit::append(
+            &host_prefs_dir_for_app(window.app_handle()),
+            audit,
+            "delivered",
+        )
+        .err()
+        .map(|error| {
+            AcpHostError::environment(
+                "PERMISSION_AUDIT_WRITE_FAILED",
+                error,
+                false,
+                false,
+                "权限决定已送达；请检查应用数据目录的空间和权限",
+            )
+        })
+    });
+    tracing::info!(
+        target: "grox::permission",
+        session_id = %lease.session_id,
+        block_id = %lease.block_id,
+        generation = lease.generation,
+        kind = lease.kind,
+        audit_warning = audit_warning.is_some(),
+        "Host interaction resolved"
+    );
+    Ok(ResolveInteractionResult { audit_warning })
+}
+
+/// 发送 ACP 请求并在原生 Host 内等待其响应。响应不再广播给所有 WebView。
+#[tauri::command]
+async fn acp_request(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    leases: tauri::State<'_, Arc<McpLeaseStore>>,
+    line: String,
+    request_id: u64,
+    generation: u64,
+    timeout_ms: u64,
+    gate_token: Option<u64>,
+) -> Result<String, AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    acp_request_inner(
+        state.inner(),
+        leases.inner(),
+        line,
+        request_id,
+        generation,
+        timeout_ms,
+        gate_token,
+    )
+    .await
+}
+
+async fn acp_request_inner(
+    state: &AcpState,
+    leases: &McpLeaseStore,
+    line: String,
+    request_id: u64,
+    generation: u64,
+    timeout_ms: u64,
+    gate_token: Option<u64>,
+) -> Result<String, AcpHostError> {
+    let line = prepare_acp_line(line, leases)
+        .map_err(|error| AcpHostError::protocol("ACP_INVALID_REQUEST", error))?;
+    let message = serde_json::from_str::<serde_json::Value>(&line).map_err(|error| {
+        AcpHostError::protocol(
+            "ACP_INVALID_REQUEST",
+            format!("ACP 消息不是合法 JSON：{error}"),
+        )
+    })?;
+    let wire_id = message
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| AcpHostError::protocol("ACP_INVALID_REQUEST", "ACP 请求缺少数字 id"))?;
+    if wire_id != request_id {
+        return Err(AcpHostError::protocol(
+            "ACP_REQUEST_ID_MISMATCH",
+            "ACP 请求 id 与 Host 参数不一致",
+        ));
+    }
+    let method = message
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| AcpHostError::protocol("ACP_INVALID_REQUEST", "ACP 请求缺少 method"))?
+        .to_string();
+    state.sessions.verify_request(
+        &method,
+        message.get("params").unwrap_or(&serde_json::Value::Null),
+        gate_token,
+        generation,
+    )?;
+    let receiver = state
+        .requests
+        .register(request_id, generation, method.clone())
+        .await?;
+    if let Err(error) = write_acp_line(state, &line, generation).await {
+        let failure = AcpHostError::environment(
+            "ACP_WRITE_FAILED",
+            error,
+            true,
+            true,
+            "检查 Grok Build CLI 是否仍在运行，然后重新连接",
+        );
+        state
+            .requests
+            .reject(request_id, generation, failure.clone())
+            .await;
+        return Err(failure);
+    }
+
+    let response = if timeout_ms == 0 {
+        receiver.await.map_err(|_| {
+            AcpHostError::environment(
+                "ACP_REQUEST_CHANNEL_CLOSED",
+                "ACP 请求通道已关闭",
+                true,
+                true,
+                "重新连接 Agent 后重试",
+            )
+        })?
+    } else {
+        // 普通 RPC 最多允许等待一天；长回合使用 0 并由会话 watchdog 明确取消。
+        let timeout = Duration::from_millis(timeout_ms.min(24 * 60 * 60 * 1_000));
+        match tokio::time::timeout(timeout, receiver).await {
+            Ok(result) => result.map_err(|_| {
+                AcpHostError::environment(
+                    "ACP_REQUEST_CHANNEL_CLOSED",
+                    "ACP 请求通道已关闭",
+                    true,
+                    true,
+                    "重新连接 Agent 后重试",
+                )
+            })?,
+            Err(_) => {
+                let failure = AcpHostError::environment(
+                    "ACP_REQUEST_TIMEOUT",
+                    format!("Grok Agent 请求超时：{method}"),
+                    true,
+                    true,
+                    "检查网络和 Grok Build CLI 状态后重试",
+                );
+                state
+                    .requests
+                    .reject(request_id, generation, failure.clone())
+                    .await;
+                return Err(failure);
+            }
+        }
+    };
+    response
+}
+
+/// Host 服务使用与 WebView 完全相同的请求表、代次校验和 stdio 写通道。
+/// JavaScript 安全整数的高位命名空间避免与 WebView 递增请求 id 相撞。
+pub(crate) async fn request_acp_json(
+    state: &AcpState,
+    leases: &McpLeaseStore,
+    method: &str,
+    params: serde_json::Value,
+    generation: u64,
+    timeout_ms: u64,
+    gate_token: Option<u64>,
+) -> Result<serde_json::Value, AcpHostError> {
+    request_acp_json_tracked(
+        state,
+        leases,
+        method,
+        params,
+        generation,
+        timeout_ms,
+        gate_token,
+        None,
+    )
+    .await
+}
+
+fn acp_wire_method(method: &str) -> String {
+    method
+        .strip_prefix("x.ai/")
+        .map(|suffix| format!("_x.ai/{suffix}"))
+        .unwrap_or_else(|| method.to_string())
+}
+
+/// 与普通 Host 请求共用同一 broker；tracker 只记录当前事务可定向取消的 id。
+pub(crate) async fn request_acp_json_tracked(
+    state: &AcpState,
+    leases: &McpLeaseStore,
+    method: &str,
+    params: serde_json::Value,
+    generation: u64,
+    timeout_ms: u64,
+    gate_token: Option<u64>,
+    tracker: Option<&dyn turn_runtime::AcpRequestTracker>,
+) -> Result<serde_json::Value, AcpHostError> {
+    let request_id = state.issue_host_request_id();
+    if let Some(tracker) = tracker {
+        tracker.request_started(request_id, method)?;
+    }
+    struct TrackingGuard<'a> {
+        tracker: Option<&'a dyn turn_runtime::AcpRequestTracker>,
+        request_id: u64,
+    }
+    impl Drop for TrackingGuard<'_> {
+        fn drop(&mut self) {
+            if let Some(tracker) = self.tracker {
+                tracker.request_finished(self.request_id);
+            }
+        }
+    }
+    let _tracking = TrackingGuard {
+        tracker,
+        request_id,
+    };
+    // ACP 扩展在 wire 上使用前导下划线；Host 内部始终使用规范化的
+    // `x.ai/...` 名称做门禁、诊断和错误分类。此前只有 WebView 做了这层
+    // 编码，迁到 Host 的自动化/删除/fork 请求会在真实 CLI 上找不到方法。
+    let wire_method = acp_wire_method(method);
+    let line = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": wire_method,
+        "params": params,
+    })
+    .to_string();
+    let response = acp_request_inner(
+        state,
+        leases,
+        line,
+        request_id,
+        generation,
+        timeout_ms,
+        gate_token,
+    )
+    .await?;
+    decode_host_acp_response(&response, request_id, method)
+}
+
+fn decode_host_acp_response(
+    line: &str,
+    request_id: u64,
+    method: &str,
+) -> Result<serde_json::Value, AcpHostError> {
+    let response = serde_json::from_str::<serde_json::Value>(line).map_err(|error| {
+        AcpHostError::protocol(
+            "ACP_INVALID_RESPONSE",
+            format!("Grok Build 返回了无法解析的 ACP 响应：{error}"),
+        )
+    })?;
+    let object = response.as_object().ok_or_else(|| {
+        AcpHostError::protocol("ACP_INVALID_RESPONSE", "Grok Build 的 ACP 响应不是对象")
+    })?;
+    if object.get("id").and_then(serde_json::Value::as_u64) != Some(request_id)
+        || object.get("method").is_some()
+    {
+        return Err(AcpHostError::protocol(
+            "ACP_INVALID_RESPONSE",
+            format!("Grok Build 返回了无法归属的 ACP 响应 · {method}"),
+        ));
+    }
+    if let Some(error) = object.get("error") {
+        return Err(acp_rpc_error(method, error));
+    }
+    let result = object
+        .get("result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if method.starts_with("x.ai/") {
+        if let Some(error) = result.get("error").filter(|error| !error.is_null()) {
+            return Err(acp_rpc_error(method, error));
+        }
+        if let Some(nested) = result.get("result") {
+            return Ok(nested.clone());
+        }
+    }
+    Ok(result)
+}
+
+fn acp_rpc_error(method: &str, error: &serde_json::Value) -> AcpHostError {
+    let code = error.get("code").and_then(serde_json::Value::as_i64);
+    let detail = error
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string());
+    let detail = detail.chars().take(3_500).collect::<String>();
+    let stable_code = match code {
+        Some(-32601) => "ACP_RPC_METHOD_NOT_FOUND",
+        Some(-32602) => "ACP_RPC_INVALID_PARAMS",
+        _ => "ACP_RPC_FAILED",
+    };
+    AcpHostError::protocol(stable_code, format!("{detail} · {method}"))
+}
+
 #[tauri::command]
 async fn acp_kill(
     app: tauri::AppHandle,
+    window: tauri::WebviewWindow,
     state: tauri::State<'_, Arc<AcpState>>,
-) -> Result<(), String> {
-    state.next_generation.fetch_add(1, Ordering::Relaxed);
+    leases: tauri::State<'_, Arc<McpLeaseStore>>,
+) -> Result<(), AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    state.cancel_automatic_reconnect();
+    let _connect_guard = state.connect_lock.lock().await;
+    state.ready_generation.store(0, Ordering::Release);
+    state.paused_generation.store(0, Ordering::Release);
+    state.clear_cached_connection(None);
+    state.set_runtime_phase(RuntimePhase::Stopped);
+    let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    state.authentication.reset(AcpHostError::operation(
+        "AUTH_CANCELLED",
+        "Agent 已停止，登录同步取消",
+    ));
+    state.foreground_turns.reset(generation);
+    state.interactions.reset(generation);
+    state.client_callbacks.reset(generation).await;
+    state.sessions.reset(generation);
+    state
+        .requests
+        .reject_all(AcpHostError::operation(
+            "ACP_REQUEST_CANCELLED",
+            "Grok Agent 已停止",
+        ))
+        .await;
+    shutdown_all_mcp_resources(leases.inner());
     if let Some(process) = state.process.lock().await.take() {
         terminate_process(process).await;
         let _ = app.emit(
@@ -6523,9 +9634,12 @@ async fn acp_kill(
             AcpExitPayload {
                 code: None,
                 reason: "killed",
+                affected_session_ids: Vec::new(),
+                interrupted_session_ids: Vec::new(),
             },
         );
     }
+    state.set_runtime_phase(RuntimePhase::Stopped);
     Ok(())
 }
 
@@ -6973,8 +10087,91 @@ async fn rollback_update(app: tauri::AppHandle, version: String) -> Result<(), S
     install_release(&app, &version, release).await
 }
 
+fn main_window_close_keeps_host_alive(app: &tauri::AppHandle) -> bool {
+    let any_enabled_automation = match automations_path(app).and_then(|path| {
+        app.state::<AutomationStore>()
+            .any_enabled(&path, AUTOMATIONS_MAX_BYTES)
+    }) {
+        Ok(enabled) => enabled,
+        Err(error) => {
+            // 读不到权威排程时不能通过关闭窗口冒险杀掉可能存在的任务。
+            tracing::error!(target: "grox::automation", error = %error, "automation state unreadable; keeping Host alive");
+            true
+        }
+    };
+    let state = app.state::<Arc<AcpState>>();
+    let occupancy = state.sessions.snapshot();
+    let host_busy = !occupancy.active_turn_session_ids.is_empty()
+        || occupancy.lifecycle_active
+        || occupancy.pending_lifecycle > 0
+        || state.authentication.is_active()
+        || app.state::<AutomationRunner>().is_dispatching();
+    automation_runner::should_keep_process_alive_on_close(any_enabled_automation, host_busy)
+}
+
+async fn shutdown_host(app: &tauri::AppHandle) {
+    let state = app.state::<Arc<AcpState>>().inner().clone();
+    state.cancel_automatic_reconnect();
+    let _connect_guard = state.connect_lock.lock().await;
+    state.authentication.reset(AcpHostError::operation(
+        "AUTH_CANCELLED",
+        "Grox 正在退出，登录已取消",
+    ));
+    state.ready_generation.store(0, Ordering::Release);
+    state.paused_generation.store(0, Ordering::Release);
+    state.clear_cached_connection(None);
+    state.set_runtime_phase(RuntimePhase::Stopped);
+    let generation = state.next_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    state.foreground_turns.reset(generation);
+    state.interactions.reset(generation);
+    state.client_callbacks.reset(generation).await;
+    state.sessions.reset(generation);
+    state
+        .requests
+        .reject_all(AcpHostError::environment(
+            "ACP_HOST_EXITING",
+            "Grox 正在退出，ACP 请求已停止",
+            true,
+            true,
+            "重新打开 Grox 后检查最后一轮结果",
+        ))
+        .await;
+    shutdown_all_mcp_resources(app.state::<Arc<McpLeaseStore>>().inner());
+    if let Some(process) = state.process.lock().await.take() {
+        terminate_process(process).await;
+    }
+    let preview_state = app.state::<Arc<PreviewState>>();
+    if let Some(mut process) = preview_state.process.lock().await.take() {
+        let _ = process.child.kill().await;
+        let _ = process.child.wait().await;
+    };
+}
+
+pub(crate) fn request_host_exit(app: tauri::AppHandle) {
+    let shutdown = app.state::<AppShutdown>();
+    if shutdown.started.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    app.state::<Arc<AcpState>>().cancel_automatic_reconnect();
+    tauri::async_runtime::spawn(async move {
+        if tokio::time::timeout(Duration::from_secs(5), shutdown_host(&app))
+            .await
+            .is_err()
+        {
+            // 显式退出不能因为损坏的子进程或 callback 永久卡住；所有 child
+            // 都启用了 kill_on_drop，进程退出仍会完成最后的操作系统级回收。
+            tracing::warn!(target: "grox::host", "Host shutdown cleanup exceeded five seconds");
+        }
+        app.exit(0);
+    });
+}
+
 fn main() {
     let process_args = std::env::args().collect::<Vec<_>>();
+    #[cfg(debug_assertions)]
+    if mock_acp_fixture::try_run(&process_args) {
+        return;
+    }
     if process_args
         .iter()
         .any(|argument| argument == "--computer-mcp")
@@ -7002,6 +10199,11 @@ fn main() {
         | tauri_plugin_window_state::StateFlags::SIZE
         | tauri_plugin_window_state::StateFlags::MAXIMIZED;
     tauri::Builder::default()
+        // 必须最先注册：第二次启动只唤醒主窗口，不能再创建一套会话、
+        // 自动化 runner 和进程内持久化锁去覆盖同一批 Host 文件。
+        .plugin(tauri_plugin_single_instance::init(|app, _arguments, _cwd| {
+            tray::show_main_window(app);
+        }))
         .plugin(
             tauri_plugin_window_state::Builder::default()
                 .with_state_flags(window_state_flags)
@@ -7012,35 +10214,109 @@ fn main() {
         .manage(Arc::new(FilePreviewState::default()))
         .manage(Arc::new(McpLeaseStore::default()))
         .manage(Arc::new(GitConfirmStore::default()))
+        .manage(SessionStorageState::default())
+        .manage(DraftStore::default())
+        .manage(PromptQueueStore::default())
+        .manage(AutomationStore::default())
+        .manage(WorktreeOwnershipStore::default())
+        .manage(AutomationRunner::default())
+        .manage(Arc::new(MediaService::default()))
+        .manage(AppShutdown::default())
         .setup(|app| {
+            match app.path().app_log_dir() {
+                Ok(path) => {
+                    if let Err(error) = host_logging::init(path) {
+                        eprintln!("grox: {error}");
+                    }
+                }
+                Err(error) => eprintln!("grox: 无法定位 Host 日志目录：{error}"),
+            }
+            tracing::info!(
+                target: "grox::host",
+                version = CLIENT_VERSION,
+                pid = std::process::id(),
+                "Grox Host starting"
+            );
             let icon = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.png"))?;
             if let Some(window) = app.get_webview_window("main") {
                 window.set_icon(icon)?;
             }
+            tray::setup(app.handle()).map_err(std::io::Error::other)?;
             register_computer_emergency_shortcut(app.handle().clone());
+            app.state::<AutomationRunner>().start(app.handle().clone());
+            if let Err(error) = restore_job_journal(
+                app.handle(),
+                app.state::<Arc<MediaService>>().inner(),
+            ) {
+                tracing::error!(target: "grox::media", error = %error, "media journal restore failed");
+            }
+            if let Err(error) = media_service::scrub_reference_cache(app.handle()) {
+                tracing::warn!(target: "grox::media", error = %error, "media reference cache scrub failed");
+            }
+            let coordinator = app.state::<Arc<AcpState>>().sessions.clone();
+            let mut occupancy = coordinator.subscribe();
+            let occupancy_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                while occupancy.changed().await.is_ok() {
+                    let payload = occupancy.borrow_and_update().clone();
+                    let _ = occupancy_app.emit("session-runtime-occupancy", payload);
+                }
+            });
             // Never block setup (window interactivity) on disk / provisioning.
             // These can take seconds with large session-cache dirs and freeze
             // the first 2–3s of operator input.
             let handle = app.handle().clone();
             std::thread::spawn(move || {
                 if let Err(error) = provision_grox_deep_research_workflow() {
-                    eprintln!("grox: 无法安装完整 deep-research 工作流：{error}");
+                    tracing::warn!(target: "grox::workflow", error = %error, "workflow provisioning failed");
                 }
-                // Crash / BSOD leftovers: orphan .tmp/.bak under session-cache.
-                scrub_session_cache_dir(&handle);
+                // Crash leftovers may live in either the v1 journal tree or the
+                // legacy flat cache while migration is still pending.
+                match scrub_session_journal_dirs(&handle, Duration::from_secs(30)) {
+                    Ok(removed) if removed > 0 => {
+                        tracing::info!(target: "grox::persistence", removed, "orphan session journals scrubbed");
+                    }
+                    Err(error) => tracing::warn!(target: "grox::persistence", error = %error, "session journal scrub failed"),
+                    _ => {}
+                }
             });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
             desktop_environment,
+            agent_runtime_status,
+            replay_session_events,
+            host_session_bindings,
+            session_runtime_status,
+            foreground_turn_status,
+            session_gate_enter_lifecycle,
+            session_gate_release,
             preview_session_from_disk,
             search_session_history,
-            read_session_cache,
-            write_session_cache,
-            delete_session_cache,
+            read_session_journal,
+            write_session_journal,
+            persist_session_tool_images,
+            delete_session_journal,
+            session_journal_status,
+            read_draft,
+            write_draft,
+            delete_draft,
+            read_prompt_queues,
+            patch_prompt_queues,
+            read_automations,
+            patch_automations,
+            agent_runtime_resume,
+            agent_runtime_pause,
+            automation_runner_status,
+            run_automation_now,
+            open_agent_session,
+            fork_agent_session,
+            fork_agent_session_in_worktree,
+            close_agent_session,
+            delete_agent_session,
             delete_session_data,
             delete_project_session_data,
-            scrub_session_cache_orphans,
+            scrub_session_journal_orphans,
             validate_workspace,
             pick_workspace,
             list_workspace_files,
@@ -7056,10 +10332,7 @@ fn main() {
             git_push,
             read_preview_file,
             start_file_preview,
-            acp_read_text_file,
-            acp_read_file,
             read_prompt_image_paths,
-            acp_write_text_file,
             open_in_explorer,
             open_in_app,
             notify_desktop,
@@ -7082,6 +10355,8 @@ fn main() {
             delete_provider_profile,
             grok_runtime_info,
             export_session_trace,
+            export_session_support_bundle,
+            reveal_support_bundle,
             install_official_grok_cli,
             check_for_update,
             get_update_status,
@@ -7093,42 +10368,176 @@ fn main() {
             computer_use_env_enabled,
             host_prefs_get,
             host_prefs_migrate_computer_use,
+            host_prefs_migrate_browser_use,
             host_prefs_set_computer_use,
+            host_prefs_set_browser_use,
             host_prefs_set_permission_mode,
-            computer_session_extensions,
-            computer_shutdown_lease,
-            computer_emergency_stop,
-            computer_clear_emergency_stop,
-            browser_session_extensions,
-            browser_shutdown_lease,
+            computer_shutdown_all_leases,
+            computer_emergency_stop_session,
+            browser_shutdown_all_leases,
             save_media_reference,
-            generate_media,
-            acp_spawn,
-            acp_send,
+            release_media_reference,
+            start_media_generation,
+            media_generation_capabilities,
+            media_generation_status,
+            media_generation_history,
+            cancel_media_generation,
+            open_media_artifact,
+            agent_runtime_connect,
+            agent_runtime_auth_status,
+            agent_runtime_authenticate,
+            agent_runtime_auth_cancel,
+            execute_foreground_turn,
+            cancel_foreground_turn,
+            interaction_status,
+            resolve_interaction,
+            acp_request,
             acp_kill,
         ])
         .on_window_event(|window, event| {
-            if matches!(event, tauri::WindowEvent::Destroyed) {
-                let state = window.state::<Arc<AcpState>>().inner().clone();
-                let preview_state = window.state::<Arc<PreviewState>>().inner().clone();
-                tauri::async_runtime::spawn(async move {
-                    if let Some(process) = state.process.lock().await.take() {
-                        terminate_process(process).await;
-                    }
-                    if let Some(mut process) = preview_state.process.lock().await.take() {
-                        let _ = process.child.kill().await;
-                        let _ = process.child.wait().await;
-                    }
-                });
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() != "main" {
+                    return;
+                }
+                api.prevent_close();
+                if main_window_close_keeps_host_alive(window.app_handle()) {
+                    tray::hide_main_window(window.app_handle());
+                } else {
+                    request_host_exit(window.app_handle().clone());
+                }
             }
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Grox Desktop");
+        .build(tauri::generate_context!())
+        .expect("error while building Grox Desktop")
+        .run(|app, event| match event {
+            tauri::RunEvent::ExitRequested { api, .. } => {
+                if !app.state::<AppShutdown>().started.load(Ordering::Acquire) {
+                    api.prevent_exit();
+                    request_host_exit(app.clone());
+                }
+            }
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } if !has_visible_windows => tray::show_main_window(app),
+            _ => {}
+        });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runtime_connection(generation: u64, auth_required: bool) -> AgentRuntimeConnection {
+        AgentRuntimeConnection {
+            generation,
+            initialize: serde_json::json!({ "protocolVersion": 1 }),
+            auth: agent_runtime::AgentAuthenticationState {
+                required: auth_required,
+                in_progress: false,
+                method_id: auth_required.then(|| "grok.com".to_string()),
+                label: auth_required.then(|| "Sign in to Grok".to_string()),
+                error: None,
+            },
+        }
+    }
+
+    #[test]
+    fn runtime_connection_cache_is_generation_scoped_and_tracks_authentication() {
+        let state = AcpState::default();
+        *state
+            .connection
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(runtime_connection(7, true));
+
+        assert!(state.cached_connection(6).is_none());
+        assert!(state.cached_connection(7).unwrap().auth.required);
+        let authenticated = agent_runtime::AgentAuthenticationState {
+            required: false,
+            in_progress: false,
+            method_id: Some("grok.com".into()),
+            label: Some("Sign in to Grok".into()),
+            error: None,
+        };
+        assert!(!state.set_authentication_state(6, authenticated.clone()));
+        assert!(state.cached_connection(7).unwrap().auth.required);
+        assert!(state.set_authentication_state(7, authenticated));
+        assert!(!state.cached_connection(7).unwrap().auth.required);
+
+        state.clear_cached_connection(Some(6));
+        assert!(state.cached_connection(7).is_some());
+        state.clear_cached_connection(Some(7));
+        assert!(state.cached_connection(7).is_none());
+    }
+
+    #[test]
+    fn host_acp_request_ids_use_a_disjoint_javascript_safe_namespace() {
+        let state = AcpState::default();
+        let first = state.issue_host_request_id();
+        let second = state.issue_host_request_id();
+        assert!(first > (1_u64 << 52));
+        assert!(second <= (1_u64 << 53) - 1);
+        assert_eq!(second, first + 1);
+    }
+
+    #[test]
+    fn runtime_pause_cannot_manufacture_a_ready_generation() {
+        let state = AcpState::default();
+        let error = tauri::async_runtime::block_on(state.pause_runtime()).unwrap_err();
+        assert_eq!(error.code, "ACP_RUNTIME_NOT_READY");
+        let error = tauri::async_runtime::block_on(state.resume_runtime(7)).unwrap_err();
+        assert_eq!(error.code, "ACP_RUNTIME_RESUME_NOT_ALLOWED");
+        assert_eq!(state.ready_generation.load(Ordering::Acquire), 0);
+        assert_eq!(state.paused_generation.load(Ordering::Acquire), 0);
+        assert_eq!(
+            RuntimePhase::from_raw(state.runtime_phase.load(Ordering::Acquire)).as_str(),
+            "stopped"
+        );
+    }
+
+    #[test]
+    fn runtime_supervisor_keeps_one_reconnect_owner_and_last_successful_spec() {
+        let state = AcpState::default();
+        state.remember_connect(RuntimeConnectSpec {
+            cwd: "/workspace".into(),
+            reasoning_effort: Some("high".into()),
+        });
+        let first = state.claim_automatic_reconnect().unwrap();
+        assert!(state.claim_automatic_reconnect().is_none());
+        let spec = state.last_connect().unwrap();
+        assert_eq!(spec.cwd, "/workspace");
+        assert_eq!(spec.reasoning_effort.as_deref(), Some("high"));
+        state.cancel_automatic_reconnect();
+        assert!(state.automatic_reconnect_cancelled(first));
+        let second = state.claim_automatic_reconnect().unwrap();
+        state.finish_automatic_reconnect(first);
+        assert!(!state.automatic_reconnect_cancelled(second));
+        state.finish_automatic_reconnect(second);
+        assert!(state.claim_automatic_reconnect().is_some());
+    }
+
+    #[test]
+    fn host_acp_response_decoder_preserves_protocol_failure_kind() {
+        let error = decode_host_acp_response(
+            r#"{"jsonrpc":"2.0","id":9,"error":{"code":-32602,"message":"invalid params"}}"#,
+            9,
+            "session/set_model",
+        )
+        .unwrap_err();
+        assert_eq!(error.domain, "protocol");
+        assert_eq!(error.code, "ACP_RPC_INVALID_PARAMS");
+        assert!(error.message.contains("session/set_model"));
+        assert_eq!(
+            decode_host_acp_response(
+                r#"{"jsonrpc":"2.0","id":10,"result":{"ok":true}}"#,
+                10,
+                "session/prompt",
+            )
+            .unwrap()["ok"],
+            true
+        );
+    }
 
     fn test_release(tag_name: &str, draft: bool, prerelease: bool) -> GitHubRelease {
         GitHubRelease {
@@ -7171,25 +10580,35 @@ mod tests {
     }
 
     #[test]
-    fn session_disk_preview_keeps_recent_visible_conversation() {
+    fn session_disk_preview_keeps_recent_public_events() {
         let history = concat!(
             "{\"type\":\"system\",\"content\":\"hidden\"}\n",
             "{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"first\"}]}\n",
             "{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"reminder\"}],\"synthetic_reason\":\"system_reminder\"}\n",
-            "{\"type\":\"tool_result\",\"content\":\"hidden tool output\"}\n",
-            "{\"type\":\"assistant\",\"content\":\"answer\"}\n",
+            "{\"type\":\"reasoning\",\"summary\":[{\"type\":\"summary_text\",\"text\":\"hidden reasoning\"}]}\n",
+            "{\"type\":\"assistant\",\"content\":\"answer\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}]}\n",
+            "{\"type\":\"tool_result\",\"tool_call_id\":\"call-1\",\"content\":\"file body\"}\n",
+            "{\"type\":\"assistant\",\"content\":\"\",\"tool_calls\":[{\"id\":\"call-1\",\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"README.md\\\"}\"}]}\n",
             "{\"type\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"latest\"}]}\n",
         );
-        let preview = parse_session_disk_preview(std::io::Cursor::new(history), 2).unwrap();
+        let preview = parse_session_disk_preview(std::io::Cursor::new(history), 3).unwrap();
         assert_eq!(
             preview,
             SessionDiskPreview {
-                messages: vec![
-                    SessionPreviewMessage {
+                entries: vec![
+                    SessionPreviewEntry::Message {
                         role: "assistant".into(),
                         text: "answer".into(),
                     },
-                    SessionPreviewMessage {
+                    SessionPreviewEntry::Tool {
+                        id: "call-1".into(),
+                        name: "read_file".into(),
+                        title: "read_file".into(),
+                        input: Some("{\"path\":\"README.md\"}".into()),
+                        output: Some("file body".into()),
+                        status: SessionPreviewToolStatus::Done,
+                    },
+                    SessionPreviewEntry::Message {
                         role: "user".into(),
                         text: "latest".into(),
                     },
@@ -7198,7 +10617,6 @@ mod tests {
             }
         );
     }
-
     #[test]
     fn atomic_write_replaces_without_delete_first_gap() {
         let root = std::env::temp_dir().join(format!(
@@ -7220,6 +10638,75 @@ mod tests {
             .collect();
         assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_journal_validation_binds_version_and_app_identity() {
+        let valid = serde_json::json!({
+            "version": 1,
+            "appSessionId": "session-1",
+            "agentSessionId": "session-1",
+            "savedAt": 42,
+            "turnState": "active",
+            "session": { "id": "session-1", "blocks": [] }
+        });
+        assert!(
+            session_journal_store::validate_current_journal(&valid.to_string(), "session-1")
+                .is_ok()
+        );
+
+        let mut wrong_identity = valid.clone();
+        wrong_identity["session"]["id"] = serde_json::json!("session-2");
+        assert!(session_journal_store::validate_current_journal(
+            &wrong_identity.to_string(),
+            "session-1"
+        )
+        .is_err());
+
+        let mut unknown_version = valid;
+        unknown_version["version"] = serde_json::json!(2);
+        assert!(session_journal_store::validate_current_journal(
+            &unknown_version.to_string(),
+            "session-1"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn session_journal_storage_id_is_collision_free() {
+        assert_eq!(safe_session_storage_id("019f-ab_cd"), Ok("019f-ab_cd"));
+        assert!(safe_session_storage_id("../session").is_err());
+        assert!(safe_session_storage_id("会话").is_err());
+        assert!(safe_session_storage_id(&"x".repeat(81)).is_err());
+    }
+
+    #[test]
+    fn tool_image_storage_uses_detected_mime_and_content_hash() {
+        let png = b"\x89PNG\r\n\x1a\nminimal";
+        let checked = checked_tool_image(ToolImagePayload {
+            mime: "image/png".into(),
+            data: BASE64.encode(png),
+        })
+        .unwrap();
+        assert_eq!(checked.0, "image/png");
+        assert!(checked.2.ends_with(".png"));
+        assert!(checked_tool_image(ToolImagePayload {
+            mime: "image/jpeg".into(),
+            data: BASE64.encode(png),
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn deleted_session_storage_rejects_late_writes() {
+        let storage = SessionStorageState::default();
+        drop(storage.begin_write("session-1").unwrap());
+        drop(storage.begin_delete("session-1").unwrap());
+        assert!(storage.begin_write("session-1").is_err());
+        assert!(storage
+            .begin_write_ids(&["session-1".into(), "session-2".into()])
+            .is_err());
+        assert!(storage.begin_write("session-2").is_ok());
     }
 
     #[test]
@@ -7453,6 +10940,28 @@ mod tests {
     }
 
     #[test]
+    fn project_session_discovery_does_not_delete_before_storage_gate() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-project-session-discover-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let workspace = root
+            .join("sessions")
+            .join("%2FUsers%2Fdemo%2Ftarget");
+        let target = workspace.join("session-a");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("chat_history.jsonl"), "").unwrap();
+
+        let (ids, directories) =
+            project_session_history_data(&root, "/Users/demo/target").unwrap();
+
+        assert_eq!(ids, vec!["session-a"]);
+        assert_eq!(directories, vec![workspace.canonicalize().unwrap()]);
+        assert!(target.exists(), "枚举阶段不能抢在 tombstone 之前删除磁盘数据");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn session_history_search_matches_only_visible_user_and_assistant_text() {
         let history = concat!(
             "{\"type\":\"user\",\"content\":\"修复登录问题\"}\n",
@@ -7473,6 +10982,161 @@ mod tests {
             Some("max".into())
         );
         assert!(checked_reasoning_effort(Some("ultra".into())).is_err());
+    }
+
+    #[test]
+    fn only_main_window_can_own_acp_runtime() {
+        assert!(ensure_main_acp_owner("main").is_ok());
+        assert!(ensure_main_acp_owner("session-secondary").is_err());
+    }
+
+    #[test]
+    fn legacy_grox_worktrees_require_sibling_name_and_owned_branch() {
+        let primary = Path::new("/repo/project");
+        assert!(is_legacy_grox_worktree(
+            primary,
+            Path::new("/repo/project-worktree"),
+            Some("refs/heads/grox/worktree-123")
+        ));
+        assert!(is_legacy_grox_worktree(
+            primary,
+            Path::new("/repo/project-worktree-2"),
+            Some("refs/heads/grox/worktree-456")
+        ));
+        assert!(!is_legacy_grox_worktree(
+            primary,
+            Path::new("/repo/project-backup"),
+            Some("refs/heads/grox/worktree-123")
+        ));
+        assert!(!is_legacy_grox_worktree(
+            primary,
+            Path::new("/repo/project-worktree"),
+            Some("refs/heads/feature/user-owned")
+        ));
+    }
+
+    #[test]
+    fn dirty_worktree_confirmation_names_irrecoverable_changes() {
+        let message = worktree_remove_confirmation(Path::new("/repo/worktree"), true);
+        assert!(message.contains("未提交变更"));
+        assert!(message.contains("永久丢失"));
+        assert!(message.contains("/repo/worktree"));
+
+        let clean = worktree_remove_confirmation(Path::new("/repo/worktree"), false);
+        assert!(!clean.contains("未提交变更"));
+    }
+
+    #[test]
+    fn worktree_name_rejects_current_and_parent_directory_components() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-worktree-name-gate-{}-{}",
+            std::process::id(),
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let cwd = path_for_webview(&root);
+
+        assert!(git_worktree_add(cwd.clone(), ".".into(), None).is_err());
+        assert!(git_worktree_add(cwd, "..".into(), None).is_err());
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn parses_worktree_branch_ownership_from_porcelain() {
+        let entries = parse_worktree_list(concat!(
+            "worktree /repo/project\n",
+            "HEAD abc\n",
+            "branch refs/heads/main\n\n",
+            "worktree /repo/project-worktree\n",
+            "HEAD def\n",
+            "branch refs/heads/grox/worktree-123\n",
+        ));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].path, PathBuf::from("/repo/project-worktree"));
+        assert_eq!(
+            entries[1].branch.as_deref(),
+            Some("refs/heads/grox/worktree-123")
+        );
+    }
+
+    #[test]
+    fn managed_worktree_namespaces_distinguish_same_named_repositories() {
+        let base = std::env::temp_dir().join(format!(
+            "grox-worktree-namespace-{}-{}",
+            std::process::id(),
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let first = base.join("one").join("project");
+        let second = base.join("two").join("project");
+        fs::create_dir_all(&first).unwrap();
+        fs::create_dir_all(&second).unwrap();
+        let first_namespace = managed_worktree_project_dir(&first).unwrap();
+        let second_namespace = managed_worktree_project_dir(&second).unwrap();
+        assert_ne!(first_namespace, second_namespace);
+        assert!(first_namespace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("project-")));
+        fs::remove_dir_all(base).ok();
+    }
+
+    #[test]
+    fn session_worktree_fork_refuses_a_dirty_source_checkout() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-worktree-clean-gate-{}-{}",
+            std::process::id(),
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        git_text(&root, &["init"]).unwrap();
+        git_text(&root, &["config", "user.email", "grox@example.invalid"]).unwrap();
+        git_text(&root, &["config", "user.name", "Grox Test"]).unwrap();
+        fs::write(root.join("README.md"), "clean\n").unwrap();
+        assert!(ensure_clean_worktree(&root).is_err());
+        git_text(&root, &["add", "README.md"]).unwrap();
+        git_text(&root, &["commit", "-m", "init"]).unwrap();
+        assert!(ensure_clean_worktree(&root).is_ok());
+        fs::write(root.join("README.md"), "dirty\n").unwrap();
+        assert!(ensure_clean_worktree(&root).is_err());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn failed_session_fork_rolls_back_only_its_worktree_and_branch() {
+        let base = std::env::temp_dir().join(format!(
+            "grox-worktree-rollback-{}-{}",
+            std::process::id(),
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let root = base.join("source");
+        let target = base.join("fork");
+        fs::create_dir_all(&root).unwrap();
+        git_text(&root, &["init"]).unwrap();
+        git_text(&root, &["config", "user.email", "grox@example.invalid"]).unwrap();
+        git_text(&root, &["config", "user.name", "Grox Test"]).unwrap();
+        fs::write(root.join("README.md"), "clean\n").unwrap();
+        git_text(&root, &["add", "README.md"]).unwrap();
+        git_text(&root, &["commit", "-m", "init"]).unwrap();
+        let target_text = target.to_string_lossy().to_string();
+        let branch = "grox/worktree-rollback-test";
+        git_text(
+            &root,
+            &["worktree", "add", "-b", branch, &target_text],
+        )
+        .unwrap();
+        rollback_managed_worktree(&CreatedManagedWorktree {
+            source_root: root.clone(),
+            path: target.clone(),
+            branch: branch.to_string(),
+        })
+        .unwrap();
+        assert!(!target.exists());
+        assert!(git_text(&root, &["branch", "--list", branch])
+            .unwrap()
+            .is_empty());
+        assert!(root.join("README.md").is_file());
+        fs::remove_dir_all(base).ok();
     }
 
     #[test]
@@ -7824,36 +11488,91 @@ OPENAI_API_KEY=******** # keep env comment
     }
 
     #[test]
-    fn compatible_provider_environment_is_validated_and_complete() {
-        let env = compatible_provider_env(
-            "sk-test",
+    fn compatible_provider_metadata_is_validated_and_contains_no_secret() {
+        let env = compatible_provider_metadata(
             "https://gateway.example.com/v1",
             false,
+            Some("provider-test"),
         )
         .unwrap();
-        assert!(env.contains("XAI_API_KEY=\"sk-test\""));
+        assert!(env.contains("GROX_PROVIDER_KIND=\"compatible\""));
+        assert!(env.contains("GROX_PROVIDER_PROFILE_ID=\"provider-test\""));
         assert!(env.contains("GROK_MODELS_BASE_URL=\"https://gateway.example.com/v1\""));
         assert!(env.contains("GROK_MODELS_LIST_URL=\"https://gateway.example.com/v1/models\""));
+        assert!(!env.contains("XAI_API_KEY"));
         assert!(!env.contains("GROK_MODELS_API_BACKEND"));
-        assert!(compatible_provider_env(
-            "",
-            "https://gateway.example.com/v1",
-            false,
-        )
-        .is_err());
-        assert!(compatible_provider_env(
-            "sk-test",
+        assert!(compatible_provider_metadata(
             "http://gateway.example.com/v1",
             false,
+            None,
         )
         .is_err());
-        let insecure = compatible_provider_env(
-            "sk-test",
+        let insecure = compatible_provider_metadata(
             "http://gateway.example.com/v1",
             true,
+            None,
         )
         .unwrap();
         assert!(insecure.contains("GROK_MODELS_BASE_URL=\"http://gateway.example.com/v1\""));
+    }
+
+    #[test]
+    fn provider_profiles_never_serialize_legacy_plaintext_keys() {
+        let profile = StoredProviderProfile {
+            id: "provider-test".into(),
+            name: "Test".into(),
+            legacy_api_key: Some("must-not-leak".into()),
+            base_url: "https://gateway.example.com/v1".into(),
+            allow_insecure_http: false,
+            api_backend: ProviderApiBackend::Auto,
+            models_url: None,
+            model: None,
+            available_models: Vec::new(),
+            resident_models: Vec::new(),
+        };
+        let json = serde_json::to_string(&profile).unwrap();
+        assert!(!json.contains("apiKey"));
+        assert!(!json.contains("must-not-leak"));
+    }
+
+    #[test]
+    fn managed_profile_reference_is_single_source_for_v032_metadata() {
+        let profile = StoredProviderProfile {
+            id: "provider-test".into(),
+            name: "Test".into(),
+            legacy_api_key: None,
+            base_url: "https://gateway.example.com/v1".into(),
+            allow_insecure_http: false,
+            api_backend: ProviderApiBackend::Auto,
+            models_url: None,
+            model: None,
+            available_models: Vec::new(),
+            resident_models: Vec::new(),
+        };
+        let profiles = ProviderProfilesFile {
+            active_id: Some(profile.id.clone()),
+            profiles: vec![profile],
+        };
+        let mut values = BTreeMap::from([
+            (GROX_PROVIDER_KIND_KEY.into(), "compatible".into()),
+            (
+                "GROK_MODELS_BASE_URL".into(),
+                "https://gateway.example.com/v1".into(),
+            ),
+        ]);
+
+        // A v0.3.2 direct block intentionally ignores the legacy activeId.
+        assert_eq!(
+            compatible_secret_reference(&profiles, &values).unwrap(),
+            SECRET_REF_DIRECT_COMPATIBLE
+        );
+        values.insert(GROX_PROVIDER_PROFILE_ID_KEY.into(), "provider-test".into());
+        assert_eq!(
+            compatible_secret_reference(&profiles, &values).unwrap(),
+            "provider:provider-test"
+        );
+        values.insert("GROK_MODELS_BASE_URL".into(), "https://other.example/v1".into());
+        assert!(compatible_secret_reference(&profiles, &values).is_err());
     }
 
     #[test]
@@ -7865,7 +11584,7 @@ OPENAI_API_KEY=******** # keep env comment
     }
 
     #[test]
-    fn provider_backend_choice_is_honored_and_auto_is_conservative() {
+    fn provider_backend_choice_is_honored_and_auto_does_not_guess_from_name() {
         assert_eq!(
             ProviderApiBackend::Responses.config_value("custom", "https://api.example/v1"),
             "responses"
@@ -7881,7 +11600,7 @@ OPENAI_API_KEY=******** # keep env comment
         );
         assert_eq!(
             ProviderApiBackend::Auto.config_value("CLIProxyAPI", "https://gateway.example/v1"),
-            "responses"
+            "chat_completions"
         );
     }
 
@@ -7984,27 +11703,28 @@ UNRELATED=value
         fs::write(&path, "XAI_API_KEY=inherited-shell-key\n").unwrap();
         assert!(parse_grox_managed_provider_env(&path).is_empty());
 
-        // Official API-key mode gets its key only; it must not become a
-        // custom OpenAI-compatible endpoint.
-        fs::write(
-            &path,
-            replace_managed_env_block("", "XAI_API_KEY=official-key"),
-        )
-        .unwrap();
+        // Provider metadata never persists a key. The Host injects it into
+        // the selected child process only after resolving SecretStore.
+        fs::write(&path, replace_managed_env_block("", &official_provider_metadata())).unwrap();
         let official = parse_grox_managed_provider_env(&path);
-        assert_eq!(official.get("XAI_API_KEY"), Some(&"official-key".to_string()));
+        assert_eq!(official.get(GROX_PROVIDER_KIND_KEY), Some(&"official".to_string()));
+        assert!(!official.contains_key("XAI_API_KEY"));
         assert!(!official.contains_key("GROK_MODELS_BASE_URL"));
 
         // Compatible mode intentionally carries the full endpoint contract.
-        let compatible = compatible_provider_env(
-            "gateway-key",
+        let compatible = compatible_provider_metadata(
             "https://gateway.example/v1",
             false,
+            Some("provider-test"),
         )
         .unwrap();
         fs::write(&path, replace_managed_env_block("", &compatible)).unwrap();
         let gateway = parse_grox_managed_provider_env(&path);
-        assert_eq!(gateway.get("XAI_API_KEY"), Some(&"gateway-key".to_string()));
+        assert!(!gateway.contains_key("XAI_API_KEY"));
+        assert_eq!(
+            gateway.get(GROX_PROVIDER_PROFILE_ID_KEY),
+            Some(&"provider-test".to_string())
+        );
         assert_eq!(
             gateway.get("GROK_MODELS_BASE_URL"),
             Some(&"https://gateway.example/v1".to_string())
@@ -8082,102 +11802,29 @@ UNRELATED=value
     }
 
     #[test]
-    fn media_generation_tools_allowlist_stays_closed() {
-        assert_eq!(
-            MEDIA_GENERATION_TOOLS,
-            "image_gen,video_gen,image_to_video,reference_to_video"
-        );
-        assert!(!MEDIA_GENERATION_TOOLS.contains("bash"));
-        assert!(!MEDIA_GENERATION_TOOLS.contains("shell"));
-        assert!(!MEDIA_GENERATION_TOOLS.contains("computer"));
-    }
-
-    #[test]
-    fn media_prompt_selects_native_grok_tools() {
-        let cwd = env!("CARGO_MANIFEST_DIR");
-        let image = MediaGenerationRequest {
-            kind: "image".into(),
-            prompt: "黑洞边缘的空间站".into(),
-            aspect: "16:9".into(),
-            count: 2,
-            duration: 5,
-            resolution: "1080p".into(),
-            reference_path: None,
-            cwd: cwd.into(),
-        };
-        let prompt = checked_media_prompt(&image).unwrap();
-        assert!(prompt.contains("image_gen"));
-        assert!(prompt.contains("2 张"));
-
-        let reference = PathBuf::from(cwd).join("icons").join("icon.png");
-        let video = MediaGenerationRequest {
-            kind: "video".into(),
-            reference_path: Some(path_for_webview(&reference)),
-            ..image
-        };
-        let prompt = checked_media_prompt(&video).unwrap();
-        assert!(prompt.contains("image_to_video"));
-        assert!(prompt.contains("1080p"));
-        assert!(checked_media_prompt(&MediaGenerationRequest {
-            reference_path: Some("/tmp/outside-reference.png".into()),
-            ..video
-        })
-        .is_err());
-    }
-
-    #[test]
-    fn media_artifacts_are_limited_to_workspace_files_or_safe_urls() {
-        let root = std::env::temp_dir().join(format!(
-            "grox-media-test-{}",
-            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let image = root.join("result.png");
-        fs::write(&image, b"png").unwrap();
-        let outside = std::env::temp_dir().join(format!(
-            "grox-media-outside-{}.png",
-            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::write(&outside, b"png").unwrap();
-        let output = format!(
-            "{{\"path\":{}}}\n{{\"path\":{}}}\n{{\"url\":\"https://cdn.x.ai/result.mp4\"}}\n{{\"url\":\"https://evil.example/result.mp4\"}}",
-            serde_json::to_string(&path_for_webview(&image)).unwrap(),
-            serde_json::to_string(&path_for_webview(&outside)).unwrap()
-        );
-        let artifacts = extract_media_artifacts(&output, &root).unwrap();
-        assert_eq!(artifacts.len(), 2);
-        assert_eq!(artifacts[0].mime, "image/png");
-        assert!(artifacts[0].path.is_some());
-        assert_eq!(artifacts[1].mime, "video/mp4");
-        assert!(artifacts[1].url.is_some());
-        assert!(artifacts.iter().all(|artifact| {
-            artifact
-                .url
-                .as_deref()
-                .is_none_or(|url| !url.contains("evil.example"))
-        }));
-        let _ = fs::remove_file(&outside);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn media_reference_rejects_extension_content_mismatch() {
-        let root = std::env::temp_dir().join(format!(
-            "grox-media-reference-{}",
-            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir_all(&root).unwrap();
-        let jpeg = BASE64.encode(b"\xff\xd8\xffpayload");
-        assert!(save_media_reference(path_for_webview(&root), "fake.png".into(), jpeg).is_err());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
     fn media_url_allowlist_uses_domain_boundaries() {
         assert!(is_media_https_host_allowed(Some("cdn.x.ai")));
         assert!(is_media_https_host_allowed(Some("images.cdn.x.ai")));
         assert!(!is_media_https_host_allowed(Some("x.ai.evil.example")));
         assert!(!is_media_https_host_allowed(Some("evil.example")));
+    }
+
+    #[test]
+    fn preview_ranges_support_seek_suffix_and_reject_invalid_ranges() {
+        assert_eq!(
+            preview_byte_range("GET / HTTP/1.1\r\nRange: bytes=10-19\r\n", 100),
+            Ok(Some((10, 19)))
+        );
+        assert_eq!(
+            preview_byte_range("GET / HTTP/1.1\r\nrange: bytes=90-\r\n", 100),
+            Ok(Some((90, 99)))
+        );
+        assert_eq!(
+            preview_byte_range("GET / HTTP/1.1\r\nRange: bytes=-10\r\n", 100),
+            Ok(Some((90, 99)))
+        );
+        assert!(preview_byte_range("Range: bytes=100-101\r\n", 100).is_err());
+        assert!(preview_byte_range("Range: bytes=0-1,3-4\r\n", 100).is_err());
     }
 
     #[test]
@@ -8200,10 +11847,40 @@ UNRELATED=value
         assert!(!acp_method_allowed("_session/prompt"));
         assert!(!acp_method_allowed("session/unknown"));
         assert!(!acp_method_allowed("terminal/unknown"));
+        assert!(!acp_method_allowed("terminal/create"));
         assert!(!acp_method_allowed("fs/unknown"));
+        assert!(!acp_method_allowed("fs/read_text_file"));
+        assert!(!acp_method_allowed("fs/write_text_file"));
         assert!(acp_method_allowed("x.ai/future_extension"));
         assert!(acp_method_allowed("_x.ai/future_extension"));
         assert!(!acp_method_allowed("session/../../evil"));
+    }
+
+    #[test]
+    fn host_requests_encode_extension_methods_for_the_acp_wire() {
+        assert_eq!(acp_wire_method("x.ai/session/fork"), "_x.ai/session/fork");
+        assert_eq!(acp_wire_method("session/load"), "session/load");
+        assert_eq!(acp_wire_method("_x.ai/session/fork"), "_x.ai/session/fork");
+    }
+
+    #[test]
+    fn acp_line_gate_requires_json_rpc_and_rejects_privileged_methods() {
+        let leases = McpLeaseStore::default();
+        assert!(prepare_acp_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"session/prompt","params":{}}"#.into(),
+            &leases,
+        )
+        .is_ok());
+        assert!(prepare_acp_line(
+            r#"{"id":1,"method":"session/prompt","params":{}}"#.into(),
+            &leases,
+        )
+        .is_err());
+        assert!(prepare_acp_line(
+            r#"{"jsonrpc":"2.0","id":1,"method":"shell/exec","params":{}}"#.into(),
+            &leases,
+        )
+        .is_err());
     }
 
     #[test]
@@ -8215,5 +11892,16 @@ UNRELATED=value
         assert!(parse_browser_url("https://169.254.169.254/latest/meta-data/").is_err());
         assert!(parse_browser_url("https://metadata.google.internal/").is_err());
         assert!(parse_browser_url("https://100.100.100.200/").is_err());
+    }
+
+    #[test]
+    fn draft_workspace_scopes_are_isolated_and_validated() {
+        let cwd = std::env::temp_dir();
+        let cwd = cwd.to_string_lossy();
+        let unscoped = draft_workspace(&cwd, None).expect("temp directory is a valid workspace");
+        let scoped = draft_workspace(&cwd, Some("home")).expect("home is a valid draft scope");
+        assert_ne!(scoped, unscoped);
+        assert!(scoped.ends_with(&unscoped));
+        assert!(draft_workspace(&cwd, Some("../escape")).is_err());
     }
 }

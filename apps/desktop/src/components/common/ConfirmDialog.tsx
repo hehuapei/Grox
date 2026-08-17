@@ -7,6 +7,7 @@ interface ConfirmDialogProps {
   confirmLabel: string;
   cancelLabel: string;
   workingLabel: string;
+  tone?: "danger" | "primary";
   onCancel(): void;
   onConfirm(): Promise<void> | void;
 }
@@ -17,6 +18,7 @@ export function ConfirmDialog({
   confirmLabel,
   cancelLabel,
   workingLabel,
+  tone = "danger",
   onCancel,
   onConfirm,
 }: ConfirmDialogProps) {
@@ -72,7 +74,9 @@ export function ConfirmDialog({
                 setWorking(false);
               });
             }}
-            className="h-8 rounded-[4px] border border-red/45 bg-red/10 px-3 text-[10px] text-red hover:bg-red/15 disabled:opacity-45"
+            className={tone === "danger"
+              ? "h-8 rounded-[4px] border border-red/45 bg-red/10 px-3 text-[10px] text-red hover:bg-red/15 disabled:opacity-45"
+              : "h-8 rounded-[4px] border border-acc/55 bg-acc/10 px-3 text-[10px] text-acc hover:bg-acc/15 disabled:opacity-45"}
           >
             {working ? workingLabel : confirmLabel}
           </button>

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { classifyTurnStatus, shouldDrainLocalQueue } from "./queueTurnPolicy";
+import { classifyTurnStatus, shouldDrainLocalQueue } from "./sessionRuntime";
 
 describe("queue turn policy", () => {
   it("权限与提问阶段保持门控，不会提前排空队列", () => {
@@ -11,6 +11,8 @@ describe("queue turn policy", () => {
     const base = { status: "idle" as const, providerSwitching: false, restoring: false, suppressed: false, queueLength: 1 };
     expect(shouldDrainLocalQueue(base)).toBe(true);
     expect(shouldDrainLocalQueue({ ...base, status: "running" })).toBe(false);
+    expect(shouldDrainLocalQueue({ ...base, status: "stopping" })).toBe(false);
+    expect(shouldDrainLocalQueue({ ...base, status: "disconnected" })).toBe(false);
     expect(shouldDrainLocalQueue({ ...base, providerSwitching: true })).toBe(false);
     expect(shouldDrainLocalQueue({ ...base, suppressed: true })).toBe(false);
     expect(shouldDrainLocalQueue({ ...base, hasLiveProcess: true })).toBe(false);

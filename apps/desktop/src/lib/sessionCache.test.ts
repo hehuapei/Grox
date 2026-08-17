@@ -1,10 +1,11 @@
-import { describe, expect, it, beforeEach } from "vitest";
+import { describe, expect, it } from "vitest";
 import type { Session } from "../bridge/types";
 import {
-  clearDraftBuffer,
   compactSession,
-  loadDraftBuffer,
-  saveDraftBuffer,
+  nextSessionJournalSavedAt,
+  parseSessionJournal,
+  recordSessionJournalHostEvent,
+  sessionJournalSnapshot,
   sliceCacheBlocks,
 } from "./sessionCache";
 
@@ -28,11 +29,75 @@ describe("compactSession", () => {
     expect(result.blocks[0]).toMatchObject({ type: "assistant", streaming: false });
   });
 
-  it("只保留最后 160 个块", () => {
-    const blocks = Array.from({ length: 170 }, (_, index) => ({ type: "user" as const, id: String(index), text: String(index), ts: index }));
+  it("旧 journal 的传输信封不会再次显示或写回", () => {
+    const result = compactSession(session([
+      { type: "user", id: "internal", text: "<user_info>internal</user_info>", ts: 1 },
+      { type: "user", id: "wrapped", text: "<user_query>duplicate</user_query>", ts: 2 },
+      { type: "user", id: "interrupted", text: "The user interrupted the previous turn:\n<user_query>duplicate</user_query>\nMake sure to complete any unfinished tasks from previous turns.", ts: 2 },
+      { type: "user", id: "real", text: "真实请求", ts: 3 },
+    ]));
+    expect(result.blocks).toHaveLength(1);
+    expect(result.blocks[0]).toMatchObject({ id: "real", text: "真实请求" });
+  });
+
+  it("journal 在体积边界内保留最近 600 个块", () => {
+    const blocks = Array.from({ length: 610 }, (_, index) => ({ type: "user" as const, id: String(index), text: String(index), ts: index }));
     const result = compactSession(session(blocks));
-    expect(result.blocks).toHaveLength(160);
+    expect(result.blocks).toHaveLength(600);
     expect(result.blocks[0].id).toBe("10");
+  });
+
+  it("版本化 journal 保留崩溃前的回合活动事实", () => {
+    const snapshot = sessionJournalSnapshot(session([], "running"), 42);
+    expect(snapshot).toMatchObject({ version: 1, appSessionId: "session-1", agentSessionId: "session-1", savedAt: 42, turnState: "active" });
+    expect(snapshot.session.status).toBe("running");
+    expect(snapshot.session.preview).not.toBe(true);
+    expect(parseSessionJournal(JSON.stringify(snapshot), "session-1")).toEqual(snapshot);
+  });
+
+  it("journal 把待确认 Host 事件与同一份会话快照原子提交", () => {
+    recordSessionJournalHostEvent("session-1", "host-stream-a", 7);
+    recordSessionJournalHostEvent("session-1", "host-stream-a", 4);
+    const snapshot = sessionJournalSnapshot(session([
+      { type: "assistant", id: "a", text: "live", ts: 1, streaming: true },
+    ]), 43);
+
+    expect(snapshot.hostEvents).toEqual({ streamId: "host-stream-a", sequences: [4, 7] });
+    expect(snapshot.session.blocks[0]).toMatchObject({ type: "assistant", streaming: true });
+    expect(parseSessionJournal(JSON.stringify(snapshot), "session-1")).toEqual(snapshot);
+  });
+
+  it("journal 版本在系统时间回拨后仍单调递增", () => {
+    expect(nextSessionJournalSavedAt(100, 50)).toBe(101);
+    expect(nextSessionJournalSavedAt(100, 200)).toBe(200);
+  });
+
+  it("journal 只保存 Host 管理的工具图片引用", () => {
+    const result = compactSession(session([{
+      type: "tool",
+      id: "tool-image",
+      ts: 1,
+      call: {
+        id: "call-image",
+        kind: "computer",
+        title: "screenshot",
+        status: "done",
+        startedAt: 1,
+        images: [
+          { mime: "image/png", data: "inline-only" },
+          { mime: "image/png", data: "live-copy", path: "/managed/session/media/hash.png" },
+        ],
+      },
+    }]));
+    const block = result.blocks[0];
+    expect(block.type).toBe("tool");
+    if (block.type !== "tool") return;
+    expect(block.call.images).toEqual([{ mime: "image/png", path: "/managed/session/media/hash.png" }]);
+  });
+
+  it("读取旧版裸 Session 时迁移为 settled journal", () => {
+    const migrated = parseSessionJournal(JSON.stringify(session([], "idle")), "session-1");
+    expect(migrated).toMatchObject({ version: 1, appSessionId: "session-1", turnState: "settled" });
   });
 });
 
@@ -58,81 +123,5 @@ describe("sliceCacheBlocks", () => {
     const sliced = sliceCacheBlocks(blocks, 2);
     // Prefer starting at user u1 rather than tool-only tail when over budget.
     expect(sliced[0].type === "user" || sliced.length <= 2).toBe(true);
-  });
-});
-
-describe("draft buffer", () => {
-  beforeEach(() => {
-    localStorage.clear();
-  });
-
-  it("persists and reloads unsent draft text per cwd", () => {
-    saveDraftBuffer("C:\\Work\\Repo", "未发送的提示词");
-    const loaded = loadDraftBuffer("C:/Work/Repo");
-    expect(loaded?.text).toBe("未发送的提示词");
-  });
-
-  it("persists attachments for first-send crash recovery", () => {
-    saveDraftBuffer("C:\\Work\\Repo", "with file", [
-      {
-        id: "a1",
-        kind: "text",
-        name: "notes.txt",
-        mime: "text/plain",
-        size: 4,
-        text: "body",
-      },
-    ]);
-    const loaded = loadDraftBuffer("C:/Work/Repo");
-    expect(loaded?.text).toBe("with file");
-    expect(loaded?.attachments).toEqual([
-      {
-        id: "a1",
-        kind: "text",
-        name: "notes.txt",
-        mime: "text/plain",
-        size: 4,
-        text: "body",
-      },
-    ]);
-  });
-
-  it("falls back to text-only when attachments blow the size budget", () => {
-    const huge = "x".repeat(900_000);
-    saveDraftBuffer("C:\\Work\\Repo", "keep me", [
-      {
-        id: "img",
-        kind: "image",
-        name: "big.png",
-        mime: "image/png",
-        size: huge.length,
-        data: huge,
-      },
-      {
-        id: "img2",
-        kind: "image",
-        name: "big2.png",
-        mime: "image/png",
-        size: huge.length,
-        data: huge,
-      },
-    ]);
-    const loaded = loadDraftBuffer("C:/Work/Repo");
-    expect(loaded?.text).toBe("keep me");
-    // Full dual payloads exceed budget; metadata-only or empty attachments OK.
-    const bodies = (loaded?.attachments ?? []).filter((a) => a.data || a.text);
-    expect(bodies.length).toBe(0);
-  });
-
-  it("clears empty drafts", () => {
-    saveDraftBuffer("C:\\Work\\Repo", "x");
-    saveDraftBuffer("C:\\Work\\Repo", "   ");
-    expect(loadDraftBuffer("C:\\Work\\Repo")).toBeNull();
-  });
-
-  it("clearDraftBuffer removes entry", () => {
-    saveDraftBuffer("C:\\A", "hello");
-    clearDraftBuffer("C:\\A");
-    expect(loadDraftBuffer("C:\\A")).toBeNull();
   });
 });

@@ -11,7 +11,7 @@ import {
   type PromptAttachment,
   type SlashCommand,
 } from "../../bridge/types";
-import { sessionLooksBusy } from "../../lib/sessionBusy";
+import { deriveSessionSnapshot } from "../../lib/sessionRuntime";
 import { ChipSelect } from "../common/ChipSelect";
 import { PromptOptionsMenu, ProviderSwitcher } from "../common/PromptControls";
 import { Icon } from "../fx/Icon";
@@ -58,6 +58,7 @@ export function Composer() {
   const updateQueuedPrompt = useDesktop((s) => s.updateQueuedPrompt);
   const moveQueuedPrompt = useDesktop((s) => s.moveQueuedPrompt);
   const moveQueuedAttachment = useDesktop((s) => s.moveQueuedAttachment);
+  const resumePromptQueue = useDesktop((s) => s.resumePromptQueue);
   const clearPromptQueue = useDesktop((s) => s.clearPromptQueue);
   const activeId = useDesktop((s) => s.activeId);
   const workspace = useDesktop((s) => s.workspace);
@@ -98,13 +99,14 @@ export function Composer() {
   const runtimeCommands = useDesktop((s) => s.activeId ? s.slashCommands[s.activeId] ?? NO_RUNTIME_COMMANDS : NO_RUNTIME_COMMANDS);
   const promptQueues = useDesktop((s) => s.promptQueues);
   const queue = activeId ? promptQueues[activeId] ?? NO_QUEUED_PROMPTS : NO_QUEUED_PROMPTS;
+  const queueParked = useDesktop((s) => Boolean(activeId && s.queueDrainParked[activeId]));
 
   const openExtensionSettings = (section: "mcp" | "skills" | "plugins") => {
     setSettingsOpen(true);
     window.dispatchEvent(new CustomEvent("grox:settings-section", { detail: section }));
   };
 
-  const running = sessionLooksBusy({ status });
+  const running = deriveSessionSnapshot({ status }).busy;
   const deepResearchAvailable = runtimeCommands.some((command) => command.name === "deep-research");
 
   const slashCommands: SlashCmd[] = [
@@ -217,7 +219,9 @@ export function Composer() {
   };
 
   const send = async () => {
-    const t = text.trim();
+    const submittedText = text;
+    const submittedAttachmentIds = attachments.map((attachment) => attachment.id);
+    const t = submittedText.trim();
     if ((!t && attachments.length === 0) || creating || restoring || readingFiles) return;
     // Path attachments are resolved asynchronously. Pin this turn to the
     // session that owned the composer when Enter was pressed; otherwise a
@@ -240,9 +244,15 @@ export function Composer() {
       let accepted: boolean;
       if (modeCommand?.[2]) {
         const nextMode = modeCommand[1].toLowerCase() as "plan" | "agent" | "ask";
-        accepted = sendPrompt(modeCommand[2].trim(), turnAttachments, targetSessionId, nextMode);
+        accepted = sendPrompt(modeCommand[2].trim(), turnAttachments, targetSessionId, nextMode, {
+          text: submittedText,
+          attachmentIds: submittedAttachmentIds,
+        });
       } else {
-        accepted = sendPrompt(t, turnAttachments, targetSessionId);
+        accepted = sendPrompt(t, turnAttachments, targetSessionId, undefined, {
+          text: submittedText,
+          attachmentIds: submittedAttachmentIds,
+        });
       }
       // sendPrompt clears the targeted session's persisted draft itself. If
       // the provider started switching while we were reading, leave this
@@ -256,13 +266,18 @@ export function Composer() {
   };
 
   const interject = async () => {
-    const t = text.trim();
+    const submittedText = text;
+    const submittedAttachmentIds = attachments.map((attachment) => attachment.id);
+    const t = submittedText.trim();
     if ((!t && attachments.length === 0) || creating || restoring || readingFiles || !activeId) return;
     setReadingFiles(true);
     setAttachmentError("");
     try {
       const turnAttachments = await attachExplicitPromptImages(workspace, t, attachments);
-      await interjectPrompt(t, turnAttachments, activeId);
+      await interjectPrompt(t, turnAttachments, activeId, {
+        text: submittedText,
+        attachmentIds: submittedAttachmentIds,
+      });
     } catch (cause) {
       setAttachmentError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -404,13 +419,32 @@ export function Composer() {
           {queue.length > 0 && (
             <div className="border-t border-line px-3 py-2">
               <div className="mb-1.5 flex items-center justify-between">
-                <span className="font-mono text-[9.5px] text-dim">
-                  {language === "zh-CN" ? `等待发送 ${queue.length}` : `${queue.length} queued`}
-                </span>
+                <div className="flex items-center gap-2">
+                  <span className={`font-mono text-[9.5px] ${queueParked ? "text-gold" : "text-dim"}`}>
+                    {queueParked
+                      ? (language === "zh-CN" ? `队列已暂停 · ${queue.length} 条待确认` : `Queue paused · ${queue.length} held`)
+                      : (language === "zh-CN" ? `等待发送 ${queue.length}` : `${queue.length} queued`)}
+                  </span>
+                  {queueParked && (
+                    <button
+                      onClick={() => resumePromptQueue(activeId ?? undefined)}
+                      className="rounded border border-gold/35 bg-gold/10 px-1.5 py-0.5 font-mono text-[9px] text-gold transition-colors hover:bg-gold/20"
+                    >
+                      {language === "zh-CN" ? "确认并继续" : "Review & resume"}
+                    </button>
+                  )}
+                </div>
                 <button onClick={() => clearPromptQueue(activeId ?? undefined)} className="font-mono text-[9px] text-faint hover:text-red">
                   {language === "zh-CN" ? "清空" : "Clear"}
                 </button>
               </div>
+              {queueParked && (
+                <p className="mb-1.5 text-[9.5px] leading-relaxed text-mute">
+                  {language === "zh-CN"
+                    ? "上次停止或异常后，Grox 不会自动发送这些内容。请先核对最后一轮结果。"
+                    : "Grox will not auto-send these after a stop or incident. Review the previous result first."}
+                </p>
+              )}
               <div className="space-y-1">
                 {queue.map((item, index) => (
                   <div key={item.id} className="rounded-lg bg-high/60 px-2 py-1.5">
@@ -418,20 +452,21 @@ export function Composer() {
                     <input
                       value={item.text}
                       onChange={(event) => activeId && updateQueuedPrompt(activeId, item.id, event.target.value)}
+                      disabled={item.state === "sending"}
                       placeholder={item.attachments.length > 0 ? (language === "zh-CN" ? "图片消息" : "Image prompt") : undefined}
                       className="min-w-0 flex-1 bg-transparent text-[10.5px] text-fg2 outline-none placeholder:text-faint"
                     />
-                    <button disabled={index === 0} onClick={() => activeId && moveQueuedPrompt(activeId, item.id, -1)} className="text-faint enabled:hover:text-fg disabled:opacity-25" title={language === "zh-CN" ? "上移" : "Move up"}><Icon name="arrowUp" size={9} /></button>
-                    <button disabled={index === queue.length - 1} onClick={() => activeId && moveQueuedPrompt(activeId, item.id, 1)} className="rotate-180 text-faint enabled:hover:text-fg disabled:opacity-25" title={language === "zh-CN" ? "下移" : "Move down"}><Icon name="arrowUp" size={9} /></button>
-                    <button onClick={() => activeId && removeQueuedPrompt(activeId, item.id)} className="text-faint hover:text-red" title={language === "zh-CN" ? "移出队列" : "Remove from queue"}>
+                    <button disabled={item.state === "sending" || queue[index - 1]?.state === "sending" || index === 0} onClick={() => activeId && moveQueuedPrompt(activeId, item.id, -1)} className="text-faint enabled:hover:text-fg disabled:opacity-25" title={language === "zh-CN" ? "上移" : "Move up"}><Icon name="arrowUp" size={9} /></button>
+                    <button disabled={item.state === "sending" || queue[index + 1]?.state === "sending" || index === queue.length - 1} onClick={() => activeId && moveQueuedPrompt(activeId, item.id, 1)} className="rotate-180 text-faint enabled:hover:text-fg disabled:opacity-25" title={language === "zh-CN" ? "下移" : "Move down"}><Icon name="arrowUp" size={9} /></button>
+                    <button disabled={item.state === "sending"} onClick={() => activeId && removeQueuedPrompt(activeId, item.id)} className="text-faint enabled:hover:text-red disabled:opacity-25" title={language === "zh-CN" ? "移出队列" : "Remove from queue"}>
                       <Icon name="x" size={9} />
                     </button>
                     </div>
                     {item.attachments.length > 0 && <div className="mt-1 flex flex-wrap gap-1">{item.attachments.map((attachment, attachmentIndex) => (
                       <span key={attachment.id} className="flex items-center gap-1 rounded-[3px] border border-line px-1.5 py-0.5 font-mono text-[8.5px] text-mute">
                         <span className="max-w-28 truncate">{attachment.name}</span>
-                        <button disabled={attachmentIndex === 0} onClick={() => activeId && moveQueuedAttachment(activeId, item.id, attachment.id, -1)} className="disabled:opacity-20" aria-label="上移附件">↑</button>
-                        <button disabled={attachmentIndex === item.attachments.length - 1} onClick={() => activeId && moveQueuedAttachment(activeId, item.id, attachment.id, 1)} className="disabled:opacity-20" aria-label="下移附件">↓</button>
+                        <button disabled={item.state === "sending" || attachmentIndex === 0} onClick={() => activeId && moveQueuedAttachment(activeId, item.id, attachment.id, -1)} className="disabled:opacity-20" aria-label="上移附件">↑</button>
+                        <button disabled={item.state === "sending" || attachmentIndex === item.attachments.length - 1} onClick={() => activeId && moveQueuedAttachment(activeId, item.id, attachment.id, 1)} className="disabled:opacity-20" aria-label="下移附件">↓</button>
                       </span>
                     ))}</div>}
                   </div>

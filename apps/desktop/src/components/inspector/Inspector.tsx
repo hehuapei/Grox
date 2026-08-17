@@ -16,11 +16,12 @@ import { usePreferences } from "../../state/preferences";
 import { useI18n } from "../../lib/i18n";
 import { Icon } from "../fx/Icon";
 import { openFileWithConfiguredApplication } from "../../lib/defaultOpen";
+import { projectPreviewUrl } from "../../lib/projectPreviewUrl";
 
 const EMPTY_WORKFLOWS: WorkflowRun[] = [];
 
 export function Inspector() {
-  const { t } = useI18n();
+  const { t, language } = useI18n();
   const tab = useDesktop((s) => s.inspectorTab);
   const setTab = useDesktop((s) => s.setInspectorTab);
   const session = useDesktop((s) => (s.activeId ? s.sessions[s.activeId] : null));
@@ -38,10 +39,12 @@ export function Inspector() {
     <ResizeHandle side="left" value={width} onChange={setWidth} />
     <aside className="flex shrink-0 flex-col border-l border-line bg-panel" style={{ width }}>
       {/* tab strip */}
-      <div className="flex h-10 shrink-0 items-center gap-1 border-b border-line px-3">
+      <div role="tablist" aria-label={language === "zh-CN" ? "检查器" : "Inspector"} className="flex h-10 shrink-0 items-center gap-1 border-b border-line px-3">
         {tabs.map((t) => (
           <button
             key={t.id}
+            role="tab"
+            aria-selected={tab === t.id}
             onClick={() => setTab(t.id)}
             className={`relative h-full px-2 font-mono text-[10px] tracking-[0.14em] transition-colors ${
               tab === t.id ? "text-fg" : "text-dim hover:text-mute"
@@ -149,7 +152,7 @@ function buildFileTree(entries: WorkspaceEntry[]): FileNode[] {
   return sort(root.children);
 }
 
-const canPreview = (path: string) => /\.(md|mdx|markdown|html?|png|jpe?g|gif|webp|svg|bmp|txt|json|toml|ya?ml|css|[jt]sx?|rs|py)$/i.test(path);
+const canPreview = (path: string) => /\.(md|mdx|markdown|html?|png|jpe?g|gif|webp|svg|bmp|mp4|m4v|webm|mov|mp3|m4a|wav|ogg|oga|flac|pdf|txt|json|toml|ya?ml|css|[jt]sx?|rs|py)$/i.test(path);
 
 function FileTreeNode({ node, onOpen, workspace }: { node: FileNode; onOpen(path: string): void; workspace: string }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -231,7 +234,9 @@ function FileActionMenu({
   }, false);
   const copyContent = () => run(async () => {
     const file = await invoke<PreviewFile>("read_preview_file", { cwd: workspace, path });
-    if (file.kind === "image") throw new Error(zh ? "图片没有可复制的文本内容" : "Images do not have text content to copy");
+    if (["image", "video", "audio", "pdf"].includes(file.kind)) {
+      throw new Error(zh ? "二进制媒体没有可复制的文本内容" : "Binary media does not have text content to copy");
+    }
     await navigator.clipboard.writeText(file.content);
     setNotice(zh ? "已复制文件内容" : "Contents copied");
   }, false);
@@ -250,7 +255,7 @@ function FileActionMenu({
         <FileAction label={zh ? "打开方式…" : "Open with…"} icon="external" onClick={() => void run(() => invoke("open_file_with_dialog", { cwd: workspace, path }))} />
         <FileAction label={zh ? "在 Finder 中显示" : "Reveal in Finder"} icon="folder" onClick={() => void run(() => invoke("reveal_in_explorer", { cwd: workspace, path }))} />
         <FileAction label={zh ? "复制路径" : "Copy path"} icon="copy" onClick={() => void copyPath()} />
-        {previewable && !/\.(png|jpe?g|gif|webp|svg|bmp)$/i.test(path) && <FileAction label={zh ? "复制文件内容" : "Copy contents"} icon="copy" onClick={() => void copyContent()} />}
+        {previewable && !/\.(png|jpe?g|gif|webp|svg|bmp|mp4|m4v|webm|mov|mp3|m4a|wav|ogg|oga|flac|pdf)$/i.test(path) && <FileAction label={zh ? "复制文件内容" : "Copy contents"} icon="copy" onClick={() => void copyContent()} />}
         {notice && <p className="border-t border-line px-2 py-1.5 font-mono text-[8.5px] leading-relaxed text-red">{notice}</p>}
       </div>}
     </div>
@@ -492,16 +497,19 @@ function PreviewTab() {
   const setUrl = useDesktop((state) => state.setProjectPreviewUrl);
   const [draft, setDraft] = useState(preview.url ?? "");
   const [frameKey, setFrameKey] = useState(0);
-  useEffect(() => setDraft(preview.url ?? ""), [preview.url]);
+  const [navigationError, setNavigationError] = useState("");
+  useEffect(() => {
+    setDraft(preview.url ?? "");
+    setNavigationError("");
+  }, [preview.url]);
   const zh = language === "zh-CN";
   const navigate = (event: FormEvent) => {
     event.preventDefault();
     try {
-      const url = new URL(draft);
-      if (!/^https?:$/.test(url.protocol)) return;
-      setUrl(url.toString());
-    } catch {
-      // Keep the current page when the address is incomplete.
+      setUrl(projectPreviewUrl(draft));
+      setNavigationError("");
+    } catch (cause) {
+      setNavigationError(cause instanceof Error ? cause.message : String(cause));
     }
   };
   return (
@@ -512,11 +520,17 @@ function PreviewTab() {
         </button>
         <input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="http://localhost:5173" className="h-6 min-w-0 flex-1 rounded-[3px] border border-line bg-raise px-2 font-mono text-[9.5px] text-fg2 outline-none focus:border-line3" />
         {preview.url && (
-          <button type="button" onClick={() => void invoke("open_external", { url: preview.url })} className="flex h-6 w-6 items-center justify-center text-dim hover:text-fg" title={zh ? "在浏览器打开" : "Open in browser"}>
+          <button type="button" onClick={() => {
+            setNavigationError("");
+            void invoke("open_external", { url: preview.url }).catch((cause) => {
+              setNavigationError(cause instanceof Error ? cause.message : String(cause));
+            });
+          }} className="flex h-6 w-6 items-center justify-center text-dim hover:text-fg" title={zh ? "在浏览器打开" : "Open in browser"}>
             <Icon name="external" size={11} />
           </button>
         )}
       </form>
+      {navigationError && <p role="alert" className="shrink-0 border-b border-red/25 bg-red/5 px-3 py-2 font-mono text-[9px] leading-relaxed text-red">{navigationError}</p>}
       {preview.status === "ready" && preview.url ? (
         <iframe key={`${preview.url}-${frameKey}`} src={preview.url} title="Project preview" className="min-h-0 flex-1 border-0 bg-white" sandbox="allow-scripts allow-same-origin allow-forms allow-modals" />
       ) : (
@@ -575,7 +589,7 @@ function UsageTab({ session }: { session: Session }) {
       <Readout label={t("turns")} value={String(u.turns)} />
       <Readout label={t("model")} value={session.model.toUpperCase()} tone="text-fg2" />
       <Readout
-        label={t("elapsed")}
+        label={t("sessionSpan")}
         value={fmtDuration(Math.max(0, session.updatedAt - session.createdAt))}
       />
 

@@ -2,6 +2,7 @@ import { describe, expect, it, beforeEach } from "vitest";
 import {
   SHELL_VERSION_STORAGE_KEY,
   consumeShellUpgradeRescan,
+  sanitizeCatalogStatusOnColdStart,
   sanitizeSessionForOpen,
   shouldCloseDetachedSession,
   shouldForceOfflineRescan,
@@ -95,6 +96,20 @@ describe("shouldForceOfflineRescan (0.2.30 per-session)", () => {
 describe("sanitizeSessionForOpen", () => {
   it("always paints idle", () => {
     expect(sanitizeSessionForOpen({ status: "running", blocks: [] }).status).toBe("idle");
+  });
+});
+
+describe("sanitizeCatalogStatusOnColdStart", () => {
+  it("does not revive transient status from the previous process", () => {
+    for (const status of ["connecting", "running", "stopping", "awaiting_permission", "awaiting_input"] as const) {
+      expect(sanitizeCatalogStatusOnColdStart(status)).toBe("disconnected");
+    }
+  });
+
+  it("preserves terminal catalogue status", () => {
+    expect(sanitizeCatalogStatusOnColdStart("idle")).toBe("idle");
+    expect(sanitizeCatalogStatusOnColdStart("failed")).toBe("failed");
+    expect(sanitizeCatalogStatusOnColdStart("cancelled")).toBe("cancelled");
   });
 });
 

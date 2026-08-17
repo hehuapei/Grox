@@ -1,0 +1,30 @@
+name: 功能建议
+description: 说明要解决的真实场景，而不只是功能名称
+title: "[Feature] "
+labels: ["enhancement", "triage", "from:community"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你遇到了什么问题
+      description: 描述现在的工作流为什么不顺畅
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: 理想结果
+      description: 描述完成后的用户结果，不必先设计实现方案
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 目前如何绕过
+  - type: dropdown
+    id: area
+    attributes:
+      label: 相关区域
+      options: [首页与输入, 会话与恢复, 账户与配置, 工具与权限, 扩展, 发布与安装, 其它]
+    validations:
+      required: true

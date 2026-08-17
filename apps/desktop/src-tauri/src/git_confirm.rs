@@ -20,6 +20,7 @@ pub struct GitConfirmStore {
 struct Entry {
     kind: Kind,
     cwd: String,
+    target: Option<String>,
     expires: Instant,
 }
 
@@ -32,15 +33,15 @@ enum Kind {
 
 impl GitConfirmStore {
     pub fn issue_commit(&self, cwd: &str) -> Result<String, String> {
-        self.issue(Kind::Commit, cwd)
+        self.issue(Kind::Commit, cwd, None)
     }
 
     pub fn issue_push(&self, cwd: &str) -> Result<String, String> {
-        self.issue(Kind::Push, cwd)
+        self.issue(Kind::Push, cwd, None)
     }
 
-    pub fn issue_worktree_remove(&self, cwd: &str) -> Result<String, String> {
-        self.issue(Kind::WorktreeRemove, cwd)
+    pub fn issue_worktree_remove(&self, cwd: &str, target: &str) -> Result<String, String> {
+        self.issue(Kind::WorktreeRemove, cwd, Some(target))
     }
 
     pub fn consume_commit(&self, cwd: &str, token: &str) -> Result<(), String> {
@@ -51,11 +52,16 @@ impl GitConfirmStore {
         self.consume(Kind::Push, cwd, token)
     }
 
-    pub fn consume_worktree_remove(&self, cwd: &str, token: &str) -> Result<(), String> {
-        self.consume(Kind::WorktreeRemove, cwd, token)
+    pub fn consume_worktree_remove(
+        &self,
+        cwd: &str,
+        target: &str,
+        token: &str,
+    ) -> Result<(), String> {
+        self.consume_scoped(Kind::WorktreeRemove, cwd, Some(target), token)
     }
 
-    fn issue(&self, kind: Kind, cwd: &str) -> Result<String, String> {
+    fn issue(&self, kind: Kind, cwd: &str, target: Option<&str>) -> Result<String, String> {
         let mut bytes = [0_u8; 16];
         getrandom::fill(&mut bytes).map_err(|error| format!("无法创建 git 确认令牌：{error}"))?;
         let token = bytes
@@ -72,6 +78,7 @@ impl GitConfirmStore {
             Entry {
                 kind,
                 cwd: cwd.to_string(),
+                target: target.map(str::to_string),
                 expires: Instant::now() + TOKEN_TTL,
             },
         );
@@ -79,6 +86,16 @@ impl GitConfirmStore {
     }
 
     fn consume(&self, kind: Kind, cwd: &str, token: &str) -> Result<(), String> {
+        self.consume_scoped(kind, cwd, None, token)
+    }
+
+    fn consume_scoped(
+        &self,
+        kind: Kind,
+        cwd: &str,
+        target: Option<&str>,
+        token: &str,
+    ) -> Result<(), String> {
         let token = token.trim();
         if token.is_empty() {
             return Err("缺少 git 操作确认令牌；请先在界面中确认".into());
@@ -91,7 +108,7 @@ impl GitConfirmStore {
         let Some(entry) = guard.get(token) else {
             return Err("git 确认令牌无效或已过期，请重新确认".into());
         };
-        if entry.kind != kind || entry.cwd != cwd {
+        if entry.kind != kind || entry.cwd != cwd || entry.target.as_deref() != target {
             return Err("git 确认令牌与当前操作不匹配".into());
         }
         guard.remove(token);
@@ -124,8 +141,26 @@ mod tests {
     #[test]
     fn worktree_remove_token_is_kind_bound() {
         let store = GitConfirmStore::default();
-        let token = store.issue_worktree_remove("/project").unwrap();
+        let token = store
+            .issue_worktree_remove("/project", "/worktree-a")
+            .unwrap();
         assert!(store.consume_commit("/project", &token).is_err());
-        store.consume_worktree_remove("/project", &token).unwrap();
+        store
+            .consume_worktree_remove("/project", "/worktree-a", &token)
+            .unwrap();
+    }
+
+    #[test]
+    fn worktree_remove_token_cannot_switch_target_after_confirmation() {
+        let store = GitConfirmStore::default();
+        let token = store
+            .issue_worktree_remove("/project", "/worktree-a")
+            .unwrap();
+        assert!(store
+            .consume_worktree_remove("/project", "/worktree-b", &token)
+            .is_err());
+        store
+            .consume_worktree_remove("/project", "/worktree-a", &token)
+            .unwrap();
     }
 }

@@ -1,0 +1,207 @@
+# ADR-0003：原生 Host 成为 Grox 后端唯一运行时
+
+- 状态：Accepted（v0.3.2 已收口）
+- 日期：2026-08-14
+- 版本：v0.3.2
+- 取代：ADR-0001 第 4、6、7 条
+
+## Context
+
+Grox 的 Rust 进程已经负责启动 CLI、文件和 Git 操作，但迁移前 ACP JSON-RPC 请求关联、
+会话门控、流式回合、重连、提示队列和多数恢复决策仍在 `AcpBridge`/Zustand 内。
+这不是单纯的 `main.rs` 过长问题，而是权威被拆成了三份：
+
+1. Rust 知道子进程和宿主环境，却不知道一个 ACP 请求属于谁、何时终止；
+2. Bridge 知道协议请求和会话流，却随 WebView 刷新、关闭而消失；
+3. Store 知道产品队列和展示状态，却无法原子地约束进程、journal 与后台任务。
+
+因此，只在某条功能链增加门禁会产生新的平行状态。多窗口、后台会话、自动化、
+异常恢复和进程池也无法在这个边界上可靠实现。
+
+`grok-app` 的正确方向是让 Rust `SessionManager`、`AcpClient`、FSM、store、自动化
+runner 和媒体 Host 共同拥有后台事实，前端只接收快照与事件。它也存在连接锁、
+journal RMW、单权限槽、进程树和网络超时等已知问题，所以 Grox 学习其职责归属，
+不复制具体竞态或以文件数量作为目标。
+
+## Decision
+
+### 后端边界
+
+原生 Host 是以下事实的唯一所有者：
+
+- CLI 探测、认证、进程启动/退出、代次和资源上限；
+- ACP 请求关联、超时、取消、重连和主动事件路由；
+- 会话生命周期、活动回合、门禁、停止和恢复；
+- journal、提示队列、草稿、自动化与删除 tombstone 的持久化事务；
+- 工作树所有权、权限策略、路径授权、密钥和媒体访问令牌；
+- 后台自动化与前台发送共用的会话执行入口；
+- 可导出的结构化错误、运行时快照和诊断记录。
+
+WebView 可以保留渲染节流、临时编辑态和乐观界面，但不能裁决进程、协议、会话终态
+或持久化事务。前端缓存丢失不得改变后台正在执行的事实。
+
+### 必须维持的不变量
+
+1. 一个出站 ACP 请求只能由 Host 注册一次，并只接受同一进程代次的响应。
+2. 进程退出、替换、CLI 更新或主 Host 关闭时，所有相关请求必须立即得到明确失败。
+3. 主动通知和 Agent 发起的请求可以广播为事件；普通 RPC 响应不得广播给所有窗口。
+4. `session/prompt` 的结果、用户停止或明确失败是回合终态；早到通知不裁决终态。
+5. 每个持久化实体只有一个原生写入入口；RMW 必须在同一把锁内完成并原子替换。
+6. 删除先建立 Host tombstone，再清理数据；任何晚到写入都必须失败。
+7. 自动化调用与前台调用使用同一个 SessionCoordinator，不得另建简化执行器。
+8. 路径、权限和密钥由 Host 验证；前端开关只能表达意图，不能扩大授权。
+9. 协议、用户操作、环境错误在 Host 边界具有稳定代码，前端只负责本地化呈现。
+10. 共享单进程存在期间，进程级事故必须列出全部受影响会话，不能只更新当前页面。
+11. Agent 发起的交互请求只接受 Host 保存的 session + rpc id + generation；WebView 不得回传或猜测 wire id。
+12. Client callback 只能使用 Host 在 session/new|load 时绑定的工作区；未知会话不得回退到当前页面目录。
+13. ACP 派生的 assistant/thinking/user/tool/plan block 身份与开闭顺序只由 Host 按 session + generation + turn 推进；WebView 重载与补放不得生成第二个身份。
+14. ACP 会话事件只有在对应应用 journal 原子落盘后才能按 session + stream + 精确 sequence 确认；“WebView 已看过”不等于“事实已持久化”，媒体事件还必须等到受控文件引用落盘。
+15. WebView 重载必须先用 Host 的会话绑定、活动回合、交互门禁和自动化活动快照重建会话壳，再消费补放事件；页面消失不能把仍在运行的 Host 回合判为崩溃。
+
+### v0.3.2 内的迁移顺序
+
+以下是同一个 v0.3.2 版本内的迁移切片，不拆分为多个发布版本：
+
+| 顺序 | 后端主干 | 迁移结果 |
+| --- | --- | --- |
+| 1 | Native ACP transport | Host 关联请求/响应并负责超时、取消、退出清算；已落地 |
+| 2 | SessionCoordinator | Host 签发/校验 lifecycle 与 turn 许可并发布占用快照；已落地 |
+| 3 | Native repositories | PromptQueueStore、AutomationStore、SessionJournalStore、DraftStore 与媒体任务 journal 已迁移；已落地 |
+| 4 | Unified turn execution | Host 自动化与普通前台回合均拥有许可、模型/模式绑定、Prompt、watchdog、取消和 effort 降级；block 身份、流式边界和恢复确认已归 Host；已落地 |
+| 5 | Interaction service | Host 持有权限、计划审批、ask-user 的 rpc id、代次、回复和 Stop 清算；已落地 |
+| 6 | Client callback service | Host 持有 FS/terminal callback 的 session/cwd/rpc/generation 与终端进程树生命周期；已落地 |
+| 7 | Host services | worktree、原生 fork、安全删除、权限策略、媒体与密钥均已统一到 Host 身份和路径授权；已落地 |
+| 8 | Command facade | 高风险状态、持久化和运行时职责已进入领域服务；剩余 `main.rs` 拆分只属于代码组织，不再承载第二份业务权威 |
+| 9 | Error/diagnostics | 稳定错误码、运行时快照、审计事件和支持包已覆盖上述服务；已落地 |
+
+顺序不能倒置：在 Host 尚未拥有会话状态前直接增加进程池，只会把当前分裂状态复制
+到多个进程；在 repository 尚未拥有事务前运行后台自动化，会放大队列和 journal 竞态。
+
+## 当前实现（v0.3.2）
+
+- `acp_host::AcpRequestBroker` 已成为出站 RPC 的 Host 请求表；
+- `acp_request` 定向返回响应；通用 `acp_send` IPC 已删除，WebView 不能再自行拼接通知或反向 RPC 回复；
+- `acp_inbound::AcpInbound` 是 stdout 主循环唯一的 JSON-RPC/x.ai wrapper 解码结果，请求表、回合监控、Client callback、交互门禁和事件 journal 读取同一份 method/params/id；
+- Host 内部统一使用规范化的 `x.ai/...` 方法名做门禁与错误分类，唯一请求入口负责在 ACP wire 上编码为 `_x.ai/...`；自动化、会话删除与 fork 不再依赖 WebView 才拥有的扩展编码；
+- 普通请求超时与长回合 watchdog 都由 Host 处理；WebView 不再持有 prompt RPC id 或调用任意请求取消命令；
+- 进程替换、自然退出、停止、CLI 更新和主窗口退出都会清算请求；
+- 自然退出时 Host 会冻结受影响会话与活动回合清单，并由单一 RuntimeSupervisor 使用最后一次成功连接参数限次重连；WebView 只投影 reconnecting/ready/offline，不再自己 spawn 或维护重试循环；重连成功仍把被中断回合保留为 failed，绝不自动重发；显式停止、配置强制切换和 Host 退出会推进取消代次，旧退避任务不能把已停止的 Agent 再次拉起；
+- Host 为退出、通道替换、超时、停滞、取消和协议校验返回稳定错误代码，前端不再用字符串正则覆盖这些分类；
+- 环境摘要和支持包记录 Host 悬挂请求、待用户交互门控、Client callback 与已绑定工作区会话数；
+- WebView 只解释已经归属的响应；未知响应由 Host 归一为不含 rpc id 的协议错误投影。
+- `ensure_agent_runtime_ready` 在 Host 连接锁内完成 CLI 检测、进程替换、`initialize`、非交互认证和 ready 提交，并缓存与进程代次绑定的握手快照；页面首次加载和自动化复用健康连接，只有显式配置切换能够强制替换进程；WebView 不再用 `acp_spawn`、`initialize` 和 `runtime_ready` 三次调用拼出连接事实；
+- 初始化失败或进程在握手中退出会清算该代请求、能力租约和半连接子进程；运行时快照区分 starting、initializing、authenticating、ready、paused 与 offline，不再把“有 PID”等同于“可派发”；
+- `ready_generation` 和初始化/认证快照只存在于 `AcpState`；交互认证成功会更新同一代次的 Host 快照，页面重载不会为了重建能力目录而重启健康进程；供应商/认证配置事务暂停时由 Host 保存一次性的已就绪代次，恢复必须消费同一进程的凭据，页面不能在握手中制造 ready 或单独宣布 runner 就绪；
+- 交互式 OAuth 仍需用户显式点击，Host 只返回方法与标签，不在后台连接时擅自打开浏览器；非交互认证失败会保留结构化错误，也不会再被账户投影反向推断成已登录。
+- `session_coordinator::SessionCoordinator` 在 Host 内维护活动回合、FIFO 生命周期队列和进程代次；
+- `session/new`、`session/load`、`session/prompt` 必须携带 Host 签发且与方法、会话、代次匹配的许可；
+- 生命周期排队会阻止新回合抢占，不同已绑定会话仍可并发运行；等待任务取消、进程自然退出、替换、停止、CLI 更新和主窗口退出都会清除旧许可；
+- 占用快照由 Host 通过事件和查询命令发布，环境摘要与支持包不再依赖 WebView 自报门控状态；
+- 前端 `SharedAcpLifecycleGate` 及其平行测试已删除，兼容重试、回放收尾和模型/模式预绑定仍保持在同一 Host 许可窗口内。
+- `prompt_queue_store::PromptQueueStore` 在 Host 锁内按会话合并 patch 并原子替换文件，前端不再提交整个队列文件；
+- 不同会话的并发队列写不会互相覆盖，Host 会校验队列条目/附件契约、容量和重复 id；
+- 旧 localStorage 队列只在原生仓储从未初始化时迁移一次，原生空对象也是初始化标记，避免已删除队列在重启后再次导入；
+- 删除会话/项目会在同一 tombstone 锁序内删除提示队列，晚到 upsert 会被 Host 拒绝，不能让已删除会话复活。
+- 普通前台队列不再由 Store 先删行再调用 `bridge.prompt()`：`execute_foreground_turn` 在同一 Host 命令内按 queue id 原子领取磁盘首项、用权威文本/附件/模型/模式派发，并在 RPC 成功或用户停止后消费；协议、环境或进程代次失败会原位回队并触发人工确认门禁；
+- 提示队列的 `_hostRuntime` 记录 Host 实例、claim token、进程代次和领取时间。WebView 只收到去除保留字段的快照，普通 patch 不能伪造、擦除、编辑或删除活动领取；旧 token 不能结算新领取；新 Host 实例、进程代次变化和旧版无 token 的 `sending` 行会恢复为 `queued`；
+- 队列领取事件会在 Agent 输出前校正前端乐观用户气泡，避免磁盘权威内容与屏幕内容不一致；发送中的行不可编辑/排序/删除，清空操作也保留当前活动领取；
+- 入队时保存的权限模式只是历史意图。派发时 Host 会与当前 `host_prefs` 取更严格者，旧队列不能在用户关闭 bypass 后重新扩大授权；
+- 本地队列以稳定 id 和 Host settlement 判断是否消费，不再根据“文本刚好等于最后一个用户气泡”删除条目；因此异常回队后显式“确认并继续”确实会重发，而不会被文本去重静默吞掉。
+- 成功消费或用户停止会在 Host 进程内留下 queue id tombstone；结算前已进入前端 Promise 链的旧 patch 会在原生锁内剔除这些 id，不能在结算后把已执行提示复活。应用重启后旧前端链已不存在，永久删除仍由 SessionStorage tombstone 跨操作兜底。
+- `automation_store::AutomationStore` 按 automation id 在 Host 锁内合并更新/删除，不同任务的启停、编辑和运行结果不再通过整包数组互相覆盖；
+- 自动化 DTO、时间、频率、权限模式、可选运行结果和重复 id 均由 Host 校验，失败 patch 不修改原文件。
+- `automation_runner::AutomationRunner` 在应用进程内每 30 秒检查到期任务；SessionCoordinator 无活动回合/生命周期操作且运行时不处于切换事务时即可认领，离线时由任务自己的 cwd/effort 主动建立 AgentRuntime，不再等待页面调用 connect；WebView 不再持有调度定时器、到期判断或执行回调；
+- Runner 在认领前先原子取得进程级 dispatch reservation，手动点击与调度 tick 不能让两个不同任务同时穿过空闲检查；认领、两分钟租约、30 秒 Host 续租、排程推进、一次性任务停用和安全失败退避都在 AutomationStore 的同一文件事务内完成；建会话前失败会五分钟退避，已经创建会话后的模糊失败会消费本次排程，避免自动复制可能已写入 Agent 的工作；
+- `_hostRuntime` 是 Host 保留字段：普通 UI patch 不能伪造或擦除认领，旧 token 不能结算新认领；`session/new` 成功后 Host 会先把真实 session id 持久绑定到租约再发送 prompt，进程若在最终结算前退出，过期恢复会标记结果未知并消费该次排程，而不是重复创建会话；删除任务仍然优先，不会被晚到结算复活；
+- `session/new` 与 `session/load` 已由 Host 原子完成：读取系统提示、验证工作区/模型/权限、创建 Computer/Browser 租约、取得 lifecycle permit、执行兼容重试并把资源绑定到真实 session id；WebView 只登记返回的会话和投影流事件；
+- Computer/Browser lease id 不再保存在 WebView Map；会话关闭/删除、功能关闭、运行时替换、进程异常退出和主窗口销毁都由 Host 释放资源，TTL/容量淘汰也同步停止 MCP server 并清除会话绑定；
+- Bypass/YOLO 建会话必须与 `host_prefs` 的 Host 授权一致，前端参数只能降权或表达能力意图，不能扩大权限；自动化 prompt 继续使用 Host 实际裁决后的权限模式，不能在建会话被降权后用原始配置重新扩大授权；Computer 与 Browser 开关都持久化为 Host 偏好，可选 Browser 降级与扩展参数兼容回退通过结构化 warning 呈现；
+- 自动化从认领开始完全由 Host 执行：从磁盘重读权威配置，复用同一个 `open_agent_session` 事务完成 `session/new`、callback/MCP 绑定和会话注册，再在同一个 SessionCoordinator 中完成 `session/set_model`、`session/set_mode`、`session/prompt`、推理强度兼容降级、长回合续租和最终结算；WebView 只接收不含 claim token 的 started/settled 投影；
+- `session/prompt` 的 RPC 成败现在直接决定自动化结果，不再经过会吞掉异常的 UI `bridge.prompt()`；终态和用量由 Host 事件投影到会话，前端不能把协议失败结算成成功；
+- 自动化启动只执行非交互认证；需要 OAuth 或凭据失败时，Host 在建会话前按结构化错误结算并进入失败退避，绝不会由后台时钟擅自打开浏览器；
+- `foreground_turn::ForegroundTurnRegistry` 是普通前台回合的 Host 状态源：按 session + generation 记录当前请求、准备/提示/取消阶段、活动时间、开放工具和权限/问题门禁；进程替换时与请求表、许可一起清空；
+- `execute_foreground_turn` 在一个自动释放的 turn permit 内完成模型/模式绑定、Host-attested 权限元数据、`session/prompt` 和 invalid-effort 降级；前台与自动化复用 `turn_runtime` 的协议规则，不再各自维护一套 fallback；
+- `cancel_foreground_turn` 先定向拒绝当前 Host 请求，使 prompt future 与 turn permit 立即释放，再尽力写 `session/cancel`；发送前 Stop 的 IPC 竞态由短期取消墓碑消费，不会在用户停止后反向启动回合；
+- Host 从入站 ACP 更新维护 stream 活动、开放工具和 operator gate。学习 grok-app 的停滞策略：普通 5 分钟静默只发一次可见提示，不自动误杀长工具；Host 配置的绝对上限仍会清算僵尸回合；
+- `session/prompt` RPC 结果仍是回合终态权威；`turn_completed` / `prompt_complete` 只更新用量或触发协议恢复，不能提前释放下一条队列；
+- `interaction_service::InteractionRegistry` 截获 `session/request_permission`、`x.ai/exit_plan_mode` 和 `x.ai/ask_user_question`：按 generation 保存 rpc id、session、原始 options/questions 和回复中状态，只向主窗口发布不含 rpc id/wire option 的不透明 block id；
+- `resolve_interaction` 不接受 WebView 回传 rpc id 或 optionId，而是用 Host 保存的协议材料构造回复；跨会话、过期、重复点击、未知选项和伪造问题键都有稳定错误，stdin 写入结果不确定时不会自动重发批准；
+- `permission_policy::PermissionMode` 是 `default / auto / bypass` 的唯一解释入口；建会话、恢复、前台发送、历史队列和自动化都以当前 Host 授权为上限，使用同一个降权函数，`auto` 与 `bypass` 不再在不同执行路径得到相互矛盾的结果；
+- `host_prefs` 的读取、迁移和设置在同一把原生锁内完成 RMW，并通过唯一原子写入口提交；损坏或不可读的现有文件返回 `HOST_PREFS_READ_FAILED`，不会再静默回退到默认权限。Bypass 提权使用原生确认对话框且与写入处于同一事务，直接调用 WebView IPC 也不能绕过；Bypass 与 Computer Use 的互斥关系由 Host 原子维护；
+- WebView 不再用 `window.confirm`、localStorage 乐观写和 `x.ai/yolo_mode_changed` 通知拼装权限切换；Store 只应用 Host 返回的完整偏好快照，异步回复仍绑定发起设置的会话，切换页面不会改写另一个会话的 composer；
+- Grok Build 的 `allow-always-command`、`allow-always-mcp` 等 scoped option 只在 Host 保存 wire id/_meta，页面仅接收规范化的 `allow_once / allow_always / deny` 语义；用户选择后 Host 从原始请求找回精确 optionId，不根据页面输入猜测持久授权范围；
+- 已送达或交付状态不确定的用户权限决定会写入有界的原生 JSONL 审计，并把选定会话最近记录加入本地支持包；记录仅含会话、代次、工具类别和决定，不保存命令、路径、prompt 或 rawInput。审计写失败作为独立环境 warning 呈现，不会把已经送达 Agent 的决定伪装成回复失败；
+- Stop 与绝对 watchdog 会先由 Host 回复当前会话的全部反向 RPC 为 cancelled，再发送 `session/cancel`；符合 ACP 对 pending permission 的取消要求，也避免 Agent 永久卡在 ask-user/plan gate；
+- `interaction_status` 允许主 WebView 重载后重新投影仍存活的门控；进程代次切换、自然退出和 CLI 更新会在 Host 清空旧请求，新页面不能把旧卡片回复到新进程；
+- `client_callbacks::ClientCallbackRegistry` 截获标准文件与 `terminal/*` Client RPC：Host 按 generation 保存 rpc id，并用 session binding epoch 绑定 canonical cwd；失败的 `session/load` 不能借旧 sessionId 执行新工作区回调，WebView 不再接收或回复这些特权请求；
+- `session/new` 尚未返回真实 id 时，唯一 lifecycle opening 临时绑定本次 cwd，并只允许观察到的一个 session id；成功后原子提交 binding epoch，失败会释放该 opening 创建的终端，close/delete、进程替换和主窗口退出会清除整组资源；
+- 未绑定会话、跨代次、重复 rpc id、越界路径和超限响应都由 Host 明确拒绝，不再用 `AcpBridge.workspace` 猜 cwd；原先暴露给 WebView 的 `acp_read_*` / `acp_write_*` commands 已移除；
+- `terminal_host::TerminalHost` 完整实现标准 `create/output/wait_for_exit/kill/release` 后才把 `clientCapabilities.terminal` 设为 true：terminal id 同时绑定 generation 与 session，cwd 必须位于已绑定工作区，参数/环境/输出均有硬上限，输出只保留 UTF-8 尾部且报告 truncated；
+- `wait_for_exit` 在独立 Host task 中等待，不阻塞 ACP stdout reader 或其它会话；Unix 使用独立进程组、Windows 使用 Kill-on-close Job Object，kill/release/session close/generation reset/Host shutdown 都终止完整进程树，release 保持幂等；
+- Agent 与 ACP terminal 共用 GUI PATH 补齐规则，只加入实际存在的 Grok/Cargo/Bun/pyenv/asdf/Volta/NVM/Conda 等工具目录；ACP 显式传入的 PATH 仍有最高优先级，解决系统终端可用但桌面 Agent 找不到命令的问题；
+- `worktree_ownership::WorktreeOwnershipStore` 以原子文件持久化 session 与 linked worktree 的 Host 关联，并用现存 journal 兼容旧会话；前端 localStorage 不再参与删除裁决；
+- “在新工作树中继续”改为调用 Grok Build 的 `x.ai/session/fork` 复制完整服务端上下文，再用新 session id 加载投影；不再截取最后一轮消息拼提示词伪装续接。源工作区必须干净，monorepo 子目录会在目标 worktree 中保持相对位置；
+- worktree 创建、原生会话 fork 与所有权落盘作为一个 Host 事务呈现：fork 或落盘失败只回滚本次创建的唯一 worktree/branch，并尽力删除已复制会话，不触碰源会话和用户已有目录；
+- worktree 删除令牌同时绑定仓库与规范化目标，执行时在 Host 生命周期锁内重新核对持久会话、活动 callback、正在打开的会话、旧 journal 与自动化 cwd 后才运行 `git worktree remove`，关闭确认后换目标和检查后新增引用两类竞态；
+- Grox 管理目录由“仓库 basename”升级为“basename + 主工作树路径摘要”，同名仓库不再共享命名空间；旧版管理目录仍可通过原有边界安全删除；
+- 自动化执行不再定向派发给 `main` WebView；供应商、认证或全局配置切换会先暂停 runner，并取得 Host lifecycle permit 后才替换进程，因此能够等待 Host 后台回合而不是只观察 `activePromptSessions`；
+- `agent_auth` 持有显式 OAuth 的唯一活动事务：认证方法只从 Host initialize 快照解析，并发点击附着同一次登录；URL 轮询、系统浏览器、五分钟 watchdog、用户取消、请求清算和 generation 换代均不再依赖 WebView promise 或 localStorage；
+- 主窗口关闭与进程退出已经拆分：存在已启用自动化或 Host 正在执行会话/生命周期事务时，CloseRequested 只隐藏窗口并保留托盘；没有后台责任时关闭才进入真正退出；
+- 托盘恢复窗口不重建 WebView 或 AgentRuntime；托盘“退出”、普通关闭退出、系统退出和更新退出都汇入幂等的 Host shutdown 事务，统一清算请求、门禁、callback、MCP、ACP 和预览子进程；
+- 运行时切换已删除前端 `promptDrainWaiters` 第二门控，只等待 SessionCoordinator 的 lifecycle permit；`activePromptSessions` 仅保留 UI 中断标记与权限提示延迟，不再裁决进程替换；
+- Host 返回 `AUTOMATION_RUNTIME_BUSY`、`AUTOMATION_CLAIM_STALE`、`AUTOMATION_INVALID_RESULT` 和 `AUTOMATION_STORAGE_FAILED` 等分域错误，前端不再把所有失败折叠成“启动失败”。
+- `session_storage::SessionStorageState` 改为按会话写/删除租约：同一会话串行、不同会话并行，删除先标 tombstone 再等待现有 writer，避免全局文件锁拖慢多会话；
+- `session_journal_store::SessionJournalStore` 校验现有和提交快照，前端以磁盘 savedAt 为基线生成单调逻辑版本；旧窗口的等版本/低版本写入会明确冲突并停止续写，不能覆盖新 journal；
+- 旧版裸 Session 只保留只读迁移入口，损坏的现有 journal 不会被新快照静默覆盖。
+- `draft_store::DraftStore` 按规范化工作区保存草稿、附件和单调 revision；删除保留 tombstone revision，晚到旧页面写入与旧 localStorage 迁移都不能让草稿复活。WebView 只做串行合并与投影，原生环境下 localStorage 不再是草稿权威；
+- prompt queue、automation、session journal、draft、worktree ownership、权限审计、媒体任务和支持包等敏感文件都在临时文件创建时即限制为 0600，再原子替换；不再出现“写完后再 chmod”的短暂泄露窗口；
+- 现有持久化文件为空、损坏或无法读取时按结构性错误处理：repository 拒绝覆盖，worktree 删除引用扫描也拒绝跳过坏 journal，避免坏数据被误当成“没有引用”；
+- `MediaService` 用独立原子 journal 保存最近任务，启动时将崩溃遗留的活动任务结算为 `MEDIA_JOB_INTERRUPTED`；WebView 通过有界历史查询恢复最近 12 次同类生成，不再只看最后一次。打开/定位产物只提交 job id + artifact index，Host 从持久任务解析真实路径并重新验证当前工作区或 Grok 会话目录，恢复后的 session 产物可用且页面不能伪造任意路径；媒体历史、journal 状态和 Host 自动重连状态都进入环境摘要或支持包诊断。
+- `session_event_journal::SessionEventJournal` 为所有可投影 ACP 入站消息分配进程级 `streamId`、单调序号和 generation；Host 统一解码 JSON-RPC 与 x.ai 扩展封装，把入站消息归一为 session update、普通通知、未知反向请求、孤儿响应或协议错误。WebView 不再收到原始 wire 行或 rpc id，未知反向请求由 Host 写回 `-32601`，通用 `acp_send` IPC 已删除；
+- 同一 journal 内的 session 投影状态按 generation + session 隔离，为 user/assistant/thinking/tool/plan 分配稳定 block id，并输出 `open/update/close` 操作；前台回合与自动化回合都用自动释放的 Host lease 写入 `turn_started/turn_finished`，因此成功、取消、watchdog、协议失败和任意 `?` 退出都会关闭当前流，下一轮不能续写上一轮 block；
+- `session/load` 在请求前写入 `session_reset`，close/delete 写入 `session_removed`；旧进程代次的迟到事件不能清除新代次投影。AcpBridge 的 `ContentCursor` 已降为只服务 rewind 归档响应的 `ReplayContentCursor`，实时路径不再用 WebView UUID 或 Map 决定 tool/plan/text 身份；
+- Zustand 与 load replay 的 `block_add` 按 Host block id 幂等，Host 事件即使在页面重载后补放也不会追加重复卡片；assistant/thinking 的最终 streaming/live 状态由 Host close 操作收口，而不是依赖页面 Promise 的 finally 猜测当前块；
+- Host 为每个活动 user/assistant/thinking block 保存最多 1 MiB 的累计文本，只在 replay 最后一页返回同一锁截面的 active snapshot；WebView 严格按 `replay(N) → snapshot(N) → buffered(N+1...)` 恢复，游标已推进但应用 journal 尚未落盘时仍能补回正在生成的内容。截断快照只用于缺失块冷启动，不覆盖可能更完整的本地块；活动块数量与字节数进入 RuntimeStatus/支持包；
+- Host 事件不再把 localStorage 游标当作耐久性证明：应用 journal 携带当前 stream 的精确 sequence 集合，`SessionJournalStore` 校验并原子提交后才推进 Host 确认；不同会话、workflow 等其它持久化域和未完成媒体写入不能被一个全局最大游标越过；
+- 补放前通过 Host callback binding 恢复活动或含未确认事件的 session/cwd 壳，并从应用 journal 建立展示基线；已确认事件可安全跳过，未确认事件在基线之上幂等补放。活动块快照携带 `updatedThrough`，快照写入也走同一精确确认链路；
+- 应用 journal 保留 running、streaming/live 和未结算工具事实；只有 Host 活动回合已经消失时才生成 interrupted 门禁。若页面只是重载且 Host 回合仍在，occupancy 会撤销临时中断标记并继续队列与流式恢复；
+- `AutomationRunnerStatus` 持久投影当前 automation/session，页面重载不再依赖一次性 started 广播；活动状态由 reservation 析构清理，异常退出不能把任务永久留在 running；
+- Host 保留 8192 条且最多 16 MiB 的类型化有界补放窗口，超大消息只实时投影并把缺口显式记录为 truncated，不能静默伪装成完整历史；保留预算仍按原 wire 字节计量，避免结构化序列化差异绕过内存上限；
+- WebView 按“先监听、再分页补放、最后合并实时缓冲”的次序消费 `host-session-event`，并以 stream + sequence 去重。页面重载不再依赖不可重放的裸 `acp-event`；游标失配、窗口截断和持久化失败都有稳定错误代码。事件窗口健康状态进入 RuntimeStatus 与支持包；
+- Tauri single-instance 插件作为 Builder 的第一个插件注册；第二次启动只恢复并聚焦现有主窗口，不会再创建另一套 AgentRuntime、AutomationRunner 和进程内仓储锁。因此 draft、queue、automation、worktree ownership 等 Host RMW 不再暴露给两个 Grox 进程并发提交；
+- `host_logging` 将 Host 生命周期、runtime generation、session/turn/block/automation 身份和结构化错误代码写入 stderr 与按日滚动文件；日志目录限制为当前用户，最多保留 8 个文件/32 MiB，panic 另走同步落盘。支持包只收集最多 192 KiB 的脱敏日志尾部，不写入 ACP 正文、Prompt 或凭据值；
+- debug binary 提供在 Tauri 初始化前退出的 mock ACP fixture；集成测试以真实 OS 子进程和 stdin/stdout 驱动交错会话流、坏 JSON、权限反向 RPC、半截 JSON EOF 与门控中异常退出，验证响应关联、EOF 和“不得伪造成功”的边界，而不是只测内存函数；
+- `file_commands` 成为工作区文件打开/定位的领域门面，路径错误、用户操作错误和系统启动失败返回稳定 `HostError`；媒体服务复用其平台动作，但保留自己的 job capability 校验，不再让原始路径 IPC 同时承担授权和执行两种职责；
+
+v0.3.2 的后端职责迁移到此收口：连接、认证、会话执行与恢复、队列、自动化、交互门禁、
+Client callback、持久化、工作树、权限、媒体、密钥、错误和诊断的后台事实都由 Host 持有。
+前端仍保留卡片渲染、节流和编辑态，这是产品投影边界，不是第二套后端状态机。
+
+## 完整后端对照结论
+
+| 领域 | Grox 迁移前 | `grok-app` 可学习点 | Grox 决定 |
+| --- | --- | --- | --- |
+| 组合根 | 9k+ 行 `main.rs` 同时承担命令与业务 | `lib.rs` 组合状态，commands 为薄门面 | 随职责迁移拆模块，不做纯文件搬家 |
+| ACP | Rust 透传 stdio，Bridge 关联请求 | `AcpClient` 在 Host 维护 pending/退出 | 请求归属、退出清算、入站解码、事件补放、UI block 身份/生命周期和活动文本快照已由 Host 持有 |
+| Client callback | Bridge 用当前页面 catalogue 猜 FS cwd；terminal 未宣告 | 未实现能力就不宣告，避免 Agent 挂起 | 文件与完整 terminal 生命周期均由 Host binding epoch 应答，能力已设为 true |
+| 会话 | Bridge + Store 共同裁决 | Host SessionManager + FSM + snapshots | 建立单一 SessionCoordinator |
+| 多会话 | 单进程共享、生命周期门控在前端 | 每应用会话进程、后台 busy 不被抢占 | Host 已按会话隔离生命周期、回合、binding 和流投影；v0.3.2 明确采用一个共享 CLI 进程 |
+| 持久化 | 前端组装完整 JSON，Host 原子写 | store + 锁 + journal 对账 | Host 仓储、tombstone、单调版本和精确事件确认共同约束落盘 |
+| 队列 | Store/localStorage 主导 | Host 运行时可观察 busy/退出 | Host 原子领取/消费/回队，异常退出不重复发送 |
+| 自动化 | Host 已拥有认领、建会话、运行时注册、能力租约、模型/模式、Prompt、崩溃去重与结算；页面只做 started/settled 投影 | runner 复用 SessionManager | 前台与后台共用 SessionCoordinator/turn_runtime，页面登记屏障已删除 |
+| 认证 | WebView 曾持有 authenticate promise、URL 轮询和取消时序 | 单例认证事务、可取消子进程、硬超时、认证后淘汰旧 runtime | `agent_auth` 按 generation 持有 ACP OAuth；页面只 start/cancel/status 并消费事件 |
+| 工作树 | Host 已持久化 session 关联并拥有创建/fork/引用检查/删除事务；旧 localStorage 安全源已删除 | worktree 与 session metadata 绑定、原生复制会话上下文 | 已完成 Host 所有权索引、干净树门禁、失败回滚、目标绑定确认和同名仓库隔离 |
+| 权限/提问 | Host 已按 session + generation 持有反向 RPC、统一权限上限、偏好事务、原生提权确认、scoped option 映射和决定审计；持久 allow cache 仍由 Grok Build 原生 option 负责 | 每会话策略、allow cache、Host resolve | 权限裁决与审计已迁移；后续再扩展项目/会话分层策略，不复制 Agent 的持久规则库 |
+| 媒体 | Host 已持有生成任务、取消、参考图租约、结构化产物授权和跨进程任务 journal（ADR 0004） | token loopback + path scope | Host 恢复有界任务历史，按 job 身份重新授权产物动作，崩溃遗留显式结算，WebView 只投影 |
+| 密钥 | Host SecretStore 已接管供应商密钥，档案与 `.env` 只留非敏感路由元数据（ADR 0005） | OS keychain + 受限文件后备 | 后端类型显式投影，删除墓碑防复活，诊断永不带值 |
+| 错误 | ACP、持久化、权限、媒体与供应商命令共享 HostError 契约 | 稳定 AgentErrorCode | 前端按 protocol/operation/environment 和稳定 code 呈现，不再从文案推断 |
+| 诊断 | support bundle 已有但依赖前端快照 | 日志、运行时、审计集中 | Host runtime/event/log 快照为主，支持包含脱敏原生日志尾部，前端快照只作补充 |
+| 测试 | 工具函数测试多，跨层运行时少 | mock ACP、路由/停机/竞态测试 | 已覆盖真实 mock ACP 子进程、恢复、精确确认、门禁、异常退出和仓储竞态 |
+
+## Consequences
+
+- WebView 刷新或隐藏不再决定任务是否创建、执行或结算，也不会丢失仍在 Host 等待的权限/提问、正在进行的 OAuth 或 Agent terminal；会话关闭和 Host 退出会清理终端进程树。已创建会话但未结算的自动化在租约过期后会标记结果未知并禁止自动重放。完全退出 Grox 进程后调度仍会暂停，这是明确限制。
+- v0.3.2 明确保留一个共享官方 CLI 进程；这是一项已记录的产品容量边界，不是未完成的平行后端。它支持多个 ACP 会话，但不承诺进程级隔离。
+- `AcpBridge` 不再解析 JSON-RPC、x.ai wrapper、回复 Agent 反向 RPC或为实时内容生成 block id；它只把 Host 的类型化 update/operation/snapshot 转换为 UI 卡片。活动流和已关闭历史块都通过应用 journal 的精确耐久确认闭合崩溃窗口。
+- Host 模块会增加，但每次拆分必须伴随职责迁移、测试或不变量，禁止只为了缩短文件。
+- v0.3.2 完成标准不是“看起来像 grok-app”，而是上述十五条不变量可由 Host 与跨层测试证明；该标准已经满足。

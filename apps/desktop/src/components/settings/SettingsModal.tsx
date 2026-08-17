@@ -1,18 +1,26 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { bridge } from "../../bridge";
-import type { ConfigDocument, ProviderApiBackend, ProviderKind } from "../../bridge/types";
+import type { ConfigDocument, ProviderApiBackend, ProviderKind, SecretBackendKind } from "../../bridge/types";
 import { EFFORTS } from "../../bridge/types";
 import { useDesktop } from "../../state/store";
 import { usePreferences } from "../../state/preferences";
 import { useI18n } from "../../lib/i18n";
 import { fmtBillingDate, fmtBillingValue } from "../../lib/format";
+import { formatGroxError, toGroxError } from "../../lib/errorModel";
 import { Icon } from "../fx/Icon";
 import { Wordmark } from "../fx/Wordmark";
 import { ChipSelect } from "../common/ChipSelect";
 import { ConfirmDialog } from "../common/ConfirmDialog";
+import {
+  getSettingsCatalog,
+  isSettingsSection,
+  searchSettings,
+  settingsHash,
+  settingsSectionFromHash,
+  type SettingsSection,
+} from "../../lib/settingsCatalog";
 
-type Section = "general" | "account" | "archives" | "appearance" | "mcp" | "skills" | "plugins" | "hooks";
 type Json = Record<string, unknown>;
 
 const object = (value: unknown): Json =>
@@ -21,35 +29,96 @@ const list = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
 const text = (value: unknown, fallback = "") => (typeof value === "string" ? value : fallback);
 const bool = (value: unknown) => value === true;
 
+const providerErrorText = (cause: unknown) => formatGroxError(toGroxError(cause, {
+  domain: "operation",
+  code: "PROVIDER_OPERATION_FAILED",
+}));
+
+const extensionErrorText = (cause: unknown) => formatGroxError(toGroxError(cause, {
+  domain: "operation",
+  code: "EXTENSION_OPERATION_FAILED",
+}));
+
+function secretBackendLabel(backend: SecretBackendKind, zh: boolean) {
+  switch (backend) {
+    case "keychain": return zh ? "系统凭据库" : "System credential store";
+    case "private_file": return zh ? "私有文件（0600）" : "Private file (0600)";
+    case "legacy_file": return zh ? "旧版明文（待迁移）" : "Legacy plaintext (pending migration)";
+    case "missing": return zh ? "未设置" : "Not configured";
+  }
+}
+
 export function SettingsModal() {
   const { t, language } = useI18n();
   const open = useDesktop((state) => state.settingsOpen);
   const setOpen = useDesktop((state) => state.setSettingsOpen);
-  const [section, setSection] = useState<Section>("general");
+  const [section, setSection] = useState<SettingsSection>(() => settingsSectionFromHash(window.location.hash) ?? "general");
+  const [query, setQuery] = useState("");
+  const wasOpen = useRef(false);
+  const zh = language === "zh-CN";
+  const catalog = useMemo(() => getSettingsCatalog(zh), [zh]);
+  const results = useMemo(() => searchSettings(catalog, query), [catalog, query]);
 
   useEffect(() => {
     const openSection = (event: Event) => {
-      const next = (event as CustomEvent<Section>).detail;
-      if (["general", "account", "archives", "appearance", "mcp", "skills", "plugins", "hooks"].includes(next)) setSection(next);
+      const next = (event as CustomEvent<SettingsSection>).detail;
+      if (isSettingsSection(next)) {
+        setSection(next);
+        setOpen(true);
+      }
     };
     window.addEventListener("grox:settings-section", openSection);
     return () => window.removeEventListener("grox:settings-section", openSection);
-  }, []);
+  }, [setOpen]);
+
+  useEffect(() => {
+    const syncHash = () => {
+      const next = settingsSectionFromHash(window.location.hash);
+      if (next) {
+        setSection(next);
+        setOpen(true);
+      }
+    };
+    syncHash();
+    window.addEventListener("hashchange", syncHash);
+    return () => window.removeEventListener("hashchange", syncHash);
+  }, [setOpen]);
+
+  useEffect(() => {
+    if (!open) return;
+    wasOpen.current = true;
+    window.history.replaceState(null, "", settingsHash(section));
+  }, [open, section]);
+
+  useEffect(() => {
+    if (open || !wasOpen.current || !settingsSectionFromHash(window.location.hash)) return;
+    wasOpen.current = false;
+    window.history.replaceState(null, "", "#/");
+  }, [open]);
+
   if (!open) return null;
 
-  const sections: { id: Section; label: string; icon: React.ComponentProps<typeof Icon>["name"] }[] = [
-    { id: "general", label: t("settings"), icon: "gear" },
-    { id: "account", label: language === "zh-CN" ? "账户与配置" : "Account & config", icon: "user" },
-    { id: "archives", label: language === "zh-CN" ? "归档管理" : "Archive manager", icon: "archive" },
-    { id: "appearance", label: t("appearance"), icon: "sun" },
-    { id: "mcp", label: t("mcp"), icon: "globe" },
-    { id: "skills", label: t("skills"), icon: "bolt" },
-    { id: "plugins", label: `${t("plugins")} / ${t("marketplace")}`, icon: "layers" },
-    { id: "hooks", label: language === "zh-CN" ? "Hooks" : "Hooks", icon: "bolt" },
+  const sections: { id: SettingsSection; label: string; icon: React.ComponentProps<typeof Icon>["name"]; group: "personal" | "extensions" }[] = [
+    { id: "general", label: zh ? "通用" : "General", icon: "gear", group: "personal" },
+    { id: "account", label: zh ? "账户与服务" : "Account & providers", icon: "user", group: "personal" },
+    { id: "appearance", label: t("appearance"), icon: "sun", group: "personal" },
+    { id: "archives", label: zh ? "归档管理" : "Archive manager", icon: "archive", group: "personal" },
+    { id: "mcp", label: t("mcp"), icon: "globe", group: "extensions" },
+    { id: "skills", label: t("skills"), icon: "bolt", group: "extensions" },
+    { id: "plugins", label: `${t("plugins")} / ${t("marketplace")}`, icon: "layers", group: "extensions" },
+    { id: "hooks", label: "Hooks", icon: "bolt", group: "extensions" },
   ];
+
+  const selectSection = (next: SettingsSection) => {
+    setSection(next);
+    setQuery("");
+  };
 
   return (
     <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={zh ? "设置" : "Settings"}
       className="settings-shell fixed inset-0 z-50 flex items-center justify-center bg-void/75 p-5 backdrop-blur-[3px]"
       onMouseDown={() => setOpen(false)}
     >
@@ -57,26 +126,50 @@ export function SettingsModal() {
         className="flex h-[min(820px,92vh)] w-[min(1180px,96vw)] overflow-hidden rounded-[9px] border border-line3 bg-panel shadow-2xl animate-fade-up"
         onMouseDown={(event) => event.stopPropagation()}
       >
-        <nav className="flex w-[210px] shrink-0 flex-col border-r border-line bg-void py-3">
-          <div className="px-4 pb-3"><Wordmark size={11} withMark={false} /></div>
-          {sections.map((item) => (
-            <button key={item.id} onClick={() => setSection(item.id)} className={`flex items-center gap-2 px-4 py-2 text-left font-mono text-[10px] transition-colors ${section === item.id ? "bg-high text-acc" : "text-dim hover:text-fg2"}`}>
-              <Icon name={item.icon} size={11} />
-              <span className="truncate">{item.label}</span>
-            </button>
+        <nav className="flex w-[246px] shrink-0 flex-col border-r border-line bg-void py-3">
+          <div className="px-4 pb-3"><Wordmark size={12} withMark={false} /></div>
+          <label className="mx-3 mb-4 flex h-9 items-center gap-2 rounded-[8px] border border-line2 bg-panel px-3 focus-within:border-line3">
+            <Icon name="search" size={12} className="text-dim" />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={zh ? "搜索设置" : "Search settings"} aria-label={zh ? "搜索设置" : "Search settings"} autoFocus className="min-w-0 flex-1 bg-transparent text-[12px] text-fg outline-none placeholder:text-faint" />
+            {query && <button onClick={() => setQuery("")} aria-label={zh ? "清除搜索" : "Clear search"} className="text-faint hover:text-fg"><Icon name="x" size={10} /></button>}
+          </label>
+          {(["personal", "extensions"] as const).map((group) => (
+            <div key={group} className="mb-3">
+              <p className="px-4 pb-1 text-[10px] font-medium tracking-[0.08em] text-faint">{group === "personal" ? (zh ? "个人" : "PERSONAL") : (zh ? "扩展" : "EXTENSIONS")}</p>
+              {sections.filter((item) => item.group === group).map((item) => (
+                <button key={item.id} aria-current={section === item.id && !query ? "page" : undefined} onClick={() => selectSection(item.id)} className={`flex w-full items-center gap-2.5 px-4 py-2 text-left text-[12px] transition-colors ${section === item.id && !query ? "bg-high text-acc" : "text-dim hover:text-fg2"}`}>
+                  <Icon name={item.icon} size={12} />
+                  <span className="truncate">{item.label}</span>
+                </button>
+              ))}
+            </div>
           ))}
           <div className="flex-1" />
           <button onClick={() => setOpen(false)} className="mx-3 flex h-8 items-center justify-center rounded-[4px] border border-line2 text-[10px] text-mute hover:border-line3 hover:text-fg">{language === "zh-CN" ? "关闭" : "Close"}</button>
         </nav>
         <div className="min-w-0 flex-1 overflow-y-auto p-8">
-          {section === "general" && <General />}
-          {section === "account" && <Account />}
-          {section === "archives" && <ArchiveManager />}
-          {section === "appearance" && <Appearance />}
-          {section === "mcp" && <McpPanel />}
-          {section === "skills" && <SkillsPanel />}
-          {section === "plugins" && <PluginsPanel />}
-          {section === "hooks" && <HooksPanel />}
+          {query ? (
+            <div>
+              <Heading title={zh ? "搜索设置" : "Search settings"} description={zh ? `“${query}”的匹配结果` : `Matches for “${query}”`} />
+              {results.length > 0 ? <div className="space-y-2">{results.map((result) => (
+                <button key={result.id} onClick={() => selectSection(result.section)} className="flex w-full items-center gap-4 rounded-[10px] border border-line2 bg-raise px-4 py-3 text-left hover:border-line3 hover:bg-high">
+                  <div className="min-w-0 flex-1"><p className="text-[13px] text-fg2">{result.label}</p><p className="mt-1 text-[11.5px] text-dim">{result.description}</p></div>
+                  <span className="text-[11px] text-faint">{sections.find((item) => item.id === result.section)?.label} →</span>
+                </button>
+              ))}</div> : <div className="rounded-[10px] border border-dashed border-line2 px-4 py-12 text-center text-[12px] text-dim">{zh ? "没有匹配设置，试试更短的关键词" : "No matching settings. Try a shorter keyword."}</div>}
+            </div>
+          ) : (
+            <>
+              {section === "general" && <General />}
+              {section === "account" && <Account />}
+              {section === "archives" && <ArchiveManager />}
+              {section === "appearance" && <Appearance />}
+              {section === "mcp" && <McpPanel />}
+              {section === "skills" && <SkillsPanel />}
+              {section === "plugins" && <PluginsPanel />}
+              {section === "hooks" && <HooksPanel />}
+            </>
+          )}
         </div>
       </div>
     </div>
@@ -84,15 +177,15 @@ export function SettingsModal() {
 }
 
 function Heading({ title, description }: { title: string; description?: string }) {
-  return <div className="mb-5"><h2 className="text-[15px] font-medium text-fg">{title}</h2>{description && <p className="mt-1 text-[10.5px] leading-relaxed text-dim">{description}</p>}</div>;
+  return <div className="mb-5"><h2 className="text-[18px] font-medium text-fg">{title}</h2>{description && <p className="mt-1 text-[12px] leading-relaxed text-dim">{description}</p>}</div>;
 }
 
 function Row({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
-  return <div className="flex items-center justify-between border-b border-line py-3"><div className="min-w-0 pr-4"><p className="text-[11.5px] text-fg2">{label}</p>{hint && <p className="mt-0.5 text-[10px] text-dim">{hint}</p>}</div><div className="shrink-0">{children}</div></div>;
+  return <div className="flex items-center justify-between border-b border-line py-3.5"><div className="min-w-0 pr-4"><p className="text-[13px] text-fg2">{label}</p>{hint && <p className="mt-0.5 text-[11.5px] leading-relaxed text-dim">{hint}</p>}</div><div className="shrink-0">{children}</div></div>;
 }
 
-function Toggle({ on, onChange, disabled = false }: { on: boolean; onChange(value: boolean): void; disabled?: boolean }) {
-  return <button disabled={disabled} onClick={() => onChange(!on)} className={`relative h-[18px] w-8 rounded-full border transition-colors disabled:opacity-40 ${on ? "border-acc-dim bg-acc-wash" : "border-line3 bg-high"}`}><span className={`absolute top-[2px] h-[12px] w-[12px] rounded-full transition-all ${on ? "left-[16px] bg-acc" : "left-[2px] bg-dim"}`} /></button>;
+function Toggle({ on, onChange, label, disabled = false }: { on: boolean; onChange(value: boolean): void; label: string; disabled?: boolean }) {
+  return <button type="button" role="switch" aria-checked={on} aria-label={label} disabled={disabled} onClick={() => onChange(!on)} className={`relative h-[18px] w-8 rounded-full border transition-colors disabled:opacity-40 ${on ? "border-acc-dim bg-acc-wash" : "border-line3 bg-high"}`}><span className={`absolute top-[2px] h-[12px] w-[12px] rounded-full transition-all ${on ? "left-[16px] bg-acc" : "left-[2px] bg-dim"}`} /></button>;
 }
 
 function ActionButton({ children, onClick, tone = "normal", disabled = false }: { children: React.ReactNode; onClick(): void; tone?: "normal" | "danger" | "accent"; disabled?: boolean }) {
@@ -106,21 +199,13 @@ function Input({ value, onChange, placeholder, type = "text" }: { value: string;
 function HooksPanel() {
   const { language } = useI18n();
   const zh = language === "zh-CN";
-  const [enabled, setEnabled] = useState<Record<string, boolean>>(() => {
-    try { return JSON.parse(localStorage.getItem("grox.hooks") ?? "{}") as Record<string, boolean>; } catch { return {}; }
-  });
   const hooks = [
     ["session.start", zh ? "任务开始时初始化上下文" : "Initialize context when a mission starts"],
     ["tool.before", zh ? "工具调用前检查权限与参数" : "Check permissions and arguments before tools"],
     ["tool.after", zh ? "工具完成后记录结果摘要" : "Record a compact result after tools"],
     ["session.stop", zh ? "任务结束时整理产物与日志" : "Collect artifacts and logs when done"],
   ];
-  const toggle = (id: string) => setEnabled((current) => {
-    const next = { ...current, [id]: !current[id] };
-    localStorage.setItem("grox.hooks", JSON.stringify(next));
-    return next;
-  });
-  return <div><Heading title="Hooks" description={zh ? "管理 Grok Build 生命周期钩子。开关会保存到本机，并在下一次任务启动时生效。" : "Manage Grok Build lifecycle hooks. Changes are stored locally and apply to the next mission."} /><div className="space-y-2">{hooks.map(([id, description]) => <div key={id} className="flex items-center gap-3 rounded-[6px] border border-line2 bg-raise px-3 py-3"><Icon name="bolt" size={12} className={enabled[id] ? "text-gold" : "text-faint"} /><div className="min-w-0 flex-1"><p className="font-mono text-[10.5px] text-fg2">{id}</p><p className="mt-0.5 text-[10px] text-dim">{description}</p></div><Toggle on={Boolean(enabled[id])} onChange={() => toggle(id)} /></div>)}</div><div className="mt-5 rounded-[5px] border border-gold/20 bg-gold/5 px-3 py-2 text-[10px] leading-relaxed text-dim">{zh ? "提示：Hooks 与 Plugin、Skills、MCP 共用 Grok Build 扩展目录；启用后无需额外服务。" : "Hooks share the Grok Build extension directory with Plugins, Skills, and MCP; no extra service is required."}</div></div>;
+  return <div><Heading title="Hooks" description={zh ? "预览 Grok Build 生命周期钩子入口。" : "Preview Grok Build lifecycle hook entry points."} /><div role="status" className="mb-4 rounded-[5px] border border-gold/30 bg-gold/5 px-3 py-2 text-[10px] leading-relaxed text-gold">{zh ? "运行时尚未接入，本版本仅展示、不生效。" : "Runtime integration is not available yet. These controls are display-only in this version."}</div><div className="space-y-2">{hooks.map(([id, description]) => <div key={id} className="flex items-center gap-3 rounded-[6px] border border-line2 bg-raise px-3 py-3 opacity-70"><Icon name="bolt" size={12} className="text-faint" /><div className="min-w-0 flex-1"><p className="font-mono text-[10.5px] text-fg2">{id}</p><p className="mt-0.5 text-[10px] text-dim">{description}</p></div><Toggle label={id} on={false} disabled onChange={() => {}} /></div>)}</div></div>;
 }
 
 function SecretInput({ value, onChange, hidden, onToggle, placeholder }: { value: string; onChange(value: string): void; hidden: boolean; onToggle(): void; placeholder?: string }) {
@@ -176,9 +261,9 @@ function General() {
         aria-label={zh ? "权限模式" : "Permission mode"}
       />
     </Row>
-    <Row label="Computer Use" hint={zh ? "写入本机 host_prefs（主机权威）。关闭后无法仅靠 localStorage 重开。与 Bypass 互斥；变更后需新建或重新加载会话。" : "Persists to host_prefs (host authority). localStorage alone cannot re-open after host off. Mutually exclusive with Bypass; reload session after change."}><Toggle on={computerUse} onChange={setComputerUse} /></Row>
-    <Row label="Browser Use" hint={zh ? "默认开启。提供打开 URL 与本机 Chrome/Edge 无头截图 MCP；变更后需新建或重新加载会话。" : "On by default. Mounts URL open + headless Chrome/Edge screenshot MCP. Reload or create a session after changing."}><Toggle on={browserUse} onChange={setBrowserUse} /></Row>
-    <Row label={zh ? "桌面通知" : "Desktop notifications"} hint={zh ? "窗口在后台时，权限批准与问答会弹出系统通知。" : "When Grox is in the background, permission and question prompts raise OS notifications."}><Toggle on={desktopNotify} onChange={(on) => { localStorage.setItem("grox.desktopNotify", on ? "1" : "0"); setDesktopNotify(on); if (on) void import("../../lib/notify").then((module) => module.ensureNotifyPermission()); }} /></Row>
+    <Row label="Computer Use" hint={zh ? "写入本机 host_prefs（主机权威）。关闭后无法仅靠 localStorage 重开。与 Bypass 互斥；变更后需新建或重新加载会话。" : "Persists to host_prefs (host authority). localStorage alone cannot re-open after host off. Mutually exclusive with Bypass; reload session after change."}><Toggle label="Computer Use" on={computerUse} onChange={setComputerUse} /></Row>
+    <Row label="Browser Use" hint={zh ? "默认开启。提供打开 URL 与本机 Chrome/Edge 无头截图 MCP；变更后需新建或重新加载会话。" : "On by default. Mounts URL open + headless Chrome/Edge screenshot MCP. Reload or create a session after changing."}><Toggle label="Browser Use" on={browserUse} onChange={setBrowserUse} /></Row>
+    <Row label={zh ? "桌面通知" : "Desktop notifications"} hint={zh ? "窗口在后台时，权限批准与问答会弹出系统通知。" : "When Grox is in the background, permission and question prompts raise OS notifications."}><Toggle label={zh ? "桌面通知" : "Desktop notifications"} on={desktopNotify} onChange={(on) => { localStorage.setItem("grox.desktopNotify", on ? "1" : "0"); setDesktopNotify(on); if (on) void import("../../lib/notify").then((module) => module.ensureNotifyPermission()); }} /></Row>
   </div>;
 }
 
@@ -269,6 +354,7 @@ function Account() {
   const refresh = useDesktop((state) => state.refreshAccount);
   const openSetup = useDesktop((state) => state.setAccountSetupOpen);
   const logout = useDesktop((state) => state.logout);
+  const [actionError, setActionError] = useState("");
   return <div>
     <Heading title={zh ? "账户与配置" : "Account & configuration"} description={zh ? "身份、模型服务与 Grok 本地配置集中在这里管理。OAuth 目录实时跟随 Grok，API 模式由你控制端点与常驻模型。" : "Manage identity, model providers, and local Grok configuration in one place. OAuth follows Grok live; API modes keep endpoints and the resident model under your control."} />
     <div className="rounded-[6px] border border-line2 bg-raise p-4">
@@ -278,10 +364,11 @@ function Account() {
         <Metric label={zh ? "周期结束" : "Period ends"} value={fmtBillingDate(billing?.periodEnd, language)} />
         <Metric label={zh ? "按量上限" : "On-demand cap"} value={fmtBillingValue(billing?.onDemandCap)} />
         <Metric label={zh ? "预付余额" : "Prepaid balance"} value={fmtBillingValue(billing?.prepaidBalance)} />
-      </> : <><Metric label={zh ? "API 密钥" : "API key"} value={provider.hasApiKey ? (zh ? "已安全保存" : "Stored securely") : (zh ? "未设置" : "Not configured")} /><Metric label={zh ? "可用模型" : "Available models"} value={`${models.length}`} /></>}</div>
+      </> : <><Metric label={zh ? "密钥存储" : "Secret storage"} value={secretBackendLabel(provider.secretBackend, zh)} /><Metric label={zh ? "可用模型" : "Available models"} value={`${models.length}`} /></>}</div>
       {provider.kind === "oauth" && <p className="mt-3 text-[10px] leading-relaxed text-dim">{billing?.creditUsagePercent !== undefined ? (zh ? `订阅额度已使用 ${Math.round(billing.creditUsagePercent)}%。` : `${Math.round(billing.creditUsagePercent)}% of plan quota used.`) : (zh ? "Grok Build 当前未公开五小时或订阅剩余额度；这里展示 CLI 实际返回的订阅周期与按量额度。" : "Grok Build does not currently expose five-hour or remaining subscription quota; the values above are the billing data actually returned by the CLI.")}</p>}
     </div>
-    <div className="mt-3 flex gap-2">{provider.kind === "oauth" && !account?.authenticated && <ActionButton tone="accent" onClick={() => openSetup(true)}>{t("login")}</ActionButton>}{provider.kind === "oauth" && account?.authenticated && <ActionButton tone="danger" onClick={() => void logout()}>{t("logout")}</ActionButton>}<ActionButton onClick={() => void invoke("open_external", { url: "https://grok.com/supergrok?referrer=grok-build" })}>{t("upgrade")}</ActionButton></div>
+    <div className="mt-3 flex gap-2">{provider.kind === "oauth" && !account?.authenticated && <ActionButton tone="accent" onClick={() => openSetup(true)}>{t("login")}</ActionButton>}{provider.kind === "oauth" && account?.authenticated && <ActionButton tone="danger" onClick={() => { setActionError(""); void logout().catch((cause) => setActionError(providerErrorText(cause))); }}>{t("logout")}</ActionButton>}<ActionButton onClick={() => { setActionError(""); void invoke("open_external", { url: "https://grok.com/supergrok?referrer=grok-build" }).catch((cause) => setActionError(providerErrorText(cause))); }}>{t("upgrade")}</ActionButton></div>
+    {actionError && <p role="alert" className="mt-2 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{actionError}</p>}
     <ProviderAndModels />
     <div className="mt-8 border-t border-line pt-6"><ConfigDocumentsPanel /></div>
   </div>;
@@ -309,7 +396,7 @@ function ProviderAndModels() {
   const [editingProfileId, setEditingProfileId] = useState<string | undefined>();
   const [profileName, setProfileName] = useState("");
   const [apiKey, setApiKey] = useState("");
-  const [apiKeyHidden, setApiKeyHidden] = useState(false);
+  const [apiKeyHidden, setApiKeyHidden] = useState(true);
   const [baseUrl, setBaseUrl] = useState(provider.kind === "compatible" ? "" : (provider.baseUrl ?? ""));
   const [allowInsecureHttp, setAllowInsecureHttp] = useState(false);
   const [apiBackend, setApiBackend] = useState<ProviderApiBackend>("auto");
@@ -319,6 +406,7 @@ function ProviderAndModels() {
   const [modelQuery, setModelQuery] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [confirmingProfile, setConfirmingProfile] = useState<{ id: string; name: string } | null>(null);
 
   useEffect(() => {
     setKind(provider.kind);
@@ -347,7 +435,7 @@ function ProviderAndModels() {
     setEditingProfileId(undefined);
     setProfileName("");
     setApiKey("");
-    setApiKeyHidden(false);
+    setApiKeyHidden(true);
     setBaseUrl("");
     setAllowInsecureHttp(false);
     setApiBackend("auto");
@@ -366,7 +454,7 @@ function ProviderAndModels() {
     setKind(next);
     setEditingProfileId(undefined);
     setApiKey("");
-    setApiKeyHidden(false);
+    setApiKeyHidden(true);
     setBaseUrl("");
     setAllowInsecureHttp(false);
     setAvailableModels([]);
@@ -405,7 +493,7 @@ function ProviderAndModels() {
       }
       setBusy(false);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(providerErrorText(cause));
       setBusy(false);
     }
   };
@@ -422,7 +510,7 @@ function ProviderAndModels() {
         setAvailableModels(discovered);
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(providerErrorText(cause));
     } finally {
       setBusy(false);
     }
@@ -437,14 +525,15 @@ function ProviderAndModels() {
       if (editingProfileId === id) startNewProfile();
       setError("");
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      setError(providerErrorText(cause));
+      throw cause;
     } finally {
       setBusy(false);
     }
   };
 
   return <div className="mt-7" data-testid="provider-manager">
-    <div className="mb-4 flex items-end justify-between"><div><h3 className="text-[15px] font-medium text-fg">{zh ? "模型服务" : "Model provider"}</h3><p className="mt-1 text-[11.5px] leading-relaxed text-dim">{zh ? "供应商或模型切换会等待当前请求完成，再重连后台 Grok Build ACP；运行中的请求始终保持原供应商与原模型。密钥仅保存在本机原生层，不会回传到 WebView。" : "Provider and model changes wait for the current request to finish before reconnecting Grok Build ACP; an active request always keeps its original provider and model. Keys stay in the native layer and are never returned to the WebView."}</p></div><span className="chip">{provider.kind.toUpperCase()}</span></div>
+    <div className="mb-4 flex items-end justify-between"><div><h3 className="text-[15px] font-medium text-fg">{zh ? "模型服务" : "Model provider"}</h3><p className="mt-1 text-[11.5px] leading-relaxed text-dim">{zh ? "供应商或模型切换会等待当前请求完成，再重连后台 Grok Build ACP；运行中的请求始终保持原供应商与原模型。Host 优先使用系统凭据库，平台不可用时明确降级为 0600 私有文件；真实密钥不会写入供应商档案、.env 或回传 WebView。" : "Provider and model changes wait for the current request before reconnecting Grok Build ACP. The Host prefers the system credential store and explicitly falls back to a 0600 private file; literal keys are never written to provider profiles or .env, nor returned to the WebView."}</p></div><span className="chip">{provider.kind.toUpperCase()}</span></div>
     <div className="grid grid-cols-3 gap-2">
       {(["oauth", "official", "compatible"] as ProviderKind[]).map((item) => <button key={item} onClick={() => selectProviderKind(item)} className={`min-w-0 rounded-[5px] border px-3 py-2.5 text-left transition-colors ${kind === item ? "border-acc-dim bg-acc-wash" : "border-line2 bg-raise hover:border-line3"}`}><Icon name={item === "oauth" ? "user" : item === "official" ? "bolt" : "globe"} size={12} className={kind === item ? "text-acc" : "text-dim"} /><p className="mt-2 truncate font-mono text-[9.5px] text-fg2">{item === "oauth" ? t("oauth") : item === "official" ? t("officialApi") : t("compatibleApi")}</p></button>)}
     </div>
@@ -453,8 +542,8 @@ function ProviderAndModels() {
         <div className="mb-2 flex items-center justify-between px-1"><span className="lbl !text-[8.5px]">{zh ? "供应商" : "PROVIDERS"}</span><span className="tnum text-[8.5px] text-faint">{profiles.length}</span></div>
         <button onClick={startNewProfile} className={`mb-2 flex h-8 items-center gap-2 rounded-[4px] border px-2 font-mono text-[9px] transition-colors ${editingProfileId === undefined ? "border-acc-dim bg-acc-wash text-acc" : "border-line2 text-dim hover:border-line3 hover:text-fg"}`}><Icon name="plus" size={10} /><span className="truncate">{zh ? "新建供应商" : "NEW PROVIDER"}</span></button>
         <div className="min-h-0 flex-1 space-y-1.5 overflow-y-auto pr-0.5">{profiles.map((profile) => <div key={profile.id} className={`group rounded-[5px] border px-3 py-2.5 transition-colors ${editingProfileId === profile.id ? "border-acc-dim bg-acc-wash" : "border-transparent bg-high/45 hover:border-line2"}`}>
-          <button onClick={() => editProfile(profile.id)} className="block w-full min-w-0 text-left"><span className="flex items-center gap-2"><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${activeProfileId === profile.id ? "bg-acc" : "bg-faint"}`} /><span className="min-w-0 flex-1 truncate text-[11px] font-medium text-fg2" title={profile.name}>{profile.name}</span></span><span className="mt-1.5 block truncate pl-3.5 font-mono text-[9px] text-faint" title={profile.baseUrl}>{profile.baseUrl.replace(/^https?:\/\//, "")}</span></button>
-          <div className="mt-2 flex items-center justify-end gap-3 border-t border-line/70 pt-2">{activeProfileId === profile.id ? <span className="mr-auto font-mono text-[9px] text-acc">{providerSwitching ? (zh ? "等待本轮完成…" : "WAITING FOR TURN…") : (zh ? "使用中" : "ACTIVE")}</span> : <button disabled={providerSwitching} onClick={() => void activateProfile(profile.id).catch((cause) => setError(cause instanceof Error ? cause.message : String(cause)))} className="mr-auto font-mono text-[9.5px] text-acc hover:text-fg disabled:opacity-40">{zh ? "切换" : "USE"}</button>}<button onClick={() => editProfile(profile.id)} className="font-mono text-[9.5px] text-dim hover:text-fg">{zh ? "编辑" : "EDIT"}</button><button disabled={busy || providerSwitching} onClick={() => void removeProfile(profile.id, profile.name)} className="flex items-center gap-1 font-mono text-[9.5px] text-faint hover:text-red disabled:opacity-40" title={zh ? "删除" : "Delete"}><Icon name="trash" size={10} />{zh ? "删除" : "DELETE"}</button></div>
+          <button onClick={() => editProfile(profile.id)} className="block w-full min-w-0 text-left"><span className="flex items-center gap-2"><span className={`h-1.5 w-1.5 shrink-0 rounded-full ${activeProfileId === profile.id ? "bg-acc" : "bg-faint"}`} /><span className="min-w-0 flex-1 truncate text-[11px] font-medium text-fg2" title={profile.name}>{profile.name}</span></span><span className="mt-1.5 block truncate pl-3.5 font-mono text-[9px] text-faint" title={profile.baseUrl}>{profile.baseUrl.replace(/^https?:\/\//, "")}</span><span className="mt-1 block truncate pl-3.5 font-mono text-[8px] text-faint">{secretBackendLabel(profile.secretBackend, zh)}</span></button>
+          <div className="mt-2 flex items-center justify-end gap-3 border-t border-line/70 pt-2">{activeProfileId === profile.id ? <span className="mr-auto font-mono text-[9px] text-acc">{providerSwitching ? (zh ? "等待本轮完成…" : "WAITING FOR TURN…") : (zh ? "使用中" : "ACTIVE")}</span> : <button disabled={providerSwitching} onClick={() => void activateProfile(profile.id).catch((cause) => setError(providerErrorText(cause)))} className="mr-auto font-mono text-[9.5px] text-acc hover:text-fg disabled:opacity-40">{zh ? "切换" : "USE"}</button>}<button onClick={() => editProfile(profile.id)} className="font-mono text-[9.5px] text-dim hover:text-fg">{zh ? "编辑" : "EDIT"}</button><button disabled={busy || providerSwitching} onClick={() => setConfirmingProfile({ id: profile.id, name: profile.name })} className="flex items-center gap-1 font-mono text-[9.5px] text-faint hover:text-red disabled:opacity-40" title={zh ? "删除" : "Delete"}><Icon name="trash" size={10} />{zh ? "删除" : "DELETE"}</button></div>
         </div>)}</div>
       </aside>}
       <div className={kind === "compatible" ? "min-w-0 p-4" : "rounded-[6px] border border-line2 bg-raise p-3"}>
@@ -462,8 +551,8 @@ function ProviderAndModels() {
         {kind === "compatible" && <label className="block"><span className="lbl !text-[9px]">{zh ? "供应商名称" : "PROVIDER NAME"}</span><Input value={profileName} onChange={setProfileName} placeholder={zh ? "例如：公司中转 / OpenRouter" : "e.g. Company gateway / OpenRouter"} /></label>}
         <label className="block"><span className="lbl !text-[9px]">API KEY</span><SecretInput value={apiKey} onChange={(value) => { setApiKey(value); if (kind === "compatible") setAvailableModels([]); }} hidden={apiKeyHidden} onToggle={() => setApiKeyHidden((value) => !value)} placeholder={editingProfileId && profiles.find((item) => item.id === editingProfileId)?.hasApiKey ? (zh ? "已保存 · 留空则保持原密钥" : "Saved · leave blank to keep") : "xai-…"} /></label>
         {kind === "official" ? <div><span className="lbl !text-[9px]">BASE URL</span><div className="h-8 rounded-[4px] border border-line bg-void px-2.5 font-mono text-[10px] leading-8 text-dim">https://api.x.ai/v1</div></div> : <label className="block"><span className="lbl !text-[9px]">BASE URL</span><Input value={baseUrl} onChange={(value) => { setBaseUrl(value); setAvailableModels([]); setResidentModels([]); }} placeholder="https://example.com/v1" /></label>}
-        {kind === "compatible" && <label className="block"><span className="lbl !text-[9px]">API BACKEND</span><ChipSelect variant="field" menuPlacement="down" fullWidth activeId={apiBackend} label={apiBackend === "auto" ? (zh ? "自动识别" : "Auto detect") : apiBackend === "responses" ? "Responses API" : "Chat Completions"} items={[{ id: "auto", label: zh ? "自动识别" : "Auto detect", hint: zh ? "标准服务默认 Chat Completions，已知 Responses 网关自动匹配" : "Chat Completions by default; known Responses gateways are detected" }, { id: "chat_completions", label: "Chat Completions", hint: "/chat/completions" }, { id: "responses", label: "Responses API", hint: "/responses" }]} onSelect={(id) => setApiBackend(id as ProviderApiBackend)} aria-label={zh ? "API 请求协议" : "API backend"} /></label>}
-        {kind === "compatible" && <div className={`col-span-2 flex items-start gap-3 rounded-[5px] border px-3 py-2.5 ${allowInsecureHttp ? "border-gold/45 bg-gold/5" : "border-line bg-void/60"}`}><Toggle on={allowInsecureHttp} onChange={setAllowInsecureHttp} /><button type="button" className="min-w-0 flex-1 text-left" onClick={() => setAllowInsecureHttp((value) => !value)}><span className={`block font-mono text-[9.5px] ${allowInsecureHttp ? "text-gold" : "text-fg2"}`}>{zh ? "允许远程 HTTP（不安全）" : "ALLOW REMOTE HTTP (INSECURE)"}</span><span className="mt-1 block text-[9.5px] leading-relaxed text-dim">{zh ? "仅用于无法提供 HTTPS 的可信中转；API Key 与请求内容会以明文经过网络。云元数据和链路本地地址仍会被拒绝。" : "Only for trusted gateways that cannot provide HTTPS. API keys and prompts travel in plaintext; metadata and link-local targets remain blocked."}</span></button></div>}
+        {kind === "compatible" && <label className="block"><span className="lbl !text-[9px]">API BACKEND</span><ChipSelect variant="field" menuPlacement="down" fullWidth activeId={apiBackend} label={apiBackend === "auto" ? (zh ? "自动识别" : "Auto detect") : apiBackend === "responses" ? "Responses API" : "Chat Completions"} items={[{ id: "auto", label: zh ? "自动识别" : "Auto detect", hint: zh ? "默认 Chat Completions；Responses 网关请明确选择" : "Defaults to Chat Completions; select Responses explicitly when required" }, { id: "chat_completions", label: "Chat Completions", hint: "/chat/completions" }, { id: "responses", label: "Responses API", hint: "/responses" }]} onSelect={(id) => setApiBackend(id as ProviderApiBackend)} aria-label={zh ? "API 请求协议" : "API backend"} /></label>}
+        {kind === "compatible" && <div className={`col-span-2 flex items-start gap-3 rounded-[5px] border px-3 py-2.5 ${allowInsecureHttp ? "border-gold/45 bg-gold/5" : "border-line bg-void/60"}`}><Toggle label={zh ? "允许远程 HTTP（不安全）" : "Allow remote HTTP (insecure)"} on={allowInsecureHttp} onChange={setAllowInsecureHttp} /><button type="button" className="min-w-0 flex-1 text-left" onClick={() => setAllowInsecureHttp((value) => !value)}><span className={`block font-mono text-[9.5px] ${allowInsecureHttp ? "text-gold" : "text-fg2"}`}>{zh ? "允许远程 HTTP（不安全）" : "ALLOW REMOTE HTTP (INSECURE)"}</span><span className="mt-1 block text-[9.5px] leading-relaxed text-dim">{zh ? "仅用于无法提供 HTTPS 的可信中转；API Key 与请求内容会以明文经过网络。云元数据和链路本地地址仍会被拒绝。" : "Only for trusted gateways that cannot provide HTTPS. API keys and prompts travel in plaintext; metadata and link-local targets remain blocked."}</span></button></div>}
         {kind === "compatible" && <p className="col-span-2 rounded-[4px] border border-line bg-void/60 px-2.5 py-2 text-[9.5px] leading-relaxed text-dim">{zh ? "Grox 只把真实 Key 注入当前 ACP 子进程，并为当前模型与标题别名写入可恢复的 env_key、base_url 和所选 API 协议；切走供应商时原样恢复用户配置。" : "Grox injects the literal key only into the active ACP child and applies reversible env_key, base_url, and API backend overrides for the selected models and title alias."}</p>}
       </div>
       {kind === "compatible" && <div className="mt-4 grid grid-cols-2 gap-3 border-t border-line pt-4">
@@ -502,6 +591,18 @@ function ProviderAndModels() {
       />
       <p className="mt-2 text-[9.5px] leading-relaxed text-dim">{zh ? "该选择会持久保存，并作为新任务及后续请求的默认模型；若目录移除该模型，会自动回退到 Grok 当前可用模型。" : "This choice persists for new missions and later turns. If the catalog removes it, Grox falls back to an available Grok model."}</p>
     </div>
+    {confirmingProfile && <ConfirmDialog
+      title={zh ? "删除供应商？" : "Delete provider?"}
+      description={zh ? `将删除“${confirmingProfile.name}”的配置和本机保存的密钥。` : `This removes “${confirmingProfile.name}” and its locally stored secret.`}
+      confirmLabel={zh ? "删除供应商" : "Delete provider"}
+      cancelLabel={zh ? "取消" : "Cancel"}
+      workingLabel={zh ? "删除中" : "Deleting"}
+      onCancel={() => setConfirmingProfile(null)}
+      onConfirm={async () => {
+        await removeProfile(confirmingProfile.id, confirmingProfile.name);
+        setConfirmingProfile(null);
+      }}
+    />}
   </div>;
 }
 
@@ -547,34 +648,47 @@ function Appearance() {
       </div>
     </Row>
     <Row label={uiLanguage === "zh-CN" ? "字体粗细" : "Font weight"} hint={uiLanguage === "zh-CN" ? "建议 400 以获得更清晰的 WebView 渲染。" : "400 is usually sharpest in WebView2."}><RangeControl value={fontWeight} min={400} max={700} step={25} display={String(fontWeight)} onChange={setFontWeight} label={uiLanguage === "zh-CN" ? "字体粗细" : "Font weight"} /></Row>
-    <Row label={uiLanguage === "zh-CN" ? "减少动态效果" : "Reduce motion"} hint={uiLanguage === "zh-CN" ? "停用轨道动画和进入过渡。" : "Disable orbital animations and entrance transitions."}><Toggle on={reduceMotion} onChange={updateMotion} /></Row>
+    <Row label={uiLanguage === "zh-CN" ? "减少动态效果" : "Reduce motion"} hint={uiLanguage === "zh-CN" ? "停用轨道动画和进入过渡。" : "Disable orbital animations and entrance transitions."}><Toggle label={uiLanguage === "zh-CN" ? "减少动态效果" : "Reduce motion"} on={reduceMotion} onChange={updateMotion} /></Row>
   </div>;
 }
 
-function Choice({ active, onClick, children }: { active: boolean; onClick(): void; children: React.ReactNode }) { return <button onClick={onClick} className={`flex h-8 items-center gap-1.5 rounded-[4px] border px-3 font-mono text-[9.5px] ${active ? "border-acc-dim bg-acc-wash text-acc" : "border-line2 text-dim"}`}>{children}</button>; }
+function Choice({ active, onClick, children }: { active: boolean; onClick(): void; children: React.ReactNode }) { return <button aria-pressed={active} onClick={onClick} className={`flex h-8 items-center gap-1.5 rounded-[4px] border px-3 font-mono text-[9.5px] ${active ? "border-acc-dim bg-acc-wash text-acc" : "border-line2 text-dim"}`}>{children}</button>; }
 
 function RangeControl({ value, min, max, step, display, label, onChange }: { value: number; min: number; max: number; step: number; display: string; label: string; onChange(value: number): void }) {
   return <div className="w-[260px]"><div className="mb-1 flex items-center justify-between font-mono text-[9.5px] text-faint"><span>{min}</span><output className="rounded-[3px] border border-line2 bg-void px-2 py-0.5 text-acc">{display}</output><span>{max}</span></div><input aria-label={label} className="grox-range block w-full appearance-none bg-transparent" type="range" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} /></div>;
 }
 
-function useExtension<T>(loader: () => Promise<T>, dependencies: unknown[]) {
+export function useExtension<T>(loader: () => Promise<T>, dependencies: unknown[]) {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const [version, setVersion] = useState(0);
-  useEffect(() => { let live = true; setError(null); void loader().then((value) => live && setData(value)).catch((cause) => live && setError(cause instanceof Error ? cause.message : String(cause))); return () => { live = false; }; }, [...dependencies, version]);
-  return { data, error, reload: () => setVersion((value) => value + 1) };
+  useEffect(() => {
+    let live = true;
+    setData(null);
+    setError(null);
+    setLoading(true);
+    void loader()
+      .then((value) => { if (live) setData(value); })
+      .catch((cause) => { if (live) setError(extensionErrorText(cause)); })
+      .finally(() => { if (live) setLoading(false); });
+    return () => { live = false; };
+  }, [...dependencies, version]);
+  return { data, error, loading, reload: () => setVersion((value) => value + 1) };
 }
 
-function ExtensionState({ error, empty }: { error: string | null; empty: string }) { return error ? <p className="rounded-[5px] border border-red/30 bg-red/5 p-3 text-[10px] text-red">{error}</p> : <p className="rounded-[5px] border border-line bg-raise p-5 text-center text-[10px] text-dim">{empty}</p>; }
+function ExtensionState({ error, empty, loading = false }: { error: string | null; empty: string; loading?: boolean }) { return error ? <p role="alert" className="rounded-[5px] border border-red/30 bg-red/5 p-3 text-[10px] text-red">{error}</p> : <p className="rounded-[5px] border border-line bg-raise p-5 text-center text-[10px] text-dim">{loading ? "…" : empty}</p>; }
 
 function McpPanel() {
   const { t, language } = useI18n();
   const zh = language === "zh-CN";
   const sessionId = useDesktop((state) => state.activeId);
   const [name, setName] = useState(""); const [endpoint, setEndpoint] = useState(""); const [kind, setKind] = useState<"http" | "stdio">("http");
+  const [confirmingServer, setConfirmingServer] = useState<string | null>(null);
+  const [actionError, setActionError] = useState("");
   const state = useExtension(async () => object(await bridge.callExtension("x.ai/mcp/list", { ...(sessionId ? { sessionId } : {}), cache: false })), [sessionId]);
   const servers = list(state.data?.servers).map(object);
-  const action = async (method: string, params: Json) => { if (!sessionId) throw new Error(zh ? "请先打开一个项目任务，以便 Grok Build 创建运行时上下文。" : "Open a project mission first so Grok Build can create its runtime context."); await bridge.callExtension(method, { session_id: sessionId, ...params }); state.reload(); };
+  const action = async (method: string, params: Json) => { setActionError(""); try { if (!sessionId) throw new Error(zh ? "请先打开一个项目任务，以便 Grok Build 创建运行时上下文。" : "Open a project mission first so Grok Build can create its runtime context."); await bridge.callExtension(method, { session_id: sessionId, ...params }); state.reload(); } catch (cause) { setActionError(extensionErrorText(cause)); throw cause; } };
   const add = async () => { if (!name.trim() || !endpoint.trim()) return; await action("x.ai/mcp/upsert", { server_name: name.trim(), ...(kind === "http" ? { type: "http", url: endpoint.trim(), enabled: true } : { command: endpoint.trim(), args: [], enabled: true }) }); setName(""); setEndpoint(""); };
   return <div><Heading title={t("mcp")} description={zh ? "直接读写 Grok Build 的 MCP 配置；启停和删除会同步到 config.toml。" : "Manage Grok Build MCP configuration directly; toggles and deletions sync to config.toml."} />
     <div className="mb-4 grid grid-cols-[120px_1fr_110px_auto] items-center gap-2">
@@ -594,40 +708,123 @@ function McpPanel() {
         onSelect={(id) => setKind(id as typeof kind)}
         aria-label={zh ? "MCP 类型" : "MCP kind"}
       />
-      <ActionButton tone="accent" disabled={!sessionId} onClick={() => void add()}>{t("add")}</ActionButton>
+      <ActionButton tone="accent" disabled={!sessionId || !name.trim() || !endpoint.trim()} onClick={() => void add().catch(() => {})}>{t("add")}</ActionButton>
     </div>
-    {servers.length === 0 ? <ExtensionState error={state.error} empty={zh ? "尚未配置 MCP Server" : "No MCP servers configured"} /> : <div className="space-y-2">{servers.map((server) => { const session = object(server.session); const enabled = bool(session.enabled); const serverName = text(server.name); return <div key={serverName} className="flex items-center gap-3 rounded-[5px] border border-line2 bg-raise p-3"><Icon name="globe" size={13} className="text-mute" /><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-fg2">{text(server.displayName, serverName)}</p><p className="truncate font-mono text-[9.5px] text-dim">{text(server.url) || text(server.command) || text(server.sourceLabel)}</p></div><span className="font-mono text-[9.5px] text-faint">{text(session.status).toUpperCase()}</span><Toggle on={enabled} disabled={!sessionId} onChange={(value) => void action("x.ai/mcp/toggle", { server_name: serverName, enabled: value })} />{text(server.source) === "local" && <ActionButton tone="danger" disabled={!sessionId} onClick={() => void action("x.ai/mcp/delete", { server_name: serverName })}>{t("delete")}</ActionButton>}</div>; })}</div>}
+    {servers.length === 0 ? <ExtensionState error={state.error} loading={state.loading} empty={zh ? "尚未配置 MCP Server" : "No MCP servers configured"} /> : <div className="space-y-2">{servers.map((server) => { const session = object(server.session); const enabled = bool(session.enabled); const serverName = text(server.name); return <div key={serverName} className="flex items-center gap-3 rounded-[5px] border border-line2 bg-raise p-3"><Icon name="globe" size={13} className="text-mute" /><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-fg2">{text(server.displayName, serverName)}</p><p className="truncate font-mono text-[9.5px] text-dim">{text(server.url) || text(server.command) || text(server.sourceLabel)}</p></div><span className="font-mono text-[9.5px] text-faint">{text(session.status).toUpperCase()}</span><Toggle label={`${serverName} MCP`} on={enabled} disabled={!sessionId} onChange={(value) => void action("x.ai/mcp/toggle", { server_name: serverName, enabled: value }).catch(() => {})} />{text(server.source) === "local" && <ActionButton tone="danger" disabled={!sessionId} onClick={() => setConfirmingServer(serverName)}>{t("delete")}</ActionButton>}</div>; })}</div>}
+    {actionError && <p className="mt-2 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{actionError}</p>}
     <MarketLinks kind="mcp" />
+    {confirmingServer && <ConfirmDialog
+      title={zh ? "删除 MCP Server？" : "Delete MCP server?"}
+      description={zh ? `将从 Grok Build 配置中删除“${confirmingServer}”。` : `This removes “${confirmingServer}” from the Grok Build configuration.`}
+      confirmLabel={zh ? "删除 Server" : "Delete server"}
+      cancelLabel={zh ? "取消" : "Cancel"}
+      workingLabel={zh ? "删除中" : "Deleting"}
+      onCancel={() => setConfirmingServer(null)}
+      onConfirm={async () => {
+        await action("x.ai/mcp/delete", { server_name: confirmingServer });
+        setConfirmingServer(null);
+      }}
+    />}
   </div>;
 }
 
 function SkillsPanel() {
   const { t, language } = useI18n(); const zh = language === "zh-CN"; const cwd = useDesktop((state) => state.workspace); const [path, setPath] = useState("");
+  const [confirmingSkill, setConfirmingSkill] = useState<{ name: string; path: string } | null>(null);
+  const [actionError, setActionError] = useState("");
   const state = useExtension(async () => object(await bridge.callExtension("x.ai/skills/list", { cwd })), [cwd]);
   const skills = list(state.data?.skills).map(object).sort((a, b) => text(a.displayName, text(a.name)).localeCompare(text(b.displayName, text(b.name))));
   const groups = [...skills.reduce((result, skill) => { const scope = text(skill.scope, "other"); result.set(scope, [...(result.get(scope) ?? []), skill]); return result; }, new Map<string, Json[]>()).entries()].sort(([a], [b]) => a.localeCompare(b));
-  const run = async (method: string, params: Json) => { await bridge.callExtension(method, { ...params, cwd }); state.reload(); };
-  return <div><Heading title={t("skills")} description={zh ? "从 Grok Build 的用户、项目和插件作用域发现 Skill，可视化启停与移除。" : "Discover Skills from Grok Build user, project, and plugin scopes; toggle or remove them visually."} /><div className="mb-4 flex gap-2"><div className="flex-1"><Input value={path} onChange={setPath} placeholder={zh ? "C:\\path\\to\\skill 或 SKILL.md" : "C:\\path\\to\\skill or SKILL.md"} /></div><ActionButton tone="accent" onClick={() => void run("x.ai/skills/add", { path }).then(() => setPath(""))}>{t("add")}</ActionButton></div>
-    {skills.length === 0 ? <ExtensionState error={state.error} empty={zh ? "尚未发现 Skill" : "No Skills discovered"} /> : <div className="space-y-2">{groups.map(([scope, entries]) => <details key={scope} open className="rounded-[5px] border border-line2 bg-void/40"><summary className="cursor-pointer px-3 py-2 font-mono text-[9.5px] uppercase tracking-[0.08em] text-mute">{scope} · {entries.length}</summary><div className="grid grid-cols-2 gap-2 border-t border-line p-2">{entries.map((skill) => { const name = text(skill.name); const enabled = skill.enabled !== false; return <div key={`${name}-${text(skill.path)}`} className="rounded-[5px] border border-line2 bg-raise p-3"><div className="flex items-start gap-2"><Icon name="bolt" size={12} className="mt-0.5 text-gold" /><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-fg2">{text(skill.displayName, name)}</p><p className="mt-1 line-clamp-2 text-[10px] leading-relaxed text-dim">{text(skill.description, text(skill.path))}</p></div><Toggle on={enabled} onChange={(value) => void run("x.ai/skills/toggle", { name, enabled: value })} /></div>{text(skill.scope) !== "bundled" && <button onClick={() => void run("x.ai/skills/remove", { path: text(skill.path) })} className="mt-2 font-mono text-[9.5px] text-red/70 hover:text-red">{t("remove")}</button>}</div>; })}</div></details>)}</div>}
+  const run = async (method: string, params: Json) => { setActionError(""); try { await bridge.callExtension(method, { ...params, cwd }); state.reload(); } catch (cause) { setActionError(extensionErrorText(cause)); throw cause; } };
+  return <div><Heading title={t("skills")} description={zh ? "从 Grok Build 的用户、项目和插件作用域发现 Skill，可视化启停与移除。" : "Discover Skills from Grok Build user, project, and plugin scopes; toggle or remove them visually."} /><div className="mb-4 flex gap-2"><div className="flex-1"><Input value={path} onChange={setPath} placeholder={zh ? "C:\\path\\to\\skill 或 SKILL.md" : "C:\\path\\to\\skill or SKILL.md"} /></div><ActionButton tone="accent" disabled={!path.trim()} onClick={() => void run("x.ai/skills/add", { path }).then(() => setPath("")).catch(() => {})}>{t("add")}</ActionButton></div>
+    {skills.length === 0 ? <ExtensionState error={state.error} loading={state.loading} empty={zh ? "尚未发现 Skill" : "No Skills discovered"} /> : <div className="space-y-2">{groups.map(([scope, entries]) => <details key={scope} open className="rounded-[5px] border border-line2 bg-void/40"><summary className="cursor-pointer px-3 py-2 font-mono text-[9.5px] uppercase tracking-[0.08em] text-mute">{scope} · {entries.length}</summary><div className="grid grid-cols-2 gap-2 border-t border-line p-2">{entries.map((skill) => { const name = text(skill.name); const skillPath = text(skill.path); const enabled = skill.enabled !== false; return <div key={`${name}-${skillPath}`} className="rounded-[5px] border border-line2 bg-raise p-3"><div className="flex items-start gap-2"><Icon name="bolt" size={12} className="mt-0.5 text-gold" /><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-fg2">{text(skill.displayName, name)}</p><p className="mt-1 line-clamp-2 text-[10px] leading-relaxed text-dim">{text(skill.description, skillPath)}</p></div><Toggle label={`${name} Skill`} on={enabled} onChange={(value) => void run("x.ai/skills/toggle", { name, enabled: value }).catch(() => {})} /></div>{text(skill.scope) !== "bundled" && <button onClick={() => setConfirmingSkill({ name, path: skillPath })} className="mt-2 font-mono text-[9.5px] text-red/70 hover:text-red">{t("remove")}</button>}</div>; })}</div></details>)}</div>}
+    {actionError && <p className="mt-2 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{actionError}</p>}
     <MarketLinks kind="skills" />
+    {confirmingSkill && <ConfirmDialog
+      title={zh ? "移除 Skill？" : "Remove Skill?"}
+      description={zh ? `将移除“${confirmingSkill.name}”及其本机 Skill 文件。` : `This removes “${confirmingSkill.name}” and its local Skill files.`}
+      confirmLabel={zh ? "移除 Skill" : "Remove Skill"}
+      cancelLabel={zh ? "取消" : "Cancel"}
+      workingLabel={zh ? "移除中" : "Removing"}
+      onCancel={() => setConfirmingSkill(null)}
+      onConfirm={async () => {
+        await run("x.ai/skills/remove", { path: confirmingSkill.path });
+        setConfirmingSkill(null);
+      }}
+    />}
   </div>;
 }
 
 function PluginsPanel() {
   const { t, language } = useI18n(); const zh = language === "zh-CN"; const sessionId = useDesktop((state) => state.activeId);
   const [actionBusy, setActionBusy] = useState(false);
+  const [confirmingPlugin, setConfirmingPlugin] = useState<{ id: string; name: string } | null>(null);
+  const [actionError, setActionError] = useState("");
   const actionLocked = useRef(false);
   const pluginsState = useExtension(async () => sessionId ? object(await bridge.callExtension("x.ai/plugins/list", { sessionId })) : { plugins: [] }, [sessionId]);
   const marketState = useExtension(async () => object(await bridge.callExtension("x.ai/marketplace/list", sessionId ? { sessionId } : {})), [sessionId]);
   const plugins = list(pluginsState.data?.plugins).map(object);
   const sources = list(marketState.data?.sources).map(object);
   const unlockLater = () => window.setTimeout(() => { actionLocked.current = false; setActionBusy(false); }, 500);
-  const action = async (action: Json) => { if (!sessionId) throw new Error(zh ? "请先打开一个任务" : "Open a mission first"); if (actionLocked.current) return; actionLocked.current = true; setActionBusy(true); try { await bridge.callExtension("x.ai/plugins/action", { sessionId, action }); pluginsState.reload(); marketState.reload(); } finally { unlockLater(); } };
-  const marketAction = async (source: Json, plugin: Json) => { if (!sessionId) throw new Error(zh ? "请先打开一个任务" : "Open a mission first"); if (actionLocked.current) return; actionLocked.current = true; setActionBusy(true); try { await bridge.callExtension("x.ai/marketplace/action", { sessionId, action: { type: "install", source_url_or_path: text(source.sourceUrlOrPath), plugin_relative_path: text(plugin.relativePath) } }); pluginsState.reload(); marketState.reload(); } finally { unlockLater(); } };
+  const action = async (action: Json) => {
+    setActionError("");
+    if (!sessionId) {
+      const cause = new Error(zh ? "请先打开一个任务" : "Open a mission first");
+      setActionError(cause.message);
+      throw cause;
+    }
+    if (actionLocked.current) return;
+    actionLocked.current = true;
+    setActionBusy(true);
+    try {
+      await bridge.callExtension("x.ai/plugins/action", { sessionId, action });
+      pluginsState.reload();
+      marketState.reload();
+    } catch (cause) {
+      setActionError(extensionErrorText(cause));
+      throw cause;
+    } finally {
+      unlockLater();
+    }
+  };
+  const marketAction = async (source: Json, plugin: Json) => {
+    setActionError("");
+    if (!sessionId) {
+      const cause = new Error(zh ? "请先打开一个任务" : "Open a mission first");
+      setActionError(cause.message);
+      throw cause;
+    }
+    if (actionLocked.current) return;
+    actionLocked.current = true;
+    setActionBusy(true);
+    try {
+      await bridge.callExtension("x.ai/marketplace/action", { sessionId, action: { type: "install", source_url_or_path: text(source.sourceUrlOrPath), plugin_relative_path: text(plugin.relativePath) } });
+      pluginsState.reload();
+      marketState.reload();
+    } catch (cause) {
+      setActionError(extensionErrorText(cause));
+      throw cause;
+    } finally {
+      unlockLater();
+    }
+  };
   return <div><Heading title={`${t("plugins")} / ${t("marketplace")}`} description={zh ? "使用 Grok Build 原生 Plugin 与 Marketplace 扩展，安装后可即时刷新技能、Hook 与 MCP。" : "Use native Grok Build Plugins and Marketplace sources; installed Skills, hooks, and MCP refresh immediately."} />
-    <h3 className="lbl mb-2 !text-[9.5px]">{t("plugins")}</h3>{!sessionId ? <ExtensionState error={null} empty={zh ? "请先打开一个项目任务后管理 Plugin" : "Open a project mission before managing Plugins"} /> : plugins.length === 0 ? <ExtensionState error={pluginsState.error} empty={zh ? "尚未安装 Plugin" : "No Plugins installed"} /> : <div className="grid grid-cols-2 gap-2">{plugins.map((plugin) => { const id = text(plugin.id); const enabled = plugin.enabled !== false; return <div key={id} className="rounded-[5px] border border-line2 bg-raise p-3"><div className="flex gap-2"><Icon name="layers" size={12} className="text-acc" /><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-fg2">{text(plugin.name, id)}</p><p className="mt-1 line-clamp-2 text-[9.5px] text-dim">{text(plugin.description)} · {Number(plugin.skillCount ?? 0)} skills</p></div><Toggle on={enabled} disabled={actionBusy} onChange={(value) => void action({ type: value ? "enable" : "disable", plugin_id: id })} /></div><button disabled={actionBusy} onClick={() => void action({ type: "uninstall", plugin_id: id, confirmed: true })} className="mt-2 font-mono text-[9.5px] text-red/70 hover:text-red disabled:opacity-40">{t("uninstall")}</button></div>; })}</div>}
-    <h3 className="lbl mb-2 mt-6 !text-[9.5px]">{t("marketplace")}</h3><div className="space-y-3">{sources.flatMap((source) => list(source.plugins).map(object).slice(0, 30).map((plugin) => <div key={`${text(source.sourceName)}-${text(plugin.relativePath)}`} className="flex items-center gap-3 rounded-[5px] border border-line bg-raise px-3 py-2"><div className="min-w-0 flex-1"><p className="text-[10.5px] text-fg2">{text(plugin.name)}</p><p className="truncate text-[9.5px] text-dim">{text(plugin.description)} · {text(source.sourceName)}</p></div><span className="font-mono text-[9.5px] text-faint">{text(plugin.installStatus)}</span>{text(plugin.installStatus) === "not_installed" && <ActionButton disabled={!sessionId || actionBusy} onClick={() => void marketAction(source, plugin)}>{t("install")}</ActionButton>}</div>))}</div>
-    {sources.length === 0 && <ExtensionState error={marketState.error} empty={zh ? "Marketplace 暂无可用来源" : "No Marketplace sources available"} />}<MarketLinks kind="plugins" />
+    <h3 className="lbl mb-2 !text-[9.5px]">{t("plugins")}</h3>{!sessionId ? <ExtensionState error={null} empty={zh ? "请先打开一个项目任务后管理 Plugin" : "Open a project mission before managing Plugins"} /> : plugins.length === 0 ? <ExtensionState error={pluginsState.error} loading={pluginsState.loading} empty={zh ? "尚未安装 Plugin" : "No Plugins installed"} /> : <div className="grid grid-cols-2 gap-2">{plugins.map((plugin) => { const id = text(plugin.id); const name = text(plugin.name, id); const enabled = plugin.enabled !== false; return <div key={id} className="rounded-[5px] border border-line2 bg-raise p-3"><div className="flex gap-2"><Icon name="layers" size={12} className="text-acc" /><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-fg2">{name}</p><p className="mt-1 line-clamp-2 text-[9.5px] text-dim">{text(plugin.description)} · {Number(plugin.skillCount ?? 0)} skills</p></div><Toggle label={`${name} Plugin`} on={enabled} disabled={actionBusy} onChange={(value) => void action({ type: value ? "enable" : "disable", plugin_id: id }).catch(() => {})} /></div><button disabled={actionBusy} onClick={() => setConfirmingPlugin({ id, name })} className="mt-2 font-mono text-[9.5px] text-red/70 hover:text-red disabled:opacity-40">{t("uninstall")}</button></div>; })}</div>}
+    <h3 className="lbl mb-2 mt-6 !text-[9.5px]">{t("marketplace")}</h3><div className="space-y-3">{sources.flatMap((source) => list(source.plugins).map(object).slice(0, 30).map((plugin) => <div key={`${text(source.sourceName)}-${text(plugin.relativePath)}`} className="flex items-center gap-3 rounded-[5px] border border-line bg-raise px-3 py-2"><div className="min-w-0 flex-1"><p className="text-[10.5px] text-fg2">{text(plugin.name)}</p><p className="truncate text-[9.5px] text-dim">{text(plugin.description)} · {text(source.sourceName)}</p></div><span className="font-mono text-[9.5px] text-faint">{text(plugin.installStatus)}</span>{text(plugin.installStatus) === "not_installed" && <ActionButton disabled={!sessionId || actionBusy} onClick={() => void marketAction(source, plugin).catch(() => {})}>{t("install")}</ActionButton>}</div>))}</div>
+    {actionError && <p className="mt-2 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{actionError}</p>}
+    {sources.length === 0 && <ExtensionState error={marketState.error} loading={marketState.loading} empty={zh ? "Marketplace 暂无可用来源" : "No Marketplace sources available"} />}<MarketLinks kind="plugins" />
+    {confirmingPlugin && <ConfirmDialog
+      title={zh ? "卸载 Plugin？" : "Uninstall Plugin?"}
+      description={zh ? `将卸载“${confirmingPlugin.name}”，并移除它提供的 Skills、Hooks 与 MCP 配置。` : `This uninstalls “${confirmingPlugin.name}” and removes its Skills, hooks, and MCP configuration.`}
+      confirmLabel={zh ? "卸载 Plugin" : "Uninstall Plugin"}
+      cancelLabel={zh ? "取消" : "Cancel"}
+      workingLabel={zh ? "卸载中" : "Uninstalling"}
+      onCancel={() => setConfirmingPlugin(null)}
+      onConfirm={async () => {
+        await action({ type: "uninstall", plugin_id: confirmingPlugin.id, confirmed: true });
+        setConfirmingPlugin(null);
+      }}
+    />}
   </div>;
 }
 
@@ -670,7 +867,7 @@ function ConfigDocumentsPanel() {
     return () => { live = false; window.clearInterval(timer); };
   }, [cwd, dirty]);
   const document = useMemo(() => documents.find((item) => item.id === active), [documents, active]);
-  const canApply = !activeId || !activeStatus || activeStatus === "idle" || activeStatus === "failed";
+  const canApply = !activeId || !activeStatus || activeStatus === "idle" || activeStatus === "failed" || activeStatus === "cancelled";
   const save = async () => {
     if (!document || !canApply || saving) return;
     setSaving(true);
@@ -678,7 +875,7 @@ function ConfigDocumentsPanel() {
       ? (zh ? "正在验证并重启 Grok Build…" : "Validating and restarting Grok Build…")
       : (zh ? "正在保存并重新载入当前任务…" : "Saving and reloading the current mission…"));
     try {
-      const saved = await bridge.writeConfigDocument({ ...document, content: drafts[document.id] ?? "" });
+      const saved = await bridge.writeConfigDocument({ ...document, content: drafts[document.id] ?? "" }, cwd);
       setDocuments((items) => items.map((item) => item.id === saved.id ? saved : item));
       setDirty((current) => ({ ...current, [saved.id]: false }));
       if (activeId) await bridge.loadSession(activeId);

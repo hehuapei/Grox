@@ -1,13 +1,14 @@
 import { describe, expect, it } from "vitest";
 import type { SessionBlock } from "../bridge/types";
 import {
+  deriveSessionSnapshot,
   sessionAcceptsNewPrimaryPrompt,
   sessionLooksBusy,
   settleLiveProcessBlocks,
   settleLiveTextBlocks,
   shouldArmPostPromptSettle,
   shouldPromotePostPrompt,
-} from "./sessionBusy";
+} from "./sessionRuntime";
 
 const liveThought: SessionBlock = {
   type: "thinking",
@@ -36,6 +37,42 @@ describe("sessionLooksBusy", () => {
   });
 });
 
+describe("deriveSessionSnapshot", () => {
+  it("provides one coherent projection for rendering and send admission", () => {
+    expect(deriveSessionSnapshot({ status: "awaiting_permission", blocks: [] })).toMatchObject({
+      status: "awaiting_permission",
+      phase: "waiting_permission",
+      busy: true,
+      sendable: false,
+    });
+    expect(deriveSessionSnapshot({ status: "idle", blocks: [] })).toMatchObject({
+      phase: "idle",
+      busy: false,
+      sendable: true,
+    });
+    expect(deriveSessionSnapshot({ status: "connecting", blocks: [] })).toMatchObject({
+      phase: "connecting",
+      busy: true,
+      sendable: false,
+    });
+    expect(deriveSessionSnapshot({ status: "stopping", blocks: [] })).toMatchObject({
+      phase: "stopping",
+      busy: true,
+      sendable: false,
+    });
+    expect(deriveSessionSnapshot({ status: "cancelled", blocks: [] })).toMatchObject({
+      phase: "cancelled",
+      busy: false,
+      sendable: true,
+    });
+    expect(deriveSessionSnapshot({ status: "disconnected", blocks: [] })).toMatchObject({
+      phase: "disconnected",
+      busy: true,
+      sendable: false,
+    });
+  });
+});
+
 describe("sessionAcceptsNewPrimaryPrompt", () => {
   it("queues while the session is still running", () => {
     expect(sessionAcceptsNewPrimaryPrompt({ status: "running", blocks: [doneThought] })).toBe(false);
@@ -44,6 +81,7 @@ describe("sessionAcceptsNewPrimaryPrompt", () => {
   it("allows a new primary on a finished conversation even if a thought stayed live", () => {
     expect(sessionAcceptsNewPrimaryPrompt({ status: "idle", blocks: [liveThought] })).toBe(true);
     expect(sessionAcceptsNewPrimaryPrompt({ status: "failed", blocks: [doneThought] })).toBe(true);
+    expect(sessionAcceptsNewPrimaryPrompt({ status: "cancelled", blocks: [doneThought] })).toBe(true);
   });
 });
 

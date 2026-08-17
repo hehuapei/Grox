@@ -8,7 +8,7 @@ import {
   rememberProcessOpen,
   resolveInitialProcessOpen,
 } from "../../lib/processFold";
-import { sessionLooksBusy } from "../../lib/sessionBusy";
+import { deriveSessionSnapshot } from "../../lib/sessionRuntime";
 import {
   TIMELINE_TURN_WINDOW_INITIAL,
   TIMELINE_TURN_WINDOW_STEP,
@@ -27,6 +27,7 @@ import { PlanCard } from "./PlanCard";
 import { PermissionCard } from "./PermissionCard";
 import { QuestionCard } from "./QuestionCard";
 import { TurnChangeCard } from "./TurnChangeCard";
+import { ConfirmDialog } from "../common/ConfirmDialog";
 
 /** Near-bottom slack for stick-to-bottom while streaming. */
 const FOLLOW_BOTTOM_PX = 96;
@@ -131,6 +132,54 @@ export function groupTurns(blocks: SessionBlock[]): Turn[] {
     else turns[turns.length - 1].blocks.push(block);
   }
   return turns;
+}
+
+export function DeadSessionNotice({ session }: { session: Session }) {
+  const { language } = useI18n();
+  const [confirmRemoval, setConfirmRemoval] = useState(false);
+  const copy = deadSessionCopy(language === "zh-CN" ? "zh-CN" : "en", session.id);
+  return (
+    <div className="flex flex-1 flex-col items-center justify-center gap-4 px-8 pb-24">
+      <BlackHole size={34} />
+      <div className="max-w-[420px] text-center">
+        <p className="text-[15px] font-medium text-fg">{copy.title}</p>
+        <p className="mt-2 text-[12px] leading-relaxed text-mute">{copy.body}</p>
+        <p className="mt-3 break-all font-mono text-[9.5px] text-faint">{copy.detail}</p>
+      </div>
+      <div className="flex flex-wrap items-center justify-center gap-2">
+        <button
+          type="button"
+          className="rounded-[5px] border border-red/40 bg-red/10 px-3 py-2 font-mono text-[10px] text-red transition-colors hover:border-red hover:bg-red/15"
+          onClick={() => setConfirmRemoval(true)}
+        >
+          {copy.remove}
+        </button>
+        <button
+          type="button"
+          className="rounded-[5px] border border-line2 px-3 py-2 font-mono text-[10px] text-fg2 transition-colors hover:border-acc/40 hover:text-fg"
+          onClick={() => useDesktop.getState().goHome()}
+        >
+          {copy.home}
+        </button>
+      </div>
+      {confirmRemoval && (
+        <ConfirmDialog
+          title={language === "zh-CN" ? "永久删除失效会话记录？" : "Permanently delete the unavailable session?"}
+          description={language === "zh-CN"
+            ? "这不仅会隐藏侧栏条目，还会删除该会话残留的本机缓存、CLI 历史与支持数据。此操作无法撤销。"
+            : "This does more than hide the sidebar row: it deletes remaining local cache, CLI history, and support data for this session. This cannot be undone."}
+          confirmLabel={language === "zh-CN" ? "永久删除" : "Delete permanently"}
+          cancelLabel={language === "zh-CN" ? "取消" : "Cancel"}
+          workingLabel={language === "zh-CN" ? "删除中" : "Deleting"}
+          onCancel={() => setConfirmRemoval(false)}
+          onConfirm={async () => {
+            await useDesktop.getState().removeSessionFromSidebar(session.id);
+            setConfirmRemoval(false);
+          }}
+        />
+      )}
+    </div>
+  );
 }
 
 function compactPreview(text: string, limit: number): string {
@@ -579,7 +628,7 @@ export function Timeline({ session }: { session: Session }) {
   const settleTimerRef = useRef<number | undefined>(undefined);
   const turns = useMemo(() => groupTurns(session.blocks), [session.blocks]);
   const [visibleCount, setVisibleCount] = useState(TIMELINE_TURN_WINDOW_INITIAL);
-  const sessionRunning = sessionLooksBusy({ status: session.status, blocks: session.blocks });
+  const sessionRunning = deriveSessionSnapshot({ status: session.status, blocks: session.blocks }).busy;
   const wasRunningRef = useRef(sessionRunning);
   const lastBlock = session.blocks.at(-1);
   const liveSignature = sessionRunning
@@ -713,33 +762,7 @@ export function Timeline({ session }: { session: Session }) {
   }
 
   if (isDeadSessionView(session)) {
-    const copy = deadSessionCopy(language === "zh-CN" ? "zh-CN" : "en", session.id);
-    return (
-      <div className="flex flex-1 flex-col items-center justify-center gap-4 px-8 pb-24">
-        <BlackHole size={34} />
-        <div className="max-w-[420px] text-center">
-          <p className="text-[15px] font-medium text-fg">{copy.title}</p>
-          <p className="mt-2 text-[12px] leading-relaxed text-mute">{copy.body}</p>
-          <p className="mt-3 break-all font-mono text-[9.5px] text-faint">{copy.detail}</p>
-        </div>
-        <div className="flex flex-wrap items-center justify-center gap-2">
-          <button
-            type="button"
-            className="rounded-[5px] border border-red/40 bg-red/10 px-3 py-2 font-mono text-[10px] text-red transition-colors hover:border-red hover:bg-red/15"
-            onClick={() => void useDesktop.getState().removeSessionFromSidebar(session.id)}
-          >
-            {copy.remove}
-          </button>
-          <button
-            type="button"
-            className="rounded-[5px] border border-line2 px-3 py-2 font-mono text-[10px] text-fg2 transition-colors hover:border-acc/40 hover:text-fg"
-            onClick={() => useDesktop.getState().goHome()}
-          >
-            {copy.home}
-          </button>
-        </div>
-      </div>
-    );
+    return <DeadSessionNotice session={session} />;
   }
 
   if (session.blocks.length === 0) return <div className="flex flex-1 flex-col items-center justify-center gap-4 pb-24"><BlackHole size={44} spin="slow" /><div className="text-center"><p className="text-[14px] text-mute">{language === "zh-CN" ? "任务通道已打开。" : "Mission channel open."}</p><p className="lbl mt-1.5 !text-[10px]">{language === "zh-CN" ? "输入你的第一个请求" : "TRANSMIT YOUR FIRST DIRECTIVE"}</p></div></div>;

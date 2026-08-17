@@ -1,10 +1,8 @@
 /* Real Grok Build bridge over ACP / newline-delimited JSON-RPC 2.0. */
 
 import { invoke } from "@tauri-apps/api/core";
-import { getVersion } from "@tauri-apps/api/app";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { GrokBridge } from "./GrokBridge";
-import { claimPendingBrowserLease } from "./browserLeaseBind";
 import { EFFORTS, MODELS } from "./types";
 import type {
   AccountInfo,
@@ -19,7 +17,6 @@ import type {
   PromptOptions,
   QuestionItem,
   QuestionResponse,
-  GrokRuntimeInfo,
   ModelState,
   Effort,
   Session,
@@ -42,18 +39,41 @@ import type {
   RewindMode,
   RewindPoint,
   RewindResult,
+  RuntimeOccupancy,
+  AutomationSessionStarted,
+  AutomationRunnerStatus,
+  AutomationSessionSettled,
+  GroxError,
   SlashCommand,
   WorkflowAgentTrace,
   WorkflowTraceEntry,
   WorkflowRun,
+  SessionForkResult,
+  WorktreeForkResult,
 } from "./types";
 import { readStoredPermissionMode } from "../lib/permissionMode";
 import { cleanApiError, toolCanonicalKind, toolReadOnly, versionMismatchNotice } from "../lib/runtimeNotice";
 import {
   isOpenToolStatus,
-  promptTurnTimeoutMessage,
-  shouldFirePromptStallWatchdog,
 } from "../lib/promptTurnTimeout";
+import {
+  formatGroxError,
+  groxFailure,
+  runtimeNoticeFromError,
+  toGroxError,
+} from "../lib/errorModel";
+import type { ErrorFallback } from "../lib/errorModel";
+import { sessionFromDiskPreview, type SessionDiskPreview } from "../lib/sessionDiskPreview";
+import {
+  parseSessionJournal,
+  rememberSessionJournalSnapshot,
+  type SessionJournalSnapshot,
+} from "../lib/sessionCache";
+import { reconcileSessionJournal } from "../lib/sessionJournalReconcile";
+import { mapToolKind } from "../lib/toolKind";
+import { displayReplayUserPrompt } from "../lib/replayUserPrompt";
+import { mergeOfflineWithLive } from "../lib/offlineMerge";
+import { AcpRpcError, decodeAcpResponse } from "./acpRpc";
 
 export const ACP_METHODS = {
   initialize: "initialize",
@@ -79,22 +99,121 @@ export const ACP_METHODS = {
   promptHistory: "x.ai/prompt_history",
 } as const;
 
-// Grox hosts the official `grok agent stdio` process. Keep ACP metadata
-// aligned with a terminal `grok` invocation so subscription eligibility is
-// evaluated as Grok Build CLI rather than as an unreleased desktop client.
-const UPSTREAM_CLI_CLIENT_IDENTIFIER = "grok-shell";
-
 type JsonObject = Record<string, unknown>;
-type RpcId = string | number;
 
-interface JsonRpcMessage extends JsonObject {
-  jsonrpc?: string;
-  id?: RpcId;
-  method?: string;
-  params?: unknown;
-  result?: unknown;
-  error?: unknown;
+interface ResolveInteractionResult {
+  auditWarning?: GroxError;
 }
+
+interface AgentRuntimeConnection {
+  generation: number;
+  initialize: unknown;
+  auth: AuthState & { methodId?: string };
+}
+
+type HostAuthenticationState = AuthState & { methodId?: string };
+
+interface ForegroundTurnResult {
+  response: unknown;
+  requestedEffort: Effort;
+  effectiveEffort: Effort;
+  assistantText?: string;
+}
+
+interface ForegroundTurnStalled {
+  sessionId: string;
+  silentForMs: number;
+}
+
+interface PromptQueueChanged {
+  sessionId: string;
+  itemId: string;
+  queue: unknown[];
+  reason: "claimed" | "consumed" | "recovered";
+}
+
+interface HostSessionEvent {
+  streamId: string;
+  sequence: number;
+  generation: number;
+  receivedAt: number;
+  sessionId?: string;
+  method?: string;
+  updateType?: string;
+  projection: HostSessionProjection;
+  journalRecoverable: boolean;
+  journalAcknowledged: boolean;
+}
+
+type HostSessionProjection =
+  | {
+      kind: "session_update";
+      channel: "session" | "notification";
+      sessionId: string;
+      updateType?: string;
+      update: unknown;
+      blockOps: HostBlockOperation[];
+    }
+  | { kind: "block_lifecycle"; sessionId: string; phase: "turn_started" | "turn_finished" | "session_reset" | "session_removed"; blockOps: HostBlockOperation[] }
+  | { kind: "notification"; method: string; params: unknown }
+  | { kind: "unsupported_request"; method: string }
+  | { kind: "orphan_response" }
+  | { kind: "protocol_error"; code: string; message: string };
+
+interface HostBlockOperation {
+  action: "open" | "update" | "close";
+  blockType: "user" | "assistant" | "thinking" | "tool" | "plan";
+  blockId: string;
+  sourceId?: string;
+  startedAt?: number;
+}
+
+interface HostActiveBlockSnapshot {
+  generation: number;
+  sessionId: string;
+  blockType: "user" | "assistant" | "thinking";
+  blockId: string;
+  startedAt: number;
+  updatedThrough: number;
+  text: string;
+  textComplete: boolean;
+}
+
+interface HostSessionEventReplay {
+  streamId: string;
+  events: HostSessionEvent[];
+  earliestSequence: number;
+  latestSequence: number;
+  truncated: boolean;
+  reset: boolean;
+  hasMore: boolean;
+  activeBlocks: HostActiveBlockSnapshot[];
+}
+
+interface HostSessionEventCursor {
+  streamId?: string;
+  sequence: number;
+}
+
+interface HostSessionBinding {
+  sessionId: string;
+  cwd: string;
+}
+
+interface HostInteractionProjection {
+  blockId: string;
+  sessionId: string;
+  kind: "permission" | "plan" | "question";
+  params: unknown;
+}
+
+interface HostInteractionClosed {
+  blockId: string;
+  sessionId: string;
+  kind: HostInteractionProjection["kind"];
+  reason: "resolved" | "cancelled" | "write_failed";
+}
+type RpcId = string | number;
 
 interface DesktopEnvironment {
   defaultWorkspace: string;
@@ -105,21 +224,22 @@ interface DesktopEnvironment {
 interface ExitPayload {
   code?: number | null;
   reason: "exited" | "killed";
+  affectedSessionIds?: string[];
+  interruptedSessionIds?: string[];
 }
 
-interface AcpReadFilePayload {
-  content: string;
-  contentBase64?: string;
-  size: number;
-  lineCount?: number;
-  type: string;
+interface RuntimeReconnectPayload {
+  state: "reconnecting" | "ready" | "offline";
+  attempt: number;
+  affectedSessionIds: string[];
+  interruptedSessionIds: string[];
+  connection?: AgentRuntimeConnection;
+  error?: GroxError;
 }
 
-interface PendingRequest {
-  resolve(value: unknown): void;
-  reject(error: Error): void;
-  method: string;
-  timeoutId?: number;
+interface SessionGatePermit {
+  token: number;
+  generation: number;
 }
 
 function storedEffort(): Effort {
@@ -127,7 +247,8 @@ function storedEffort(): Effort {
   return EFFORTS.find((effort) => effort === value) ?? "high";
 }
 
-interface ContentCursor {
+/** 仅供 rewind 的归档响应降级投影；实时块身份由 Host blockOps 决定。 */
+interface ReplayContentCursor {
   assistantId?: string;
   thinkingId?: string;
   thinkingStartedAt?: number;
@@ -139,111 +260,8 @@ interface ContentCursor {
   toolBlocks: Map<string, string>;
 }
 
-interface PendingInteraction {
-  rpcId: RpcId;
-  sessionId: string;
-  blockId: string;
-  kind: "permission" | "plan" | "question";
-  optionIds: Partial<Record<PermissionOption, string>>;
-  questions?: QuestionItem[];
-}
-
-class AcpRpcError extends Error {
-  constructor(
-    readonly method: string,
-    readonly code: number | undefined,
-    message: string,
-    readonly data?: unknown,
-  ) {
-    super(`${message} · ${method}`);
-    this.name = "AcpRpcError";
-  }
-}
-
-function isInvalidParamsError(error: unknown): boolean {
-  if (error instanceof AcpRpcError && error.code === -32602) return true;
-  return error instanceof Error && /\binvalid params\b/i.test(error.message);
-}
-
-/** API 400 / invalid-argument: Invalid reasoning effort (resume + sticky session). */
-function isInvalidReasoningEffortError(error: unknown): boolean {
-  const message = errorText(error);
-  return (
-    /invalid\s+reasoning\s+effort/i.test(message)
-    || /invalid-argument[^\n]*reasoning\s*effort/i.test(message)
-    || /unknown effort level/i.test(message)
-  );
-}
-
-/** True when a turn/stream update carries the invalid-effort API failure. */
-function isInvalidReasoningEffortMessage(message: string | undefined): boolean {
-  if (!message) return false;
-  return (
-    /invalid\s+reasoning\s+effort/i.test(message)
-    || /invalid-argument[^\n]*reasoning\s*effort/i.test(message)
-    || /unknown effort level/i.test(message)
-  );
-}
-
-/** Coerce UI / composer values onto the catalogue (drops garbage after shell upgrades). */
-function normalizeEffort(value: unknown, fallback: Effort = "high"): Effort {
-  if (typeof value === "string") {
-    const lowered = value.trim().toLowerCase();
-    const hit = EFFORTS.find((effort) => effort === lowered);
-    if (hit) return hit;
-  }
-  return fallback;
-}
-
-/**
- * Prefer requested effort, then Grok-safe ladder only.
- * Do not re-try xhigh/max after a failure (they are the usual rejectors).
- */
-function effortFallbackChain(preferred: Effort): Effort[] {
-  const ordered: Effort[] = [preferred, "high", "medium", "low"];
-  const seen = new Set<Effort>();
-  const out: Effort[] = [];
-  for (const effort of ordered) {
-    if (seen.has(effort)) continue;
-    seen.add(effort);
-    out.push(effort);
-  }
-  return out;
-}
-
 function isMethodUnavailable(error: unknown): boolean {
   return error instanceof AcpRpcError && (error.code === -32601 || error.code === -32602);
-}
-
-/**
- * Upstream's built-in /deep-research exits before Verify/Report when an
- * evidence panel is empty. The native shell provisions a user workflow with
- * the same research contract but no early terminal branch; preserve the
- * familiar command while dispatching to that complete pipeline.
- */
-function completeDeepResearchPrompt(text: string): string {
-  const match = text.trim().match(/^\/deep-research(?:\s+([\s\S]*))?$/i);
-  if (!match) return text;
-  return `/workflow grox-deep-research ${JSON.stringify({ query: match[1]?.trim() ?? "" })}`;
-}
-
-/** Keep Grox's transport-only workflow alias out of the conversation replay. */
-function displayDeepResearchPrompt(text: string): string {
-  const match = text.trim().match(/^\/workflow\s+grox-deep-research\s+([\s\S]+)$/i);
-  if (!match) {
-    // Some older CLI session/load replays collapse the next user chunk and a
-    // stale host-side workflow command into one string (for example
-    // `你好/workflow grox-deep-research {...}`). The command was never typed by
-    // the user and, after a rewind, must not be allowed to resurrect itself.
-    const leaked = text.search(/\/workflow\s+(?:grox-deep-research|(?:pause|resume|stop)\s+\S+)\b/i);
-    return leaked > 0 ? text.slice(0, leaked).trimEnd() : text;
-  }
-  try {
-    const args = JSON.parse(match[1]) as { query?: unknown };
-    return typeof args.query === "string" ? `/deep-research${args.query ? ` ${args.query}` : ""}` : text;
-  } catch {
-    return text;
-  }
 }
 
 /** Workflow controls are task-panel protocol, never authored chat content. */
@@ -441,16 +459,6 @@ function wireMethod(method: string): string {
   return method.startsWith("x.ai/") ? `_${method}` : method;
 }
 
-function normalizeInboundExtension(message: JsonRpcMessage): JsonRpcMessage {
-  if (!message.method?.startsWith("_x.ai/")) return message;
-  const envelope = record(message.params);
-  const nestedMethod = string(envelope?.method);
-  if (nestedMethod?.startsWith("x.ai/") && envelope && "params" in envelope) {
-    return { ...message, method: nestedMethod, params: envelope.params };
-  }
-  return { ...message, method: message.method.slice(1) };
-}
-
 function byteText(value: unknown): string | undefined {
   if (!Array.isArray(value) || !value.every((entry) => Number.isInteger(entry))) return undefined;
   try {
@@ -511,43 +519,6 @@ function parseTimestamp(value: unknown, fallback = Date.now()): number {
 
 function emptySession(meta: SessionMeta): Session {
   return { ...meta, blocks: [], usage: { ...EMPTY_USAGE }, status: "idle" };
-}
-
-const TOOL_KINDS = new Set<ToolKind>([
-  "read", "edit", "delete", "list_dir", "write", "move", "search", "lsp", "execute",
-  "plan", "web_search", "web_fetch", "background_task_action", "wait_tasks_action",
-  "kill_task_action", "list", "skill", "memory_search", "memory_get", "task", "enter_plan",
-  "exit_plan", "ask_user", "image_gen", "video_gen", "image_to_video", "reference_to_video", "computer",
-  "deploy_app", "search_tool", "use_tool", "monitor", "goal_update", "terminal", "web",
-  "think", "switch_mode", "voice", "finance", "other",
-]);
-
-function mapToolKind(kindValue: unknown, titleValue: unknown): ToolKind {
-  const exact = (string(kindValue) ?? "").toLowerCase();
-  if (TOOL_KINDS.has(exact as ToolKind)) return exact as ToolKind;
-  if (exact === "fetch") return "web_fetch";
-  const source = `${exact} ${string(titleValue) ?? ""}`.toLowerCase();
-  if (/\b(voice|speech|audio|transcri(?:be|ption))\b/.test(source)) return "voice";
-  if (/\b(finance|market|stock|quote|ticker)\b/.test(source)) return "finance";
-  if (
-    /\bcomputer_(screenshot|mouse|click|drag|scroll|key|type|wait)\b/.test(source) ||
-    (
-      /\bcomputer\b/.test(source) &&
-      /\b(list_(apps|windows)|start|pause|resume|stop|get_window_state|activate_window|click|double_click|perform_secondary_action|scroll|press_key|type_text|set_value|drag|wait)\b/.test(source)
-    )
-  ) return "computer";
-  if (/\bgoal\b/.test(source)) return "goal_update";
-  if (/\bworkflow\b/.test(source)) return "task";
-  if (/\b(read|view|cat)\b/.test(source)) return "read";
-  if (/\b(delete|remove|unlink)\b/.test(source)) return "delete";
-  if (/\b(move|rename)\b/.test(source)) return "move";
-  if (/\b(edit|write|patch|replace)\b/.test(source)) return "edit";
-  if (/\b(execute|terminal|shell|bash|command|process)\b/.test(source)) return "execute";
-  if (/\b(web|fetch|browser|url)\b/.test(source)) return "web_fetch";
-  if (/\b(search|grep|find|glob)\b/.test(source)) return "search";
-  if (/\b(task|agent|todo|plan)\b/.test(source)) return "task";
-  if (/\b(think|reason)\b/.test(source)) return "think";
-  return "other";
 }
 
 function mapToolStatus(value: unknown): ToolStatus {
@@ -629,8 +600,8 @@ function extractDiffs(value: unknown): DiffHunk[] | undefined {
   return diffs.length > 0 ? diffs : undefined;
 }
 
-function extractImages(value: unknown): ToolCall["images"] {
-  const images: NonNullable<ToolCall["images"]> = [];
+function extractImages(value: unknown): Array<{ mime: string; data: string }> | undefined {
+  const images: Array<{ mime: string; data: string }> = [];
   const seen = new Set<string>();
   walkJson(value, (object) => {
     const type = string(object.type);
@@ -716,34 +687,10 @@ function mapPlanSteps(value: unknown): PlanStep[] {
   });
 }
 
-interface ComputerSessionExtensions {
-  mcpServers: unknown[];
-  pluginDirs: string[];
-  leaseId: string;
-}
-
-interface BrowserSessionExtensions {
-  mcpServers: unknown[];
-  leaseId: string;
-}
-
-interface SessionDiskPreview {
-  messages: Array<{ role: "user" | "assistant"; text: string }>;
-  truncated: boolean;
-}
-
-function sessionFromDiskPreview(meta: SessionMeta, preview: SessionDiskPreview): Session {
-  return {
-    ...meta,
-    blocks: preview.messages.map((message, index) => ({
-      type: message.role,
-      id: `preview-${meta.id}-${index}`,
-      text: message.text,
-      ts: meta.createdAt + index,
-    })),
-    usage: { ...EMPTY_USAGE },
-    status: "idle",
-  };
+interface OpenAgentSessionResult {
+  response: unknown;
+  warnings: GroxError[];
+  effectivePermissionMode: PermissionMode;
 }
 
 function mapAvailableCommands(value: unknown): SlashCommand[] {
@@ -963,11 +910,20 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
     case "workflow_update":
     case "workflow_trace_update":
     case "runtime_notice":
+    case "runtime_state":
+    case "runtime_occupancy":
+    case "session_journal_checkpoint":
+    case "prompt_queue_changed":
+    case "automation_session_started":
+    case "automation_session_settled":
+    case "automation_runner_tick":
       return session;
     case "session_meta":
       return { ...session, ...event.patch };
     case "block_add":
-      return { ...session, blocks: [...session.blocks, event.block] };
+      return session.blocks.some((block) => block.id === event.block.id)
+        ? session
+        : { ...session, blocks: [...session.blocks, event.block] };
     case "block_patch":
       return { ...session, blocks: patchBlock(event.blockId, event.patch) };
     case "assistant_append":
@@ -977,6 +933,15 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
         blocks: session.blocks.map((block) =>
           block.id === event.blockId &&
           (block.type === "assistant" || block.type === "thinking")
+            ? { ...block, text: block.text + event.delta }
+            : block,
+        ),
+      };
+    case "user_append":
+      return {
+        ...session,
+        blocks: session.blocks.map((block) =>
+          block.id === event.blockId && block.type === "user"
             ? { ...block, text: block.text + event.delta }
             : block,
         ),
@@ -1044,10 +1009,10 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
     case "error":
       return {
         ...session,
-        status: "failed",
+        status: event.error.fatal ? "failed" : session.status,
         blocks: [
           ...session.blocks,
-          { type: "system", id: uid(), text: event.message, ts: Date.now(), kind: "error" },
+          { type: "system", id: uid(), text: formatGroxError(event.error), ts: Date.now(), kind: "error" },
         ],
       };
     case "session_ready":
@@ -1059,9 +1024,10 @@ export class AcpBridge implements GrokBridge {
   readonly kind = "acp" as const;
 
   private listeners = new Set<(event: BridgeEvent) => void>();
-  private pending = new Map<RpcId, PendingRequest>();
-  private interactions = new Map<string, PendingInteraction>();
-  private cursors = new Map<string, ContentCursor>();
+  /** Host 门控的 UI 投影；不包含 rpc id 或 wire option。 */
+  private hostInteractions = new Map<string, HostInteractionProjection>();
+  private resolvingInteractions = new Set<string>();
+  private replayCursors = new Map<string, ReplayContentCursor>();
   private catalogue = new Map<string, SessionMeta>();
   private replaying = new Map<string, Session>();
   // `session/load` may replay the immutable pre-rewind journal before the
@@ -1075,31 +1041,41 @@ export class AcpBridge implements GrokBridge {
   private canonicalReplaySessions = new Set<string>();
   private usage = new Map<string, Usage>();
   private sessionOptions = new Map<string, PromptOptions>();
-  /** Active session/prompt JSON-RPC id — stream errors can reject it for effort fallback. */
-  private promptRpcBySession = new Map<string, RpcId>();
-  private sessionSetModelUnsupported = false;
   private activePromptSessions = new Set<string>();
-  private promptDrainWaiters = new Set<() => void>();
+  /** 本轮已经收到 ACP 文本事件；用于避免 Host 最终文本补齐产生重复气泡。 */
+  private liveAssistantSessions = new Set<string>();
+  /** 客户端操作 id 只用于把“发送前 Stop”归属到同一 Host 回合。 */
+  private foregroundTurnIds = new Map<string, string>();
+  private stoppingSessions = new Set<string>();
   private knownSessions = new Set<string>();
   private loadPromises = new Map<string, Promise<void>>();
-  private sessionMetaCache = new Map<string, { expiresAt: number; systemPromptOverride?: string }>();
-  private lastActivity = new Map<string, number>();
-  /** Wall clock when the current session/prompt was written. */
-  private promptWrittenAt = new Map<string, number>();
-  /** toolCallIds still pending/running/awaiting_permission for the stall watchdog. */
+  /** toolCallIds still pending/running/awaiting_permission for UI projection. */
   private openToolCalls = new Map<string, Set<string>>();
   private unlisten: UnlistenFn[] = [];
+  /** 仅用于当前 WebView 去重；跨重载恢复由 Host 的 journal ACK 决定。 */
+  private hostSessionEventCursor: HostSessionEventCursor = { sequence: 0 };
+  private hostSessionEventCatchup = true;
+  private bufferedHostSessionEvents: HostSessionEvent[] = [];
+  private recoveredReplaySessions = new Set<string>();
+  private automationStartedSessions = new Set<string>();
   private streamAppends = new Map<string, Extract<BridgeEvent, { type: "assistant_append" | "thinking_append" }>>();
   private repeatedDeltas = new Map<string, { value: string; count: number }>();
   private streamFlushTimer: number | undefined;
   private toolPatches = new Map<string, Extract<BridgeEvent, { type: "tool_patch" }>>();
   private toolFlushTimer: number | undefined;
+  private pendingHostEventCheckpoints = new Map<string, HostSessionEvent>();
+  private toolImagePersistGeneration = new Map<string, number>();
+  private toolImagePersistCheckpoints = new Map<string, HostSessionEvent[]>();
+  private toolImagePersistFailures = new Set<string>();
   private diagnostics: string[] = [];
   private requestId = 0;
   /** 与原生 ACP 子进程绑定，防止旧异步请求写入新子进程。 */
   private acpGeneration = 0;
-  private reconnecting: Promise<void> | null = null;
-  private authMethodId: string | undefined;
+  private reconnectProjection: {
+    promise: Promise<void>;
+    resolve: () => void;
+    reject: (cause: unknown) => void;
+  } | null = null;
   private authState: AuthState = { required: false, inProgress: false };
   private modelState: ModelState = { models: MODELS, currentId: MODELS[0].id };
   private runtimeCommandBase: SlashCommand[] = [];
@@ -1109,9 +1085,7 @@ export class AcpBridge implements GrokBridge {
   private computerUseEnabled = localStorage.getItem("grox.computerUseEnabled") !== "0";
   private browserUseEnabled = localStorage.getItem("grox.browserUseEnabled") !== "0";
   private workspace = "";
-  private sessionWorkspaces = new Map<string, string>();
-  private computerLeases = new Map<string, string>();
-  private browserLeases = new Map<string, string>();
+  private workspaceSelectionGeneration = 0;
   private activeComputerSessions = new Set<string>();
   private activeComputerToolCalls = new Set<string>();
   private workflowChildTraces = new Map<string, { sessionId: string; runId: string; trace: WorkflowAgentTrace }>();
@@ -1133,13 +1107,6 @@ export class AcpBridge implements GrokBridge {
   ensureReady(): Promise<void> {
     if (!this.boot) {
       this.boot = this.connect()
-        .then(() => {
-          if (localStorage.getItem("grox.pendingOAuth") !== "1") return;
-          localStorage.removeItem("grox.pendingOAuth");
-          void this.authenticate().catch(() => {
-            // authenticate() already publishes the actionable error through auth_state.
-          });
-        })
         .catch((error) => {
           // Allow a later caller to retry after a failed first boot.
           this.boot = null;
@@ -1154,13 +1121,31 @@ export class AcpBridge implements GrokBridge {
     return () => this.listeners.delete(callback);
   }
 
-  private setAuthState(patch: Partial<AuthState>) {
-    this.authState = { ...this.authState, ...patch };
+  private projectAuthState(state: AuthState) {
+    const next = {
+      required: state.required,
+      inProgress: state.inProgress,
+      label: state.label,
+      error: state.error,
+    };
+    if (
+      this.authState.required === next.required
+      && this.authState.inProgress === next.inProgress
+      && this.authState.label === next.label
+      && this.authState.error === next.error
+    ) return;
+    this.authState = next;
     this.emit({ type: "auth_state", state: { ...this.authState } });
   }
 
+  private emitError(sessionId: string, cause: unknown, fallback: ErrorFallback) {
+    const error = toGroxError(cause, fallback);
+    this.emit({ type: "error", sessionId, error });
+    return error;
+  }
+
   private emit(event: BridgeEvent) {
-    if ("sessionId" in event) {
+    if ("sessionId" in event && event.type !== "session_journal_checkpoint") {
       const replay = this.replaying.get(event.sessionId);
       if (replay) {
         this.replaying.set(event.sessionId, applyToSession(replay, event));
@@ -1207,6 +1192,7 @@ export class AcpBridge implements GrokBridge {
     if (this.streamAppends.size > 0) {
       this.streamFlushTimer = window.setTimeout(() => this.flushStreamAppends(), STREAM_FLUSH_MS);
     }
+    this.flushPendingHostEventCheckpoints(sessionId);
   }
 
   private queueToolPatch(event: Extract<BridgeEvent, { type: "tool_patch" }>) {
@@ -1231,70 +1217,608 @@ export class AcpBridge implements GrokBridge {
     if (this.toolPatches.size > 0) {
       this.toolFlushTimer = window.setTimeout(() => this.flushToolPatches(), TOOL_FLUSH_MS);
     }
+    this.flushPendingHostEventCheckpoints(sessionId);
   }
 
-  private cursor(sessionId: string): ContentCursor {
-    let cursor = this.cursors.get(sessionId);
+  private hasPendingSessionProjection(sessionId: string): boolean {
+    return [...this.streamAppends.values()].some((event) => event.sessionId === sessionId)
+      || [...this.toolPatches.values()].some((event) => event.sessionId === sessionId);
+  }
+
+  private queueHostEventCheckpoint(event: HostSessionEvent) {
+    if (!event.journalRecoverable || !event.sessionId) return;
+    if (this.hasPendingSessionProjection(event.sessionId)) {
+      this.pendingHostEventCheckpoints.set(`${event.streamId}:${event.sequence}`, event);
+      return;
+    }
+    this.emitHostEventCheckpoint(event);
+  }
+
+  private flushPendingHostEventCheckpoints(sessionId?: string) {
+    for (const [key, event] of this.pendingHostEventCheckpoints) {
+      if ((sessionId && event.sessionId !== sessionId)
+        || !event.sessionId
+        || this.hasPendingSessionProjection(event.sessionId)) continue;
+      this.pendingHostEventCheckpoints.delete(key);
+      this.emitHostEventCheckpoint(event);
+    }
+  }
+
+  private persistToolImages(
+    sessionId: string,
+    blockId: string,
+    images: Array<{ mime: string; data: string }> | undefined,
+    checkpoint?: HostSessionEvent,
+  ): boolean {
+    if (!images || images.length === 0) return false;
+    const key = `${sessionId}:${blockId}`;
+    if (checkpoint) {
+      const pending = this.toolImagePersistCheckpoints.get(key) ?? [];
+      if (!pending.some((event) => (
+        event.streamId === checkpoint.streamId && event.sequence === checkpoint.sequence
+      ))) {
+        pending.push(checkpoint);
+        this.toolImagePersistCheckpoints.set(key, pending);
+      }
+    }
+    const generation = (this.toolImagePersistGeneration.get(key) ?? 0) + 1;
+    this.toolImagePersistGeneration.set(key, generation);
+    void invoke<ToolCall["images"]>("persist_session_tool_images", { sessionId, images }).then((references) => {
+      if (this.toolImagePersistGeneration.get(key) !== generation) return;
+      if (!references?.length) throw new Error("Host 未返回可持久化的工具图片引用");
+      // 先提交可能仍在节流队列中的 base64 patch，再用持久引用替换它。
+      this.flushToolPatches(sessionId);
+      this.emit({ type: "tool_patch", sessionId, blockId, call: { images: references } });
+      for (const event of this.toolImagePersistCheckpoints.get(key) ?? []) {
+        this.queueHostEventCheckpoint(event);
+      }
+      this.toolImagePersistCheckpoints.delete(key);
+      this.toolImagePersistFailures.delete(key);
+    }).catch((error) => {
+      this.diagnostics.push(`工具图片持久化失败：${errorText(error)}`);
+      this.diagnostics = this.diagnostics.slice(-20);
+      if (this.toolImagePersistFailures.has(key)) return;
+      this.toolImagePersistFailures.add(key);
+      this.emit({
+        type: "runtime_notice",
+        notice: runtimeNoticeFromError(toGroxError(error, {
+          domain: "environment",
+          code: "TOOL_MEDIA_PERSIST_FAILED",
+          message: "工具图片未能写入会话存储，重启后可能无法恢复",
+          recoverable: true,
+          fatal: false,
+          holdQueue: false,
+          action: "请检查应用配置目录的磁盘空间和写入权限",
+        })),
+      });
+    });
+    return true;
+  }
+
+  private forgetToolImagePersistence(sessionId: string) {
+    for (const key of this.toolImagePersistGeneration.keys()) {
+      if (!key.startsWith(`${sessionId}:`)) continue;
+      this.toolImagePersistGeneration.delete(key);
+      this.toolImagePersistCheckpoints.delete(key);
+    }
+    for (const key of this.toolImagePersistFailures) {
+      if (key.startsWith(`${sessionId}:`)) this.toolImagePersistFailures.delete(key);
+    }
+  }
+
+  private replayCursor(sessionId: string): ReplayContentCursor {
+    let cursor = this.replayCursors.get(sessionId);
     if (!cursor) {
       cursor = { toolBlocks: new Map() };
-      this.cursors.set(sessionId, cursor);
+      this.replayCursors.set(sessionId, cursor);
     }
     return cursor;
   }
 
+  private projectHostSessionEvent(event: HostSessionEvent) {
+    if (!Number.isSafeInteger(event.sequence) || event.sequence < 1 || !event.streamId) {
+      this.emitHostSessionEventGap("Host 返回了无效的 ACP 事件序号");
+      return;
+    }
+    this.adoptHostSessionEventStream(event.streamId);
+    if (event.sequence <= this.hostSessionEventCursor.sequence) return;
+    if (event.sequence !== this.hostSessionEventCursor.sequence + 1) {
+      this.emitHostSessionEventGap(
+        `ACP 事件序列从 ${this.hostSessionEventCursor.sequence} 跳到 ${event.sequence}`,
+      );
+    }
+    if (!event.journalAcknowledged) {
+      const waitsForMedia = this.hostEventWaitsForToolMedia(event);
+      const mediaDeferred = this.projectHostSessionProjection(
+        event.projection,
+        waitsForMedia ? event : undefined,
+      );
+      // 有图片不代表该投影一定会展示图片（例如已取消的 workflow 尾帧）。
+      // 只有真正启动 Host 媒体落盘时才延后确认，否则当前投影即可写 journal。
+      if (!mediaDeferred) this.queueHostEventCheckpoint(event);
+    }
+    this.hostSessionEventCursor = { streamId: event.streamId, sequence: event.sequence };
+  }
+
+  private adoptHostSessionEventStream(streamId: string) {
+    if (this.hostSessionEventCursor.streamId === streamId) return;
+    this.hostSessionEventCursor = { streamId, sequence: 0 };
+    this.pendingHostEventCheckpoints.clear();
+    this.toolImagePersistGeneration.clear();
+    this.toolImagePersistCheckpoints.clear();
+    this.toolImagePersistFailures.clear();
+    this.recoveredReplaySessions.clear();
+  }
+
+  private emitHostEventCheckpoint(event: HostSessionEvent) {
+    if (!event.journalRecoverable || !event.sessionId) return;
+    this.emit({
+      type: "session_journal_checkpoint",
+      sessionId: event.sessionId,
+      streamId: event.streamId,
+      sequence: event.sequence,
+    });
+  }
+
+  private hostEventWaitsForToolMedia(event: HostSessionEvent): boolean {
+    if (!event.journalRecoverable || event.projection.kind !== "session_update") return false;
+    if (event.projection.updateType !== "tool_call" && event.projection.updateType !== "tool_call_update") {
+      return false;
+    }
+    const update = record(event.projection.update);
+    if (!update) return false;
+    return (extractImages([array(update.content), update.rawOutput])?.length ?? 0) > 0;
+  }
+
+  private onHostSessionEvent(event: HostSessionEvent) {
+    if (this.hostSessionEventCatchup) {
+      this.bufferedHostSessionEvents.push(event);
+      return;
+    }
+    this.projectHostSessionEvent(event);
+  }
+
+  private emitHostSessionEventGap(detail: string) {
+    this.diagnostics.push(detail);
+    this.diagnostics = this.diagnostics.slice(-20);
+    this.emit({
+      type: "runtime_notice",
+      notice: runtimeNoticeFromError({
+        domain: "protocol",
+        code: "ACP_EVENT_REPLAY_GAP",
+        message: "会话流补放窗口不完整，当前页面可能缺少部分输出",
+        recoverable: true,
+        fatal: false,
+        holdQueue: true,
+        action: "重新打开受影响会话以从 Agent 历史记录重建内容",
+      }),
+    });
+  }
+
+  private projectHostActiveBlockSnapshots(snapshots: HostActiveBlockSnapshot[]) {
+    for (const snapshot of snapshots) {
+      const recoveredText = snapshot.textComplete
+        ? snapshot.text
+        : `${snapshot.text}\n… [Grox 活动流快照已截断]`;
+      if (snapshot.blockType === "user") {
+        const text = displayReplayUserPrompt(recoveredText);
+        if (!text) continue;
+        this.emit({
+          type: "block_add",
+          sessionId: snapshot.sessionId,
+          block: { type: "user", id: snapshot.blockId, text, ts: snapshot.startedAt },
+        });
+        if (snapshot.textComplete) {
+          this.emit({
+            type: "block_patch",
+            sessionId: snapshot.sessionId,
+            blockId: snapshot.blockId,
+            patch: { type: "user", text } as Partial<SessionBlock>,
+          });
+        }
+        continue;
+      }
+      if (snapshot.blockType === "assistant") {
+        this.emit({
+          type: "block_add",
+          sessionId: snapshot.sessionId,
+          block: {
+            type: "assistant",
+            id: snapshot.blockId,
+            text: recoveredText,
+            ts: snapshot.startedAt,
+            streaming: true,
+          },
+        });
+        if (snapshot.textComplete) {
+          this.emit({
+            type: "block_patch",
+            sessionId: snapshot.sessionId,
+            blockId: snapshot.blockId,
+            patch: { type: "assistant", text: snapshot.text, streaming: true } as Partial<SessionBlock>,
+          });
+        }
+        continue;
+      }
+      this.emit({
+        type: "block_add",
+        sessionId: snapshot.sessionId,
+        block: {
+          type: "thinking",
+          id: snapshot.blockId,
+          text: recoveredText,
+          ts: snapshot.startedAt,
+          live: true,
+        },
+      });
+      if (snapshot.textComplete) {
+        this.emit({
+          type: "block_patch",
+          sessionId: snapshot.sessionId,
+          blockId: snapshot.blockId,
+          patch: { type: "thinking", text: snapshot.text, live: true } as Partial<SessionBlock>,
+        });
+      }
+    }
+  }
+
+  private async recoverHostReplaySessions(
+    sessionIds: Iterable<string>,
+    bindings: Map<string, string>,
+    activeTurnSessionIds: Set<string>,
+  ): Promise<void> {
+    const pending = [...new Set(sessionIds)]
+      .filter((sessionId) => sessionId && !this.recoveredReplaySessions.has(sessionId))
+      .slice(0, 128);
+    for (let offset = 0; offset < pending.length; offset += 8) {
+      await Promise.all(pending.slice(offset, offset + 8).map(async (sessionId) => {
+        const boundCwd = bindings.get(sessionId);
+        let snapshot: SessionJournalSnapshot | null = null;
+        try {
+          const raw = await invoke<string | null>("read_session_journal", { id: sessionId });
+          if (raw) {
+            snapshot = parseSessionJournal(raw, sessionId);
+            rememberSessionJournalSnapshot(snapshot);
+          }
+        } catch (error) {
+          this.diagnostics.push(`会话 ${sessionId} 的补放基线读取失败：${errorText(error)}`);
+          this.diagnostics = this.diagnostics.slice(-20);
+          throw error;
+        }
+        if (!snapshot && !boundCwd) {
+          // 没有磁盘基线且 Host 已解除绑定，通常表示会话已被删除。记录这一
+          // 事实，避免同一补放窗口重复读取，也不能凭事件片段把它复活。
+          this.recoveredReplaySessions.add(sessionId);
+          return;
+        }
+
+        const active = activeTurnSessionIds.has(sessionId);
+        const recovered = snapshot
+          ? snapshot.turnState === "active" && !active
+            ? reconcileSessionJournal(snapshot, null).session
+            : {
+                ...snapshot.session,
+                ...(boundCwd ? { cwd: boundCwd } : {}),
+                ...(active ? { status: "running" as const, preview: false } : {}),
+              }
+          : {
+              ...emptySession({
+                id: sessionId,
+                title: "Recovered mission",
+                cwd: boundCwd!,
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+                model: this.modelState.currentId,
+              }),
+              ...(active ? { status: "running" as const, preview: false } : {}),
+            };
+        if (!recovered) return;
+        if (boundCwd) this.knownSessions.add(sessionId);
+        const meta: SessionMeta = {
+          id: recovered.id,
+          title: recovered.title,
+          cwd: recovered.cwd,
+          createdAt: recovered.createdAt,
+          updatedAt: recovered.updatedAt,
+          model: recovered.model,
+          lastStatus: recovered.status,
+        };
+        this.catalogue.set(sessionId, meta);
+        this.usage.set(sessionId, recovered.usage);
+        this.emit({ type: "session_ready", session: recovered, background: true });
+        this.recoveredReplaySessions.add(sessionId);
+      }));
+    }
+  }
+
+  private async catchUpHostSessionEvents(
+    bindings: Map<string, string>,
+    activeTurnSessionIds: Set<string>,
+  ) {
+    let finalLatestSequence = this.hostSessionEventCursor.sequence;
+    let replayTruncated = false;
+    let activeBlocks: HostActiveBlockSnapshot[] = [];
+    try {
+      await this.recoverHostReplaySessions(
+        activeTurnSessionIds,
+        bindings,
+        activeTurnSessionIds,
+      );
+      for (let page = 0; page < 32; page += 1) {
+        const replay = await invoke<HostSessionEventReplay>("replay_session_events", {
+          streamId: this.hostSessionEventCursor.streamId,
+          afterSequence: this.hostSessionEventCursor.sequence,
+          limit: 1_000,
+        });
+        if (replay.reset || this.hostSessionEventCursor.streamId !== replay.streamId) {
+          this.adoptHostSessionEventStream(replay.streamId);
+          finalLatestSequence = replay.latestSequence;
+        } else {
+          finalLatestSequence = Math.max(finalLatestSequence, replay.latestSequence);
+        }
+        activeBlocks = replay.activeBlocks ?? [];
+        replayTruncated ||= replay.truncated;
+        const events = [...replay.events].sort((left, right) => left.sequence - right.sequence);
+        await this.recoverHostReplaySessions(
+          events
+            .filter((event) => !event.journalAcknowledged && event.sessionId)
+            .map((event) => event.sessionId!),
+          bindings,
+          activeTurnSessionIds,
+        );
+        for (const event of events) {
+          this.projectHostSessionEvent(event);
+        }
+        if (!replay.hasMore) break;
+        if (page === 31) replayTruncated = true;
+      }
+    } catch (error) {
+      this.emit({
+        type: "runtime_notice",
+        notice: runtimeNoticeFromError(toGroxError(error, {
+          domain: "environment",
+          code: "ACP_EVENT_REPLAY_FAILED",
+          message: "无法从 Host 恢复会话流",
+          recoverable: true,
+          fatal: true,
+          holdQueue: true,
+          action: "重新连接 Agent 后再继续发送",
+        })),
+      });
+      throw error;
+    }
+    const activeSnapshotSessionIds = [...new Set(
+      activeBlocks.map((snapshot) => snapshot.sessionId),
+    )];
+    for (const sessionId of activeSnapshotSessionIds) {
+      // occupancy 与 replay 是两个查询；两者之间新启动的后台回合以同一
+      // journal 锁内的活动块快照为准，重新投影 running 基线。
+      activeTurnSessionIds.add(sessionId);
+      this.recoveredReplaySessions.delete(sessionId);
+    }
+    await this.recoverHostReplaySessions(
+      activeSnapshotSessionIds,
+      bindings,
+      activeTurnSessionIds,
+    );
+    // 快照与最后一页 replay 在同一把 Host journal 锁内读取。先恢复快照，
+    // 再打开实时闸门并消费缓冲事件，才能保证 N 的累计文本先于 N+1 增量。
+    // replay 增量仍在 UI 合并队列时必须先提交，否则快照写入完整文本后，
+    // 迟到的增量会再次追加同一段内容。
+    this.flushStreamAppends();
+    this.flushToolPatches();
+    this.projectHostActiveBlockSnapshots(activeBlocks);
+    for (const snapshot of activeBlocks) {
+      if (!this.hostSessionEventCursor.streamId || snapshot.updatedThrough < 1) continue;
+      this.emit({
+        type: "session_journal_checkpoint",
+        sessionId: snapshot.sessionId,
+        streamId: this.hostSessionEventCursor.streamId,
+        sequence: snapshot.updatedThrough,
+      });
+    }
+    // 只有完整查询成功后才打开实时闸门。查询失败时继续缓冲，下一次
+    // ensureReady 会从已提交游标重试，不能让较新的实时事件越过缺口。
+    this.hostSessionEventCatchup = false;
+    const buffered = this.bufferedHostSessionEvents
+      .splice(0)
+      .sort((left, right) => left.sequence - right.sequence);
+    for (const event of buffered) this.projectHostSessionEvent(event);
+    if (replayTruncated) {
+      this.emitHostSessionEventGap("Host ACP 事件补放窗口已发生截断");
+    }
+    // 超大事件若无法保留，只推进当前 WebView 的内存游标；跨页面恢复仍由
+    // journal ACK 决定，绝不能把“已经看过”冒充“已经落盘”。
+    if (
+      this.hostSessionEventCursor.streamId
+      && finalLatestSequence > this.hostSessionEventCursor.sequence
+    ) {
+      this.hostSessionEventCursor = {
+        streamId: this.hostSessionEventCursor.streamId,
+        sequence: finalLatestSequence,
+      };
+    }
+  }
+
   private async connect(): Promise<void> {
+    this.emit({ type: "runtime_state", state: "starting" });
     const environment = await invoke<DesktopEnvironment>("desktop_environment");
     this.workspace = localStorage.getItem("grok.workspace") ?? environment.defaultWorkspace;
 
-    this.unlisten.push(
-      await listen<string>("acp-event", ({ payload }) => this.onLine(payload)),
+    if (this.unlisten.length === 0) this.unlisten.push(
+      await listen<HostSessionEvent>("host-session-event", ({ payload }) => {
+        this.onHostSessionEvent(payload);
+      }),
+      await listen<HostInteractionProjection>("interaction-opened", ({ payload }) => {
+        this.projectHostInteraction(payload);
+      }),
+      await listen<HostInteractionClosed>("interaction-closed", ({ payload }) => {
+        this.closeHostInteraction(payload);
+      }),
       await listen<string>("acp-stderr", ({ payload }) => {
         this.diagnostics.push(payload);
         this.diagnostics = this.diagnostics.slice(-20);
       }),
       await listen<ExitPayload>("acp-exit", ({ payload }) => this.onExit(payload)),
+      await listen<RuntimeReconnectPayload>("agent-runtime-reconnect", ({ payload }) => {
+        void this.onRuntimeReconnect(payload);
+      }),
+      await listen<HostAuthenticationState>("agent-runtime-auth-state", ({ payload }) => {
+        this.projectAuthState(payload);
+      }),
+      await listen<RuntimeOccupancy>("session-runtime-occupancy", ({ payload }) => {
+        this.emit({ type: "runtime_occupancy", occupancy: payload });
+      }),
+      await listen<PromptQueueChanged>("prompt-queue-changed", ({ payload }) => {
+        this.emit({
+          type: "prompt_queue_changed",
+          sessionId: payload.sessionId,
+          itemId: payload.itemId,
+          queue: payload.queue,
+          reason: payload.reason,
+        });
+      }),
+      await listen<AutomationSessionStarted>("automation-session-started", ({ payload }) => {
+        if (this.projectAutomationSessionStarted(payload)) {
+          this.emit({ type: "automation_session_started", started: payload });
+        }
+      }),
+      await listen<AutomationRunnerStatus>("automation-runner-tick", ({ payload }) => {
+        this.emit({ type: "automation_runner_tick", status: payload });
+      }),
+      await listen<GroxError>("automation-runner-error", ({ payload }) => {
+        this.emit({ type: "runtime_notice", notice: runtimeNoticeFromError(payload) });
+      }),
+      await listen<ForegroundTurnStalled>("foreground-turn-stalled", ({ payload }) => {
+        const minutes = Math.max(1, Math.round(payload.silentForMs / 60_000));
+        this.emit({
+          type: "block_add",
+          sessionId: payload.sessionId,
+          block: {
+            type: "system",
+            id: uid(),
+            text: `Agent 已 ${minutes} 分钟没有新输出；Host 仍在等待，运行中的长工具不会被误杀。你可以继续等待或停止本轮。`,
+            ts: Date.now(),
+            kind: "info",
+          },
+        });
+      }),
+      await listen<AutomationSessionSettled>("automation-session-settled", ({ payload }) => {
+        if (payload.sessionId && payload.model && payload.effectiveEffort && payload.mode) {
+          this.sessionOptions.set(payload.sessionId, {
+            model: payload.model,
+            effort: payload.effectiveEffort,
+            mode: payload.mode,
+          });
+        }
+        if (
+          payload.sessionId
+          && payload.requestedEffort
+          && payload.effectiveEffort
+          && payload.requestedEffort !== payload.effectiveEffort
+        ) {
+          this.emit({
+            type: "block_add",
+            sessionId: payload.sessionId,
+            block: {
+              type: "system",
+              id: uid(),
+              text: `推理强度 ${payload.requestedEffort} 不被当前模型/API 接受，已自动改用 ${payload.effectiveEffort} 继续。`,
+              ts: Date.now(),
+              kind: "info",
+            },
+          });
+        }
+        if (payload.sessionId) {
+          this.finishTurn(
+            payload.sessionId,
+            record(payload.usage),
+            payload.error ? "failed" : "idle",
+          );
+        }
+        this.emit({ type: "automation_session_settled", settled: payload });
+        if (payload.error && payload.sessionId) {
+          this.emit({ type: "error", sessionId: payload.sessionId, error: payload.error });
+        }
+      }),
       await listen("computer-emergency-shortcut", () => {
         for (const sessionId of this.activeComputerSessions) {
           void this.emergencyStopComputer(sessionId);
         }
       }),
     );
+    const [occupancy, automationStatus, bindingRows] = await Promise.all([
+      invoke<RuntimeOccupancy>("session_runtime_status"),
+      invoke<AutomationRunnerStatus>("automation_runner_status"),
+      invoke<HostSessionBinding[]>("host_session_bindings"),
+    ]);
+    if (
+      automationStatus.activeSession
+      && this.projectAutomationSessionStarted(automationStatus.activeSession)
+    ) {
+      this.emit({ type: "automation_session_started", started: automationStatus.activeSession });
+    }
+    const bindings = new Map(bindingRows.map((binding) => [binding.sessionId, binding.cwd]));
+    await this.catchUpHostSessionEvents(bindings, new Set(occupancy.activeTurnSessionIds));
+    this.emit({ type: "runtime_occupancy", occupancy });
+    this.emit({ type: "automation_runner_tick", status: automationStatus });
 
-    await this.initializeAgent();
+    try {
+      await this.initializeAgent();
+      this.emit({ type: "runtime_state", state: "ready" });
+    } catch (error) {
+      this.emit({ type: "runtime_state", state: "offline" });
+      this.emit({
+        type: "runtime_notice",
+        notice: runtimeNoticeFromError(toGroxError(error, {
+          domain: "environment",
+          code: "ACP_START_FAILED",
+          message: "无法启动或初始化 Grok Build CLI",
+          recoverable: true,
+          action: "请检查 CLI 安装、认证与当前工作目录后重试",
+        })),
+      });
+      throw error;
+    }
   }
 
-  private async initializeAgent(): Promise<void> {
-    // Diagnostics belong to one concrete child process. Keeping stderr from a
-    // process replaced during a Tauri hot reload produces misleading errors.
+  private async initializeAgent(forceReconnect = false): Promise<void> {
+    // Diagnostics belong to one concrete child process. A forced reconnect
+    // starts a fresh stream; an ordinary boot may reuse Host's live snapshot.
     this.diagnostics = [];
-    this.acpGeneration = await invoke<number>("acp_spawn", {
+    const connection = await invoke<AgentRuntimeConnection>("agent_runtime_connect", {
       cwd: this.workspace,
-      computerUseEnabled: this.computerUseEnabled,
       reasoningEffort: storedEffort(),
+      forceReconnect,
     });
-    // The inference proxy gates on the client version, so never assert a
-    // hardcoded one: report the actual CLI version whenever it is detectable.
-    const clientVersion = await this.detectCliVersion();
-    const response = await this.requestRaw(ACP_METHODS.initialize, {
-      protocolVersion: 1,
-      clientCapabilities: {
-        fs: { readTextFile: true, writeTextFile: true },
-        terminal: false,
-      },
-      clientInfo: {
-        name: UPSTREAM_CLI_CLIENT_IDENTIFIER,
-        title: "Grok Build CLI",
-        version: clientVersion ?? (await getVersion().catch(() => "0.2.0")),
-      },
-      _meta: {
-        clientIdentifier: UPSTREAM_CLI_CLIENT_IDENTIFIER,
-        clientType: "shell",
-        ...(clientVersion ? { clientVersion } : {}),
-      },
-    }, 15_000);
-    this.captureModelState(response);
-    this.captureRuntimeCommands(response);
-    await this.configureAuthentication(response);
+    await this.projectRuntimeConnection(connection);
+  }
+
+  private async projectRuntimeConnection(connection: AgentRuntimeConnection): Promise<void> {
+    this.acpGeneration = connection.generation;
+    this.captureModelState(connection.initialize);
+    this.captureRuntimeCommands(connection.initialize);
+    this.projectAuthState({
+      required: connection.auth.required,
+      inProgress: connection.auth.inProgress,
+      label: connection.auth.label,
+      error: connection.auth.error,
+    });
+    // 运行时连接已经由 Host 提交；交互门控投影失败不能把一个真实可用的
+    // 新代次误判为重连失败。保留明确诊断，并让下次状态同步继续修复投影。
+    await this.syncHostInteractions().catch((error) => {
+      const failure = toGroxError(error, {
+        domain: "environment",
+        code: "INTERACTION_SYNC_FAILED",
+        message: "Agent 已连接，但待处理交互未能同步",
+        recoverable: true,
+        fatal: false,
+        holdQueue: true,
+        action: "重新打开会话；若问题持续，请导出支持包",
+      });
+      this.diagnostics.push(`交互门控同步失败：${formatGroxError(failure)}`);
+      this.emit({ type: "runtime_notice", notice: runtimeNoticeFromError(failure) });
+    });
     // v1 source snapshots make startup structurally non-blocking: initialize
     // may expose a cached/bundled catalog before the authenticated fetch ends.
     // Refresh in the background so desktop readiness never waits on network.
@@ -1307,113 +1831,63 @@ export class AcpBridge implements GrokBridge {
       });
   }
 
-  /** Best-effort version of the spawned `grok` CLI ("grok 0.2.106 (abc) [stable]" → "0.2.106"). */
-  private async detectCliVersion(): Promise<string | undefined> {
-    try {
-      const runtime = await invoke<GrokRuntimeInfo>("grok_runtime_info");
-      return runtime.version
-        ?.split(/\s+/)
-        .find((token) => /^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?$/.test(token));
-    } catch {
-      return undefined;
-    }
-  }
-
   private async restartAgent(): Promise<void> {
+    this.emit({ type: "runtime_state", state: "starting" });
     this.flushStreamAppends();
     this.flushToolPatches();
-    const error = new Error("模型服务已切换，请重新发送尚未完成的请求");
-    for (const request of this.pending.values()) {
-      if (request.timeoutId !== undefined) window.clearTimeout(request.timeoutId);
-      request.reject(error);
-    }
-    this.pending.clear();
-    this.interactions.clear();
-    this.cursors.clear();
+    this.replayCursors.clear();
     this.openToolCalls.clear();
-    this.promptWrittenAt.clear();
-    this.lastActivity.clear();
     this.sessionOptions.clear();
-    this.sessionSetModelUnsupported = false;
     this.knownSessions.clear();
     this.workflowChildTraces.clear();
     this.cancelledWorkflowRuns.clear();
-    this.authMethodId = undefined;
     this.modelState = { models: MODELS, currentId: MODELS[0].id };
     this.runtimeCommandBase = [];
     this.runtimeCommands = [];
     this.runtimeCommandTags.clear();
-    const next = this.initializeAgent();
+    const next = this.initializeAgent(true);
     this.boot = next;
-    await next;
+    try {
+      await next;
+      this.emit({ type: "runtime_state", state: "ready" });
+    } catch (error) {
+      this.emit({ type: "runtime_state", state: "offline" });
+      throw error;
+    }
   }
 
-  private async waitForActivePrompts(): Promise<void> {
-    if (this.activePromptSessions.size === 0) return;
-    await new Promise<void>((resolve) => {
-      this.promptDrainWaiters.add(resolve);
-    });
+  /**
+   * 配置写入与 ACP 子进程替换是一个运行时切换事务。先暂停 Host 派发；
+   * 写入失败时只在旧代次仍存活的情况下恢复调度。
+   */
+  private async reconfigureRuntime<T>(change: () => Promise<T>): Promise<T> {
+    const previousGeneration = this.acpGeneration;
+    await invoke("agent_runtime_pause");
+    try {
+      // SessionCoordinator 的 lifecycle permit 会等待 session/new|load 和
+      // 全部活动 turn；不再用 WebView 集合复制一次运行时 drain 事实。
+      return await this.withLifecycleGate(async () => {
+        const result = await change();
+        await this.restartAgent();
+        return result;
+      });
+    } catch (error) {
+      await invoke("agent_runtime_resume", { generation: previousGeneration }).catch((resumeError) => {
+        this.diagnostics.push(`自动化调度未能恢复：${errorText(resumeError)}`);
+      });
+      throw error;
+    }
   }
 
   private markPromptFinished(sessionId: string) {
     this.activePromptSessions.delete(sessionId);
-    if (this.activePromptSessions.size !== 0) return;
-    for (const resolve of this.promptDrainWaiters) resolve();
-    this.promptDrainWaiters.clear();
-  }
-
-  private async configureAuthentication(responseValue: unknown) {
-    const response = record(responseValue);
-    const methods = array(response?.authMethods).map((value) => record(value) ?? {});
-    if (methods.length === 0) {
-      // Per ACP semantics an empty authMethods list means the agent needs no
-      // authentication — treating it as "required" wedges the UI with no
-      // usable recovery path (the OAuth button has no method id to call).
-      this.setAuthState({ required: false, inProgress: false, error: undefined });
-      return;
-    }
-
-    const first = methods[0];
-    const firstId = string(first.id);
-    const firstInteractive = firstId === "grok.com" || firstId === "oidc";
-    const meta = record(response?._meta);
-    const defaultId = string(meta?.defaultAuthMethodId);
-    this.authMethodId = firstInteractive
-      ? firstId
-      : defaultId && methods.some((method) => string(method.id) === defaultId)
-        ? defaultId
-        : firstId;
-
-    if (firstInteractive) {
-      this.setAuthState({
-        required: true,
-        inProgress: false,
-        label: string(first.name) ?? "Sign in to Grok",
-        error: undefined,
-      });
-      return;
-    }
-
-    try {
-      await this.requestRaw("authenticate", { methodId: this.authMethodId });
-      this.setAuthState({ required: false, inProgress: false, error: undefined });
-    } catch (error) {
-      const interactive = methods.find((method) => {
-        const id = string(method.id);
-        return id === "grok.com" || id === "oidc";
-      });
-      this.authMethodId = string(interactive?.id);
-      this.setAuthState({
-        required: Boolean(this.authMethodId),
-        inProgress: false,
-        label: string(interactive?.name) ?? "Sign in to Grok",
-        error: this.authMethodId ? undefined : errorText(error),
-      });
-    }
   }
 
   private onExit(payload: ExitPayload) {
-    if (payload.reason === "killed") return;
+    if (payload.reason === "killed") {
+      this.reconcileHostInteractions([]);
+      return;
+    }
     this.flushStreamAppends();
     this.flushToolPatches();
     const diagnostic = this.diagnostics
@@ -1430,198 +1904,169 @@ export class AcpBridge implements GrokBridge {
     const message = `Grok Agent 已退出${payload.code == null ? "" : `（代码 ${payload.code}）`}${
       diagnostic ? `：${diagnostic}` : ""
     }`;
-    for (const request of this.pending.values()) {
-      if (request.timeoutId !== undefined) window.clearTimeout(request.timeoutId);
-      request.reject(new Error(message));
+    const affected = payload.affectedSessionIds ?? [...this.knownSessions];
+    for (const sessionId of affected) {
+      this.emit({ type: "status", sessionId, status: "disconnected" });
     }
-    this.pending.clear();
-    const affected = [...this.knownSessions];
+    this.reconcileHostInteractions([]);
     this.knownSessions.clear();
     this.loadPromises.clear();
-    this.cursors.clear();
+    this.replayCursors.clear();
     this.sessionOptions.clear();
-    this.beginReconnect(affected, message);
+    if (!this.reconnectProjection) {
+      let resolve!: () => void;
+      let reject!: (cause: unknown) => void;
+      const promise = new Promise<void>((accept, decline) => {
+        resolve = accept;
+        reject = decline;
+      });
+      this.reconnectProjection = { promise, resolve, reject };
+      this.boot = promise;
+      void promise.catch(() => {
+        if (this.boot === promise) this.boot = null;
+      });
+    }
+    this.emit({ type: "runtime_state", state: "reconnecting" });
+    if (diagnostic) this.diagnostics.push(message);
   }
 
-  private beginReconnect(sessionIds: string[], reason: string) {
-    if (this.reconnecting) return;
-    const reconnect = (async () => {
-      let lastError = reason;
-      for (let attempt = 1; attempt <= 2; attempt += 1) {
-        this.setAuthState({ inProgress: true, error: `Agent 异常退出，正在自动重连（${attempt}/2）…` });
-        await new Promise((resolve) => window.setTimeout(resolve, attempt * 800));
-        try {
-          await this.initializeAgent();
-          this.setAuthState({ inProgress: false, error: undefined });
-          for (const sessionId of sessionIds) {
-            this.emit({
-              type: "block_add",
-              sessionId,
-              block: { type: "system", id: uid(), text: "Agent 已自动重连；下次发送会重新绑定会话", ts: Date.now(), kind: "info" },
-            });
-            this.emit({ type: "status", sessionId, status: "idle" });
-          }
-          return;
-        } catch (error) {
-          lastError = errorText(error);
-        }
-      }
-      this.setAuthState({ inProgress: false, error: `Agent 自动重连失败：${lastError}` });
-      for (const sessionId of sessionIds) this.emit({ type: "error", sessionId, message: lastError });
-      throw new Error(lastError);
-    })();
-    this.reconnecting = reconnect.finally(() => { this.reconnecting = null; });
-    this.boot = this.reconnecting;
-    void this.reconnecting.catch(() => {});
-  }
-
-  private onLine(line: string) {
-    let message: JsonRpcMessage;
-    try {
-      message = normalizeInboundExtension(JSON.parse(line) as JsonRpcMessage);
-    } catch {
-      this.diagnostics.push(`无效 ACP JSON：${line.slice(0, 500)}`);
+  private async onRuntimeReconnect(payload: RuntimeReconnectPayload): Promise<void> {
+    if (payload.state === "reconnecting") {
+      this.emit({ type: "runtime_state", state: "reconnecting" });
       return;
     }
+    if (payload.state === "ready" && payload.connection) {
+      await this.projectRuntimeConnection(payload.connection);
+      this.emit({ type: "runtime_state", state: "ready" });
+      const interrupted = new Set(payload.interruptedSessionIds);
+      for (const sessionId of payload.affectedSessionIds) {
+        this.emit({
+          type: "block_add",
+          sessionId,
+          block: {
+            type: "system",
+            id: uid(),
+            text: "Agent 已由 Host 自动重连；下次发送会重新绑定会话",
+            ts: Date.now(),
+            kind: "info",
+          },
+        });
+        this.emit({
+          type: "status",
+          sessionId,
+          status: interrupted.has(sessionId) ? "failed" : "idle",
+        });
+      }
+      this.reconnectProjection?.resolve();
+      this.reconnectProjection = null;
+      return;
+    }
+    this.emit({ type: "runtime_state", state: "offline" });
+    const cause = payload.error ?? new Error("Agent 自动重连失败");
+    for (const sessionId of payload.affectedSessionIds) {
+      this.emitError(sessionId, cause, {
+        domain: "environment",
+        code: "ACP_RECONNECT_FAILED",
+        recoverable: true,
+        fatal: true,
+        holdQueue: true,
+        action: "检查 Grok Build CLI、认证与网络后重新连接；重发前先检查最后一轮结果",
+      });
+    }
+    this.reconnectProjection?.reject(cause);
+    this.reconnectProjection = null;
+  }
 
-    if (message.id !== undefined && !message.method) {
-      const pending = this.pending.get(message.id);
-      if (!pending) return;
-      this.pending.delete(message.id);
-      if (pending.timeoutId !== undefined) window.clearTimeout(pending.timeoutId);
-      if (message.error !== undefined) {
-        const error = record(message.error);
-        pending.reject(
-          new AcpRpcError(
-            pending.method,
-            number(error?.code),
-            string(error?.message) ?? `ACP 请求失败：${pending.method}`,
-            error?.data,
-          ),
-        );
-      } else {
-        const extension = pending.method.startsWith("x.ai/")
-          ? record(message.result)
-          : undefined;
-        if (extension && "error" in extension && extension.error != null) {
-          pending.reject(
-            new AcpRpcError(
-              pending.method,
-              number(record(extension.error)?.code),
-              errorText(extension.error),
-              extension.error,
-            ),
-          );
-        } else if (extension && "result" in extension) {
-          pending.resolve(extension.result);
+  private projectHostSessionProjection(
+    projection: HostSessionProjection,
+    mediaCheckpoint?: HostSessionEvent,
+  ): boolean {
+    switch (projection.kind) {
+      case "session_update":
+        if (projection.channel === "notification") {
+          this.handleXaiUpdate(projection.sessionId, projection.update);
+          return false;
         } else {
-          pending.resolve(message.result);
+          return Boolean(this.handleSessionUpdate(
+            projection.sessionId,
+            projection.update,
+            projection.blockOps,
+            mediaCheckpoint,
+          ));
         }
+      case "block_lifecycle":
+        this.applyHostBlockCloses(projection.sessionId, projection.blockOps);
+        if (projection.phase === "session_reset" || projection.phase === "session_removed") {
+          this.replayCursors.delete(projection.sessionId);
+        }
+        return false;
+      case "notification":
+        this.onNotification(projection.method, projection.params);
+        return false;
+      case "orphan_response":
+        // 正常响应已由原生 Host 定向交付；进入事件流的响应没有请求归属。
+        this.emitProtocolNotice(
+          "ACP_ORPHAN_RESPONSE",
+          "收到无法归属到当前请求的 ACP 响应",
+          "若会话状态异常，请重新打开该会话",
+        );
+        return false;
+      case "protocol_error":
+        this.diagnostics.push(`${projection.code}：${projection.message}`);
+        this.diagnostics = this.diagnostics.slice(-20);
+        this.emitProtocolNotice(
+          projection.code,
+          projection.message,
+          projection.code === "ACP_MISSING_SESSION_ID"
+            || projection.code === "ACP_INVALID_SESSION_UPDATE"
+            ? "升级 Grok Build CLI；事件不会写入其它会话"
+            : "若持续出现，请升级 CLI 并导出会话诊断",
+        );
+        return false;
+      case "unsupported_request": {
+        const callback = projection.method === "fs/read_text_file"
+          || projection.method === ACP_METHODS.fsRead
+          || projection.method === "fs/write_text_file"
+          || projection.method.startsWith("terminal/");
+        const interaction = projection.method === ACP_METHODS.requestPermission
+          || projection.method === "x.ai/exit_plan_mode"
+          || projection.method === "x.ai/ask_user_question";
+        this.emitProtocolNotice(
+          callback
+            ? "CLIENT_CALLBACK_HOST_BYPASSED"
+            : interaction
+              ? "INTERACTION_HOST_BYPASSED"
+              : "ACP_UNSUPPORTED_CLIENT_METHOD",
+          callback
+            ? "收到未由 Host 处理的 Client callback"
+            : interaction
+              ? "收到未由 Host 登记的交互请求"
+              : `Agent 请求了 Host 不支持的方法：${projection.method}`,
+          callback
+            ? "重新连接 Agent；Host 不会猜测回调所属工作区"
+            : interaction
+              ? "重新连接 Agent；不要重复批准当前请求"
+              : "升级 Grox 或 Grok Build CLI 后重试",
+          callback || interaction,
+        );
+        return false;
       }
-      return;
     }
-
-    // Any session-scoped traffic (updates, permission prompts, ...) proves the
-    // agent is still alive; the prompt watchdog keys off this timestamp.
-    const activitySession = string(record(message.params)?.sessionId);
-    if (activitySession) this.lastActivity.set(activitySession, Date.now());
-
-    if (message.method && message.id !== undefined) {
-      this.onServerRequest(message);
-      return;
-    }
-    if (message.method) this.onNotification(message.method, message.params);
   }
 
-  private onServerRequest(message: JsonRpcMessage) {
-    if (
-      message.method === "fs/read_text_file"
-      || message.method === ACP_METHODS.fsRead
-      || message.method === "fs/write_text_file"
-    ) {
-      void this.handleFileSystemRequest(message);
-      return;
-    }
-    if (message.method === ACP_METHODS.requestPermission) {
-      this.handlePermission(message.id!, message.params);
-      return;
-    }
-    if (message.method === "x.ai/exit_plan_mode") {
-      this.handlePlanApproval(message.id!, message.params);
-      return;
-    }
-    if (message.method === "x.ai/ask_user_question") {
-      this.handleQuestion(message.id!, message.params);
-      return;
-    }
-    void this.sendRaw({
-      jsonrpc: "2.0",
-      id: message.id,
-      error: { code: -32601, message: `Unsupported client method: ${message.method}` },
+  private emitProtocolNotice(code: string, message: string, action: string, holdQueue = false) {
+    this.emit({
+      type: "runtime_notice",
+      notice: runtimeNoticeFromError({
+        domain: "protocol",
+        code,
+        message,
+        recoverable: true,
+        fatal: false,
+        holdQueue,
+        action,
+      }),
     });
-  }
-
-  private async handleFileSystemRequest(message: JsonRpcMessage) {
-    const params = record(message.params) ?? {};
-    // Grok's ACP adapters have used both `path` and the TUI-facing
-    // `file_path` spelling over time. Accept the aliases here while keeping
-    // the native command's canonical path boundary unchanged.
-    const path = string(params.path)
-      ?? string(params.filePath)
-      ?? string(params.file_path)
-      ?? string(params.target_file);
-    const sessionId = string(params.sessionId);
-    const explicitLine = number(params.line) ?? number(params.startLine) ?? number(params.start_line);
-    const offset = number(params.offset);
-    // Grok Build's read_file schema uses a one-based line offset. ACP's
-    // standard text callback also uses one-based line numbers, so keep one
-    // interpretation here instead of silently shifting a requested image or
-    // skill document by one line.
-    const line = explicitLine ?? (offset === undefined ? undefined : Math.max(1, Math.floor(offset)));
-    const limit = number(params.limit) ?? number(params.maxLines);
-    const cwd = (sessionId ? this.sessionWorkspaces.get(sessionId) ?? this.catalogue.get(sessionId)?.cwd : undefined) ?? this.workspace;
-    if (!path) {
-      await this.sendRaw({
-        jsonrpc: "2.0",
-        id: message.id,
-        error: { code: -32602, message: "文件路径不能为空" },
-      });
-      return;
-    }
-    try {
-      if (message.method === ACP_METHODS.fsRead) {
-        const payload = await invoke<AcpReadFilePayload>("acp_read_file", {
-          cwd,
-          path,
-          line,
-          limit,
-        });
-        await this.sendRaw({ jsonrpc: "2.0", id: message.id, result: payload });
-        return;
-      }
-      if (message.method === "fs/read_text_file") {
-        const content = await invoke<string>("acp_read_text_file", {
-          cwd,
-          path,
-          line,
-          limit,
-        });
-        await this.sendRaw({ jsonrpc: "2.0", id: message.id, result: { content } });
-        return;
-      }
-      const content = string(params.content);
-      if (content === undefined) {
-        throw new Error("写入内容必须是文本");
-      }
-      await invoke("acp_write_text_file", { cwd, path, content });
-      await this.sendRaw({ jsonrpc: "2.0", id: message.id, result: {} });
-    } catch (cause) {
-      await this.sendRaw({
-        jsonrpc: "2.0",
-        id: message.id,
-        error: { code: -32000, message: cause instanceof Error ? cause.message : String(cause) },
-      });
-    }
   }
 
   private onNotification(method: string, paramsValue: unknown) {
@@ -1634,12 +2079,14 @@ export class AcpBridge implements GrokBridge {
       const params = record(paramsValue);
       const sessionId = string(params?.sessionId);
       if (sessionId) this.handleSessionUpdate(sessionId, params?.update);
+      else this.emitMissingSessionNotice(method);
       return;
     }
     if (method === "x.ai/session_notification") {
       const params = record(paramsValue);
       const sessionId = string(params?.sessionId);
       if (sessionId) this.handleXaiUpdate(sessionId, params?.update);
+      else this.emitMissingSessionNotice(method);
       return;
     }
     if (method === "x.ai/models/update") {
@@ -1657,7 +2104,7 @@ export class AcpBridge implements GrokBridge {
             typeof value === "string" ? [[name.replace(/^\//, ""), value] as const] : []),
         );
         this.runtimeCommands = applyCommandTags(this.runtimeCommandBase, this.runtimeCommandTags);
-        for (const sessionId of this.cursors.keys()) {
+        for (const sessionId of this.knownSessions) {
           this.emit({ type: "available_commands", sessionId, commands: this.runtimeCommands });
         }
       }
@@ -1666,8 +2113,27 @@ export class AcpBridge implements GrokBridge {
     if (method === "x.ai/session/prompt_complete") {
       const params = record(paramsValue);
       const sessionId = string(params?.sessionId);
-      if (sessionId) this.finishTurn(sessionId, record(params?.usage));
+      // 该扩展通知可能早于 `session/prompt` RPC 返回；只能更新用量，不能
+      // 宣布回合结束。RPC 的 resolve/reject 才是 turn lifetime 的权威。
+      const usage = record(params?.usage);
+      if (sessionId && usage) this.emitUsage(sessionId, usage);
+      else if (!sessionId) this.emitMissingSessionNotice(method);
     }
+  }
+
+  private emitMissingSessionNotice(method: string) {
+    this.emit({
+      type: "runtime_notice",
+      notice: runtimeNoticeFromError({
+        domain: "protocol",
+        code: "ACP_MISSING_SESSION_ID",
+        message: `${method} 缺少 sessionId，事件已被隔离`,
+        recoverable: true,
+        fatal: false,
+        holdQueue: false,
+        action: "升级 Grok Build CLI；事件不会写入当前查看的其它会话",
+      }),
+    });
   }
 
   private trackWorkflowStatus(sessionId: string, workflow: WorkflowRun) {
@@ -1693,7 +2159,42 @@ export class AcpBridge implements GrokBridge {
     localStorage.setItem(REWOUND_SESSIONS_STORAGE_KEY, JSON.stringify([...this.rewoundSessions].slice(-500)));
   }
 
-  private handleSessionUpdate(sessionId: string, updateValue: unknown) {
+  private applyHostBlockCloses(sessionId: string, operations: HostBlockOperation[] = []) {
+    for (const operation of operations) {
+      if (operation.action !== "close") continue;
+      if (operation.blockType === "assistant") {
+        this.flushStreamAppends(sessionId);
+        this.emit({
+          type: "block_patch",
+          sessionId,
+          blockId: operation.blockId,
+          patch: { type: "assistant", streaming: false } as Partial<SessionBlock>,
+        });
+      } else if (operation.blockType === "thinking") {
+        this.flushStreamAppends(sessionId);
+        this.emit({
+          type: "block_patch",
+          sessionId,
+          blockId: operation.blockId,
+          patch: {
+            type: "thinking",
+            live: false,
+            elapsedMs: operation.startedAt ? Date.now() - operation.startedAt : undefined,
+          } as Partial<SessionBlock>,
+        });
+      }
+      for (const key of this.repeatedDeltas.keys()) {
+        if (key.includes(`:${sessionId}:${operation.blockId}`)) this.repeatedDeltas.delete(key);
+      }
+    }
+  }
+
+  private handleSessionUpdate(
+    sessionId: string,
+    updateValue: unknown,
+    hostBlockOps?: HostBlockOperation[],
+    mediaCheckpoint?: HostSessionEvent,
+  ) {
     const update = record(updateValue);
     if (!update) return;
     const type = string(update.sessionUpdate);
@@ -1715,7 +2216,12 @@ export class AcpBridge implements GrokBridge {
       child.trace = applyWorkflowTraceUpdate(child.trace, update, Date.now());
       this.emit({ type: "workflow_trace_update", sessionId: child.sessionId, runId: child.runId, trace: child.trace });
     }
-    const cursor = this.cursor(sessionId);
+    const hostManaged = hostBlockOps !== undefined;
+    if (hostManaged) this.applyHostBlockCloses(sessionId, hostBlockOps);
+    const blockOperations = hostBlockOps?.filter((operation) => operation.action !== "close") ?? [];
+    const blockOperation = (blockType: HostBlockOperation["blockType"]) =>
+      blockOperations.find((operation) => operation.blockType === blockType);
+    const cursor = hostManaged ? undefined : this.replayCursor(sessionId);
 
     switch (type) {
       case "user_message_chunk": {
@@ -1726,29 +2232,65 @@ export class AcpBridge implements GrokBridge {
         if (!this.replaying.has(sessionId)) return;
         const combined = combinedDisplayTexts(update.content);
         if (combined) {
-          for (const text of combined) {
+          const userOperations = blockOperations.filter((operation) => operation.blockType === "user");
+          for (const [index, text] of combined.entries()) {
             if (isWorkflowControlCommand(text)) continue;
-            const displayText = displayDeepResearchPrompt(text);
+            const displayText = displayReplayUserPrompt(text);
             if (!displayText || isWorkflowControlCommand(displayText)) continue;
-            const blockId = uid();
-            cursor.userId = blockId;
-            cursor.userText = displayText;
+            const blockId = userOperations[index]?.blockId ?? uid();
             this.emit({
               type: "block_add",
               sessionId,
-              block: { type: "user", id: blockId, text: displayText, ts: Date.now() },
+              block: {
+                type: "user",
+                id: blockId,
+                text: displayText,
+                ts: userOperations[index]?.startedAt ?? Date.now(),
+              },
             });
+            if (!hostManaged && cursor) {
+              cursor.userId = blockId;
+              cursor.userText = displayText;
+            }
           }
-          cursor.userOpen = true;
-          const promptIndex = number(record(update._meta)?.promptIndex);
-          if (promptIndex !== undefined) cursor.userPromptIndex = promptIndex;
-          cursor.assistantId = undefined;
-          cursor.thinkingId = undefined;
-          cursor.thinkingStartedAt = undefined;
+          if (cursor) {
+            cursor.userOpen = true;
+            const promptIndex = number(record(update._meta)?.promptIndex);
+            if (promptIndex !== undefined) cursor.userPromptIndex = promptIndex;
+            cursor.assistantId = undefined;
+            cursor.thinkingId = undefined;
+            cursor.thinkingStartedAt = undefined;
+          }
           return;
         }
         const delta = contentText(update.content);
         if (isWorkflowControlCommand(delta)) return;
+        if (!displayReplayUserPrompt(delta)) return;
+        const hostUser = blockOperation("user");
+        if (hostManaged) {
+          if (!hostUser) return;
+          const opened = hostUser.action === "open";
+          this.emit({
+            type: "block_add",
+            sessionId,
+            block: {
+              type: "user",
+              id: hostUser.blockId,
+              text: opened ? displayReplayUserPrompt(delta) : "",
+              ts: hostUser.startedAt ?? Date.now(),
+            },
+          });
+          if (!opened) {
+            this.emit({
+              type: "user_append",
+              sessionId,
+              blockId: hostUser.blockId,
+              delta,
+            });
+          }
+          return;
+        }
+        if (!cursor) return;
         const promptIndex = number(record(update._meta)?.promptIndex);
         const userId = cursor.userId;
         const beginsNewPrompt =
@@ -1760,14 +2302,14 @@ export class AcpBridge implements GrokBridge {
         if (beginsNewPrompt) {
           const nextUserId = uid();
           cursor.userId = nextUserId;
-          cursor.userText = displayDeepResearchPrompt(delta);
+          cursor.userText = displayReplayUserPrompt(delta);
           this.emit({
             type: "block_add",
             sessionId,
             block: { type: "user", id: nextUserId, text: cursor.userText, ts: Date.now() },
           });
         } else {
-          cursor.userText = displayDeepResearchPrompt(`${cursor.userText ?? ""}${delta}`);
+          cursor.userText = displayReplayUserPrompt(`${cursor.userText ?? ""}${delta}`);
           this.emit({
             type: "block_patch",
             sessionId,
@@ -1783,16 +2325,42 @@ export class AcpBridge implements GrokBridge {
         return;
       }
       case "agent_message_chunk": {
-        this.closeUser(sessionId);
-        this.closeThinking(sessionId);
         const delta = contentText(update.content);
+        const hostAssistant = blockOperation("assistant");
         // Starting the workflow is already represented by the live task card.
         // Do not manufacture a redundant assistant bubble for the CLI's
         // boilerplate acknowledgement; the eventual report remains visible.
         if (
-          (!cursor.assistantId && (isWorkflowLaunchAcknowledgement(delta) || isWorkflowControlAcknowledgement(delta)))
+          ((hostManaged ? hostAssistant?.action === "open" : !cursor?.assistantId)
+            && (isWorkflowLaunchAcknowledgement(delta) || isWorkflowControlAcknowledgement(delta)))
           || (workflowCompletionContinuation && cancelledWorkflowCompletion)
         ) return;
+        if (hostManaged) {
+          if (!hostAssistant) return;
+          this.liveAssistantSessions.add(sessionId);
+          this.emit({
+            type: "block_add",
+            sessionId,
+            block: {
+              type: "assistant",
+              id: hostAssistant.blockId,
+              text: "",
+              ts: hostAssistant.startedAt ?? Date.now(),
+              streaming: true,
+            },
+          });
+          this.queueStreamAppend({
+            type: "assistant_append",
+            sessionId,
+            blockId: hostAssistant.blockId,
+            delta,
+          });
+          return;
+        }
+        if (!cursor) return;
+        this.liveAssistantSessions.add(sessionId);
+        this.closeUser(sessionId);
+        this.closeThinking(sessionId);
         if (!cursor.assistantId) {
           cursor.assistantId = uid();
           this.emit({
@@ -1816,9 +2384,32 @@ export class AcpBridge implements GrokBridge {
         // final report remains in the chat and the auditable workflow trace
         // remains in the task panel.
         if (workflowCompletionContinuation) return;
+        const delta = contentText(update.content);
+        const hostThinking = blockOperation("thinking");
+        if (hostManaged) {
+          if (!hostThinking) return;
+          this.emit({
+            type: "block_add",
+            sessionId,
+            block: {
+              type: "thinking",
+              id: hostThinking.blockId,
+              text: "",
+              ts: hostThinking.startedAt ?? Date.now(),
+              live: true,
+            },
+          });
+          this.queueStreamAppend({
+            type: "thinking_append",
+            sessionId,
+            blockId: hostThinking.blockId,
+            delta,
+          });
+          return;
+        }
+        if (!cursor) return;
         this.closeUser(sessionId);
         this.closeAssistant(sessionId);
-        const delta = contentText(update.content);
         if (!cursor.thinkingId) {
           cursor.thinkingId = uid();
           cursor.thinkingStartedAt = Date.now();
@@ -1859,18 +2450,43 @@ export class AcpBridge implements GrokBridge {
         }
         return;
       }
-      case "tool_call":
+      case "tool_call": {
         if (workflowCompletionContinuation) return;
-        this.closeUser(sessionId);
-        this.addTool(sessionId, update);
-        return;
+        const hostTool = blockOperation("tool");
+        if (hostManaged && !hostTool) return;
+        if (!hostManaged) this.closeUser(sessionId);
+        if (hostTool?.action === "update") {
+          return this.patchTool(sessionId, update, hostTool, mediaCheckpoint);
+        } else {
+          return this.addTool(sessionId, update, hostTool, mediaCheckpoint);
+        }
+      }
       case "tool_call_update":
         if (workflowCompletionContinuation) return;
-        this.patchTool(sessionId, update);
-        return;
+        if (hostManaged && !blockOperation("tool")) return;
+        return this.patchTool(sessionId, update, blockOperation("tool"), mediaCheckpoint);
       case "plan": {
-        this.closeUser(sessionId);
         const steps = mapPlanSteps(update.entries);
+        const hostPlan = blockOperation("plan");
+        if (hostManaged) {
+          if (!hostPlan) return;
+          this.emit({
+            type: "block_add",
+            sessionId,
+            block: {
+              type: "plan",
+              id: hostPlan.blockId,
+              steps,
+              ts: hostPlan.startedAt ?? Date.now(),
+            },
+          });
+          if (hostPlan.action === "update") {
+            this.emit({ type: "plan_patch", sessionId, blockId: hostPlan.blockId, steps });
+          }
+          return;
+        }
+        if (!cursor) return;
+        this.closeUser(sessionId);
         if (!cursor.planId) {
           cursor.planId = uid();
           this.emit({
@@ -1884,24 +2500,32 @@ export class AcpBridge implements GrokBridge {
         return;
       }
       case "turn_completed":
-        this.rejectPromptOnInvalidEffortUpdate(sessionId, update);
-        this.finishTurn(sessionId, record(update.usage));
+        if (record(update.usage)) this.emitUsage(sessionId, record(update.usage)!);
         return;
       default:
         return;
     }
   }
 
-  private addTool(sessionId: string, update: JsonObject) {
-    const cursor = this.cursor(sessionId);
-    this.closeThinking(sessionId);
-    this.closeAssistant(sessionId);
-    const toolCallId = string(update.toolCallId) ?? uid();
-    const blockId = cursor.toolBlocks.get(toolCallId) ?? uid();
-    cursor.toolBlocks.set(toolCallId, blockId);
+  private addTool(
+    sessionId: string,
+    update: JsonObject,
+    hostBlock?: HostBlockOperation,
+    mediaCheckpoint?: HostSessionEvent,
+    persistImages = true,
+  ): boolean {
+    const cursor = hostBlock ? undefined : this.replayCursor(sessionId);
+    if (!hostBlock) {
+      this.closeThinking(sessionId);
+      this.closeAssistant(sessionId);
+    }
+    const toolCallId = hostBlock?.sourceId ?? string(update.toolCallId) ?? uid();
+    const blockId = hostBlock?.blockId ?? cursor?.toolBlocks.get(toolCallId) ?? uid();
+    cursor?.toolBlocks.set(toolCallId, blockId);
     const content = array(update.content);
     const canonicalKind = toolCanonicalKind(update);
     const kind = mapToolKind(canonicalKind ?? update.kind, update.title);
+    const images = extractImages([content, update.rawOutput]);
     const call: ToolCall = {
       id: toolCallId,
       kind,
@@ -1910,11 +2534,11 @@ export class AcpBridge implements GrokBridge {
       title: string(update.title) ?? "tool",
       detail: string(update.detail),
       status: mapToolStatus(update.status),
-      startedAt: Date.now(),
+      startedAt: hostBlock?.startedAt ?? Date.now(),
       input: jsonText(update.rawInput),
       output: toolOutputText(update.rawOutput, content),
       diff: extractDiffs([content, update.rawInput, update.rawOutput]),
-      images: extractImages([content, update.rawOutput]),
+      images,
       terminal: extractTerminal(
         kind,
         update.title,
@@ -1934,17 +2558,30 @@ export class AcpBridge implements GrokBridge {
       sessionId,
       block: { type: "tool", id: blockId, call, ts: Date.now() },
     });
+    return persistImages
+      ? this.persistToolImages(sessionId, blockId, images, mediaCheckpoint)
+      : false;
   }
 
-  private patchTool(sessionId: string, update: JsonObject) {
-    const cursor = this.cursor(sessionId);
-    const toolCallId = string(update.toolCallId);
-    if (!toolCallId) return;
-    let blockId = cursor.toolBlocks.get(toolCallId);
+  private patchTool(
+    sessionId: string,
+    update: JsonObject,
+    hostBlock?: HostBlockOperation,
+    mediaCheckpoint?: HostSessionEvent,
+  ): boolean {
+    const cursor = hostBlock ? undefined : this.replayCursor(sessionId);
+    const toolCallId = hostBlock?.sourceId ?? string(update.toolCallId);
+    if (!toolCallId) return false;
+    let blockId = hostBlock?.blockId ?? cursor?.toolBlocks.get(toolCallId);
+    let mediaDeferred = false;
     if (!blockId) {
-      this.addTool(sessionId, update);
-      blockId = cursor.toolBlocks.get(toolCallId);
-      if (!blockId) return;
+      mediaDeferred = this.addTool(sessionId, update, undefined, mediaCheckpoint);
+      blockId = cursor?.toolBlocks.get(toolCallId);
+      if (!blockId) return mediaDeferred;
+    } else if (hostBlock) {
+      // 页面可能在 tool_call 与 update 之间重载。稳定 ID + 幂等 block_add
+      // 可先补一个最小工具块，再用当前 update 完成投影。
+      this.addTool(sessionId, update, hostBlock, undefined, false);
     }
     const status = mapToolStatus(update.status);
     this.markOpenTool(sessionId, toolCallId, status);
@@ -1975,6 +2612,9 @@ export class AcpBridge implements GrokBridge {
       }
     }
     const locations = extractLocations(update.locations, update.rawInput, update.rawOutput, content);
+    const images = content.length > 0 || update.rawOutput !== undefined
+      ? extractImages([content, update.rawOutput])
+      : undefined;
     this.queueToolPatch({
       type: "tool_patch",
       sessionId,
@@ -1991,11 +2631,15 @@ export class AcpBridge implements GrokBridge {
         ...(content.length > 0 || update.rawInput !== undefined || update.rawOutput !== undefined
           ? { diff: extractDiffs([content, update.rawInput, update.rawOutput]) }
           : {}),
-        ...(content.length > 0 || update.rawOutput !== undefined ? { images: extractImages([content, update.rawOutput]) } : {}),
+        ...(images ? { images } : {}),
         ...(terminal ? { terminal } : {}),
         ...(locations ? { locations } : {}),
       },
     });
+    if (!mediaDeferred) {
+      mediaDeferred = this.persistToolImages(sessionId, blockId, images, mediaCheckpoint);
+    }
+    return mediaDeferred;
   }
 
   private handleXaiUpdate(sessionId: string, updateValue: unknown) {
@@ -2039,8 +2683,7 @@ export class AcpBridge implements GrokBridge {
         break;
       }
       case "turn_completed":
-        this.rejectPromptOnInvalidEffortUpdate(sessionId, update);
-        this.finishTurn(sessionId, record(update.usage));
+        if (record(update.usage)) this.emitUsage(sessionId, record(update.usage)!);
         break;
       case "auto_compact_started":
         this.emit({
@@ -2057,17 +2700,18 @@ export class AcpBridge implements GrokBridge {
         break;
       case "auto_compact_failed":
       case "auto_recovery_exhausted":
-        this.emit({
-          type: "error",
-          sessionId,
-          message: string(update.error) ?? "Grok Agent 恢复失败",
+        this.emitError(sessionId, string(update.error) ?? "Grok Agent 恢复失败", {
+          domain: "protocol",
+          code: string(update.sessionUpdate) === "auto_compact_failed"
+            ? "AUTO_COMPACT_FAILED"
+            : "AUTO_RECOVERY_EXHAUSTED",
+          fatal: true,
+          holdQueue: true,
+          action: "检查当前会话状态后再继续发送",
         });
         break;
       case "retry_state": {
         const retry = record(update.retryState) ?? update;
-        // Agent surfaces API 400 Invalid reasoning effort here while session/prompt
-        // may still be pending — reject so prompt() catch can fall back to high.
-        this.rejectPromptOnInvalidEffortUpdate(sessionId, retry);
         this.emit({
           type: "block_add",
           sessionId,
@@ -2094,7 +2738,8 @@ export class AcpBridge implements GrokBridge {
   }
 
   private closeThinking(sessionId: string) {
-    const cursor = this.cursor(sessionId);
+    const cursor = this.replayCursors.get(sessionId);
+    if (!cursor) return;
     if (cursor.thinkingId) {
       this.flushStreamAppends(sessionId);
       this.emit({
@@ -2116,14 +2761,16 @@ export class AcpBridge implements GrokBridge {
   }
 
   private closeUser(sessionId: string) {
-    const cursor = this.cursor(sessionId);
+    const cursor = this.replayCursors.get(sessionId);
+    if (!cursor) return;
     cursor.userOpen = false;
     cursor.userId = undefined;
     cursor.userText = undefined;
   }
 
   private closeAssistant(sessionId: string) {
-    const cursor = this.cursor(sessionId);
+    const cursor = this.replayCursors.get(sessionId);
+    if (!cursor) return;
     if (cursor.assistantId) {
       this.flushStreamAppends(sessionId);
       this.emit({
@@ -2145,7 +2792,6 @@ export class AcpBridge implements GrokBridge {
     this.closeAssistant(sessionId);
     this.flushToolPatches(sessionId);
     this.openToolCalls.delete(sessionId);
-    this.promptWrittenAt.delete(sessionId);
     if (usageValue) this.emitUsage(sessionId, usageValue);
     this.emit({ type: "status", sessionId, status });
   }
@@ -2165,64 +2811,12 @@ export class AcpBridge implements GrokBridge {
     if (open.size === 0) this.openToolCalls.delete(sessionId);
   }
 
-  private sessionHasOpenTools(sessionId: string): boolean {
-    return (this.openToolCalls.get(sessionId)?.size ?? 0) > 0;
-  }
-
-  private sessionHasOpenGate(sessionId: string): boolean {
-    for (const interaction of this.interactions.values()) {
-      if (interaction.sessionId === sessionId) return true;
+  private sessionGateStatus(sessionId: string): SessionStatus | null {
+    for (const interaction of this.hostInteractions.values()) {
+      if (interaction.sessionId !== sessionId) continue;
+      return interaction.kind === "question" ? "awaiting_input" : "awaiting_permission";
     }
-    return false;
-  }
-
-  /**
-   * Stream-path Invalid reasoning effort (set_model often accepts max; API 400
-   * arrives as retry_state / turn_completed). Reject the in-flight session/prompt
-   * so prompt() can rebind high→medium→low and continue.
-   */
-  private rejectPromptOnInvalidEffortUpdate(sessionId: string, update: JsonObject): void {
-    const stop = string(update.stop_reason) ?? string(update.stopReason);
-    const message =
-      string(update.agent_result)
-      ?? string(update.message)
-      ?? string(update.error)
-      ?? string(record(update.error)?.message)
-      ?? "";
-    const failed =
-      stop === "error"
-      || string(update.type) === "failed"
-      || string(update.error_type) === "api"
-      || isInvalidReasoningEffortMessage(message);
-    if (!failed || !isInvalidReasoningEffortMessage(message)) return;
-
-    const rpcId = this.promptRpcBySession.get(sessionId);
-    if (rpcId === undefined) return;
-    const pending = this.pending.get(rpcId);
-    if (!pending || pending.method !== ACP_METHODS.sessionPrompt) return;
-    this.pending.delete(rpcId);
-    this.promptRpcBySession.delete(sessionId);
-    if (pending.timeoutId !== undefined) window.clearTimeout(pending.timeoutId);
-    pending.reject(new Error(message || "Invalid reasoning effort"));
-  }
-
-  /** If session/prompt resolves with an error body instead of rejecting. */
-  private throwIfPromptResultInvalidEffort(responseValue: unknown): void {
-    const response = record(responseValue);
-    if (!response) return;
-    const stop = string(response.stop_reason) ?? string(response.stopReason);
-    const message =
-      string(response.agent_result)
-      ?? string(response.message)
-      ?? string(response.error)
-      ?? errorText(response.error)
-      ?? "";
-    if (
-      (stop === "error" || isInvalidReasoningEffortMessage(message))
-      && isInvalidReasoningEffortMessage(message)
-    ) {
-      throw new Error(message || "Invalid reasoning effort");
-    }
+    return null;
   }
 
   private emitUsage(sessionId: string, usageValue: JsonObject) {
@@ -2240,61 +2834,99 @@ export class AcpBridge implements GrokBridge {
     this.emit({ type: "usage", sessionId, usage: next });
   }
 
-  private handlePermission(rpcId: RpcId, paramsValue: unknown) {
-    const params = record(paramsValue) ?? {};
-    const tool = record(params.toolCall) ?? {};
-    const sessionId = string(params.sessionId);
-    if (!sessionId) {
-      void this.sendRaw({
-        jsonrpc: "2.0",
-        id: rpcId,
-        result: { outcome: { outcome: "cancelled" } },
-      });
-      return;
+  private async syncHostInteractions(): Promise<void> {
+    const interactions = await invoke<HostInteractionProjection[]>("interaction_status");
+    this.reconcileHostInteractions(interactions);
+  }
+
+  private reconcileHostInteractions(interactions: HostInteractionProjection[]): void {
+    const currentIds = new Set(interactions.map((interaction) => interaction.blockId));
+    for (const interaction of [...this.hostInteractions.values()]) {
+      if (!currentIds.has(interaction.blockId)) {
+        this.closeHostInteraction({ ...interaction, reason: "cancelled" });
+      }
     }
+    for (const interaction of interactions) this.projectHostInteraction(interaction);
+  }
+
+  private projectHostInteraction(interaction: HostInteractionProjection): void {
+    if (
+      !interaction.blockId
+      || !interaction.sessionId
+      || this.hostInteractions.has(interaction.blockId)
+    ) return;
+    this.hostInteractions.set(interaction.blockId, interaction);
+    this.emitHostInteraction(interaction);
+  }
+
+  private emitHostInteraction(interaction: HostInteractionProjection): void {
+    switch (interaction.kind) {
+      case "permission":
+        this.handlePermission(interaction);
+        break;
+      case "plan":
+        this.handlePlanApproval(interaction);
+        break;
+      case "question":
+        this.handleQuestion(interaction);
+        break;
+    }
+  }
+
+  private closeHostInteraction(interaction: HostInteractionClosed): void {
+    const pending = this.hostInteractions.get(interaction.blockId);
+    if (!pending || pending.sessionId !== interaction.sessionId) return;
+    this.hostInteractions.delete(interaction.blockId);
+    this.resolvingInteractions.delete(interaction.blockId);
+    if (pending.kind === "question") {
+      this.emit({
+        type: "question_resolved",
+        sessionId: pending.sessionId,
+        blockId: pending.blockId,
+        response: { outcome: "cancelled" },
+      });
+    } else {
+      this.emit({
+        type: "permission_resolved",
+        sessionId: pending.sessionId,
+        blockId: pending.blockId,
+        option: "deny",
+      });
+    }
+  }
+
+  private handlePermission(interaction: HostInteractionProjection) {
+    const params = record(interaction.params) ?? {};
+    const tool = record(params.toolCall) ?? {};
+    const { sessionId, blockId } = interaction;
     const toolCallId = string(tool.toolCallId) ?? string(params.toolCallId) ?? uid();
-    const blockId = `permission-${toolCallId}`;
-    const optionIds: PendingInteraction["optionIds"] = {};
+    const optionKinds = new Set<PermissionOption>();
     for (const rawOption of array(params.options)) {
       const option = record(rawOption) ?? {};
-      const optionId = string(option.optionId);
-      if (!optionId) continue;
-      switch ((string(option.kind) ?? string(option.name) ?? "").toLowerCase()) {
+      const optionKind = (string(option.kind) ?? "").toLowerCase();
+      switch (optionKind) {
         case "allow_once":
-          optionIds.allow_once = optionId;
+          optionKinds.add("allow_once");
           break;
         case "allow_always":
-          optionIds.allow_always = optionId;
+          optionKinds.add("allow_always");
           break;
         case "reject_once":
         case "reject_always":
         case "deny":
-          optionIds.deny ??= optionId;
-          break;
-        default:
-          // Unknown kind from a newer/mismatched agent build: fall back to
-          // the option id so the card never collapses to a deny-only choice.
-          if (/allow/.test(optionId)) optionIds.allow_once ??= optionId;
-          else if (/reject|deny/.test(optionId)) optionIds.deny ??= optionId;
+          optionKinds.add("deny");
           break;
       }
     }
     const options = (["allow_once", "allow_always", "deny"] as PermissionOption[]).filter(
-      (option) => optionIds[option] !== undefined || option === "deny",
+      (option) => optionKinds.has(option) || option === "deny",
     );
-    this.interactions.set(blockId, {
-      rpcId,
-      sessionId,
-      blockId,
-      kind: "permission",
-      optionIds,
-    });
     this.emit({
       type: "permission_request",
       sessionId,
       blockId,
       req: {
-        id: String(rpcId),
+        id: blockId,
         toolCallId,
         title: string(tool.title) ?? "Tool approval",
         description: string(tool.kind) ?? "Grok requests permission to continue.",
@@ -2305,28 +2937,16 @@ export class AcpBridge implements GrokBridge {
     });
   }
 
-  private handlePlanApproval(rpcId: RpcId, paramsValue: unknown) {
-    const params = record(paramsValue) ?? {};
-    const sessionId = string(params.sessionId);
-    if (!sessionId) {
-      void this.sendRaw({ jsonrpc: "2.0", id: rpcId, result: { outcome: "abandoned" } });
-      return;
-    }
+  private handlePlanApproval(interaction: HostInteractionProjection) {
+    const params = record(interaction.params) ?? {};
+    const { sessionId, blockId } = interaction;
     const toolCallId = string(params.toolCallId) ?? uid();
-    const blockId = `plan-approval-${toolCallId}`;
-    this.interactions.set(blockId, {
-      rpcId,
-      sessionId,
-      blockId,
-      kind: "plan",
-      optionIds: {},
-    });
     this.emit({
       type: "permission_request",
       sessionId,
       blockId,
       req: {
-        id: String(rpcId),
+        id: blockId,
         toolCallId,
         title: "Approve execution plan",
         description: "Grok has finished planning and is waiting to enter agent mode.",
@@ -2337,9 +2957,9 @@ export class AcpBridge implements GrokBridge {
     });
   }
 
-  private handleQuestion(rpcId: RpcId, paramsValue: unknown) {
-    const params = record(paramsValue) ?? {};
-    const sessionId = string(params.sessionId);
+  private handleQuestion(interaction: HostInteractionProjection) {
+    const params = record(interaction.params) ?? {};
+    const { sessionId, blockId } = interaction;
     const toolCallId = string(params.toolCallId) ?? uid();
     const questions: QuestionItem[] = [];
     for (const value of array(params.questions)) {
@@ -2365,26 +2985,13 @@ export class AcpBridge implements GrokBridge {
       });
     }
 
-    if (!sessionId || questions.length === 0) {
-      void this.sendRaw({ jsonrpc: "2.0", id: rpcId, result: { outcome: "cancelled" } });
-      return;
-    }
-
-    const blockId = `question-${toolCallId}`;
-    this.interactions.set(blockId, {
-      rpcId,
-      sessionId,
-      blockId,
-      kind: "question",
-      optionIds: {},
-      questions,
-    });
+    if (questions.length === 0) return;
     this.emit({
       type: "question_request",
       sessionId,
       blockId,
       req: {
-        id: String(rpcId),
+        id: blockId,
         toolCallId,
         questions,
         mode: string(params.mode) === "plan" ? "plan" : "default",
@@ -2392,41 +2999,62 @@ export class AcpBridge implements GrokBridge {
     });
   }
 
-  private async sendRaw(message: JsonRpcMessage): Promise<void> {
-    await invoke("acp_send", { line: JSON.stringify(message), generation: this.acpGeneration });
-  }
-
-  private requestRaw(method: string, params: unknown, timeoutMs = 30_000, onPending?: (id: RpcId) => void): Promise<unknown> {
+  private async requestRaw(
+    method: string,
+    params: unknown,
+    timeoutMs = 30_000,
+    onPending?: (id: RpcId) => void,
+    gateToken?: number,
+  ): Promise<unknown> {
     const id = ++this.requestId;
     onPending?.(id);
-    return new Promise((resolve, reject) => {
-      const timeoutId = timeoutMs > 0
-        ? window.setTimeout(() => {
-            const pending = this.pending.get(id);
-            if (!pending) return;
-            this.pending.delete(id);
-            pending.reject(new Error(`Grok Agent 请求超时：${method}`));
-          }, timeoutMs)
-        : undefined;
-      this.pending.set(id, { resolve, reject, method, timeoutId });
-      void this.sendRaw({ jsonrpc: "2.0", id, method: wireMethod(method), params }).catch((cause) => {
-        const pending = this.pending.get(id);
-        if (!pending) return;
-        this.pending.delete(id);
-        if (pending.timeoutId !== undefined) window.clearTimeout(pending.timeoutId);
-        reject(cause instanceof Error ? cause : new Error(String(cause)));
-      });
+    const response = await invoke<string>("acp_request", {
+      line: JSON.stringify({ jsonrpc: "2.0", id, method: wireMethod(method), params }),
+      requestId: id,
+      generation: this.acpGeneration,
+      timeoutMs,
+      gateToken,
     });
+    return decodeAcpResponse(response, id, method);
   }
 
-  private async request(method: string, params: unknown, timeoutMs = 30_000): Promise<unknown> {
+  private async request(
+    method: string,
+    params: unknown,
+    timeoutMs = 30_000,
+    gateToken?: number,
+  ): Promise<unknown> {
     await this.ensureReady();
-    return this.requestRaw(method, params, timeoutMs);
+    return this.requestRaw(method, params, timeoutMs, undefined, gateToken);
   }
 
-  private async notify(method: string, params: unknown): Promise<void> {
+  private async withLifecycleGate<T>(
+    operation: (permit: SessionGatePermit) => Promise<T>,
+  ): Promise<T> {
     await this.ensureReady();
-    await this.sendRaw({ jsonrpc: "2.0", method: wireMethod(method), params });
+    const permit = {
+      generation: this.acpGeneration,
+      token: await invoke<number>("session_gate_enter_lifecycle", {
+        generation: this.acpGeneration,
+      }),
+    };
+    try {
+      return await operation(permit);
+    } finally {
+      await this.releaseSessionGate(permit);
+    }
+  }
+
+  private async releaseSessionGate(permit: SessionGatePermit): Promise<void> {
+    try {
+      await invoke<boolean>("session_gate_release", {
+        token: permit.token,
+        generation: permit.generation,
+      });
+    } catch (error) {
+      this.diagnostics.push(`释放原生会话许可失败：${errorText(error)}`);
+      this.diagnostics = this.diagnostics.slice(-20);
+    }
   }
 
   private captureModelState(responseValue: unknown) {
@@ -2501,6 +3129,8 @@ export class AcpBridge implements GrokBridge {
 
   async getAuthState(): Promise<AuthState> {
     await this.ensureReady();
+    const state = await invoke<HostAuthenticationState>("agent_runtime_auth_status");
+    this.projectAuthState(state);
     return { ...this.authState };
   }
 
@@ -2510,36 +3140,13 @@ export class AcpBridge implements GrokBridge {
   }
 
   setPermissionMode(mode: PermissionMode): void {
-    if (mode === "bypass" && this.computerUseEnabled) {
-      this.computerUseEnabled = false;
-      localStorage.setItem("grox.computerUseEnabled", "0");
-    }
     this.permissionMode = mode;
-    localStorage.setItem("grok.permissionMode", mode);
-    void this.notify("x.ai/yolo_mode_changed", {
-      clientIdentifier: UPSTREAM_CLI_CLIENT_IDENTIFIER,
-      permission_mode:
-        mode === "bypass" ? "always-approve" : mode === "auto" ? "auto" : "default",
-      yolo_mode: mode === "bypass",
-      auto_mode: mode === "auto",
-    }).catch((error) => {
-      for (const sessionId of this.knownSessions) {
-        this.emit({ type: "error", sessionId, message: errorText(error) });
-      }
-    });
   }
 
   setComputerUseEnabled(enabled: boolean): void {
-    if (enabled && this.permissionMode === "bypass") {
-      this.setPermissionMode("default");
-    }
     this.computerUseEnabled = enabled;
-    localStorage.setItem("grox.computerUseEnabled", enabled ? "1" : "0");
     if (!enabled) {
-      for (const leaseId of this.computerLeases.values()) {
-        void invoke("computer_shutdown_lease", { leaseId }).catch(() => {});
-        void invoke("computer_emergency_stop", { leaseId }).catch(() => {});
-      }
+      void invoke("computer_shutdown_all_leases").catch(() => {});
     }
   }
 
@@ -2549,101 +3156,13 @@ export class AcpBridge implements GrokBridge {
 
   setBrowserUseEnabled(enabled: boolean): void {
     this.browserUseEnabled = enabled;
-    localStorage.setItem("grox.browserUseEnabled", enabled ? "1" : "0");
     if (!enabled) {
-      for (const leaseId of this.browserLeases.values()) {
-        void invoke("browser_shutdown_lease", { leaseId }).catch(() => {});
-      }
-      this.browserLeases.clear();
+      void invoke("browser_shutdown_all_leases").catch(() => {});
     }
   }
 
   getBrowserUseEnabled(): boolean {
     return this.browserUseEnabled;
-  }
-
-  private async discardLeaseAttempt(computer: {
-    pluginDirs: string[];
-    computerLeaseId: string;
-    browserLeaseId: string;
-  }): Promise<void> {
-    if (computer.computerLeaseId) {
-      await invoke("computer_shutdown_lease", { leaseId: computer.computerLeaseId }).catch(() => {});
-    }
-    if (computer.browserLeaseId) {
-      await invoke("browser_shutdown_lease", { leaseId: computer.browserLeaseId }).catch(() => {});
-      this.browserLeases.delete(`pending:${computer.browserLeaseId}`);
-      for (const [key, leaseId] of [...this.browserLeases.entries()]) {
-        if (leaseId === computer.browserLeaseId) this.browserLeases.delete(key);
-      }
-    }
-  }
-
-  private async resolveComputerExtensions(): Promise<{
-    pluginDirs: string[];
-    computerLeaseId: string;
-    browserLeaseId: string;
-  }> {
-    let pluginDirs: string[] = [];
-    let computerLeaseId = "";
-    let browserLeaseId = "";
-
-    if (this.computerUseEnabled && this.permissionMode !== "bypass") {
-      const computer = await invoke<ComputerSessionExtensions>("computer_session_extensions");
-      pluginDirs = computer.pluginDirs ?? [];
-      computerLeaseId = computer.leaseId ?? "";
-    }
-
-    if (this.browserUseEnabled) {
-      try {
-        const browser = await invoke<BrowserSessionExtensions>("browser_session_extensions");
-        if (browser.leaseId) {
-          browserLeaseId = browser.leaseId;
-          // Stash under a synthetic key until session id is known; callers also
-          // record per-session after session/new.
-          this.browserLeases.set(`pending:${browser.leaseId}`, browser.leaseId);
-        }
-      } catch {
-        // Browser Use is optional — missing Chrome must not block session creation.
-      }
-    }
-
-    return { pluginDirs, computerLeaseId, browserLeaseId };
-  }
-
-  private sessionPermissionMeta() {
-    return {
-      clientIdentifier: UPSTREAM_CLI_CLIENT_IDENTIFIER,
-      yoloMode: this.permissionMode === "bypass",
-      autoMode: this.permissionMode === "auto",
-    };
-  }
-
-  private async sessionMeta(cwd: string) {
-    const cached = this.sessionMetaCache.get(cwd);
-    if (cached && cached.expiresAt > Date.now()) {
-      return {
-        ...this.sessionPermissionMeta(),
-        ...(cached.systemPromptOverride ? { systemPromptOverride: cached.systemPromptOverride } : {}),
-      };
-    }
-    let systemPromptOverride: string | undefined;
-    try {
-      const documents = await invoke<ConfigDocument[]>("read_config_documents", { cwd });
-      systemPromptOverride = documents
-        .find((document) => document.id === "system-prompt")
-        ?.content.trim();
-    } catch {
-      // A missing optional prompt document must never block session creation.
-    }
-    this.sessionMetaCache.set(cwd, {
-      expiresAt: Date.now() + 30_000,
-      ...(systemPromptOverride ? { systemPromptOverride } : {}),
-    });
-    return {
-      ...this.sessionPermissionMeta(),
-      ...(systemPromptOverride ? { systemPromptOverride } : {}),
-    };
   }
 
   async authenticate(): Promise<void> {
@@ -2653,45 +3172,34 @@ export class AcpBridge implements GrokBridge {
     // previously selected API gateway can keep owning the next ACP child.
     const provider = await this.getProviderStatus();
     if (provider.kind !== "oauth") {
-      await invoke("configure_provider", { request: { kind: "oauth" } });
-      await this.restartAgent();
+      await this.reconfigureRuntime(() => invoke("configure_provider", { request: { kind: "oauth" } }));
     }
-    if (!this.authMethodId) throw new Error("Grok Agent 没有可用的交互认证方式");
-    if (this.authState.inProgress) return;
-    this.setAuthState({ required: true, inProgress: true, error: undefined });
-    const requestSeq = Date.now();
     try {
-      const auth = this.requestRaw("authenticate", {
-        methodId: this.authMethodId,
-        _meta: { use_oauth: true, force_interactive: true, request_seq: requestSeq },
-      }, 5 * 60_000).then(
-        () => ({ error: undefined }),
-        (error: unknown) => ({ error }),
-      );
-      let authUrl: string | undefined;
-      for (let attempt = 0; attempt < 60 && !authUrl; attempt += 1) {
-        if (attempt > 0) {
-          await new Promise((resolve) => window.setTimeout(resolve, 50));
-        }
-        const urlResponse = record(await this.requestRaw("x.ai/auth/get_url", {}));
-        authUrl = string(urlResponse?.auth_url) ?? string(urlResponse?.authUrl);
-      }
-      if (!authUrl) throw new Error("Grok Agent 未返回登录链接，请重试");
-      await invoke("open_external", { url: authUrl });
-      const authResult = await auth;
-      if (authResult.error) throw authResult.error;
-      this.setAuthState({ required: false, inProgress: false, error: undefined });
-    } catch (error) {
-      void this.requestRaw("x.ai/auth/cancel", { request_seq: requestSeq }).catch(() => {});
-      this.setAuthState({ required: true, inProgress: false, error: errorText(error) });
-      throw error;
+      const state = await invoke<HostAuthenticationState>("agent_runtime_authenticate");
+      this.projectAuthState(state);
+    } catch (cause) {
+      throw groxFailure(toGroxError(cause, {
+        domain: "environment",
+        code: "AUTH_FAILED",
+        message: "Grok 登录未完成",
+        recoverable: true,
+        fatal: false,
+        holdQueue: false,
+        action: "检查登录页、网络或认证错误后重试",
+      }));
     }
   }
 
+  async cancelAuthentication(): Promise<void> {
+    const state = await invoke<HostAuthenticationState>("agent_runtime_auth_cancel");
+    this.projectAuthState(state);
+  }
+
   async logout(): Promise<void> {
-    await this.callExtension("x.ai/auth/logout", {});
-    await invoke("configure_provider", { request: { kind: "oauth" } });
-    await this.restartAgent();
+    await this.reconfigureRuntime(async () => {
+      await this.callExtension("x.ai/auth/logout", {});
+      await invoke("configure_provider", { request: { kind: "oauth" } });
+    });
   }
 
   async getAccountInfo(): Promise<AccountInfo> {
@@ -2710,7 +3218,8 @@ export class AcpBridge implements GrokBridge {
     }
     const meta = record(subscription.meta) ?? {};
     return {
-      authenticated: Boolean(subscription.authenticated) || !this.authState.required,
+      authenticated: Boolean(subscription.authenticated)
+        || (!this.authState.required && !this.authState.error),
       methodId: string(authInfo.methodId),
       email: string(authInfo.email) ?? string(meta.email),
       firstName: string(authInfo.firstName),
@@ -2747,9 +3256,7 @@ export class AcpBridge implements GrokBridge {
   async configureProvider(config: ProviderConfig): Promise<void> {
     // Keep the old child and its environment intact for the current turn.
     // The configuration file is intentionally not touched until it finishes.
-    await this.waitForActivePrompts();
-    await invoke("configure_provider", { request: config });
-    await this.restartAgent();
+    await this.reconfigureRuntime(() => invoke("configure_provider", { request: config }));
     if (config.kind === "oauth" && this.authState.required) await this.authenticate();
   }
 
@@ -2773,9 +3280,7 @@ export class AcpBridge implements GrokBridge {
     // Profile activation also writes the endpoint and per-model transport.
     // Do it only after the prior turn has finished so it cannot change the
     // provider or model underneath an in-flight request.
-    await this.waitForActivePrompts();
-    await invoke("activate_provider_profile", { id });
-    await this.restartAgent();
+    await this.reconfigureRuntime(() => invoke("activate_provider_profile", { id }));
   }
 
   async setSessionMode(sessionId: string, mode: AgentMode): Promise<void> {
@@ -2789,28 +3294,25 @@ export class AcpBridge implements GrokBridge {
 
   async deleteProviderProfile(id: string): Promise<void> {
     const active = (await this.listProviderProfiles()).activeId === id;
-    if (active) await this.waitForActivePrompts();
-    await invoke("delete_provider_profile", { id });
-    if (active) await this.restartAgent();
+    if (active) {
+      await this.reconfigureRuntime(() => invoke("delete_provider_profile", { id }));
+    } else {
+      await invoke("delete_provider_profile", { id });
+    }
   }
 
   async readConfigDocuments(cwd: string): Promise<ConfigDocument[]> {
     return invoke<ConfigDocument[]>("read_config_documents", { cwd });
   }
 
-  async writeConfigDocument(document: ConfigDocument): Promise<ConfigDocument> {
-    const saved = await invoke<ConfigDocument>("write_config_document", {
-      request: { id: document.id, cwd: this.workspace, content: document.content },
+  async writeConfigDocument(document: ConfigDocument, cwd: string): Promise<ConfigDocument> {
+    // 保存目标必须由打开编辑器时的工作区决定，不能在异步重启后读取
+    // 可能已变化的 this.workspace，否则快速切换项目会写错 AGENTS.md。
+    const targetCwd = cwd;
+    const write = () => invoke<ConfigDocument>("write_config_document", {
+      request: { id: document.id, cwd: targetCwd, content: document.content },
     });
-    if (document.id === "system-prompt") this.sessionMetaCache.delete(this.workspace);
-    if (document.id === "config") {
-      // Grok reads its global config at agent startup. Restart only after an
-      // active prompt settles, then the settings UI reloads the idle session
-      // so a successful save has an observable effect immediately.
-      await this.waitForActivePrompts();
-      await this.restartAgent();
-    }
-    return saved;
+    return document.id === "config" ? this.reconfigureRuntime(write) : write();
   }
 
   async callExtension<T>(method: string, params: unknown = {}): Promise<T> {
@@ -2823,9 +3325,18 @@ export class AcpBridge implements GrokBridge {
     return this.workspace;
   }
 
+  invalidateWorkspaceSelection(): void {
+    this.workspaceSelectionGeneration += 1;
+  }
+
   async setWorkspace(cwd: string): Promise<void> {
+    const generation = ++this.workspaceSelectionGeneration;
     await this.ensureReady();
+    if (generation !== this.workspaceSelectionGeneration) return;
     const validated = await invoke<string>("validate_workspace", { cwd });
+    // 快速跨项目切换时，较早的路径校验可能较晚返回；旧结果不能覆盖
+    // 最后一次用户选择。
+    if (generation !== this.workspaceSelectionGeneration) return;
     this.workspace = validated;
     localStorage.setItem("grok.workspace", validated);
   }
@@ -2852,7 +3363,6 @@ export class AcpBridge implements GrokBridge {
     const sessions = [...collected.values()].sort((a, b) => b.updatedAt - a.updatedAt);
     for (const meta of sessions) {
       this.catalogue.set(meta.id, meta);
-      this.sessionWorkspaces.set(meta.id, meta.cwd);
     }
     return sessions;
   }
@@ -2864,62 +3374,144 @@ export class AcpBridge implements GrokBridge {
     const creationLock = `session/new:${++this.requestId}`;
     this.activePromptSessions.add(creationLock);
     try {
-      await this.createSession(cwd);
+      await this.createSession(cwd, false);
     } finally {
       this.markPromptFinished(creationLock);
     }
   }
 
-  private async createSession(cwd: string): Promise<void> {
-    const metaRequest = await this.sessionMeta(cwd);
+  async newBackgroundSession(cwd: string): Promise<string> {
+    const creationLock = `session/new-background:${++this.requestId}`;
+    this.activePromptSessions.add(creationLock);
+    try {
+      return await this.createSession(cwd, true);
+    } finally {
+      this.markPromptFinished(creationLock);
+    }
+  }
+
+  async forkSession(sessionId: string, cwd: string, title?: string): Promise<SessionForkResult> {
+    await this.ensureReady();
+    const source = this.catalogue.get(sessionId);
+    const result = await invoke<SessionForkResult>("fork_agent_session", {
+      request: {
+        sourceSessionId: sessionId,
+        sourceCwd: cwd,
+        generation: this.acpGeneration,
+      },
+    });
+    const now = Date.now();
+    const catalogueTitle = source?.title?.trim();
+    const requestedTitle = title?.trim();
+    const forkTitle = catalogueTitle && catalogueTitle !== "Untitled mission"
+      ? catalogueTitle
+      : requestedTitle || catalogueTitle || "Forked mission";
+    this.catalogue.set(result.sessionId, {
+      id: result.sessionId,
+      // CLI catalogue rows can remain "Untitled mission" even after the UI
+      // has derived a useful title from the first prompt. Prefer that visible
+      // source title so a successful native fork does not look like an empty
+      // or unrelated task in the sidebar.
+      title: forkTitle,
+      cwd: result.cwd,
+      createdAt: now,
+      updatedAt: now,
+      model: source?.model ?? localStorage.getItem("grok.model") ?? "grok-build",
+      parentId: sessionId,
+    });
+    return result;
+  }
+
+  async forkSessionInNewWorktree(sessionId: string, cwd: string): Promise<WorktreeForkResult> {
+    await this.ensureReady();
+    const source = this.catalogue.get(sessionId);
+    const result = await invoke<WorktreeForkResult>("fork_agent_session_in_worktree", {
+      request: {
+        sourceSessionId: sessionId,
+        sourceCwd: cwd,
+        generation: this.acpGeneration,
+      },
+    });
+    const now = Date.now();
+    this.catalogue.set(result.sessionId, {
+      id: result.sessionId,
+      title: source?.title ? `Fork of ${source.title}` : "Forked mission",
+      cwd: result.cwd,
+      createdAt: now,
+      updatedAt: now,
+      model: source?.model ?? localStorage.getItem("grok.model") ?? "grok-build",
+      parentId: sessionId,
+    });
+    return result;
+  }
+
+  private emitHostWarnings(warnings: GroxError[] | undefined): void {
+    for (const warning of warnings ?? []) {
+      this.emit({ type: "runtime_notice", notice: runtimeNoticeFromError(warning) });
+    }
+  }
+
+  private projectAutomationSessionStarted(started: AutomationSessionStarted): boolean {
+    if (this.automationStartedSessions.has(started.sessionId)) return false;
+    this.automationStartedSessions.add(started.sessionId);
+    const automation = started.automation;
+    const now = started.claimedAt || Date.now();
+    const meta: SessionMeta = {
+      id: started.sessionId,
+      title: automation.title || "Scheduled mission",
+      cwd: automation.cwd,
+      createdAt: now,
+      updatedAt: now,
+      model: automation.model,
+    };
+    this.emitHostWarnings(started.warnings);
+    this.knownSessions.add(started.sessionId);
+    this.sessionOptions.set(started.sessionId, {
+      model: automation.model,
+      effort: automation.effort,
+      mode: automation.mode,
+    });
+    this.catalogue.set(started.sessionId, meta);
+    this.usage.set(started.sessionId, { ...EMPTY_USAGE });
+    this.emit({
+      type: "session_ready",
+      session: {
+        ...emptySession(meta),
+        status: "running",
+        blocks: [{
+          type: "user",
+          id: uid(),
+          text: automation.prompt,
+          ts: now,
+        }],
+      },
+      background: true,
+    });
+    this.emit({ type: "available_commands", sessionId: started.sessionId, commands: this.runtimeCommands });
+    return true;
+  }
+
+  private async createSession(cwd: string, background: boolean): Promise<string> {
     const preferredModel = localStorage.getItem("grok.model")?.trim();
     const reasoningEffort = storedEffort();
-    let computer = await this.resolveComputerExtensions();
-    let responseValue: unknown;
-    try {
-      try {
-        responseValue = await this.request(ACP_METHODS.sessionNew, {
-          cwd,
-          // Bearer tokens are injected natively from lease ids — never from the WebView.
-          mcpServers: [],
-          _meta: {
-            ...metaRequest,
-            ...(preferredModel ? { modelId: preferredModel } : {}),
-            reasoningEffort,
-            ...(computer.pluginDirs.length ? { pluginDirs: computer.pluginDirs } : {}),
-            ...(computer.computerLeaseId ? { groxComputerLeaseId: computer.computerLeaseId } : {}),
-            ...(computer.browserLeaseId ? { groxBrowserLeaseId: computer.browserLeaseId } : {}),
-          },
-        });
-      } catch (error) {
-        // Older Grok CLIs reject the v0.2.3 Computer Use session extensions
-        // instead of ignoring unknown fields. Keep core ACP usable by retrying
-        // with the standard session/new shape.
-        if (!isInvalidParamsError(error)) throw error;
-        await this.discardLeaseAttempt(computer);
-        computer = { pluginDirs: [], computerLeaseId: "", browserLeaseId: "" };
-        responseValue = await this.request(ACP_METHODS.sessionNew, {
-          cwd,
-          mcpServers: [],
-          _meta: {
-            ...metaRequest,
-            ...(preferredModel ? { modelId: preferredModel } : {}),
-            reasoningEffort,
-          },
-        });
-      }
-    } catch (error) {
-      await this.discardLeaseAttempt(computer);
-      throw error;
-    }
+    const opened = await invoke<OpenAgentSessionResult>("open_agent_session", {
+      request: {
+        cwd,
+        generation: this.acpGeneration,
+        preferredModel,
+        reasoningEffort,
+        permissionMode: this.permissionMode,
+        computerUseEnabled: this.computerUseEnabled,
+        browserUseEnabled: this.browserUseEnabled,
+      },
+    });
+    this.emitHostWarnings(opened.warnings);
+    const responseValue = opened.response;
     const response = record(responseValue);
     const sessionId = string(response?.sessionId);
     if (!sessionId) {
-      await this.discardLeaseAttempt(computer);
       throw new Error("session/new 未返回 sessionId");
     }
-    if (computer.computerLeaseId) this.computerLeases.set(sessionId, computer.computerLeaseId);
-    claimPendingBrowserLease(this.browserLeases, sessionId, computer.browserLeaseId);
     this.captureModelState(response);
     this.captureRuntimeCommands(response);
     const detail = record(record(response?._meta)?.["x.ai/sessionDetail"]);
@@ -2942,12 +3534,11 @@ export class AcpBridge implements GrokBridge {
       effort: reasoningEffort,
       mode: "agent",
     });
-    this.sessionWorkspaces.set(sessionId, cwd);
     this.catalogue.set(sessionId, meta);
-    this.cursors.set(sessionId, { toolBlocks: new Map() });
     this.usage.set(sessionId, { ...EMPTY_USAGE });
-    this.emit({ type: "session_ready", session: emptySession(meta) });
+    this.emit({ type: "session_ready", session: emptySession(meta), background });
     this.emit({ type: "available_commands", sessionId, commands: this.runtimeCommands });
+    return sessionId;
   }
 
   async loadSession(id: string, options?: { background?: boolean }): Promise<void> {
@@ -2970,6 +3561,9 @@ export class AcpBridge implements GrokBridge {
     this.activePromptSessions.add(loadingLock);
     try {
       await this.restoreSession(id, background);
+    } catch (error) {
+      this.emit({ type: "status", sessionId: id, status: "failed" });
+      throw error;
     } finally {
       this.markPromptFinished(loadingLock);
     }
@@ -2985,63 +3579,30 @@ export class AcpBridge implements GrokBridge {
 
     if (background) {
       try {
-        const preview = await invoke<SessionDiskPreview | null>("preview_session_from_disk", { id });
-        if (preview?.messages.length) {
-          this.emit({
-            type: "session_ready",
-            session: sessionFromDiskPreview(meta, preview),
-            background: true,
-            preview: true,
-          });
-        }
+        await this.emitDiskSessionPreview(id, meta, true);
       } catch {
         // A missing or unreadable local preview must not block canonical ACP restore.
       }
     }
 
-    this.sessionWorkspaces.set(id, meta.cwd);
-    this.cursors.set(id, { toolBlocks: new Map() });
+    // 后台打开先用本地历史完成切换。Host 可能正等另一个会话的活动回合
+    // 释放生命周期许可，此时展示“正在恢复”会把正常排队伪装成卡死。
+    // 只有显式恢复（例如切换供应商）才需要锁住编辑器并显示连接状态。
+    if (!background) this.emit({ type: "status", sessionId: id, status: "connecting" });
     this.replaying.set(id, emptySession(meta));
-    let computer = {
-      pluginDirs: [] as string[],
-      computerLeaseId: "",
-      browserLeaseId: "",
-    };
     try {
-      const metaRequest = await this.sessionMeta(meta.cwd);
-      computer = await this.resolveComputerExtensions();
-      let response: unknown;
-      try {
-        response = await this.request(ACP_METHODS.sessionLoad, {
-          sessionId: id,
+      const opened = await invoke<OpenAgentSessionResult>("open_agent_session", {
+        request: {
           cwd: meta.cwd,
-          mcpServers: [],
-          _meta: {
-            ...metaRequest,
-            ...(computer.pluginDirs.length ? { pluginDirs: computer.pluginDirs } : {}),
-            ...(computer.computerLeaseId ? { groxComputerLeaseId: computer.computerLeaseId } : {}),
-            ...(computer.browserLeaseId ? { groxBrowserLeaseId: computer.browserLeaseId } : {}),
-          },
-        }, 2 * 60_000);
-      } catch (error) {
-        if (!isInvalidParamsError(error)) throw error;
-        await this.discardLeaseAttempt(computer);
-        computer = { pluginDirs: [], computerLeaseId: "", browserLeaseId: "" };
-        response = await this.request(ACP_METHODS.sessionLoad, {
+          generation: this.acpGeneration,
           sessionId: id,
-          cwd: meta.cwd,
-          mcpServers: [],
-          _meta: metaRequest,
-        }, 2 * 60_000);
-      }
-      const previousLease = this.computerLeases.get(id);
-      if (previousLease && previousLease !== computer.computerLeaseId) {
-        await invoke("computer_shutdown_lease", { leaseId: previousLease }).catch(() => {});
-        await invoke("computer_clear_emergency_stop", { leaseId: previousLease }).catch(() => {});
-      }
-      if (computer.computerLeaseId) this.computerLeases.set(id, computer.computerLeaseId);
-      else this.computerLeases.delete(id);
-      claimPendingBrowserLease(this.browserLeases, id, computer.browserLeaseId);
+          permissionMode: this.permissionMode,
+          computerUseEnabled: this.computerUseEnabled,
+          browserUseEnabled: this.browserUseEnabled,
+        },
+      });
+      this.emitHostWarnings(opened.warnings);
+      const response = opened.response;
       this.flushStreamAppends(id);
       this.flushToolPatches(id);
       this.captureModelState(response);
@@ -3051,10 +3612,10 @@ export class AcpBridge implements GrokBridge {
         await this.replayAfterLatestRewind(id, meta.cwd, meta);
       }
       const replayed = this.replaying.get(id) ?? emptySession(meta);
-      const finalized: Session = {
+      let finalized: Session = {
         ...replayed,
         usage: this.usage.get(id) ?? replayed.usage,
-        status: "idle",
+        status: this.sessionGateStatus(id) ?? "idle",
         blocks: replayed.blocks.map((block) =>
           block.type === "assistant"
             ? { ...block, streaming: false }
@@ -3063,12 +3624,34 @@ export class AcpBridge implements GrokBridge {
               : block,
         ),
       };
+      if (background) {
+        try {
+          const disk = await invoke<SessionDiskPreview | null>("preview_session_from_disk", { id });
+          if (disk?.entries.length) {
+            finalized = {
+              ...mergeOfflineWithLive(sessionFromDiskPreview(meta, disk), finalized),
+              preview: false,
+            };
+          }
+        } catch (cause) {
+          this.diagnostics.push(`会话磁盘历史合并失败：${cleanApiError(cause)}`);
+          this.diagnostics = this.diagnostics.slice(-20);
+        }
+      }
       this.replaying.delete(id);
       this.knownSessions.add(id);
       // Drop sticky model/effort so the next prompt re-binds via set_model
       // (resume after shell upgrade / effort change must not reuse dead options).
       this.sessionOptions.delete(id);
       this.emit({ type: "session_ready", session: finalized, background });
+      const visibleBlocks = new Set(finalized.blocks.map((block) => block.id));
+      for (const interaction of this.hostInteractions.values()) {
+        if (interaction.sessionId === id && !visibleBlocks.has(interaction.blockId)) {
+          // interaction_status 可能早于 session/load 完成；会话实体就绪后
+          // 重新投影卡片，但仍不恢复或暴露任何 rpc id。
+          this.emitHostInteraction(interaction);
+        }
+      }
       this.emit({ type: "available_commands", sessionId: id, commands: this.runtimeCommands });
       // Restored workflow actors emit a current snapshot, but older CLI
       // versions may have written the detailed updates only to JSONL. Read
@@ -3076,10 +3659,25 @@ export class AcpBridge implements GrokBridge {
       // reconstructs its deep-research task archive as well.
       void this.hydrateWorkflowHistory(id, meta.cwd);
     } catch (error) {
-      await this.discardLeaseAttempt(computer);
       this.replaying.delete(id);
       throw error;
     }
+  }
+
+  private async emitDiskSessionPreview(
+    id: string,
+    meta: SessionMeta,
+    preview: boolean,
+  ): Promise<boolean> {
+    const disk = await invoke<SessionDiskPreview | null>("preview_session_from_disk", { id });
+    if (!disk?.entries.length) return false;
+    this.emit({
+      type: "session_ready",
+      session: sessionFromDiskPreview(meta, disk),
+      background: true,
+      preview,
+    });
+    return true;
   }
 
   /**
@@ -3113,7 +3711,7 @@ export class AcpBridge implements GrokBridge {
       }
       this.flushStreamAppends(sessionId);
       this.flushToolPatches(sessionId);
-      this.cursors.set(sessionId, { toolBlocks: new Map() });
+      this.replayCursors.set(sessionId, { toolBlocks: new Map() });
       this.replaying.set(sessionId, emptySession(meta));
       const liveEnvelopes = marker >= 0 ? envelopes.slice(marker + 1) : envelopes;
       this.canonicalReplaySessions.add(sessionId);
@@ -3287,212 +3885,103 @@ export class AcpBridge implements GrokBridge {
     }
   }
 
-  /**
-   * Bind model + reasoning effort on the ACP session.
-   * Effort changes must re-call set_model (resume sticky sessions).
-   * Invalid effort falls through the fallback chain instead of latching
-   * `sessionSetModelUnsupported` forever.
-   */
-  private async applySessionModelAndEffort(
-    sessionId: string,
-    modelId: string,
-    effort: Effort,
-  ): Promise<Effort> {
-    const preferred = normalizeEffort(effort);
-    if (this.sessionSetModelUnsupported) return preferred;
-
-    let lastError: unknown;
-    for (const candidate of effortFallbackChain(preferred)) {
-      try {
-        await this.requestRaw(ACP_METHODS.sessionSetModel, {
-          sessionId,
-          modelId,
-          _meta: { reasoningEffort: candidate },
-        });
-        return candidate;
-      } catch (error) {
-        lastError = error;
-        if (isInvalidReasoningEffortError(error)) {
-          continue;
-        }
-        if (isInvalidParamsError(error)) {
-          // True capability miss: do not spam set_model every turn.
-          this.sessionSetModelUnsupported = true;
-          return preferred;
-        }
-        throw error;
-      }
-    }
-    if (lastError) throw lastError;
-    return preferred;
-  }
-
   async prompt(sessionId: string, text: string, options: PromptOptions): Promise<void> {
     // Register before any await. This is the critical Send → provider-switch
     // race: provider activation must see this request immediately.
     this.activePromptSessions.add(sessionId);
+    const turnId = uid();
+    this.foregroundTurnIds.set(sessionId, turnId);
     let terminalStatus: SessionStatus = "idle";
     try {
       await this.ensureReady();
       if (!this.knownSessions.has(sessionId)) {
         await this.loadSession(sessionId, { background: true });
       }
+      // Stop 可以发生在首次连接或 session/load 尚未完成时。此时 Agent 还
+      // 没收到 prompt，直接结束客户端提交即可；检查后到 Host begin 之间的
+      // 竞态由 turnId 取消墓碑处理。
+      if (this.stoppingSessions.has(sessionId)) return;
       // A new user prompt begins the new branch. It is the only event allowed
       // to lift the rewind isolation gate.
       this.forgetRewoundSession(sessionId);
       this.knownSessions.add(sessionId);
-      const sessionCwd = this.catalogue.get(sessionId)?.cwd;
-      if (sessionCwd) this.sessionWorkspaces.set(sessionId, sessionCwd);
       this.closeUser(sessionId);
       this.openToolCalls.delete(sessionId);
+      this.liveAssistantSessions.delete(sessionId);
       this.emit({ type: "status", sessionId, status: "running" });
 
-      const preferredEffort = normalizeEffort(options.effort);
-      const previous = this.sessionOptions.get(sessionId);
-      let boundEffort = preferredEffort;
-      if (
-        !previous
-        || previous.model !== options.model
-        || previous.effort !== preferredEffort
-      ) {
-        boundEffort = await this.applySessionModelAndEffort(
+      const result = await invoke<ForegroundTurnResult>("execute_foreground_turn", {
+        request: {
           sessionId,
-          options.model,
-          preferredEffort,
-        );
-      }
-      if (!previous || previous.mode !== options.mode) {
-        await this.requestRaw(ACP_METHODS.sessionSetMode, {
-          sessionId,
-          modeId: options.mode === "agent" ? "default" : options.mode,
-        });
-      }
+          turnId,
+          generation: this.acpGeneration,
+          prompt: promptContent(text, options.attachments ?? []),
+          model: options.model,
+          effort: options.effort,
+          mode: options.mode,
+          queueItemId: options.queueItemId,
+        },
+      });
       this.sessionOptions.set(sessionId, {
         model: options.model,
-        effort: boundEffort,
+        effort: result.effectiveEffort,
         mode: options.mode,
       });
-
-      const dispatchText = completeDeepResearchPrompt(text);
-      const runPromptOnce = async (effort: Effort) => {
-        let promptRpcId: RpcId | undefined;
-        const promptRequest = this.requestRaw(ACP_METHODS.sessionPrompt, {
-          sessionId,
-          prompt: promptContent(dispatchText, options.attachments ?? []),
-          _meta: { reasoningEffort: effort },
-        }, 0, (id) => {
-          promptRpcId = id;
-          this.promptRpcBySession.set(sessionId, id);
-        });
-        // session/prompt has no fixed RPC timeout (long turns stream for
-        // many minutes). A completely silent agent with no open tools/gates
-        // is a wedged gateway or dead socket. Open tools (sealed LRC,
-        // cargo test) emit nothing for 20–40+ minutes and must not cancel.
-        const writtenAt = Date.now();
-        this.promptWrittenAt.set(sessionId, writtenAt);
-        this.lastActivity.set(sessionId, writtenAt);
-        const watchdog = window.setInterval(() => {
-          if (promptRpcId === undefined) return;
-          const now = Date.now();
-          const reason = shouldFirePromptStallWatchdog({
-            silentForMs: now - (this.lastActivity.get(sessionId) ?? 0),
-            elapsedMs: now - (this.promptWrittenAt.get(sessionId) ?? writtenAt),
-            hasOpenTools: this.sessionHasOpenTools(sessionId),
-            hasOpenGate: this.sessionHasOpenGate(sessionId),
-          });
-          if (reason === "ok") return;
-          const pending = this.pending.get(promptRpcId);
-          if (!pending) return;
-          this.pending.delete(promptRpcId);
-          this.promptRpcBySession.delete(sessionId);
-          pending.reject(
-            new Error(
-              reason === "absolute"
-                ? promptTurnTimeoutMessage("absolute")
-                : "Grok Agent 长时间没有任何响应：上游服务可能无返回。请检查网络、模型或供应商配置后重试。",
-            ),
-          );
-          this.cancel(sessionId);
-        }, 15_000);
+      if (result.effectiveEffort !== result.requestedEffort) {
         try {
-          const result = await promptRequest;
-          this.throwIfPromptResultInvalidEffort(result);
-          return result;
-        } finally {
-          window.clearInterval(watchdog);
-          if (promptRpcId !== undefined && this.promptRpcBySession.get(sessionId) === promptRpcId) {
-            this.promptRpcBySession.delete(sessionId);
-          }
+          localStorage.setItem("grok.effort", result.effectiveEffort);
+        } catch {
+          /* private mode */
         }
-      };
-
-      let responseValue: unknown;
-      let usedEffort = boundEffort;
-      try {
-        responseValue = await runPromptOnce(usedEffort);
-      } catch (error) {
-        if (!isInvalidReasoningEffortError(error)) throw error;
-        // Stream/API rejected max|xhigh — rebind safe ladder and continue same turn.
-        let recovered: unknown;
-        let last: unknown = error;
-        for (const candidate of effortFallbackChain(preferredEffort)) {
-          if (candidate === usedEffort) continue;
-          try {
-            usedEffort = await this.applySessionModelAndEffort(
-              sessionId,
-              options.model,
-              candidate,
-            );
-            this.sessionOptions.set(sessionId, {
-              model: options.model,
-              effort: usedEffort,
-              mode: options.mode,
-            });
-            // Persist clamp so UI stops advertising a rejected sticky max for this session.
-            try {
-              localStorage.setItem("grok.effort", usedEffort);
-            } catch {
-              /* private mode */
-            }
-            recovered = await runPromptOnce(usedEffort);
-            last = undefined;
-            if (usedEffort !== preferredEffort) {
-              this.emit({
-                type: "block_add",
-                sessionId,
-                block: {
-                  type: "system",
-                  id: uid(),
-                  text: `推理强度 ${preferredEffort} 不被当前模型/API 接受，已自动改用 ${usedEffort} 继续。`,
-                  ts: Date.now(),
-                  kind: "info",
-                },
-              });
-            }
-            break;
-          } catch (retryError) {
-            last = retryError;
-            if (!isInvalidReasoningEffortError(retryError)) throw retryError;
-          }
-        }
-        if (last) throw last;
-        responseValue = recovered;
+        this.emit({
+          type: "block_add",
+          sessionId,
+          block: {
+            type: "system",
+            id: uid(),
+            text: `推理强度 ${result.requestedEffort} 不被当前模型/API 接受，已自动改用 ${result.effectiveEffort} 继续。`,
+            ts: Date.now(),
+            kind: "info",
+          },
+        });
       }
-      const response = record(responseValue);
+      const response = record(result.response);
       const meta = record(response?._meta);
       const promptUsage = record(meta?.usage);
       if (promptUsage) this.emitUsage(sessionId, promptUsage);
+      if (result.assistantText?.trim() && !this.liveAssistantSessions.has(sessionId)) {
+        this.emit({
+          type: "block_add",
+          sessionId,
+          block: {
+            type: "assistant",
+            id: uid(),
+            text: result.assistantText,
+            ts: Date.now(),
+            streaming: false,
+          },
+        });
+      }
       await this.refreshSessionInfo(sessionId);
     } catch (error) {
-      terminalStatus = "failed";
-      if (isInvalidReasoningEffortError(error)) {
-        // Force next send to re-run set_model + fallback chain.
-        this.sessionOptions.delete(sessionId);
+      const cancelled = this.stoppingSessions.has(sessionId);
+      terminalStatus = cancelled ? "idle" : "failed";
+      if (!cancelled) {
+        this.emitError(sessionId, error, {
+          domain: "protocol",
+          code: "SESSION_PROMPT_FAILED",
+          fatal: true,
+          holdQueue: true,
+          action: "检查最后一轮是否已在 CLI 侧完成，再决定是否重新发送",
+        });
       }
-      this.emit({ type: "error", sessionId, message: errorText(error) });
     } finally {
-      this.promptRpcBySession.delete(sessionId);
       this.finishTurn(sessionId, undefined, terminalStatus);
+      if (this.foregroundTurnIds.get(sessionId) === turnId) {
+        this.foregroundTurnIds.delete(sessionId);
+      }
+      this.stoppingSessions.delete(sessionId);
+      this.liveAssistantSessions.delete(sessionId);
       this.markPromptFinished(sessionId);
     }
   }
@@ -3528,30 +4017,37 @@ export class AcpBridge implements GrokBridge {
     return true;
   }
 
-  cancel(sessionId: string): void {
-    for (const [blockId, interaction] of this.interactions) {
-      if (interaction.sessionId !== sessionId) continue;
-      this.interactions.delete(blockId);
-      const result =
-        interaction.kind === "permission"
-          ? { outcome: { outcome: "cancelled" } }
-          : { outcome: "cancelled" };
-      void this.sendRaw({ jsonrpc: "2.0", id: interaction.rpcId, result });
-    }
-    void this.notify(ACP_METHODS.sessionCancel, {
+  cancel(sessionId: string, userInitiated = true): void {
+    if (userInitiated) this.stoppingSessions.add(sessionId);
+    this.emit({ type: "status", sessionId, status: "stopping" });
+    void invoke<boolean>("cancel_foreground_turn", {
       sessionId,
-      _meta: { trigger: "user", cancelSubagents: true },
+      turnId: this.foregroundTurnIds.get(sessionId),
+      generation: this.acpGeneration,
+      reason: userInitiated ? "用户已停止当前回合" : "Host watchdog 已停止当前回合",
+      kind: userInitiated ? "user" : "watchdog",
+    }).then(() => {
+      void this.syncHostInteractions().catch((error) => {
+        this.diagnostics.push(`交互门控快照刷新失败：${errorText(error)}`);
+        this.diagnostics = this.diagnostics.slice(-20);
+      });
     }).catch((error) => {
-      this.emit({ type: "error", sessionId, message: errorText(error) });
+      const code = string(record(error)?.code);
+      if (code === "ACP_CHANNEL_REPLACED" || code === "ACP_RUNTIME_NOT_READY") return;
+      this.emitError(sessionId, error, {
+        domain: "operation",
+        code: "SESSION_CANCEL_FAILED",
+        message: "停止请求未被 Agent 接受",
+        recoverable: true,
+        fatal: false,
+        holdQueue: true,
+        action: "等待当前回合结束，或重启运行时",
+      });
     });
   }
 
   async emergencyStopComputer(sessionId: string): Promise<void> {
-    const leaseId = this.computerLeases.get(sessionId);
-    if (leaseId) {
-      await invoke("computer_emergency_stop", { leaseId });
-      await invoke("computer_shutdown_lease", { leaseId }).catch(() => {});
-    }
+    await invoke("computer_emergency_stop_session", { sessionId });
     this.cancel(sessionId);
   }
 
@@ -3571,7 +4067,14 @@ export class AcpBridge implements GrokBridge {
       });
       await this.refreshSessionInfo(sessionId);
     } catch (error) {
-      this.emit({ type: "error", sessionId, message: errorText(error) });
+      this.emitError(sessionId, error, {
+        domain: "operation",
+        code: "COMPACT_FAILED",
+        message: "会话上下文压缩失败",
+        recoverable: true,
+        fatal: false,
+        holdQueue: false,
+      });
     }
   }
 
@@ -3595,59 +4098,73 @@ export class AcpBridge implements GrokBridge {
   }
 
   respondPermission(sessionId: string, blockId: string, option: PermissionOption, feedback?: string): void {
-    const pending = this.interactions.get(blockId);
-    if (!pending || pending.sessionId !== sessionId) return;
-    this.interactions.delete(blockId);
-
-    let result: unknown;
-    if (pending.kind === "plan") {
-      result = {
-        outcome: option === "deny" ? "cancelled" : "approved",
-        ...(option === "deny" && feedback?.trim() ? { feedback: feedback.trim() } : {}),
-      };
-    } else {
-      const optionId = pending.optionIds[option];
-      result = optionId
-        ? { outcome: { outcome: "selected", optionId } }
-        : { outcome: { outcome: "cancelled" } };
-    }
-    void this.sendRaw({ jsonrpc: "2.0", id: pending.rpcId, result }).catch((error) => {
-      this.emit({ type: "error", sessionId, message: errorText(error) });
+    const pending = this.hostInteractions.get(blockId);
+    if (
+      !pending
+      || pending.sessionId !== sessionId
+      || pending.kind === "question"
+      || this.resolvingInteractions.has(blockId)
+    ) return;
+    this.resolvingInteractions.add(blockId);
+    void invoke<ResolveInteractionResult>("resolve_interaction", {
+      sessionId,
+      blockId,
+      decision: { option, ...(feedback?.trim() ? { feedback: feedback.trim() } : {}) },
+    }).then((result) => {
+      if (this.hostInteractions.get(blockId)?.sessionId !== sessionId) return;
+      this.hostInteractions.delete(blockId);
+      this.resolvingInteractions.delete(blockId);
+      this.emit({ type: "permission_resolved", sessionId, blockId, option });
+      if (result.auditWarning) {
+        this.emit({
+          type: "runtime_notice",
+          notice: runtimeNoticeFromError(result.auditWarning),
+        });
+      }
+    }).catch((error) => {
+      this.resolvingInteractions.delete(blockId);
+      this.emitError(sessionId, error, {
+        domain: "operation",
+        code: "PERMISSION_RESPONSE_FAILED",
+        message: "权限决定未能送达 Agent",
+        recoverable: true,
+        fatal: false,
+        holdQueue: true,
+        action: "重新打开会话；失效的批准不会发送到其它会话",
+      });
     });
-    this.emit({ type: "permission_resolved", sessionId, blockId, option });
   }
 
   respondQuestion(sessionId: string, blockId: string, response: QuestionResponse): void {
-    const pending = this.interactions.get(blockId);
-    if (!pending || pending.sessionId !== sessionId || pending.kind !== "question") return;
-    this.interactions.delete(blockId);
-
-    let result: unknown;
-    if (response.outcome === "accepted") {
-      const annotations: Record<string, { preview?: string; notes?: string }> = {};
-      for (const question of pending.questions ?? []) {
-        const selected = response.answers[question.question] ?? [];
-        const preview = question.multiSelect
-          ? undefined
-          : question.options.find((option) => option.label === selected[0])?.preview;
-        const notes = response.notes[question.question]?.trim() || undefined;
-        if (preview || notes) annotations[question.question] = { preview, notes };
-      }
-      result = {
-        outcome: "accepted",
-        answers: response.answers,
-        ...(Object.keys(annotations).length > 0 ? { annotations } : {}),
-      };
-    } else if (response.outcome === "cancelled") {
-      result = { outcome: "cancelled" };
-    } else {
-      result = { outcome: response.outcome, partial_answers: response.partialAnswers };
-    }
-
-    void this.sendRaw({ jsonrpc: "2.0", id: pending.rpcId, result }).catch((error) => {
-      this.emit({ type: "error", sessionId, message: errorText(error) });
+    const pending = this.hostInteractions.get(blockId);
+    if (
+      !pending
+      || pending.sessionId !== sessionId
+      || pending.kind !== "question"
+      || this.resolvingInteractions.has(blockId)
+    ) return;
+    this.resolvingInteractions.add(blockId);
+    void invoke("resolve_interaction", {
+      sessionId,
+      blockId,
+      decision: response,
+    }).then(() => {
+      if (this.hostInteractions.get(blockId)?.sessionId !== sessionId) return;
+      this.hostInteractions.delete(blockId);
+      this.resolvingInteractions.delete(blockId);
+      this.emit({ type: "question_resolved", sessionId, blockId, response });
+    }).catch((error) => {
+      this.resolvingInteractions.delete(blockId);
+      this.emitError(sessionId, error, {
+        domain: "operation",
+        code: "QUESTION_RESPONSE_FAILED",
+        message: "回答未能送达 Agent",
+        recoverable: true,
+        fatal: false,
+        holdQueue: true,
+        action: "重新打开会话；回答不会发送到其它会话",
+      });
     });
-    this.emit({ type: "question_resolved", sessionId, blockId, response });
   }
 
   async renameSession(id: string, title: string): Promise<void> {
@@ -3664,42 +4181,29 @@ export class AcpBridge implements GrokBridge {
   async deleteSession(id: string): Promise<void> {
     const meta = this.catalogue.get(id);
     this.cancel(id);
-    const computerLease = this.computerLeases.get(id);
-    if (computerLease) {
-      await invoke("computer_clear_emergency_stop", { leaseId: computerLease }).catch(() => {});
-    }
-    await this.request(ACP_METHODS.sessionDelete, {
+    await invoke("delete_agent_session", {
       sessionId: id,
       cwd: meta?.cwd ?? this.workspace,
-      kind: "build",
+      generation: this.acpGeneration,
     });
     this.catalogue.delete(id);
-    this.computerLeases.delete(id);
     this.activeComputerSessions.delete(id);
     this.openToolCalls.delete(id);
-    this.promptWrittenAt.delete(id);
-    this.lastActivity.delete(id);
     for (const key of this.activeComputerToolCalls) {
       if (key.startsWith(`${id}:`)) this.activeComputerToolCalls.delete(key);
     }
     this.knownSessions.delete(id);
-    this.sessionWorkspaces.delete(id);
-    this.cursors.delete(id);
+    this.forgetToolImagePersistence(id);
+    this.replayCursors.delete(id);
     this.usage.delete(id);
   }
 
   async closeSession(id: string): Promise<void> {
     if (!this.knownSessions.has(id)) return;
-    try {
-      await this.request(ACP_METHODS.sessionClose, { sessionId: id });
-    } catch (error) {
-      // Grok Build v1 also retains the pre-ACP spelling for older clients.
-      if (!isMethodUnavailable(error)) throw error;
-      await this.request("x.ai/session/close", { sessionId: id });
-    }
+    await invoke("close_agent_session", { sessionId: id, generation: this.acpGeneration });
     this.knownSessions.delete(id);
-    this.sessionWorkspaces.delete(id);
-    this.cursors.delete(id);
+    this.forgetToolImagePersistence(id);
+    this.replayCursors.delete(id);
     this.usage.delete(id);
   }
 

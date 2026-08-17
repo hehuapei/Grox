@@ -78,6 +78,7 @@ const zh = {
   error: "错误",
   model: "模型",
   elapsed: "耗时",
+  sessionSpan: "会话跨度",
   context: "上下文",
   turns: "轮次",
   cost: "费用",
@@ -107,7 +108,7 @@ const en: Record<keyof typeof zh, string> = {
   mcp: "MCP", skills: "Skills", plugins: "Plugins", marketplace: "Marketplace", add: "Add", enable: "Enable",
   disable: "Disable", install: "Install", uninstall: "Uninstall", refresh: "Refresh", openSettings: "Open settings",
   signInRequired: "Account setup required", projectResources: "Project resources", openFilePreview: "Open side preview",
-  loading: "Loading", error: "Error", model: "Model", elapsed: "Elapsed", context: "Context", turns: "Turns",
+  loading: "Loading", error: "Error", model: "Model", elapsed: "Elapsed", sessionSpan: "Session span", context: "Context", turns: "Turns",
   cost: "Cost", inputTokens: "Input tokens", outputTokens: "Output tokens", cacheRead: "Cache read", sessionId: "Mission ID",
 };
 

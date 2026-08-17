@@ -10,19 +10,25 @@ use std::{
     sync::Mutex,
 };
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
+
+use crate::{atomic_write_bounded_private, permission_policy::PermissionMode};
 
 const PREFS_FILE: &str = "host_prefs.json";
+const MAX_PREFS_BYTES: u64 = 64 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HostPrefs {
     /// Operator enabled Computer Use (desktop control) in Settings.
     #[serde(default)]
     pub computer_use_enabled: bool,
-    /// Permission mode: default | auto | bypass (host-attested for bypass).
-    #[serde(default = "default_permission_mode")]
-    pub permission_mode: String,
+    /// Browser MCP 与自动化均读取 Host 偏好，页面重载不能改变后台会话能力。
+    #[serde(default)]
+    pub browser_use_enabled: bool,
+    /// Host 授权上限；页面、队列和自动化只能请求更严格的模式。
+    #[serde(default, deserialize_with = "deserialize_permission_mode")]
+    pub permission_mode: PermissionMode,
     /// Optional override for FE mid-turn idle (minutes).
     #[serde(default)]
     pub prompt_idle_minutes: Option<u32>,
@@ -34,15 +40,43 @@ pub struct HostPrefs {
     /// silently re-opens the host gate on every boot (review P1).
     #[serde(default)]
     pub computer_use_fe_migrated: bool,
+    /// 一次性把旧版 localStorage Browser Use 选择迁入 Host。
+    #[serde(default)]
+    pub browser_use_fe_migrated: bool,
 }
 
-fn default_permission_mode() -> String {
-    "auto".into()
+fn deserialize_permission_mode<'de, D>(deserializer: D) -> Result<PermissionMode, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let raw = String::deserialize(deserializer)?;
+    if raw.is_empty() {
+        // 0.3.2 之前的前端会把未初始化的选择保存为空串；升级时按新安装默认值迁移。
+        return Ok(PermissionMode::default());
+    }
+    PermissionMode::parse(&raw)
+        .ok_or_else(|| de::Error::unknown_variant(&raw, &["default", "auto", "bypass"]))
+}
+
+impl Default for HostPrefs {
+    fn default() -> Self {
+        Self {
+            computer_use_enabled: false,
+            browser_use_enabled: false,
+            permission_mode: PermissionMode::default(),
+            prompt_idle_minutes: None,
+            prompt_absolute_hours: None,
+            computer_use_fe_migrated: false,
+            browser_use_fe_migrated: false,
+        }
+    }
 }
 
 static PREFS_CACHE: Mutex<Option<HostPrefs>> = Mutex::new(None);
 /// Single data dir for this process (set from AppHandle at startup / first command).
 static PREFS_DIR: Mutex<Option<PathBuf>> = Mutex::new(None);
+/// 所有读取、迁移与更新共享同一把锁，避免不同设置的 RMW 互相覆盖。
+static PREFS_IO: Mutex<()> = Mutex::new(());
 
 fn prefs_path_from_dir(app_data: &Path) -> PathBuf {
     app_data.join(PREFS_FILE)
@@ -64,56 +98,142 @@ pub fn is_computer_use_enabled() -> bool {
         .unwrap_or(false)
 }
 
-pub fn load_prefs(app_data: &Path) -> HostPrefs {
+pub fn load_prefs(app_data: &Path) -> Result<HostPrefs, String> {
+    let _io = PREFS_IO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    load_prefs_unlocked(app_data)
+}
+
+fn load_prefs_unlocked(app_data: &Path) -> Result<HostPrefs, String> {
     set_data_dir(app_data.to_path_buf());
     let path = prefs_path_from_dir(app_data);
     let prefs = match fs::read_to_string(&path) {
-        Ok(raw) => serde_json::from_str(&raw).unwrap_or_default(),
-        Err(_) => HostPrefs::default(),
+        Ok(raw) => match serde_json::from_str(&raw) {
+            Ok(prefs) => prefs,
+            Err(error) => {
+                clear_cache();
+                return Err(format!("Host 偏好文件损坏 {}：{error}", path.display()));
+            }
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => HostPrefs::default(),
+        Err(error) => {
+            clear_cache();
+            return Err(format!("无法读取 Host 偏好 {}：{error}", path.display()));
+        }
     };
     if let Ok(mut guard) = PREFS_CACHE.lock() {
         *guard = Some(prefs.clone());
     }
-    prefs
+    Ok(prefs)
+}
+
+fn clear_cache() {
+    if let Ok(mut guard) = PREFS_CACHE.lock() {
+        *guard = None;
+    }
 }
 
 pub fn save_prefs(app_data: &Path, prefs: &HostPrefs) -> Result<(), String> {
+    let _io = PREFS_IO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    save_prefs_unlocked(app_data, prefs)
+}
+
+fn save_prefs_unlocked(app_data: &Path, prefs: &HostPrefs) -> Result<(), String> {
     set_data_dir(app_data.to_path_buf());
-    fs::create_dir_all(app_data).map_err(|e| format!("无法创建 app data 目录：{e}"))?;
     let path = prefs_path_from_dir(app_data);
     let raw = serde_json::to_string_pretty(prefs).map_err(|e| format!("序列化 host_prefs：{e}"))?;
-    let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, raw.as_bytes()).map_err(|e| format!("写入 host_prefs 失败：{e}"))?;
-    fs::rename(&tmp, &path).map_err(|e| format!("提交 host_prefs 失败：{e}"))?;
+    atomic_write_bounded_private(&path, &raw, MAX_PREFS_BYTES)?;
     if let Ok(mut guard) = PREFS_CACHE.lock() {
         *guard = Some(prefs.clone());
     }
     Ok(())
 }
 
-/// Silent one-shot migration: FE had CU on, host never set (0.2.20).
-/// After the first migration attempt, `computer_use_fe_migrated` stays true so
-/// later boots cannot re-open the host gate from localStorage alone.
-pub fn migrate_computer_use_from_fe(app_data: &Path, fe_enabled: bool) -> Result<HostPrefs, String> {
-    let mut prefs = load_prefs(app_data);
-    if prefs.computer_use_fe_migrated {
-        return Ok(prefs);
-    }
-    if fe_enabled && !prefs.computer_use_enabled {
-        prefs.computer_use_enabled = true;
-    }
-    prefs.computer_use_fe_migrated = true;
-    save_prefs(app_data, &prefs)?;
+/// 在同一把 Host 锁内读取、修改并原子提交偏好。
+pub fn update_prefs(
+    app_data: &Path,
+    update: impl FnOnce(&mut HostPrefs) -> Result<(), String>,
+) -> Result<HostPrefs, String> {
+    let _io = PREFS_IO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut prefs = load_prefs_unlocked(app_data)?;
+    update(&mut prefs)?;
+    save_prefs_unlocked(app_data, &prefs)?;
     Ok(prefs)
 }
 
-pub fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
-    match mode.trim() {
-        "default" => Some("default"),
-        "auto" => Some("auto"),
-        "bypass" => Some("bypass"),
-        _ => None,
-    }
+/// Silent one-shot migration: FE had CU on, host never set (0.2.20).
+/// After the first migration attempt, `computer_use_fe_migrated` stays true so
+/// later boots cannot re-open the host gate from localStorage alone.
+pub fn migrate_computer_use_from_fe(
+    app_data: &Path,
+    fe_enabled: bool,
+) -> Result<HostPrefs, String> {
+    update_prefs(app_data, |prefs| {
+        if prefs.computer_use_fe_migrated {
+            return Ok(());
+        }
+        if fe_enabled && !prefs.computer_use_enabled {
+            prefs.computer_use_enabled = true;
+        }
+        prefs.computer_use_fe_migrated = true;
+        Ok(())
+    })
+}
+
+pub fn migrate_browser_use_from_fe(app_data: &Path, fe_enabled: bool) -> Result<HostPrefs, String> {
+    update_prefs(app_data, |prefs| {
+        if prefs.browser_use_fe_migrated {
+            return Ok(());
+        }
+        prefs.browser_use_enabled = fe_enabled;
+        prefs.browser_use_fe_migrated = true;
+        Ok(())
+    })
+}
+
+pub fn set_computer_use(app_data: &Path, enabled: bool) -> Result<HostPrefs, String> {
+    update_prefs(app_data, |prefs| {
+        prefs.computer_use_enabled = enabled;
+        prefs.computer_use_fe_migrated = true;
+        if enabled && prefs.permission_mode == PermissionMode::Bypass {
+            prefs.permission_mode = PermissionMode::Default;
+        }
+        Ok(())
+    })
+}
+
+pub fn set_browser_use(app_data: &Path, enabled: bool) -> Result<HostPrefs, String> {
+    update_prefs(app_data, |prefs| {
+        prefs.browser_use_enabled = enabled;
+        prefs.browser_use_fe_migrated = true;
+        Ok(())
+    })
+}
+
+/// Bypass 提权确认与写入处于同一个偏好事务内，避免检查后状态被并发修改。
+pub fn set_permission_mode(
+    app_data: &Path,
+    mode: PermissionMode,
+    confirm_bypass: impl FnOnce() -> bool,
+) -> Result<HostPrefs, String> {
+    update_prefs(app_data, |prefs| {
+        if mode == PermissionMode::Bypass
+            && prefs.permission_mode != PermissionMode::Bypass
+            && !confirm_bypass()
+        {
+            return Ok(());
+        }
+        prefs.permission_mode = mode;
+        if mode == PermissionMode::Bypass {
+            prefs.computer_use_enabled = false;
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -153,7 +273,7 @@ mod tests {
         if let Ok(mut g) = PREFS_CACHE.lock() {
             *g = None;
         }
-        let loaded = load_prefs(&dir);
+        let loaded = load_prefs(&dir).unwrap();
         assert!(loaded.computer_use_enabled);
         assert!(is_computer_use_enabled());
         let _ = fs::remove_dir_all(&dir);
@@ -191,6 +311,104 @@ mod tests {
         let again = migrate_computer_use_from_fe(&dir, true).unwrap();
         assert!(!again.computer_use_enabled);
         assert!(again.computer_use_fe_migrated);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_migration_preserves_the_frontend_choice_once() {
+        let _test = isolate_process_state();
+        let dir = temp_dir();
+        let _ = fs::remove_dir_all(&dir);
+
+        let migrated = migrate_browser_use_from_fe(&dir, true).unwrap();
+        assert!(migrated.browser_use_enabled);
+        assert!(migrated.browser_use_fe_migrated);
+
+        let mut disabled = migrated;
+        disabled.browser_use_enabled = false;
+        save_prefs(&dir, &disabled).unwrap();
+        let unchanged = migrate_browser_use_from_fe(&dir, true).unwrap();
+        assert!(!unchanged.browser_use_enabled);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_existing_prefs_fail_closed_without_rewrite() {
+        let _test = isolate_process_state();
+        let dir = temp_dir();
+        let mut prefs = HostPrefs::default();
+        prefs.computer_use_enabled = true;
+        save_prefs(&dir, &prefs).unwrap();
+        assert!(is_computer_use_enabled());
+        let path = prefs_path_from_dir(&dir);
+        fs::write(&path, b"{not-json").unwrap();
+
+        let error = load_prefs(&dir).unwrap_err();
+        assert!(error.contains("Host 偏好文件损坏"));
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{not-json");
+        assert!(!is_computer_use_enabled());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_empty_permission_mode_uses_current_default() {
+        let _test = isolate_process_state();
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            prefs_path_from_dir(&dir),
+            r#"{"computerUseEnabled":true,"permissionMode":""}"#,
+        )
+        .unwrap();
+
+        let loaded = load_prefs(&dir).unwrap();
+        assert_eq!(loaded.permission_mode, PermissionMode::Auto);
+        assert!(loaded.computer_use_enabled);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unknown_permission_mode_still_fails_closed() {
+        let _test = isolate_process_state();
+        let dir = temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            prefs_path_from_dir(&dir),
+            r#"{"computerUseEnabled":true,"permissionMode":"root"}"#,
+        )
+        .unwrap();
+
+        let error = load_prefs(&dir).unwrap_err();
+        assert!(error.contains("Host 偏好文件损坏"));
+        assert!(!is_computer_use_enabled());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn settings_updates_preserve_unrelated_fields_and_safety_invariant() {
+        let _test = isolate_process_state();
+        let dir = temp_dir();
+        let bypass = set_permission_mode(&dir, PermissionMode::Bypass, || true).unwrap();
+        assert_eq!(bypass.permission_mode, PermissionMode::Bypass);
+        assert!(!bypass.computer_use_enabled);
+
+        let browser = set_browser_use(&dir, true).unwrap();
+        assert_eq!(browser.permission_mode, PermissionMode::Bypass);
+        assert!(browser.browser_use_enabled);
+
+        let computer = set_computer_use(&dir, true).unwrap();
+        assert_eq!(computer.permission_mode, PermissionMode::Default);
+        assert!(computer.computer_use_enabled);
+        assert!(computer.browser_use_enabled);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cancelling_native_bypass_confirmation_keeps_current_mode() {
+        let _test = isolate_process_state();
+        let dir = temp_dir();
+        let unchanged = set_permission_mode(&dir, PermissionMode::Bypass, || false).unwrap();
+        assert_eq!(unchanged.permission_mode, PermissionMode::Auto);
         let _ = fs::remove_dir_all(&dir);
     }
 }

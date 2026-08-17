@@ -3,7 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { useDesktop } from "../../state/store";
 import { MAX_ATTACHMENTS, prepareAttachment, validateAttachmentSet } from "../../lib/attachments";
 import { baseName } from "../../lib/format";
+import { samePath } from "../../lib/projectCatalog";
 import { useI18n } from "../../lib/i18n";
+import { ConfirmDialog } from "../common/ConfirmDialog";
 import { Icon } from "../fx/Icon";
 import { ChipSelect } from "../common/ChipSelect";
 
@@ -27,6 +29,33 @@ interface GitWorktree {
   detached: boolean;
   locked: boolean;
   prunable: boolean;
+}
+
+interface SessionJournalStatus {
+  count: number;
+  totalBytes: number;
+  latestSavedAt?: number;
+  migrationPending: number;
+  unreadableCount: number;
+}
+
+interface AgentRuntimeStatus {
+  topology: "shared_process";
+  processCapacity: number;
+  running: boolean;
+  ready: boolean;
+  phase: "stopped" | "starting" | "initializing" | "authenticating" | "ready" | "paused" | "offline";
+  generation?: number;
+  pid?: number;
+  pendingRequests: number;
+  pendingInteractions: number;
+  pendingClientCallbacks: number;
+  boundClientSessions: number;
+  activeTerminals: number;
+  automaticReconnectActive: boolean;
+  lastConnectConfigured: boolean;
+  worktreeSessionBindings: number;
+  worktreeOwnershipError?: string;
 }
 
 interface SummarySource {
@@ -60,6 +89,8 @@ export function EnvironmentSummary() {
   const [open, setOpen] = useState(false);
   const [summary, setSummary] = useState<GitSummary | null>(null);
   const [worktrees, setWorktrees] = useState<GitWorktree[]>([]);
+  const [journalStatus, setJournalStatus] = useState<SessionJournalStatus | null>(null);
+  const [runtimeStatus, setRuntimeStatus] = useState<AgentRuntimeStatus | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState<"checkout" | "commit" | "push" | "worktree" | null>(null);
   const [error, setError] = useState("");
@@ -67,10 +98,13 @@ export function EnvironmentSummary() {
   const [commitOpen, setCommitOpen] = useState(false);
   const [commitMessage, setCommitMessage] = useState("");
   const [worktreeName, setWorktreeName] = useState("");
+  const [confirmWorktree, setConfirmWorktree] = useState<GitWorktree | null>(null);
   const [showAllSources, setShowAllSources] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const loadGenerationRef = useRef(0);
   const workspace = useDesktop((state) => state.workspace);
+  const runtimeOccupancy = useDesktop((state) => state.runtimeOccupancy);
   const activeId = useDesktop((state) => state.activeId);
   const session = useDesktop((state) => (state.activeId ? state.sessions[state.activeId] : null));
   const composer = useDesktop((state) => (state.activeId ? state.sessionComposers[state.activeId] : null));
@@ -103,17 +137,30 @@ export function EnvironmentSummary() {
   }, [composer?.attachments, session]);
 
   const loadSummary = async () => {
+    const generation = ++loadGenerationRef.current;
     setLoading(true);
     setError("");
+    // 切换工作区后旧快照不能继续提供可点击的 worktree 目标；若新目录读取
+    // 失败，应呈现真实错误，而不是让旧数据挂在新的 cwd 下。
+    setSummary(null);
+    setWorktrees([]);
+    setJournalStatus(null);
+    setRuntimeStatus(null);
     try {
       if (inTauri()) {
-        const [nextSummary, nextWorktrees] = await Promise.all([
+        const [nextSummary, nextWorktrees, nextJournalStatus, nextRuntimeStatus] = await Promise.all([
           invoke<GitSummary>("git_summary", { cwd: workspace }),
-          invoke<GitWorktree[]>("git_worktrees", { cwd: workspace }).catch(() => [] as GitWorktree[]),
+          invoke<GitWorktree[]>("git_worktrees", { cwd: workspace }),
+          invoke<SessionJournalStatus>("session_journal_status"),
+          invoke<AgentRuntimeStatus>("agent_runtime_status"),
         ]);
+        if (generation !== loadGenerationRef.current) return;
         setSummary(nextSummary);
         setWorktrees(nextWorktrees);
+        setJournalStatus(nextJournalStatus);
+        setRuntimeStatus(nextRuntimeStatus);
       } else {
+        if (generation !== loadGenerationRef.current) return;
         setSummary({
           isRepository: true,
           branch: "main",
@@ -127,16 +174,19 @@ export function EnvironmentSummary() {
           behind: 0,
         });
         setWorktrees([]);
+        setJournalStatus({ count: 12, totalBytes: 1_480_000, latestSavedAt: Date.now(), migrationPending: 0, unreadableCount: 0 });
+        setRuntimeStatus({ topology: "shared_process", processCapacity: 1, running: true, ready: true, phase: "ready", generation: 1, pid: 12345, pendingRequests: 0, pendingInteractions: 0, pendingClientCallbacks: 0, boundClientSessions: 0, activeTerminals: 0, automaticReconnectActive: false, lastConnectConfigured: true, worktreeSessionBindings: 0 });
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      if (generation === loadGenerationRef.current) setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setLoading(false);
+      if (generation === loadGenerationRef.current) setLoading(false);
     }
   };
 
   useEffect(() => {
     if (open) void loadSummary();
+    else loadGenerationRef.current += 1;
   }, [open, workspace]);
 
   useEffect(() => {
@@ -227,12 +277,58 @@ export function EnvironmentSummary() {
     }
   };
 
+  const removeWorktree = async (item: GitWorktree) => {
+    setBusy("worktree");
+    setError("");
+    setNotice("");
+    try {
+      const result = inTauri()
+        ? await (async () => {
+            const confirmToken = await invoke<string>("prepare_git_worktree_remove", {
+              cwd: workspace,
+              path: item.path,
+            });
+            return invoke<string>("git_worktree_remove", {
+              request: { cwd: workspace, path: item.path, confirmToken },
+            });
+          })()
+        : (zh ? "Worktree 已移除" : "Worktree removed");
+      setNotice(result);
+      setConfirmWorktree(null);
+      await loadSummary();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      throw cause;
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const visibleSources = showAllSources ? sources : sources.slice(0, 4);
   const compareAvailable = Boolean(
     githubBaseUrl(summary?.remoteUrl)
       && summary?.branch
       && summary.branch !== (summary.defaultBranch ?? "main"),
   );
+  const activeTurns = runtimeOccupancy.activeTurnSessionIds.length;
+  const runtimeOccupancyLabel = runtimeOccupancy.lifecycleActive
+    ? (runtimeOccupancy.pendingLifecycle > 0
+      ? `${zh ? "同步中" : "syncing"} +${runtimeOccupancy.pendingLifecycle}`
+      : (zh ? "同步中" : "syncing"))
+    : runtimeOccupancy.pendingLifecycle > 0
+      ? `${runtimeOccupancy.pendingLifecycle} ${zh ? "待同步" : "queued"}`
+      : activeTurns > 0
+        ? `${activeTurns} ${zh ? "活跃" : "active"}`
+        : "";
+  const runtimePhaseLabel = runtimeStatus && ({
+    stopped: zh ? "已停止" : "stopped",
+    starting: zh ? "启动中" : "starting",
+    initializing: zh ? "初始化中" : "initializing",
+    authenticating: zh ? "认证中" : "authenticating",
+    ready: zh ? "已就绪" : "ready",
+    paused: zh ? "已暂停" : "paused",
+    offline: zh ? "离线" : "offline",
+  } as const)[runtimeStatus.phase];
 
   return (
     <div ref={rootRef} className="relative">
@@ -258,6 +354,7 @@ export function EnvironmentSummary() {
               onClick={() => void loadSummary()}
               className="ml-auto flex h-7 w-7 items-center justify-center text-dim hover:bg-high hover:text-fg"
               title={zh ? "刷新" : "Refresh"}
+              aria-label={zh ? "刷新环境信息" : "Refresh environment"}
             >
               <Icon name="refresh" size={11} className={loading ? "animate-orbit" : ""} />
             </button>
@@ -279,6 +376,77 @@ export function EnvironmentSummary() {
               <span className="max-w-[150px] truncate font-mono text-[9px] text-faint">{workspace}</span>
               <Icon name="external" size={10} className="text-faint" />
             </button>
+
+            <SummaryRow icon="clock" label={zh ? "会话 journal" : "Session journal"}>
+              <span
+                className={`ml-auto font-mono text-[9.5px] ${journalStatus?.unreadableCount ? "text-red" : journalStatus?.migrationPending ? "text-gold" : "text-dim"}`}
+                title={journalStatus?.latestSavedAt
+                  ? `${zh ? "最近写入" : "Latest write"}: ${new Date(journalStatus.latestSavedAt).toLocaleString()}`
+                  : undefined}
+              >
+                {journalStatus
+                  ? journalStatus.unreadableCount > 0
+                    ? (zh ? `${journalStatus.unreadableCount} 个无法读取` : `${journalStatus.unreadableCount} unreadable`)
+                    : journalStatus.migrationPending > 0
+                      ? (zh ? `${journalStatus.migrationPending} 个待迁移` : `${journalStatus.migrationPending} to migrate`)
+                      : `${journalStatus.count} · ${(journalStatus.totalBytes / 1024 / 1024).toFixed(1)} MB`
+                  : "—"}
+              </span>
+            </SummaryRow>
+
+            <SummaryRow icon="bolt" label={zh ? "Agent 运行时" : "Agent runtime"}>
+              <span
+                className={`ml-auto font-mono text-[9.5px] ${runtimeStatus?.ready ? "text-green" : runtimeStatus?.running ? "text-gold" : "text-dim"}`}
+                title={runtimeStatus
+                  ? [
+                      runtimeStatus.running ? (zh ? "进程运行中" : "Process running") : (zh ? "按需启动" : "Starts on demand"),
+                      `${zh ? "连接阶段" : "Connection phase"}: ${runtimePhaseLabel}`,
+                      runtimeStatus.pid ? `PID ${runtimeStatus.pid}` : "",
+                      runtimeStatus.generation ? `${zh ? "代次" : "Generation"} ${runtimeStatus.generation}` : "",
+                      runtimeStatus.pendingRequests > 0
+                        ? `${runtimeStatus.pendingRequests} ${zh ? "个 Host 请求等待响应" : "Host requests pending"}`
+                        : "",
+                      runtimeStatus.pendingInteractions > 0
+                        ? `${runtimeStatus.pendingInteractions} ${zh ? "个交互门控等待用户" : "operator gates pending"}`
+                        : "",
+                      runtimeStatus.pendingClientCallbacks > 0
+                        ? `${runtimeStatus.pendingClientCallbacks} ${zh ? "个 Client 回调处理中" : "client callbacks pending"}`
+                        : "",
+                      runtimeStatus.boundClientSessions > 0
+                        ? `${runtimeStatus.boundClientSessions} ${zh ? "个会话已绑定工作区" : "sessions bound to workspaces"}`
+                        : "",
+                      runtimeStatus.activeTerminals > 0
+                        ? `${runtimeStatus.activeTerminals} ${zh ? "个 Host 终端仍被持有" : "Host terminals retained"}`
+                        : "",
+                      runtimeStatus.automaticReconnectActive
+                        ? (zh ? "Host 正在自动重连" : "Host automatic reconnect active")
+                        : "",
+                      !runtimeStatus.lastConnectConfigured
+                        ? (zh ? "尚未建立可自动恢复的连接" : "No reconnectable connection yet")
+                        : "",
+                      runtimeStatus.worktreeSessionBindings > 0
+                        ? `${runtimeStatus.worktreeSessionBindings} ${zh ? "个会话绑定到 worktree" : "sessions bound to worktrees"}`
+                        : "",
+                      runtimeStatus.worktreeOwnershipError
+                        ? `${zh ? "Worktree 所有权索引异常" : "Worktree ownership index error"}: ${runtimeStatus.worktreeOwnershipError}`
+                        : "",
+                      activeTurns > 0 ? `${activeTurns} ${zh ? "个活动回合" : "active turns"}` : "",
+                      runtimeOccupancy.lifecycleActive ? (zh ? "会话同步占用中" : "Session sync active") : "",
+                      runtimeOccupancy.pendingLifecycle > 0
+                        ? `${runtimeOccupancy.pendingLifecycle} ${zh ? "个会话同步排队" : "session syncs queued"}`
+                        : "",
+                    ].filter(Boolean).join(" · ")
+                  : undefined}
+              >
+                {runtimeStatus
+                  ? [
+                      `${zh ? "共享" : "Shared"} · ${runtimeStatus.processCapacity} ${zh ? "进程" : "process"}`,
+                      runtimeStatus.ready ? "" : runtimePhaseLabel,
+                      runtimeOccupancyLabel,
+                    ].filter(Boolean).join(" · ")
+                  : "—"}
+              </span>
+            </SummaryRow>
 
             <div className="mx-2 mb-2 grid grid-cols-4 gap-1">
               {([
@@ -304,7 +472,11 @@ export function EnvironmentSummary() {
               ))}
             </div>
 
-            <SummaryRow icon="branch" label={summary?.isRepository ? (summary.branch ?? "DETACHED HEAD") : (zh ? "非 Git 仓库" : "Not a Git repository")}>
+            <SummaryRow icon="branch" label={summary === null
+              ? (loading ? (zh ? "正在读取 Git…" : "Reading Git…") : "Git")
+              : summary.isRepository
+                ? (summary.branch ?? "DETACHED HEAD")
+                : (zh ? "非 Git 仓库" : "Not a Git repository")}>
               {summary?.isRepository && (
                 <ChipSelect
                   variant="ghost"
@@ -366,45 +538,54 @@ export function EnvironmentSummary() {
                     <p className="text-[10px] text-faint">{zh ? "暂无附加 worktree" : "No linked worktrees"}</p>
                   ) : (
                     <div className="mb-2 space-y-1">
-                      {worktrees.map((item) => (
+                      {worktrees.map((item, index) => {
+                        const primary = index === 0;
+                        const current = samePath(item.path, workspace);
+                        return (
                         <div key={item.path} className="flex items-center gap-2 rounded-[4px] px-1.5 py-1 hover:bg-high">
                           <span className="min-w-0 flex-1 truncate font-mono text-[9.5px] text-fg2">{item.branch ?? (item.detached ? "DETACHED" : baseName(item.path))}</span>
                           <button
                             disabled={busy !== null}
-                            onClick={() => void useDesktop.getState().setWorkspace(item.path)}
+                            onClick={() => {
+                              setError("");
+                              setNotice("");
+                              void useDesktop.getState().setWorkspace(item.path).catch((cause) => {
+                                setError(cause instanceof Error ? cause.message : String(cause));
+                              });
+                            }}
                             className="text-[9px] text-acc hover:text-fg"
                           >
                             {zh ? "打开" : "Open"}
                           </button>
                           <button
-                            disabled={busy !== null}
+                            disabled={busy !== null || current || primary}
                             onClick={() => {
-                              void runAction("worktree", async () => {
-                                if (!inTauri()) return zh ? "Worktree 已移除" : "Worktree removed";
-                                // Native shell confirms via OS dialog inside prepare_git_worktree_remove.
-                                const confirmToken = await invoke<string>("prepare_git_worktree_remove", {
-                                  cwd: workspace,
-                                  path: item.path,
-                                });
-                                return invoke<string>("git_worktree_remove", {
-                                  cwd: workspace,
-                                  path: item.path,
-                                  confirmToken,
-                                });
-                              });
+                              setError("");
+                              setNotice("");
+                              setConfirmWorktree(item);
                             }}
-                            className="text-[9px] text-faint hover:text-red"
+                            className="text-[9px] text-faint hover:text-red disabled:cursor-not-allowed disabled:opacity-30"
+                            title={current
+                              ? (zh ? "不能删除当前工作树" : "Cannot delete the current worktree")
+                              : primary
+                                ? (zh ? "不能删除仓库主工作树" : "Cannot delete the primary worktree")
+                              : (zh ? "删除工作树" : "Remove worktree")}
                           >
-                            {zh ? "删" : "RM"}
+                            {zh ? "删除" : "Remove"}
                           </button>
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   )}
                   <div className="flex gap-1.5">
                     <input
                       value={worktreeName}
-                      onChange={(event) => setWorktreeName(event.target.value)}
+                      onChange={(event) => {
+                        setWorktreeName(event.target.value);
+                        setError("");
+                        setNotice("");
+                      }}
                       placeholder={zh ? "名称，如 fix-auth" : "name, e.g. fix-auth"}
                       className="h-7 min-w-0 flex-1 rounded-[4px] border border-line2 bg-raise px-2 font-mono text-[10px] text-fg2 outline-none"
                     />
@@ -442,6 +623,7 @@ export function EnvironmentSummary() {
                 onClick={() => fileRef.current?.click()}
                 className="ml-auto flex h-7 w-7 items-center justify-center text-dim hover:bg-high hover:text-fg disabled:opacity-30"
                 title={zh ? "添加到当前消息" : "Add to current message"}
+                aria-label={zh ? "添加来源到当前消息" : "Add source to current message"}
               >
                 <Icon name="plus" size={13} />
               </button>
@@ -484,11 +666,24 @@ export function EnvironmentSummary() {
           </div>
         </section>
       )}
+      {confirmWorktree && (
+        <ConfirmDialog
+          title={zh ? "删除工作树？" : "Remove worktree?"}
+          description={zh
+            ? `将删除“${confirmWorktree.branch ?? baseName(confirmWorktree.path)}”的工作树目录。Host 会再次检查会话和自动化引用；Git 分支不会被删除。`
+            : `The worktree directory for “${confirmWorktree.branch ?? baseName(confirmWorktree.path)}” will be removed. The Host will recheck session and automation references; the Git branch is kept.`}
+          confirmLabel={zh ? "删除工作树" : "Remove worktree"}
+          cancelLabel={zh ? "取消" : "Cancel"}
+          workingLabel={zh ? "删除中" : "Removing"}
+          onCancel={() => setConfirmWorktree(null)}
+          onConfirm={() => removeWorktree(confirmWorktree)}
+        />
+      )}
     </div>
   );
 }
 
-function SummaryRow({ icon, label, children }: { icon: "edit" | "branch"; label: string; children?: React.ReactNode }) {
+function SummaryRow({ icon, label, children }: { icon: "edit" | "branch" | "clock" | "bolt"; label: string; children?: React.ReactNode }) {
   return (
     <div className="summary-row">
       <Icon name={icon} size={14} className="text-mute" />

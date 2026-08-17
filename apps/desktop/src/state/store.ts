@@ -8,6 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { bridge } from "../bridge";
 import { EFFORTS, isSessionTerminal, MODELS } from "../bridge/types";
 import { notifyDesktop } from "../lib/notify";
+import { createSerialMutationQueue } from "../lib/serialMutationQueue";
 import type {
   AgentMode,
   AccountInfo,
@@ -41,51 +42,87 @@ import type {
   SlashCommand,
   WorkflowRun,
   RuntimeNotice,
+  RuntimeConnectionState,
+  RuntimeOccupancy,
 } from "../bridge/types";
 import { DEMO_CWD } from "../demo/data";
 import {
+  cancelPendingSessionJournal,
+  flushAllPendingSessionJournals,
+  flushSessionJournal,
+  recordSessionJournalHostEvent,
+  scheduleSaveSessionJournal,
+  scrubSessionJournalOrphans,
+  setSessionJournalFailureHandler,
+} from "../lib/sessionCache";
+import {
   clearDraftBuffer,
-  cancelPendingSessionCache,
-  flushAllPendingSessionCaches,
-  flushSessionCache,
+  flushDraftPersistence,
   loadDraftBuffer,
   saveDraftBuffer,
-  scheduleSaveSessionCache,
-  scrubSessionCacheOrphans,
-} from "../lib/sessionCache";
+  setDraftFailureHandler,
+} from "../lib/draftPersistence";
 import { readStoredPermissionMode } from "../lib/permissionMode";
-import { shouldDrainLocalQueue } from "../lib/queueTurnPolicy";
 import { turnHasLiveText } from "../lib/processFold";
 import {
   POST_PROMPT_SETTLE_MS,
+  nextQueueDrainParked,
+  reconcileIncomingStatus,
   sessionAcceptsNewPrimaryPrompt,
   settleLiveProcessBlocks,
   settleLiveTextBlocks,
+  shouldDrainLocalQueue,
   shouldArmPostPromptSettle,
   shouldPromotePostPrompt,
-} from "../lib/sessionBusy";
+  statusAfterGateResolve,
+} from "../lib/sessionRuntime";
 import { mergeProjectSessionsPure } from "../lib/sessionCatalogMerge";
 import { isLiveBusyStatus, mergeOfflineWithLive } from "../lib/offlineMerge";
 import {
-  reconcileIncomingStatus,
-  statusAfterGateResolve,
-} from "../lib/sessionGate";
-import {
   consumeShellUpgradeRescan,
+  sanitizeCatalogStatusOnColdStart,
   shouldCloseDetachedSession,
   shouldForceOfflineRescan,
 } from "../lib/sessionOpenPolicy";
 import {
-  filterQueueGhostsByLiveText,
   nextLocalDrainIndex,
   moveQueueEntry,
+  rehomeHeldQueueForRecovery,
 } from "../lib/promptQueue";
-import { nextQueueDrainParked } from "../lib/queueParkPolicy";
+import {
+  loadPromptQueues,
+  loadPromptQueuesFromBrowser,
+  mergeHydratedPromptQueues,
+  parsePromptQueueSnapshot,
+  persistPromptQueues,
+} from "../lib/promptQueuePersistence";
+import type { PersistedQueuedPrompt } from "../lib/promptQueuePersistence";
+import { formatGroxError, runtimeNoticeFromError, toGroxError } from "../lib/errorModel";
+import { cleanApiError } from "../lib/runtimeNotice";
+import type { ErrorFallback } from "../lib/errorModel";
+import { commitComposerSubmission } from "../lib/composerSubmission";
+import type { ComposerSubmission } from "../lib/composerSubmission";
+import {
+  adoptNativeAutomation,
+  loadAutomations,
+  persistAutomations,
+} from "../lib/automations";
+import type { Automation } from "../lib/automations";
+import {
+  failLatestAutomationSessionRun,
+  loadAutomationRunHistory,
+  newAutomationRunId,
+  patchAutomationRun,
+  persistAutomationRunHistory,
+  prependAutomationRun,
+} from "../lib/automationRunHistory";
+import type { AutomationRunRecord } from "../lib/automationRunHistory";
+import { nextViewNavigation, shouldCommitViewNavigation } from "../lib/viewNavigation";
+import type { ViewNavigationIntent } from "../lib/viewNavigation";
 import {
   isComputerUseOperatorEnabled,
   setComputerUseHostEnvEnabled,
   setComputerUseHostPrefsEnabled,
-  setComputerUseOperatorEnabled,
 } from "../lib/computerUse";
 import {
   dedupeProjects,
@@ -104,7 +141,15 @@ import {
   shouldRetainDraftBufferUntilSessionReady,
 } from "../lib/draftLaunchRecovery";
 import { sessionShellFromMeta } from "../lib/sessionShell";
-import { hydrateSessionOffline, preferRicherSession } from "../lib/offlineSessionHydrate";
+import {
+  hydrateSessionOfflineDetailed,
+  preferRicherSession,
+} from "../lib/offlineSessionHydrate";
+import {
+  POST_TURN_RECONCILE_DELAYS_MS,
+  resumeInterruptedSessionIfHostActive,
+  sessionTranscriptSignature,
+} from "../lib/sessionJournalReconcile";
 import { isUnavailableSessionError } from "../lib/sessionUnavailable";
 
 export type View = "home" | "session";
@@ -179,24 +224,14 @@ export interface SessionComposerState {
   permissionMode: PermissionMode;
 }
 
-export interface QueuedPrompt {
-  id: string;
-  text: string;
-  attachments: PromptAttachment[];
-  model: string;
-  effort: Effort;
-  mode: AgentMode;
-  permissionMode: PermissionMode;
-  createdAt: number;
-  source?: "local" | "cli";
-  state?: "queued" | "interjected" | "sending";
-  heldByCli?: boolean;
-}
+export type QueuedPrompt = PersistedQueuedPrompt;
 
 interface DesktopState {
   ready: boolean;
   startupError: string | null;
   runtimeNotices: RuntimeNotice[];
+  runtimeConnection: RuntimeConnectionState;
+  runtimeOccupancy: RuntimeOccupancy;
   auth: AuthState;
   bridgeKind: "mock" | "acp";
   workspace: string;
@@ -219,6 +254,10 @@ interface DesktopState {
   runtimeBusy: boolean;
   accountLoading: boolean;
   accountSetupOpen: boolean;
+  automations: Automation[];
+  automationRunningId: string | null;
+  automationRunHistory: AutomationRunRecord[];
+  automationLastTickAt: number | null;
 
   workspaceFiles: WorkspaceEntry[];
   workspaceDiffs: DiffHunk[];
@@ -281,10 +320,10 @@ interface DesktopState {
   copySessionValue(id: string, value: "cwd" | "id" | "link"): Promise<void>;
   continueSessionInNewChat(id: string): Promise<void>;
   continueSessionInNewWorktree(id: string): Promise<void>;
-  openSessionInNewWindow(id: string): Promise<void>;
   /** `restoreProject`: explicit add (folder picker) may undismiss a removed project. */
-  setWorkspace(cwd: string, options?: { restoreProject?: boolean }): Promise<void>;
+  setWorkspace(cwd: string, options?: { restoreProject?: boolean; navigation?: ViewNavigationIntent }): Promise<void>;
   authenticate(): Promise<void>;
+  cancelAuthentication(): Promise<void>;
   logout(): Promise<void>;
   refreshAccount(): Promise<void>;
   refreshModels(): Promise<void>;
@@ -297,6 +336,11 @@ interface DesktopState {
   deleteProviderProfile(id: string): Promise<void>;
   refreshRuntime(): Promise<void>;
   installOfficialRuntime(): Promise<void>;
+  saveAutomation(automation: Automation): void;
+  deleteAutomation(id: string): void;
+  setAutomationEnabled(id: string, enabled: boolean): void;
+  runAutomation(id: string): Promise<void>;
+  clearAutomationRunHistory(): void;
   setAccountSetupOpen(open: boolean): void;
   refreshWorkspaceFiles(): Promise<void>;
   refreshWorkspaceDiffs(): Promise<void>;
@@ -310,12 +354,13 @@ interface DesktopState {
    * asynchronously prepares path-based image attachments, so switching tasks
    * during that read cannot redirect or erase the original draft.
    */
-  sendPrompt(text: string, attachments?: PromptAttachment[], targetSessionId?: string, modeOverride?: AgentMode): boolean;
-  interjectPrompt(text: string, attachments?: PromptAttachment[], targetSessionId?: string): Promise<boolean>;
+  sendPrompt(text: string, attachments?: PromptAttachment[], targetSessionId?: string, modeOverride?: AgentMode, submission?: ComposerSubmission, queueItemId?: string): boolean;
+  interjectPrompt(text: string, attachments?: PromptAttachment[], targetSessionId?: string, submission?: ComposerSubmission): Promise<boolean>;
   removeQueuedPrompt(sessionId: string, queueId: string): void;
   updateQueuedPrompt(sessionId: string, queueId: string, text: string): void;
   moveQueuedPrompt(sessionId: string, queueId: string, direction: -1 | 1): void;
   moveQueuedAttachment(sessionId: string, queueId: string, attachmentId: string, direction: -1 | 1): void;
+  resumePromptQueue(sessionId?: string): void;
   clearPromptQueue(sessionId?: string): void;
   stop(): void;
   emergencyStopComputer(): void;
@@ -333,7 +378,7 @@ interface DesktopState {
   setComputerUseEnabled(enabled: boolean): void;
   setBrowserUseEnabled(enabled: boolean): void;
   setDraft(text: string): void;
-  /** Flush UI session cache + catalog for crash durability (visibility/pagehide). */
+  /** Flush the app session journal + catalog for crash durability. */
   flushDurableState(): void;
   setComposerAttachments(attachments: PromptAttachment[]): void;
   setInspectorTab(tab: InspectorTab): void;
@@ -347,9 +392,14 @@ interface DesktopState {
 
 const uid = () => crypto.randomUUID();
 const suppressedQueueDrain = new Set<string>();
+/** 用户主动停止的回合；下一次 Host idle 必须保留“已停止”而不是伪装完成。 */
+const userStoppedSessions = new Set<string>();
 /** Prompt RPC already returned; late thinking/tools are a continuation, not a new turn. */
 const promptReturnedSessions = new Set<string>();
 const continuationSettleTimers = new Map<string, number>();
+/** A newer prompt invalidates every delayed disk reconcile from the prior turn. */
+const postTurnReconcileGenerations = new Map<string, number>();
+const postTurnReconcilePendingGenerations = new Map<string, number>();
 /** Upgrade generation: force background load once per session after shell bump. */
 let upgradeForceOfflineRescan = false;
 const upgradeForceRescanned = new Set<string>();
@@ -362,6 +412,14 @@ let pendingComposerStates: Record<string, SessionComposerState> | undefined;
 let workflowPersistTimer: number | undefined;
 let pendingWorkflowRuns: Record<string, WorkflowRun[]> | undefined;
 let historySyncPromise: Promise<void> | undefined;
+// 项目预览检测/启动会跨进程等待。快速重试、手动输入 URL 或切换工作区后，
+// 旧请求只能结束自己的 IPC，不能再覆盖用户当前看到的预览状态。
+let projectPreviewRequestGeneration = 0;
+// 文件预览是可重入入口：快速点击 A→B 或关闭面板时，较慢的旧请求不能
+// 覆盖新文件，也不能在关闭后重新写入错误/内容。
+let previewRequestGeneration = 0;
+let viewNavigation: ViewNavigationIntent = { generation: 0, sessionId: null };
+let pendingForegroundNavigation: ViewNavigationIntent | null = null;
 
 function loadJson<T>(key: string, fallback: T): T {
   try {
@@ -725,25 +783,205 @@ function blocksBeforePrompt(blocks: SessionBlock[], targetPromptIndex: number): 
   });
 }
 
+type HostPrefsProjection = {
+  computerUseEnabled: boolean;
+  browserUseEnabled: boolean;
+  permissionMode: PermissionMode;
+};
+
+function isPermissionMode(value: unknown): value is PermissionMode {
+  return value === "default" || value === "auto" || value === "bypass";
+}
+
 export const useDesktop = create<DesktopState>((set, get) => {
+  const errorText = (cause: unknown) => cleanApiError(cause);
+  const formattedError = (cause: unknown, fallback: ErrorFallback) =>
+    formatGroxError(toGroxError(cause, fallback));
+  // Host 偏好属于同一份权威快照。把三类写入按点击顺序提交，避免并发
+  // IPC 以不同顺序取得 Host mutex，最终状态背离最后一次用户选择。
+  const enqueueHostPrefsMutation = createSerialMutationQueue();
+
+  const publishRuntimeError = (cause: unknown, fallback: ErrorFallback) => {
+    const notice = runtimeNoticeFromError(toGroxError(cause, fallback));
+    set((state) => ({
+      runtimeNotices: [...state.runtimeNotices.filter((item) => item.id !== notice.id), notice],
+    }));
+  };
+
+  const applyHostPrefs = (
+    prefs: HostPrefsProjection,
+    targetSessionId?: string | null,
+    updatePermission = true,
+  ) => {
+    if (!isPermissionMode(prefs.permissionMode)
+      || typeof prefs.computerUseEnabled !== "boolean"
+      || typeof prefs.browserUseEnabled !== "boolean") {
+      publishRuntimeError(new Error("Host 返回了无效的偏好快照"), {
+        domain: "protocol",
+        code: "HOST_PREFS_INVALID",
+        message: "Host 权限偏好快照无效",
+        recoverable: true,
+        action: "重启 Grox；若问题持续，请导出支持包",
+      });
+      return;
+    }
+
+    try {
+      localStorage.setItem("grok.permissionMode", prefs.permissionMode);
+      localStorage.setItem("grox.browserUseEnabled", prefs.browserUseEnabled ? "1" : "0");
+    } catch (cause) {
+      publishRuntimeError(cause, {
+        domain: "environment",
+        code: "HOST_PREFS_CACHE_FAILED",
+        message: "Host 偏好已生效，但页面缓存未能更新",
+        recoverable: true,
+        action: "当前运行仍使用 Host 权威设置；重启后会重新读取",
+      });
+    }
+    setComputerUseHostPrefsEnabled(prefs.computerUseEnabled);
+    const computerUseEnabled = isComputerUseOperatorEnabled();
+    bridge.setComputerUseEnabled(computerUseEnabled);
+    bridge.setBrowserUseEnabled(prefs.browserUseEnabled);
+
+    const state = get();
+    const appliesToVisibleSession = targetSessionId == null || state.activeId === targetSessionId;
+    if (updatePermission && appliesToVisibleSession) bridge.setPermissionMode(prefs.permissionMode);
+    if (!targetSessionId) {
+      set({
+        ...(updatePermission && appliesToVisibleSession ? { permissionMode: prefs.permissionMode } : {}),
+        computerUseEnabled,
+        browserUseEnabled: prefs.browserUseEnabled,
+      });
+      return;
+    }
+    if (!updatePermission) {
+      set({ computerUseEnabled, browserUseEnabled: prefs.browserUseEnabled });
+      return;
+    }
+    const current = state.sessionComposers[targetSessionId] ?? {
+      text: "",
+      attachments: [],
+      model: state.model,
+      effort: state.effort,
+      mode: state.mode,
+      permissionMode: prefs.permissionMode,
+    };
+    const sessionComposers = {
+      ...state.sessionComposers,
+      [targetSessionId]: { ...current, permissionMode: prefs.permissionMode },
+    };
+    persistSessionComposers(sessionComposers);
+    set({
+      ...(appliesToVisibleSession ? { permissionMode: prefs.permissionMode } : {}),
+      computerUseEnabled,
+      browserUseEnabled: prefs.browserUseEnabled,
+      sessionComposers,
+    });
+  };
+
+  const publishJournalReadError = (sessionId: string, cause: unknown) => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    publishRuntimeError(cause, {
+      domain: "environment",
+      code: "SESSION_JOURNAL_READ_FAILED",
+      message: `会话 ${sessionId} 的应用 journal 无法读取`,
+      recoverable: true,
+      action: "已继续尝试 Agent 磁盘历史；请检查应用数据目录、磁盘健康和文件权限",
+    });
+  };
+
+  const publishAgentHistoryReadError = (sessionId: string, cause: unknown) => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    publishRuntimeError(cause, {
+      domain: "environment",
+      code: "AGENT_HISTORY_READ_FAILED",
+      message: `会话 ${sessionId} 的 Agent 历史无法读取`,
+      recoverable: true,
+      action: "应用 journal 仍可用于展示；请检查 GROK_HOME、会话文件权限和磁盘健康",
+    });
+  };
+
+  const parkInterruptedSession = (sessionId: string) => {
+    const state = get();
+    if ((state.promptQueues[sessionId] ?? []).length === 0) {
+      suppressedQueueDrain.delete(sessionId);
+      set({ queueDrainParked: nextQueueDrainParked(state.queueDrainParked, sessionId, false) });
+      return;
+    }
+    suppressedQueueDrain.add(sessionId);
+    set({ queueDrainParked: nextQueueDrainParked(state.queueDrainParked, sessionId, true) });
+    publishRuntimeError(new Error("应用在回合完成前退出"), {
+      domain: "environment",
+      code: "SESSION_TURN_INTERRUPTED",
+      message: "检测到未完成的会话回合，提示队列已暂停",
+      recoverable: true,
+      action: "检查会话末尾后，使用“恢复队列”继续发送",
+    });
+  };
+
+  setSessionJournalFailureHandler((sessionId, cause) => {
+    const conflict = String(cause).includes("journal 写入冲突");
+    publishRuntimeError(cause, {
+      domain: conflict ? "operation" : "environment",
+      code: conflict ? "SESSION_JOURNAL_CONFLICT" : "SESSION_JOURNAL_WRITE_FAILED",
+      message: conflict
+        ? `会话 ${sessionId} 已在另一个窗口写入更新快照`
+        : `会话 ${sessionId} 的应用 journal 未能写入磁盘`,
+      recoverable: true,
+      action: conflict
+        ? "重新打开该会话以合并最新 journal；当前窗口不会继续覆盖磁盘"
+        : "当前窗口仍保留内容；请检查应用数据目录的可用空间和写入权限",
+    });
+  });
+
+  setDraftFailureHandler((cwd, cause) => {
+    publishRuntimeError(cause, {
+      domain: "environment",
+      code: "DRAFT_STORAGE_FAILED",
+      message: `工作区 ${cwd} 的未发送草稿未能写入 Host`,
+      recoverable: true,
+      action: "当前编辑器仍保留内容；请不要关闭页面，并检查应用数据目录权限与磁盘空间",
+    });
+  });
+
+  const savePromptQueues = (queues: Record<string, QueuedPrompt[]>) => {
+    void persistPromptQueues(queues).catch((cause) => {
+      publishRuntimeError(cause, {
+        domain: "environment",
+        code: "PROMPT_QUEUE_WRITE_FAILED",
+        message: "提示队列未能写入本地磁盘",
+        recoverable: true,
+        action: "请检查应用数据目录的可用空间和写入权限",
+      });
+    });
+  };
+
+  const saveAutomationHistory = (history: AutomationRunRecord[]) => {
+    set({ automationRunHistory: history });
+    try {
+      persistAutomationRunHistory(history);
+    } catch (cause) {
+      publishRuntimeError(cause, {
+        domain: "environment",
+        code: "AUTOMATION_HISTORY_WRITE_FAILED",
+        message: "自动化运行记录未能写入本地存储",
+        recoverable: true,
+        action: "任务状态仍保留在当前窗口；请检查应用数据目录的可用空间和写入权限",
+      });
+    }
+  };
+
   const drainPromptQueue = (sessionId: string) => {
     const state = get();
     const session = state.sessions[sessionId];
-    let queue = state.promptQueues[sessionId] ?? [];
-    // Ghost filter: drop rows whose text already matches last primary user.
-    const lastUser = [...session?.blocks ?? []].reverse().find(
-      (b) => b.type === "user" && !("interjected" in b && b.interjected),
-    );
-    const liveText = lastUser && lastUser.type === "user" ? lastUser.text : null;
-    queue = filterQueueGhostsByLiveText(queue, liveText);
-    if (queue.length !== (state.promptQueues[sessionId] ?? []).length) {
-      set({ promptQueues: { ...state.promptQueues, [sessionId]: queue } });
-    }
+    const queue = state.promptQueues[sessionId] ?? [];
     if (!session || !shouldDrainLocalQueue({
       status: session.status,
       providerSwitching: state.providerSwitching,
       restoring: state.restoringSessionId === sessionId,
-      suppressed: suppressedQueueDrain.has(sessionId),
+      suppressed: suppressedQueueDrain.has(sessionId)
+        || postTurnReconcilePendingGenerations.has(sessionId)
+        || Boolean(state.queueDrainParked[sessionId]),
       queueLength: queue.length,
       hasLiveProcess: turnHasLiveText(session.blocks),
     })) return;
@@ -757,7 +995,6 @@ export const useDesktop = create<DesktopState>((set, get) => {
     );
     if (drainAt < 0) return;
     const next = queue[drainAt];
-    const rest = [...queue.slice(0, drainAt), ...queue.slice(drainAt + 1)];
     const currentComposer = state.sessionComposers[sessionId] ?? {
       text: "", attachments: [], model: state.model, effort: state.effort,
       mode: state.mode, permissionMode: state.permissionMode,
@@ -773,15 +1010,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
       },
     };
     persistSessionComposers(sessionComposers);
-    set({
-      promptQueues: { ...state.promptQueues, [sessionId]: rest },
-      sessionComposers,
-    });
-    const accepted = get().sendPrompt(next.text, next.attachments, sessionId, next.mode);
-    if (!accepted) {
-      const current = get().promptQueues[sessionId] ?? [];
-      set({ promptQueues: { ...get().promptQueues, [sessionId]: [next, ...current] } });
-    }
+    set({ sessionComposers });
+    // 队列行不能在 RPC 被 Host 接受前消失。execute_foreground_turn 会在
+    // 原生事务内领取该 id，并用权威磁盘内容派发、消费或异常回队。
+    get().sendPrompt(next.text, next.attachments, sessionId, next.mode, undefined, next.id);
   };
 
   const applyQueuedModel = (sessionId: string) => {
@@ -822,6 +1054,69 @@ export const useDesktop = create<DesktopState>((set, get) => {
   const markPromptInFlight = (sessionId: string) => {
     promptReturnedSessions.delete(sessionId);
     clearContinuationSettle(sessionId);
+    postTurnReconcileGenerations.set(
+      sessionId,
+      (postTurnReconcileGenerations.get(sessionId) ?? 0) + 1,
+    );
+    postTurnReconcilePendingGenerations.delete(sessionId);
+  };
+
+  const lastPrimaryPromptText = (session: Session | undefined): string | null => {
+    const block = [...session?.blocks ?? []].reverse().find(
+      (item) => item.type === "user" && !item.interjected,
+    );
+    return block?.type === "user" ? block.text : null;
+  };
+
+  const schedulePostTurnReconcile = (sessionId: string) => {
+    const initial = get().sessions[sessionId];
+    const expectedPrompt = lastPrimaryPromptText(initial);
+    if (!initial || !expectedPrompt) return;
+    const generation = (postTurnReconcileGenerations.get(sessionId) ?? 0) + 1;
+    postTurnReconcileGenerations.set(sessionId, generation);
+    postTurnReconcilePendingGenerations.set(sessionId, generation);
+    const startedAt = Date.now();
+
+    void (async () => {
+      try {
+        for (const targetDelay of POST_TURN_RECONCILE_DELAYS_MS) {
+          const remaining = targetDelay - (Date.now() - startedAt);
+          if (remaining > 0) await new Promise<void>((resolve) => window.setTimeout(resolve, remaining));
+          if (postTurnReconcileGenerations.get(sessionId) !== generation) return;
+          const current = get().sessions[sessionId];
+          if (!current || !isSessionTerminal(current.status) || lastPrimaryPromptText(current) !== expectedPrompt) return;
+
+          const hydration = await hydrateSessionOfflineDetailed(sessionId, current);
+          if (postTurnReconcileGenerations.get(sessionId) !== generation) return;
+          const latest = get().sessions[sessionId];
+          if (!latest || !isSessionTerminal(latest.status) || lastPrimaryPromptText(latest) !== expectedPrompt) return;
+          if (hydration.journalError) publishJournalReadError(sessionId, hydration.journalError);
+          if (hydration.agentError) publishAgentHistoryReadError(sessionId, hydration.agentError);
+          if (!hydration.session) continue;
+          // The Agent can persist its final answer before our queued settled
+          // journal write lands. The live idle status proves this is a normal
+          // completion, so remove the provisional crash marker and keep the
+          // Agent transcript instead of silently dropping the final answer.
+          const hydrated = hydration.outcome === "interrupted"
+            ? resumeInterruptedSessionIfHostActive(hydration.session).session
+            : hydration.session;
+          const candidate = mergeOfflineWithLive(hydrated, latest);
+          candidate.status = latest.status;
+          if (sessionTranscriptSignature(candidate) === sessionTranscriptSignature(latest)) continue;
+          const next = { ...candidate, updatedAt: Date.now() };
+          set({ sessions: { ...get().sessions, [sessionId]: next } });
+          flushSessionJournal(next);
+          return;
+        }
+      } finally {
+        if (postTurnReconcilePendingGenerations.get(sessionId) === generation) {
+          postTurnReconcilePendingGenerations.delete(sessionId);
+          if (Date.now() - startedAt >= POST_PROMPT_SETTLE_MS) {
+            window.setTimeout(() => drainPromptQueue(sessionId), 0);
+          }
+        }
+      }
+    })();
   };
 
   const applyPostPromptContinuation = (sessionId: string) => {
@@ -865,7 +1160,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           ...get().sessions,
           [sessionId]: {
             ...current,
-            status: "idle",
+            status: "connecting",
             updatedAt: Date.now(),
             blocks: settleLiveTextBlocks(current.blocks),
           },
@@ -889,8 +1184,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (!s) return;
       const next = { ...fn(s), updatedAt: Date.now() };
       // Terminal turns flush cache immediately (BSOD window); live turns debounce.
-      if (isSessionTerminal(next.status)) flushSessionCache(next);
-      else scheduleSaveSessionCache(next);
+      if (isSessionTerminal(next.status)) flushSessionJournal(next);
+      else scheduleSaveSessionJournal(next);
       if (!touchCatalogue) {
         set({ sessions: { ...state.sessions, [sessionId]: next } });
         if (isSessionTerminal(next.status)) applyQueuedModel(sessionId);
@@ -925,6 +1220,202 @@ export const useDesktop = create<DesktopState>((set, get) => {
         if (!e.state.required && !e.state.inProgress && get().historySyncedAt === 0 && !get().historySyncing) {
           window.setTimeout(() => void get().refreshHistory(), 250);
         }
+        if (!e.state.required && !e.state.inProgress) {
+          window.setTimeout(() => void get().refreshAccount(), 250);
+        }
+        break;
+      case "runtime_state":
+        set((state) => ({
+          runtimeConnection: e.state,
+          // 同一 Bridge 随后成功握手，先前的可恢复连接错误已经失效，
+          // 不能继续悬挂在界面上让用户误以为当前仍离线。
+          runtimeNotices: e.state === "ready"
+            ? state.runtimeNotices.filter((notice) => ![
+                "error-environment-ACP_REQUEST_TIMEOUT",
+                "error-environment-ACP_START_FAILED",
+                "error-environment-ACP_SPAWN_FAILED",
+              ].includes(notice.id))
+            : state.runtimeNotices,
+        }));
+        break;
+      case "runtime_occupancy":
+        set((state) => {
+          let sessions = state.sessions;
+          let queueDrainParked = state.queueDrainParked;
+          for (const sessionId of e.occupancy.activeTurnSessionIds) {
+            const current = sessions[sessionId];
+            if (!current) continue;
+            const resumed = resumeInterruptedSessionIfHostActive(current);
+            const shouldMarkRunning = current.status === "idle" || current.status === "disconnected";
+            if (!resumed.resumed && !shouldMarkRunning) continue;
+            const activeSession = shouldMarkRunning
+              ? { ...resumed.session, status: "running" as const, preview: false }
+              : resumed.session;
+            if (resumed.resumed) {
+              suppressedQueueDrain.delete(sessionId);
+              queueDrainParked = nextQueueDrainParked(queueDrainParked, sessionId, false);
+            }
+            sessions = { ...sessions, [sessionId]: activeSession };
+            scheduleSaveSessionJournal(activeSession);
+          }
+          return { runtimeOccupancy: e.occupancy, sessions, queueDrainParked };
+        });
+        break;
+      case "session_journal_checkpoint": {
+        const session = get().sessions[e.sessionId];
+        if (!session) break;
+        recordSessionJournalHostEvent(e.sessionId, e.streamId, e.sequence);
+        scheduleSaveSessionJournal(session);
+        break;
+      }
+      case "prompt_queue_changed": {
+        const queue = parsePromptQueueSnapshot(e.queue);
+        if (queue.length !== e.queue.length) {
+          publishRuntimeError(new Error("Host 返回了无效提示队列快照"), {
+            domain: "protocol",
+            code: "PROMPT_QUEUE_SNAPSHOT_INVALID",
+            message: "提示队列快照无法投影",
+            recoverable: true,
+            action: "保留当前队列并导出诊断；不要重复发送",
+          });
+          break;
+        }
+        set((state) => {
+          const promptQueues = { ...state.promptQueues, [e.sessionId]: queue };
+          if (e.reason !== "claimed") return { promptQueues };
+          const claimed = queue.find((item) => item.id === e.itemId);
+          const session = state.sessions[e.sessionId];
+          if (!claimed || !session) return { promptQueues };
+          let blockIndex = -1;
+          for (let index = session.blocks.length - 1; index >= 0; index -= 1) {
+            const block = session.blocks[index];
+            if (block.type === "user" && !block.interjected) {
+              blockIndex = index;
+              break;
+            }
+          }
+          if (blockIndex < 0) return { promptQueues };
+          const blocks = [...session.blocks];
+          const block = blocks[blockIndex];
+          if (block.type !== "user") return { promptQueues };
+          blocks[blockIndex] = {
+            ...block,
+            text: claimed.text,
+            attachments: claimed.attachments.map(({ id, kind, name, mime, size }) => ({
+              id, kind, name, mime, size,
+            })),
+          };
+          const currentComposer = state.sessionComposers[e.sessionId];
+          return {
+            promptQueues,
+            sessions: {
+              ...state.sessions,
+              [e.sessionId]: { ...session, blocks },
+            },
+            ...(currentComposer
+              ? {
+                  sessionComposers: {
+                    ...state.sessionComposers,
+                    [e.sessionId]: {
+                      ...currentComposer,
+                      model: claimed.model,
+                      effort: claimed.effort,
+                      mode: claimed.mode,
+                      permissionMode: claimed.permissionMode,
+                    },
+                  },
+                }
+              : {}),
+          };
+        });
+        break;
+      }
+      case "automation_session_started": {
+        const automation = e.started.automation as Automation;
+        const sessionComposers = {
+          ...get().sessionComposers,
+          [e.started.sessionId]: {
+            text: "",
+            attachments: [],
+            model: automation.model,
+            effort: automation.effort,
+            mode: automation.mode,
+            permissionMode: automation.permissionMode,
+          },
+        };
+        persistSessionComposers(sessionComposers);
+        const existingRun = get().automationRunHistory.find((row) => (
+          row.automationId === automation.id
+          && row.sessionId === e.started.sessionId
+        ));
+        if (!existingRun) {
+          saveAutomationHistory(prependAutomationRun(get().automationRunHistory, {
+            id: newAutomationRunId(e.started.claimedAt),
+            automationId: automation.id,
+            title: automation.title,
+            at: e.started.claimedAt,
+            outcome: "started",
+            source: e.started.source,
+            sessionId: e.started.sessionId,
+            detail: "Host 已创建并注册会话，自动化回合正在运行。",
+          }));
+        }
+        set({
+          automationRunningId: automation.id,
+          sessionComposers,
+        });
+        void notifyDesktop("已安排任务已启动", automation.title);
+        break;
+      }
+      case "automation_session_settled": {
+        const settled = e.settled;
+        const updated = settled.automation as Automation | null | undefined;
+        if (updated) {
+          set({ automations: adoptNativeAutomation(updated) });
+        }
+        if (settled.error) {
+          const detail = formatGroxError(settled.error);
+          if (settled.sessionId) {
+            saveAutomationHistory(failLatestAutomationSessionRun(
+              get().automationRunHistory,
+              settled.sessionId,
+              detail,
+            ));
+          } else {
+            const automation = updated
+              ?? get().automations.find((item) => item.id === settled.automationId);
+            saveAutomationHistory(prependAutomationRun(get().automationRunHistory, {
+              id: newAutomationRunId(settled.claimedAt),
+              automationId: settled.automationId,
+              title: automation?.title ?? settled.automationId,
+              at: settled.claimedAt,
+              outcome: "error",
+              source: settled.source,
+              detail,
+            }));
+          }
+        } else if (settled.sessionId) {
+          const run = get().automationRunHistory.find((row) => (
+            row.sessionId === settled.sessionId
+            && ["starting", "started"].includes(row.outcome)
+          ));
+          if (run) {
+            saveAutomationHistory(patchAutomationRun(get().automationRunHistory, run.id, {
+              outcome: "completed",
+              detail: "Host 已完成回合并持久化自动化结算。",
+            }));
+          }
+        }
+        if (get().automationRunningId === settled.automationId) {
+          set({ automationRunningId: null });
+        }
+        break;
+      }
+      case "automation_runner_tick":
+        set({
+          automationLastTickAt: e.status.checkedAt ?? null,
+          automationRunningId: e.status.activeAutomationId ?? null,
+        });
         break;
       case "model_state":
         {
@@ -980,7 +1471,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({
           workflows: { ...state.workflows, [e.sessionId]: next },
           ...(state.activeId === e.sessionId && workflow.status !== "cleared"
-            ? { inspectorOpen: true, inspectorTab: "tasks" as InspectorTab }
+            ? { inspectorOpen: true, inspectorTab: "tasks" as InspectorTab, terminalOpen: false, previewOpen: false, planPreviewOpen: false }
             : {}),
         });
         persistWorkflowRuns({ ...state.workflows, [e.sessionId]: next });
@@ -1017,13 +1508,19 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
       case "session_ready": {
         if (loadDeletedSessions().has(e.session.id)) break;
+        const issuedNavigation = e.background ? null : pendingForegroundNavigation;
+        const attachesForeground = !e.background && (
+          !issuedNavigation || shouldCommitViewNavigation(issuedNavigation, viewNavigation)
+        );
+        if (!e.background) pendingForegroundNavigation = null;
+        const effectiveBackground = e.background || !attachesForeground;
         const filteredSession = {
           ...e.session,
           blocks: e.session.blocks.filter((block) => !isHiddenWorkflowControlPrompt(block)),
           preview: e.preview === true,
         };
         const existing = sessions[filteredSession.id];
-        scheduleSaveSessionCache(filteredSession);
+        scheduleSaveSessionJournal(filteredSession);
         const localPreviewSuffix = e.background && !e.preview && existing?.preview
           ? existing.blocks.filter((block) => !block.id.startsWith(`preview-${filteredSession.id}-`))
           : [];
@@ -1040,7 +1537,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           spineMerged = mergeOfflineWithLive(filteredSession, existing);
         }
         const readySession = e.preview && existing
-          ? existing
+          ? mergeOfflineWithLive(filteredSession, existing)
           : spineMerged
             ? spineMerged
           : localPreviewSuffix.length > 0
@@ -1052,7 +1549,6 @@ export const useDesktop = create<DesktopState>((set, get) => {
             : e.background && existing && existing.blocks.length > filteredSession.blocks.length
               ? { ...filteredSession, blocks: existing.blocks }
             : filteredSession;
-        const { blocks: _b, usage: _u, status: _st, preview: _preview, ...meta } = readySession;
         const launch = e.background ? undefined : pendingLaunch;
         if (!e.background) pendingLaunch = undefined;
         const optimistic = e.background
@@ -1072,13 +1568,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
               status: "running" as const,
             }
           : readySession;
+        // pending launch 的标题只存在于 nextSession；索引必须使用同一份快照，
+        // 否则侧栏会一直显示上游的 Untitled mission。
+        const { blocks: _b, usage: _u, status: _st, preview: _preview, ...meta } = nextSession;
         const previousMeta = sessionIndex.find((item) => item.id === readySession.id);
         const indexedMeta = {
           ...decorateSessions([meta])[0],
           lastStatus: nextSession.status,
           completionUnread: previousMeta?.completionUnread ?? false,
         };
-        const nextIndex = e.background && previousMeta
+        const nextIndex = effectiveBackground && previousMeta
           ? sessionIndex.map((item) => item.id === readySession.id ? indexedMeta : item)
           : [indexedMeta, ...sessionIndex.filter((item) => item.id !== readySession.id)];
         // Passive session bind must not resurrect a removed project row.
@@ -1103,19 +1602,22 @@ export const useDesktop = create<DesktopState>((set, get) => {
         );
         persistSessionComposers(sessionComposers);
         const remainsActive = state.activeId === readySession.id && state.view === "session";
-        if (!e.background || remainsActive) bridge.setPermissionMode(composer.permissionMode);
+        if (attachesForeground || remainsActive) bridge.setPermissionMode(composer.permissionMode);
         const nextSessions = e.background
           ? sessions
           : Object.fromEntries(Object.entries(sessions).filter(([id]) => !isEphemeralSessionId(id)));
         const readyProjectId = projects.some((project) => samePath(project.path, readySession.cwd))
           ? projectId(readySession.cwd)
           : null;
+        if (attachesForeground) {
+          viewNavigation = nextViewNavigation(viewNavigation, readySession.id, readySession.cwd);
+        }
         set({
           sessions: { ...nextSessions, [readySession.id]: nextSession },
           sessionIndex: nextIndex,
           projects,
           sessionComposers,
-          ...(!e.background ? {
+          ...(attachesForeground ? {
             workspace: readySession.cwd,
             activeProjectId: readyProjectId,
             activeId: readySession.id,
@@ -1133,11 +1635,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
         });
         if (launch) {
           // Create path succeeded — crash buffer is no longer needed.
-          clearDraftBuffer(readySession.cwd);
+          void clearDraftBuffer(readySession.cwd).catch(() => {});
           void bridge.prompt(readySession.id, launch.text, {
             model: composer.model,
             effort: composer.effort,
             mode: composer.mode,
+            permissionMode: composer.permissionMode,
             attachments: launch.attachments,
           });
         }
@@ -1145,14 +1648,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
       case "block_add":
         if (isHiddenWorkflowControlPrompt(e.block)) break;
-        withSession(e.sessionId, (s) => ({ ...s, blocks: [...s.blocks, e.block] }));
+        withSession(e.sessionId, (s) => s.blocks.some((block) => block.id === e.block.id)
+          ? s
+          : { ...s, blocks: [...s.blocks, e.block] });
         // Tools must not keep a post-prompt continuation alive — a leftover
         // running LRC / cargo test would reset the settle timer forever.
         if (e.block.type === "thinking" || e.block.type === "assistant") {
           applyPostPromptContinuation(e.sessionId);
         }
         if (e.block.type === "plan" && get().activeId === e.sessionId) {
-          set({ planPreviewOpen: true, previewOpen: false });
+          set({ planPreviewOpen: true, previewOpen: false, inspectorOpen: false, terminalOpen: false });
         }
         break;
       case "block_patch":
@@ -1188,6 +1693,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
         }), false);
         applyPostPromptContinuation(e.sessionId);
         break;
+      case "user_append":
+        withSession(e.sessionId, (s) => ({
+          ...s,
+          blocks: s.blocks.map((b) =>
+            b.id === e.blockId && b.type === "user"
+              ? { ...b, text: b.text + e.delta }
+              : b,
+          ),
+        }), false);
+        break;
       case "permission_request":
         withSession(e.sessionId, (s) => ({
           ...s,
@@ -1198,7 +1713,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           ],
         }));
         if (e.req.purpose === "plan" && get().activeId === e.sessionId) {
-          set({ planPreviewOpen: true, previewOpen: false });
+          set({ planPreviewOpen: true, previewOpen: false, inspectorOpen: false, terminalOpen: false });
         }
         void notifyDesktop(
           localStorage.getItem("grox.language") === "en-US" ? "Approval needed" : "需要批准",
@@ -1250,10 +1765,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
       case "status":
         if (e.status === "idle") promptReturnedSessions.add(e.sessionId);
         if (e.status === "running") markPromptInFlight(e.sessionId);
+        const stoppedByUser = e.status === "idle" && userStoppedSessions.delete(e.sessionId);
         withSession(
           e.sessionId,
           (s) => {
-            const status = reconcileIncomingStatus(s.blocks, s.status, e.status);
+            const status = stoppedByUser ? "cancelled" : reconcileIncomingStatus(s.blocks, s.status, e.status);
             return {
               ...s,
               status,
@@ -1265,6 +1781,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         );
         applyPostPromptContinuation(e.sessionId);
         if (e.status === "idle") {
+          schedulePostTurnReconcile(e.sessionId);
           window.setTimeout(() => drainPromptQueue(e.sessionId), POST_PROMPT_SETTLE_MS);
         }
         break;
@@ -1280,19 +1797,60 @@ export const useDesktop = create<DesktopState>((set, get) => {
         void notifyDesktop(e.notice.title, e.notice.message);
         break;
       case "error":
+        {
+          const automation = get().automations.find((item) => item.lastSessionId === e.sessionId);
+          if (automation) {
+            const automations = get().automations.map((item) => item.id === automation.id
+              ? { ...item, lastError: formatGroxError(e.error) }
+              : item);
+            set({ automations });
+            void persistAutomations(automations).catch(() => {});
+            saveAutomationHistory(failLatestAutomationSessionRun(
+              get().automationRunHistory,
+              e.sessionId,
+              formatGroxError(e.error),
+            ));
+          }
+        }
+        if (e.error.holdQueue) {
+          const state = get();
+          const recoverable = (state.promptQueues[e.sessionId] ?? []).map((item) => ({
+            ...item,
+            state: item.state ?? ("queued" as const),
+          }));
+          if (recoverable.length > 0) suppressedQueueDrain.add(e.sessionId);
+          else suppressedQueueDrain.delete(e.sessionId);
+          const promptQueues = {
+            ...state.promptQueues,
+            [e.sessionId]: rehomeHeldQueueForRecovery(recoverable),
+          };
+          set({
+            promptQueues,
+            queueDrainParked: nextQueueDrainParked(state.queueDrainParked, e.sessionId, recoverable.length > 0),
+          });
+          savePromptQueues(promptQueues);
+        }
         withSession(
           e.sessionId,
           (s) => ({
             ...s,
-            status: "failed",
+            status: e.error.fatal ? "failed" : s.status,
             blocks: [
               ...s.blocks,
-              { type: "system", id: uid(), text: e.message, ts: Date.now(), kind: "error" },
+              { type: "system", id: uid(), text: formatGroxError(e.error), ts: Date.now(), kind: "error" },
             ],
           }),
           true,
-          false,
+          e.error.fatal ? false : undefined,
         );
+        if (e.error.domain === "environment") {
+          const notice = runtimeNoticeFromError(e.error);
+          set((state) => ({
+            runtimeNotices: state.runtimeNotices.some((item) => item.id === notice.id)
+              ? state.runtimeNotices
+              : [...state.runtimeNotices, notice],
+          }));
+        }
         break;
     }
   };
@@ -1326,7 +1884,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         if (generation !== providerRestoreGeneration) return;
         set({
           restoringSessionId: null,
-          startupError: `模型服务已切换，但当前会话同步失败：${error instanceof Error ? error.message : String(error)}`,
+          startupError: `模型服务已切换，但当前会话同步失败：${errorText(error)}`,
         });
         resumePromptQueues();
       },
@@ -1337,6 +1895,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
     ready: false,
     startupError: null,
     runtimeNotices: [],
+    runtimeConnection: bridge.kind === "mock" ? "ready" : "starting",
+    runtimeOccupancy: { activeTurnSessionIds: [], lifecycleActive: false, pendingLifecycle: 0 },
     auth: { required: false, inProgress: false },
     bridgeKind: bridge.kind,
     workspace: DEMO_CWD,
@@ -1348,7 +1908,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     activeId: null,
     account: null,
     billing: null,
-    provider: { kind: "oauth", hasApiKey: false },
+    provider: { kind: "oauth", hasApiKey: false, secretBackend: "missing" },
     providerProfiles: [],
     activeProviderProfileId: undefined,
     providerSwitching: false,
@@ -1358,6 +1918,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
     accountLoading: false,
     accountSetupOpen:
       localStorage.getItem("grox.accountSetupComplete") !== "1" && bridge.kind !== "mock",
+    automations: [],
+    automationRunningId: null,
+    automationRunHistory: loadAutomationRunHistory(),
+    automationLastTickAt: null,
     workspaceFiles: [],
     workspaceDiffs: [],
     workspaceDiffReady: false,
@@ -1379,7 +1943,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     computerUseEnabled: isComputerUseOperatorEnabled(),
     browserUseEnabled: localStorage.getItem("grox.browserUseEnabled") !== "0",
     sessionComposers: loadSessionComposers(),
-    promptQueues: {},
+    promptQueues: loadPromptQueuesFromBrowser(),
     pendingSessionModels: {},
     queueDrainParked: {} as Record<string, boolean>,
 
@@ -1407,7 +1971,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
         decorateSessions(loadJson<SessionMeta[]>("grox.sessionCatalog", [])),
       );
       const deletedSessions = loadDeletedSessions();
-      const visibleSessionIndex = migration.sessions.filter((session) => !deletedSessions.has(session.id));
+      const visibleSessionIndex = migration.sessions
+        .filter((session) => !deletedSessions.has(session.id))
+        .map((session) => ({
+          ...session,
+          lastStatus: sanitizeCatalogStatusOnColdStart(session.lastStatus),
+        }));
+      persistSessionCatalog(visibleSessionIndex);
       const cachedWorkspace = (() => {
         try {
           return localStorage.getItem("grok.workspace")?.trim() || "";
@@ -1441,30 +2011,83 @@ export const useDesktop = create<DesktopState>((set, get) => {
         void (async () => {
           try {
             const feCu = localStorage.getItem("grox.computerUseEnabled") !== "0";
-            void invoke("host_prefs_migrate_computer_use", { feEnabled: feCu }).catch(() => {});
+            const feBrowser = localStorage.getItem("grox.browserUseEnabled") !== "0";
+            await invoke("host_prefs_migrate_computer_use", { feEnabled: feCu }).catch((cause) => {
+              publishRuntimeError(cause, {
+                domain: "environment",
+                code: "HOST_PREFS_MIGRATION_FAILED",
+                message: "Computer Use 偏好迁移失败",
+                recoverable: true,
+                action: "检查应用数据目录的文件权限后重试",
+              });
+            });
+            await invoke("host_prefs_migrate_browser_use", { feEnabled: feBrowser }).catch((cause) => {
+              publishRuntimeError(cause, {
+                domain: "environment",
+                code: "HOST_PREFS_MIGRATION_FAILED",
+                message: "Browser Use 偏好迁移失败",
+                recoverable: true,
+                action: "检查应用数据目录的文件权限后重试",
+              });
+            });
 
-            const [hostPrefs, envOn, env] = await Promise.all([
-              invoke<{ computerUseEnabled?: boolean }>("host_prefs_get").catch(() => null),
+            const [hostPrefsLoad, envOn, env, promptQueueLoad, automationLoad] = await Promise.all([
+              invoke<HostPrefsProjection>("host_prefs_get").then(
+                (value) => ({ value, error: null as unknown }),
+                (error: unknown) => ({ value: null, error }),
+              ),
               invoke<boolean>("computer_use_env_enabled").catch(() => false),
               invoke<{ appVersion?: string }>("desktop_environment").catch(() => null),
+              loadPromptQueues().then(
+                (value) => ({ value, error: null as unknown }),
+                (error: unknown) => ({ value: null, error }),
+              ),
+              loadAutomations().then(
+                (value) => ({ value, error: null as unknown }),
+                (error: unknown) => ({ value: null, error }),
+              ),
             ]);
-            if (hostPrefs && typeof hostPrefs.computerUseEnabled === "boolean") {
-              setComputerUseHostPrefsEnabled(hostPrefs.computerUseEnabled);
-            }
             setComputerUseHostEnvEnabled(Boolean(envOn));
+            if (hostPrefsLoad.value) applyHostPrefs(hostPrefsLoad.value);
             if (env?.appVersion && consumeShellUpgradeRescan(env.appVersion)) {
               upgradeForceOfflineRescan = true;
               upgradeForceRescanned.clear();
             }
-            set({ computerUseEnabled: isComputerUseOperatorEnabled() });
-          } catch {
-            // Host prefs are non-fatal.
+            set((state) => ({
+              ...(promptQueueLoad.value
+                ? { promptQueues: mergeHydratedPromptQueues(promptQueueLoad.value, state.promptQueues) }
+                : {}),
+              ...(automationLoad.value ? { automations: automationLoad.value } : {}),
+            }));
+            for (const [code, message, error] of [
+              ["HOST_PREFS_READ_FAILED", "无法读取 Host 权限偏好", hostPrefsLoad.error],
+              ["PROMPT_QUEUE_READ_FAILED", "无法恢复已持久化的提示队列", promptQueueLoad.error],
+              ["AUTOMATION_READ_FAILED", "无法恢复已安排任务", automationLoad.error],
+            ] as const) {
+              if (!error) continue;
+              const notice = runtimeNoticeFromError(toGroxError(error, {
+                domain: "environment",
+                code,
+                message,
+                recoverable: true,
+                action: "请检查应用数据目录的文件权限或磁盘状态",
+              }));
+              set((state) => ({ runtimeNotices: [...state.runtimeNotices.filter((item) => item.id !== notice.id), notice] }));
+            }
+          } catch (cause) {
+            publishRuntimeError(cause, {
+              domain: "environment",
+              code: "HOST_BOOTSTRAP_FAILED",
+              message: "Host 启动偏好与持久化状态未能完整恢复",
+              recoverable: true,
+              action: "检查应用数据目录后重启 Grox",
+            });
           }
         })();
       }, 0);
 
       // ── Phase 2: agent boot only after idle (or immediately for deep links).
-      // Keep the shell fully interactive for ~2s before any acp_spawn work.
+      // Keep the shell fully interactive for ~2s before the Host starts ACP connection work.
       const bootAgent = () => {
         void (async () => {
           try {
@@ -1516,7 +2139,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             }, 1_500);
 
             window.setTimeout(() => {
-              void scrubSessionCacheOrphans();
+              void scrubSessionJournalOrphans();
             }, 4_000);
             window.setTimeout(() => {
               if (!get().auth.inProgress && get().historySyncedAt === 0) void get().refreshHistory();
@@ -1533,11 +2156,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
             }
 
             if (open) void get().openSession(open);
-            else if (prompt) void get().newSession({ text: prompt });
+            else if (prompt) void get().newSession({ text: prompt }).catch(() => {});
           } catch (error) {
             set({
               ready: true,
-              startupError: error instanceof Error ? error.message : String(error),
+              startupError: errorText(error),
             });
           }
         })();
@@ -1558,6 +2181,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
     })),
 
     goHome: () => {
+      bridge.invalidateWorkspaceSelection();
+      viewNavigation = nextViewNavigation(viewNavigation, null);
       const state = get();
       const currentId = state.activeId;
       const current = currentId ? state.sessions[currentId] : undefined;
@@ -1568,17 +2193,25 @@ export const useDesktop = create<DesktopState>((set, get) => {
         view: "home",
         activeId: null,
         sessions: dropEphemeralSessions(state.sessions),
+        inspectorOpen: false,
+        terminalOpen: false,
+        previewOpen: false,
+        previewFile: null,
+        planPreviewOpen: false,
       });
     },
 
     async openSession(id) {
       const beforeOpen = get();
+      bridge.invalidateWorkspaceSelection();
+      const meta = beforeOpen.sessionIndex.find((entry) => entry.id === id);
+      const navigation = nextViewNavigation(viewNavigation, id, meta?.cwd);
+      viewNavigation = navigation;
       const currentId = beforeOpen.activeId;
       const current = currentId ? beforeOpen.sessions[currentId] : undefined;
       if (shouldCloseDetachedSession({ currentId, nextId: id, status: current?.status })) {
         void bridge.closeSession(currentId!).catch(() => {});
       }
-      const meta = beforeOpen.sessionIndex.find((entry) => entry.id === id);
       if (meta?.completionUnread) {
         const sessionIndex = beforeOpen.sessionIndex.map((entry) =>
           entry.id === id ? { ...entry, completionUnread: false } : entry,
@@ -1586,7 +2219,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
         persistSessionCatalog(sessionIndex);
         set({ sessionIndex });
       }
-      if (meta && !samePath(meta.cwd, get().workspace)) await get().setWorkspace(meta.cwd);
+      if (meta) {
+        if (!samePath(meta.cwd, get().workspace)) {
+          await get().setWorkspace(meta.cwd, { navigation });
+        } else {
+          // Even when the visible project already matches, issue a workspace
+          // selection so an older cross-project validation cannot win later.
+          await bridge.setWorkspace(meta.cwd);
+        }
+      }
+      if (!shouldCommitViewNavigation(navigation, viewNavigation)) return;
       const state = get();
       let existing = state.sessions[id];
       const composer = state.sessionComposers[id];
@@ -1595,7 +2237,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
       // Never leave activeId set with sessions[id] missing — that paints the
       // infinite black "RESTORING MISSION" spinner when cache/ACP is slow.
       if (!existing && meta) {
-        existing = sessionShellFromMeta(meta, meta.lastStatus === "failed" ? "failed" : "idle");
+        const shellStatus = meta.lastStatus && !isSessionTerminal(meta.lastStatus)
+          ? "disconnected"
+          : meta.lastStatus ?? "idle";
+        existing = sessionShellFromMeta(meta, shellStatus);
         set({
           activeId: id,
           view: "session",
@@ -1645,13 +2290,19 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
       // Local cache + disk jsonl first (fast paint). ACP may fail with "找不到会话"
       // when the CLI catalogue no longer lists a sidebar id.
-      if (openMeta && (!existing || existing.blocks.length === 0 || existing.preview)) {
-        void hydrateSessionOffline(id, openMeta).then((offline) => {
+      if (openMeta && (!existing || existing.blocks.length === 0 || existing.preview || isSessionTerminal(existing.status))) {
+        void hydrateSessionOfflineDetailed(id, openMeta).then((hydration) => {
+          if (hydration.journalError) publishJournalReadError(id, hydration.journalError);
+          if (hydration.agentError) publishAgentHistoryReadError(id, hydration.agentError);
+          if (hydration.outcome === "interrupted") parkInterruptedSession(id);
+          const offline = hydration.session;
           if (!offline) return;
           const latest = get();
           if (latest.activeId !== id) return;
           const currentSession = latest.sessions[id];
-          const next = preferRicherSession(currentSession, offline);
+          const next = hydration.outcome === "interrupted"
+            ? offline
+            : preferRicherSession(currentSession, offline);
           if (next === currentSession) return;
           set({ sessions: { ...latest.sessions, [id]: next } });
         });
@@ -1661,14 +2312,20 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (needsHydrate) {
         if (forceRescan) upgradeForceRescanned.add(id);
         void bridge.loadSession(id, { background: true }).catch((error) => {
-          const message = error instanceof Error ? error.message : String(error);
+          const message = errorText(error);
           void (async () => {
-            const offline = openMeta ? await hydrateSessionOffline(id, openMeta) : null;
+            const hydration = openMeta ? await hydrateSessionOfflineDetailed(id, openMeta) : null;
+            if (hydration?.journalError) publishJournalReadError(id, hydration.journalError);
+            if (hydration?.agentError) publishAgentHistoryReadError(id, hydration.agentError);
+            if (hydration?.outcome === "interrupted") parkInterruptedSession(id);
+            const offline = hydration?.session ?? null;
             set((latest) => {
               if (latest.activeId !== id) return latest;
               const shell = latest.sessions[id];
               if (offline && offline.blocks.length > 0) {
-                const next = preferRicherSession(shell, offline);
+                const next = hydration?.outcome === "interrupted"
+                  ? offline
+                  : preferRicherSession(shell, offline);
                 return {
                   // Soft notice — offline history is still usable.
                   startupError: `会话未能绑定到 CLI（已显示本地历史）：${message}`,
@@ -1712,6 +2369,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     async newSession(launch) {
       const beforeNew = get();
+      bridge.invalidateWorkspaceSelection();
+      viewNavigation = nextViewNavigation(viewNavigation, null, beforeNew.workspace);
       const currentId = beforeNew.activeId;
       const current = currentId ? beforeNew.sessions[currentId] : undefined;
       if (shouldCloseDetachedSession({ currentId, nextId: null, status: current?.status })) {
@@ -1726,9 +2385,21 @@ export const useDesktop = create<DesktopState>((set, get) => {
       if (!hasLaunch) {
         pendingLaunch = undefined;
         const draftId = `draft-${uid()}`;
+        viewNavigation = nextViewNavigation(viewNavigation, draftId, beforeNew.workspace);
         const now = Date.now();
         const workspace = get().workspace;
-        const recovered = loadDraftBuffer(workspace);
+        let recovered: Awaited<ReturnType<typeof loadDraftBuffer>> = null;
+        try {
+          recovered = await loadDraftBuffer(workspace);
+        } catch (cause) {
+          publishRuntimeError(cause, {
+            domain: "environment",
+            code: "DRAFT_READ_FAILED",
+            message: "未发送草稿无法从 Host 恢复",
+            recoverable: true,
+            action: "已保留磁盘文件且打开空编辑器；请检查应用数据目录后重试",
+          });
+        }
         const recoveredText = recovered?.text ?? "";
         const recoveredAttachments = (recovered?.attachments ?? []).map((item) => ({
           id: item.id,
@@ -1793,6 +2464,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
         attachments: launchAttachments,
       };
       const pendingId = `pending-${uid()}`;
+      viewNavigation = nextViewNavigation(viewNavigation, pendingId, beforeNew.workspace);
+      pendingForegroundNavigation = viewNavigation;
       const now = Date.now();
       set((state) => ({
         view: "session",
@@ -1836,6 +2509,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         // or ACP) can fail after we already left the draft shell.
         const failedLaunch = pendingLaunch;
         pendingLaunch = undefined;
+        pendingForegroundNavigation = null;
         const draftId = `draft-${uid()}`;
         const workspace = get().workspace;
         const restored = buildDraftRestoreAfterSessionNewFailure({
@@ -1854,7 +2528,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           now: Date.now(),
         });
         if (restored.draftText.trim() || restored.draftAttachments.length > 0) {
-          saveDraftBuffer(workspace, restored.draftText, restored.draftAttachments);
+          void saveDraftBuffer(workspace, restored.draftText, restored.draftAttachments).catch(() => {});
         }
         persistSessionComposers(restored.sessionComposers);
         set({
@@ -1862,8 +2536,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
           sessionComposers: restored.sessionComposers,
           activeId: restored.activeId,
           view: restored.view,
-          startupError: error instanceof Error ? error.message : String(error),
+          startupError: errorText(error),
         });
+        // 调用方（首页、并行任务面板）只有收到拒绝，才能保留自己的输入
+        // 和附件。store 已恢复草稿壳并呈现错误，fire-and-forget 入口会
+        // 显式吞掉这个已处理的拒绝。
+        throw error;
       }
     },
 
@@ -1875,7 +2553,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         await get().setWorkspace(cwd, { restoreProject: true });
         await get().newSession();
       } catch (error) {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
+        set({ startupError: errorText(error) });
       }
     },
 
@@ -1883,7 +2561,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const project = get().projects.find(
         (entry) => entry.id === id || samePath(entry.path, id) || entry.id === projectId(id),
       );
-      if (project) await get().setWorkspace(project.path);
+      if (!project) return;
+      try {
+        await get().setWorkspace(project.path);
+      } catch (error) {
+        set({ startupError: errorText(error) });
+        throw error;
+      }
     },
 
     renameProject(id, name) {
@@ -1913,7 +2597,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         baseSessionIndex = mergeSessions(baseSessionIndex, discovered, target.path);
       } catch (error) {
         set({
-          startupError: `无法完整枚举项目会话，将只处理当前已加载会话：${error instanceof Error ? error.message : String(error)}`,
+          startupError: `无法完整枚举项目会话，将只处理当前已加载会话：${errorText(error)}`,
         });
       }
       const projectSessions = baseSessionIndex.filter((session) => samePath(session.cwd, target.path));
@@ -1975,7 +2659,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         try {
           await get().deleteSession(sessionId);
         } catch (error) {
-          errors.push(error instanceof Error ? error.message : String(error));
+          errors.push(errorText(error));
         }
       }
       try {
@@ -1991,7 +2675,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           }
         }
       } catch (error) {
-        errors.push(error instanceof Error ? error.message : String(error));
+        errors.push(errorText(error));
       }
       if (errors.length > 0) {
         set({ startupError: `项目已从侧栏删除，但部分磁盘会话清理失败：${errors.join("；")}` });
@@ -2002,7 +2686,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const project = id
         ? get().projects.find((entry) => entry.id === id)
         : get().projects.find((entry) => entry.id === get().activeProjectId);
-      await invoke("open_in_explorer", { cwd: project?.path ?? get().workspace, path: null });
+      try {
+        await invoke("open_in_explorer", { cwd: project?.path ?? get().workspace, path: null });
+      } catch (error) {
+        set({ startupError: errorText(error) });
+      }
     },
 
     async createProjectWorktree(id) {
@@ -2014,14 +2702,21 @@ export const useDesktop = create<DesktopState>((set, get) => {
         // permanent-worktree action: create it, then reveal it in Finder.
         await invoke("open_in_explorer", { cwd: path, path: null });
       } catch (error) {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
+        set({ startupError: errorText(error) });
       }
     },
 
     async setWorkspace(cwd, options) {
+      const navigation = options?.navigation
+        ?? nextViewNavigation(viewNavigation, null, cwd);
+      if (!options?.navigation) viewNavigation = navigation;
+      const isCurrentSelection = () => shouldCommitViewNavigation(navigation, viewNavigation);
       await bridge.setWorkspace(cwd);
+      if (!isCurrentSelection()) return;
       const workspace = await bridge.getWorkspace();
+      if (!isCurrentSelection()) return;
       const fetchedSessions = await bridge.listSessions(workspace);
+      if (!isCurrentSelection()) return;
       const sessionIndex = mergeSessions(get().sessionIndex, fetchedSessions, workspace);
       const projects = ensureProject(get().projects, workspace, {
         restore: Boolean(options?.restoreProject),
@@ -2044,6 +2739,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         previewFile: null,
         planPreviewOpen: false,
       });
+      if (!isCurrentSelection()) return;
       void get().refreshWorkspaceFiles();
       void get().refreshWorkspaceDiffs();
       void get().refreshProjectPreview(false);
@@ -2056,15 +2752,30 @@ export const useDesktop = create<DesktopState>((set, get) => {
         void get().refreshAccount();
         void get().refreshHistory();
       } catch (error) {
+        let code = "";
+        if (typeof error === "object" && error !== null) {
+          const failure = error as { code?: unknown; error?: { code?: unknown } };
+          code = String(failure.code ?? failure.error?.code ?? "");
+        }
         set({
           auth: await bridge.getAuthState(),
-          startupError: error instanceof Error ? error.message : String(error),
+          startupError: code === "AUTH_CANCELLED"
+            ? null
+            : errorText(error),
         });
       }
     },
 
+    async cancelAuthentication() {
+      await bridge.cancelAuthentication();
+      set({ auth: await bridge.getAuthState(), startupError: null });
+    },
+
     async logout() {
       await bridge.logout();
+      const auth = await bridge.getAuthState();
+      set({ auth, account: null, billing: null, startupError: null });
+      await get().refreshAccount();
     },
 
     async refreshAccount() {
@@ -2126,12 +2837,19 @@ export const useDesktop = create<DesktopState>((set, get) => {
       } catch (error) {
         set({
           providerSwitching: false,
-          startupError: `模型服务切换失败：${error instanceof Error ? error.message : String(error)}`,
+          startupError: formattedError(error, {
+            domain: "environment",
+            code: "PROVIDER_RUNTIME_SWITCH_FAILED",
+            action: "确认凭据库可用、服务地址可达后重试",
+          }),
         });
         throw error;
       }
       void get().refreshAccount().catch((error) => {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
+        set({ startupError: formattedError(error, {
+          domain: "environment",
+          code: "PROVIDER_STATUS_REFRESH_FAILED",
+        }) });
       });
     },
 
@@ -2146,7 +2864,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
       try {
         profile = await bridge.refreshProviderModels(profile.id);
       } catch (error) {
-        set({ startupError: `供应商已保存，但模型列表获取失败：${error instanceof Error ? error.message : String(error)}` });
+        set({ startupError: formattedError(error, {
+          domain: "environment",
+          code: "PROVIDER_MODELS_FETCH_FAILED",
+          message: "供应商已保存，但模型列表获取失败",
+          action: "检查服务地址、API Key 与网关的 /models 兼容性",
+        }) });
       }
       if (wasActive) {
         set({ providerSwitching: true });
@@ -2212,7 +2935,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
         throw error;
       }
       void Promise.all([get().refreshAccount(), get().refreshModels()]).catch((error) => {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
+        set({ startupError: formattedError(error, {
+          domain: "environment",
+          code: "PROVIDER_STATE_REFRESH_FAILED",
+        }) });
       });
     },
 
@@ -2235,7 +2961,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       } catch (error) {
         set({
           runtimeBusy: false,
-          startupError: error instanceof Error ? error.message : String(error),
+          startupError: errorText(error),
         });
       }
     },
@@ -2251,6 +2977,87 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
     },
 
+    saveAutomation(automation) {
+      const automations = [
+        ...get().automations.filter((item) => item.id !== automation.id),
+        automation,
+      ].sort((a, b) => a.nextRunAt - b.nextRunAt);
+      set({ automations });
+      void persistAutomations(automations).catch((cause) => {
+        publishRuntimeError(cause, {
+          domain: "environment",
+          code: "AUTOMATION_WRITE_FAILED",
+          message: "自动化未能写入本地磁盘",
+          recoverable: true,
+          action: "当前进程仍保留任务；请检查磁盘空间和应用数据目录权限",
+        });
+      });
+    },
+
+    deleteAutomation(id) {
+      const automations = get().automations.filter((item) => item.id !== id);
+      set({ automations });
+      void persistAutomations(automations).catch((cause) => {
+        publishRuntimeError(cause, {
+          domain: "environment",
+          code: "AUTOMATION_DELETE_WRITE_FAILED",
+          message: "自动化删除结果未能写入本地磁盘",
+          recoverable: true,
+          action: "任务可能在重启后重新出现；请检查应用数据目录权限后再次删除",
+        });
+      });
+    },
+
+    setAutomationEnabled(id, enabled) {
+      const automations = get().automations.map((item) => item.id === id ? { ...item, enabled } : item);
+      set({ automations });
+      void persistAutomations(automations).catch((cause) => {
+        publishRuntimeError(cause, {
+          domain: "environment",
+          code: "AUTOMATION_STATE_WRITE_FAILED",
+          message: "自动化启停状态未能写入本地磁盘",
+          recoverable: true,
+          action: "当前进程已更新；重启前请检查应用数据目录权限",
+        });
+      });
+    },
+
+    async runAutomation(id) {
+      set({ automationRunningId: id });
+      try {
+        await invoke("run_automation_now", { id });
+      } catch (cause) {
+        if (get().automationRunningId === id) set({ automationRunningId: null });
+        const automation = get().automations.find((item) => item.id === id);
+        const error = toGroxError(cause, {
+          domain: "operation",
+          code: "AUTOMATION_RUN_NOW_FAILED",
+          message: automation ? `现在不能运行“${automation.title}”` : "自动化任务不存在",
+          recoverable: true,
+          action: "等待当前会话或自动化结束，并确认 Agent 运行时已连接",
+        });
+        if (automation) {
+          saveAutomationHistory(prependAutomationRun(get().automationRunHistory, {
+            id: newAutomationRunId(),
+            automationId: automation.id,
+            title: automation.title,
+            at: Date.now(),
+            outcome: error.domain === "operation" ? "skipped" : "error",
+            source: "run_now",
+            detail: error.message,
+          }));
+        }
+        const notice = runtimeNoticeFromError(error);
+        set((state) => ({
+          runtimeNotices: [...state.runtimeNotices.filter((item) => item.id !== notice.id), notice],
+        }));
+      }
+    },
+
+    clearAutomationRunHistory() {
+      saveAutomationHistory([]);
+    },
+
     setAccountSetupOpen: (accountSetupOpen) => set({ accountSetupOpen }),
 
     async refreshWorkspaceFiles() {
@@ -2260,7 +3067,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         });
         set({ workspaceFiles });
       } catch (error) {
-        set({ previewError: error instanceof Error ? error.message : String(error) });
+        set({ previewError: errorText(error) });
       }
     },
 
@@ -2283,59 +3090,72 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async refreshProjectPreview(start = false) {
+      const generation = ++projectPreviewRequestGeneration;
+      const cwd = get().workspace;
       if (bridge.kind === "mock") {
         set({ projectPreview: { status: "none" } });
         return;
       }
       try {
         const projectPreview = await invoke<ProjectPreview>("start_project_preview", {
-          cwd: get().workspace,
+          cwd,
           start,
         });
+        if (generation !== projectPreviewRequestGeneration || get().workspace !== cwd) return;
         const shouldOpen = start && (projectPreview.status === "starting" || projectPreview.status === "ready");
         set({
           projectPreview,
-          ...(shouldOpen ? { inspectorOpen: true, inspectorTab: "preview" as InspectorTab } : {}),
+          ...(shouldOpen ? { inspectorOpen: true, inspectorTab: "preview" as InspectorTab, terminalOpen: false, previewOpen: false, planPreviewOpen: false } : {}),
         });
       } catch (error) {
+        if (generation !== projectPreviewRequestGeneration || get().workspace !== cwd) return;
         set({
           projectPreview: {
             status: "error",
-            error: error instanceof Error ? error.message : String(error),
+            error: errorText(error),
           },
         });
       }
     },
 
     setProjectPreviewUrl(url) {
+      projectPreviewRequestGeneration += 1;
       set({ projectPreview: { ...get().projectPreview, status: "ready", url } });
     },
 
     async openPreview(path) {
-      set({ previewOpen: true, planPreviewOpen: false, previewLoading: true, previewError: null });
+      const generation = ++previewRequestGeneration;
+      const cwd = get().workspace;
+      set({ previewOpen: true, planPreviewOpen: false, inspectorOpen: false, terminalOpen: false, previewLoading: true, previewError: null });
       try {
         let previewFile = await invoke<PreviewFile>("read_preview_file", {
-          cwd: get().workspace,
+          cwd,
           path,
         });
-        if (previewFile.kind === "html") {
+        if (generation !== previewRequestGeneration) return;
+        if (["html", "image", "video", "audio", "pdf"].includes(previewFile.kind)) {
           const url = await invoke<string>("start_file_preview", {
-            cwd: get().workspace,
+            cwd,
             path,
           });
+          if (generation !== previewRequestGeneration) return;
           previewFile = { ...previewFile, url };
         }
         set({ previewFile, previewLoading: false });
       } catch (error) {
+        if (generation !== previewRequestGeneration) return;
         set({
           previewFile: null,
           previewLoading: false,
-          previewError: error instanceof Error ? error.message : String(error),
+          previewError: errorText(error),
         });
       }
     },
 
-    closePreview: () => set({ previewOpen: false, previewFile: null, previewError: null }),
+    closePreview: () => {
+      previewRequestGeneration += 1;
+      set({ previewOpen: false, previewLoading: false, previewFile: null, previewError: null });
+    },
 
     async deleteSession(id) {
       markPromptInFlight(id);
@@ -2343,7 +3163,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       markSessionsDeleted([id]);
       clearSessionFlags([id]);
       // 取消尚未落盘的 debounce；否则删除完成后旧缓存可能被定时器重新写回。
-      cancelPendingSessionCache(id);
+      cancelPendingSessionJournal(id);
       const { sessionIndex, sessions, activeId, sessionComposers, workflows } = get();
       const rest = { ...sessions };
       delete rest[id];
@@ -2351,10 +3171,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
       delete nextComposers[id];
       const nextWorkflows = { ...workflows };
       delete nextWorkflows[id];
+      const promptQueues = { ...get().promptQueues };
+      delete promptQueues[id];
       const pendingSessionModels = { ...get().pendingSessionModels };
       delete pendingSessionModels[id];
       persistSessionComposers(nextComposers);
       persistWorkflowRuns(nextWorkflows);
+      savePromptQueues(promptQueues);
       const nextIndex = sessionIndex.filter((m) => m.id !== id);
       persistSessionCatalog(nextIndex);
       set({
@@ -2362,6 +3185,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         sessions: rest,
         sessionComposers: nextComposers,
         workflows: nextWorkflows,
+        promptQueues,
         pendingSessionModels,
         startupError: null,
         ...(activeId === id ? { activeId: null, view: "home" as View } : {}),
@@ -2373,7 +3197,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       try {
         if ("__TAURI_INTERNALS__" in window) await invoke("delete_session_data", { id });
       } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
+        const message = errorText(error);
         set({ startupError: `会话已从侧栏删除，但本地历史清理失败：${message}` });
         diskError = new Error(message);
       }
@@ -2390,7 +3214,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     renameSession(id, title) {
-      void bridge.renameSession(id, title);
+      void bridge.renameSession(id, title).catch((error) => {
+        set({ startupError: `会话标题仅在本机更新，CLI 重命名失败：${errorText(error)}` });
+      });
       const { sessionIndex, sessions } = get();
       const nextIndex = sessionIndex.map((m) => (m.id === id ? { ...m, title } : m));
       persistSessionCatalog(nextIndex);
@@ -2451,28 +3277,25 @@ export const useDesktop = create<DesktopState>((set, get) => {
               })();
         await navigator.clipboard.writeText(text);
       } catch (error) {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
+        set({ startupError: errorText(error) });
       }
     },
 
     async continueSessionInNewChat(id) {
       const meta = get().sessionIndex.find((entry) => entry.id === id);
       if (!meta) return;
-      const session = get().sessions[id];
-      const lastUser = [...(session?.blocks ?? [])].reverse().find((block) => block.type === "user");
-      const lastAssistant = [...(session?.blocks ?? [])].reverse().find((block) => block.type === "assistant");
-      const userText = lastUser?.type === "user" ? lastUser.text : meta.title;
-      const assistantText = lastAssistant?.type === "assistant" ? lastAssistant.text.slice(-1200) : "";
-      const text = [
-        "请在新会话中继续处理下面这个任务，并保留必要的上下文。",
-        `原始请求：${userText}`,
-        assistantText ? `上一会话的最新回复：${assistantText}` : "",
-      ].filter(Boolean).join("\n\n");
       try {
         if (!samePath(meta.cwd, get().workspace)) await get().setWorkspace(meta.cwd);
-        await get().newSession({ text });
+        // 原生 fork 复制完整上下文但不启动新一轮，避免合成提示被全局
+        // AGENTS/user_rules 改写意图，也避免用户只想查看时产生模型费用。
+        const forked = await bridge.forkSession(id, meta.cwd, meta.title);
+        // fork 的完整历史已经写入 CLI 会话目录。先以后台恢复路径合并
+        // 磁盘历史，再切换视图；仅依赖 session/load 通知会把复制成功的
+        // 会话短暂显示成空白对话。
+        await bridge.loadSession(forked.sessionId, { background: true });
+        await get().openSession(forked.sessionId);
       } catch (error) {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
+        set({ startupError: errorText(error) });
       }
     },
 
@@ -2480,49 +3303,17 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const meta = get().sessionIndex.find((entry) => entry.id === id);
       if (!meta) return;
       try {
-        const path = await invoke<string>("create_permanent_worktree", { cwd: meta.cwd });
-        const session = get().sessions[id];
-        const lastUser = [...(session?.blocks ?? [])].reverse().find((block) => block.type === "user");
-        const text = `请在这个新的工作树中继续处理任务：${lastUser?.type === "user" ? lastUser.text : meta.title}`;
-        await get().setWorkspace(path);
-        await get().newSession({ text });
+        // Host 等待源回合结算、创建干净 worktree，并通过 Grok Build
+        // x.ai/session/fork 复制完整上下文；不再用摘要提示伪装会话继续。
+        const forked = await bridge.forkSessionInNewWorktree(id, meta.cwd);
+        await get().setWorkspace(forked.cwd);
+        await bridge.loadSession(forked.sessionId);
       } catch (error) {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
+        set({ startupError: errorText(error) });
       }
     },
 
-    async openSessionInNewWindow(id) {
-      const meta = get().sessionIndex.find((entry) => entry.id === id);
-      if (!meta) return;
-      try {
-        const url = new URL(window.location.href);
-        url.search = "";
-        url.hash = "";
-        url.searchParams.set("open", id);
-        if ("__TAURI_INTERNALS__" in window) {
-          const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
-          const label = `session-${id.replace(/[^a-zA-Z0-9_-]/g, "-").slice(0, 28)}-${Date.now()}`;
-          const child = new WebviewWindow(label, {
-            url: url.toString(),
-            title: meta.title,
-            width: 1180,
-            height: 780,
-            minWidth: 860,
-            minHeight: 560,
-            resizable: true,
-          });
-          child.once("tauri://error", (event) => {
-            set({ startupError: String(event.payload ?? "无法打开新窗口") });
-          });
-        } else {
-          window.open(url.toString(), "_blank", "noopener,noreferrer");
-        }
-      } catch (error) {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
-      }
-    },
-
-    sendPrompt(text, attachments = [], targetSessionId, modeOverride) {
+    sendPrompt(text, attachments = [], targetSessionId, modeOverride, submission, queueItemId) {
       const { activeId, sessions, model, effort, mode, permissionMode, sessionComposers, providerSwitching, restoringSessionId } = get();
       const sessionId = targetSessionId ?? activeId;
       if (providerSwitching || restoringSessionId === sessionId) return false;
@@ -2541,12 +3332,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const trimmed = text.trim();
       if (!trimmed && attachments.length === 0) return false;
       const cwd = session.cwd || get().workspace;
-      // Real sessions: text is durable via CLI. Draft first-send must keep the
-      // crash buffer (text + attachments) until session_ready.
-      if (!shouldRetainDraftBufferUntilSessionReady(session.id)) {
-        clearDraftBuffer(cwd);
-      } else {
-        saveDraftBuffer(cwd, trimmed, attachments);
+      // 只有编辑器提交能消费其 crash buffer；队列、自动化和 Inspector 的
+      // 内部发送不得顺手删除用户尚未发送的附件草稿。
+      if (!shouldRetainDraftBufferUntilSessionReady(session.id) && submission) {
+        void clearDraftBuffer(cwd).catch(() => {});
+      } else if (shouldRetainDraftBufferUntilSessionReady(session.id)) {
+        void saveDraftBuffer(cwd, trimmed, attachments).catch(() => {});
       }
 
       // Promote a local draft into a real ACP session on first send only.
@@ -2560,16 +3351,19 @@ export const useDesktop = create<DesktopState>((set, get) => {
           mode: modeOverride ?? composer.mode,
           permissionMode: composer.permissionMode,
         });
-        void get().newSession({ text: trimmed, attachments });
+        void get().newSession({ text: trimmed, attachments }).catch(() => {});
         return true;
       }
       if (!sessionAcceptsNewPrimaryPrompt({ status: session.status, blocks: session.blocks })) {
+        // Host 队列派发只允许领取当前空闲会话；竞态变忙时保留原行，
+        // 不能把同一个 queue id 再复制成一条新提示。
+        if (queueItemId) return false;
         const queue = get().promptQueues[session.id] ?? [];
         const duplicate = queue.some((item) => item.text.trim() === trimmed && trimmed.length > 0);
         if (duplicate) return false;
         const nextComposers = {
           ...sessionComposers,
-          [session.id]: { ...composer, text: "", attachments: [] },
+          [session.id]: commitComposerSubmission(composer, submission),
         };
         const queued: QueuedPrompt = {
           id: uid(),
@@ -2582,19 +3376,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
           createdAt: Date.now(),
         };
         persistSessionComposers(nextComposers);
+        const promptQueues = { ...get().promptQueues, [session.id]: [...queue, queued] };
         set({
           sessionComposers: nextComposers,
-          promptQueues: { ...get().promptQueues, [session.id]: [...queue, queued] },
+          promptQueues,
         });
+        savePromptQueues(promptQueues);
         return true;
       }
-      suppressedQueueDrain.delete(session.id);
+      userStoppedSessions.delete(session.id);
       markPromptInFlight(session.id);
-      if (get().queueDrainParked[session.id]) {
-        set({
-          queueDrainParked: nextQueueDrainParked(get().queueDrainParked, session.id, false),
-        });
-      }
       const internalWorkflowControl = /^\/workflow\s+(?:pause|resume|stop)\s+\S+(?:\s|$)/i.test(trimmed);
       const titleText = trimmed || attachments.map((attachment) => attachment.name).join(", ");
       const nextIndex = get().sessionIndex.map((m) =>
@@ -2611,7 +3402,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
       const nextComposers = {
         ...sessionComposers,
-        [session.id]: { ...composer, text: "", attachments: [] },
+        [session.id]: commitComposerSubmission(composer, submission),
       };
       persistSessionComposers(nextComposers);
       set({
@@ -2642,23 +3433,27 @@ export const useDesktop = create<DesktopState>((set, get) => {
         ...(activeId === session.id && modeOverride ? { mode: modeOverride } : {}),
       });
 
-      bridge.setPermissionMode(composer.permissionMode);
+      // 队列保存的是入队时的权限意图，不能在数小时后反向扩大当前 Host 授权。
+      // Host 会把该意图与当前 host_prefs 取更严格者。
+      if (!queueItemId) bridge.setPermissionMode(composer.permissionMode);
       void bridge.prompt(session.id, trimmed, {
         model: composer.model,
         effort: composer.effort,
         mode: composer.mode,
+        permissionMode: composer.permissionMode,
         attachments,
+        ...(queueItemId ? { queueItemId } : {}),
       });
       return true;
     },
 
-    async interjectPrompt(text, attachments = [], targetSessionId) {
+    async interjectPrompt(text, attachments = [], targetSessionId, submission) {
       const state = get();
       const sessionId = targetSessionId ?? state.activeId;
       if (!sessionId) return false;
       const session = state.sessions[sessionId];
       if (!session || state.providerSwitching || state.restoringSessionId === sessionId) return false;
-      if (session.status !== "running") return get().sendPrompt(text, attachments, sessionId);
+      if (session.status !== "running") return get().sendPrompt(text, attachments, sessionId, undefined, submission);
       const composer = state.sessionComposers[sessionId] ?? {
         text: "",
         attachments: [],
@@ -2675,9 +3470,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
           attachments,
         });
         if (accepted) {
+          const latestComposers = get().sessionComposers;
           const nextComposers = {
-            ...get().sessionComposers,
-            [sessionId]: { ...composer, text: "", attachments: [] },
+            ...latestComposers,
+            [sessionId]: commitComposerSubmission(latestComposers[sessionId] ?? composer, submission),
           };
           persistSessionComposers(nextComposers);
           set({ sessionComposers: nextComposers });
@@ -2689,83 +3485,114 @@ export const useDesktop = create<DesktopState>((set, get) => {
           model: composer.model, effort: composer.effort, mode: composer.mode,
           permissionMode: composer.permissionMode, createdAt: Date.now(),
         };
-        set({ promptQueues: { ...get().promptQueues, [sessionId]: [queued, ...queue] } });
+        const promptQueues = { ...get().promptQueues, [sessionId]: [queued, ...queue] };
+        set({ promptQueues });
+        savePromptQueues(promptQueues);
+        const latestComposers = get().sessionComposers;
         const nextComposers = {
-          ...get().sessionComposers,
-          [sessionId]: { ...composer, text: "", attachments: [] },
+          ...latestComposers,
+          [sessionId]: commitComposerSubmission(latestComposers[sessionId] ?? composer, submission),
         };
         persistSessionComposers(nextComposers);
         set({ sessionComposers: nextComposers });
         return true;
       } catch (error) {
-        set({ startupError: `插话失败：${error instanceof Error ? error.message : String(error)}` });
+        set({ startupError: `插话失败：${errorText(error)}` });
         return false;
       }
     },
 
     removeQueuedPrompt(sessionId, queueId) {
       const queue = get().promptQueues[sessionId] ?? [];
-      set({ promptQueues: { ...get().promptQueues, [sessionId]: queue.filter((item) => item.id !== queueId) } });
+      if (queue.some((item) => item.id === queueId && item.state === "sending")) return;
+      const promptQueues = { ...get().promptQueues, [sessionId]: queue.filter((item) => item.id !== queueId) };
+      set({ promptQueues });
+      savePromptQueues(promptQueues);
     },
 
     updateQueuedPrompt(sessionId, queueId, text) {
       const queue = get().promptQueues[sessionId] ?? [];
-      set({
-        promptQueues: {
+      if (queue.some((item) => item.id === queueId && item.state === "sending")) return;
+      const promptQueues = {
           ...get().promptQueues,
           [sessionId]: queue.map((item) => item.id === queueId ? { ...item, text } : item),
-        },
-      });
+      };
+      set({ promptQueues });
+      savePromptQueues(promptQueues);
     },
 
     moveQueuedPrompt(sessionId, queueId, direction) {
       const queue = get().promptQueues[sessionId] ?? [];
+      if (queue.some((item) => item.id === queueId && item.state === "sending")) return;
       const index = queue.findIndex((item) => item.id === queueId);
-      set({ promptQueues: { ...get().promptQueues, [sessionId]: moveQueueEntry(queue, index, direction) } });
+      if (queue[index + direction]?.state === "sending") return;
+      const promptQueues = { ...get().promptQueues, [sessionId]: moveQueueEntry(queue, index, direction) };
+      set({ promptQueues });
+      savePromptQueues(promptQueues);
     },
 
     moveQueuedAttachment(sessionId, queueId, attachmentId, direction) {
       const queue = get().promptQueues[sessionId] ?? [];
-      set({
-        promptQueues: {
+      if (queue.some((item) => item.id === queueId && item.state === "sending")) return;
+      const promptQueues = {
           ...get().promptQueues,
           [sessionId]: queue.map((item) => {
             if (item.id !== queueId) return item;
             const index = item.attachments.findIndex((attachment) => attachment.id === attachmentId);
             return { ...item, attachments: moveQueueEntry(item.attachments, index, direction) };
           }),
-        },
+      };
+      set({ promptQueues });
+      savePromptQueues(promptQueues);
+    },
+
+    resumePromptQueue(sessionId) {
+      const id = sessionId ?? get().activeId;
+      if (!id) return;
+      suppressedQueueDrain.delete(id);
+      set({
+        queueDrainParked: nextQueueDrainParked(get().queueDrainParked, id, false),
       });
+      window.setTimeout(() => drainPromptQueue(id), 0);
     },
 
     clearPromptQueue(sessionId) {
       const id = sessionId ?? get().activeId;
       if (!id) return;
       suppressedQueueDrain.delete(id);
-      set({ promptQueues: { ...get().promptQueues, [id]: [] } });
+      const sending = (get().promptQueues[id] ?? []).filter((item) => item.state === "sending");
+      const promptQueues = { ...get().promptQueues, [id]: sending };
+      set({
+        promptQueues,
+        queueDrainParked: nextQueueDrainParked(get().queueDrainParked, id, false),
+      });
+      savePromptQueues(promptQueues);
     },
 
     stop() {
-      const { activeId, queueDrainParked, sessions } = get();
+      const { activeId, promptQueues, queueDrainParked, sessions } = get();
       if (activeId) {
-        suppressedQueueDrain.add(activeId);
-        set({ queueDrainParked: nextQueueDrainParked(queueDrainParked, activeId, true) });
+        const hasQueuedPrompts = (promptQueues[activeId] ?? []).length > 0;
+        if (hasQueuedPrompts) suppressedQueueDrain.add(activeId);
+        else suppressedQueueDrain.delete(activeId);
+        userStoppedSessions.add(activeId);
+        set({ queueDrainParked: nextQueueDrainParked(queueDrainParked, activeId, hasQueuedPrompts) });
         bridge.cancel(activeId);
         const session = sessions[activeId];
-        if (session && promptReturnedSessions.has(activeId)) {
+        if (session) {
+          const returned = promptReturnedSessions.has(activeId);
           set({
             sessions: {
               ...get().sessions,
               [activeId]: {
                 ...session,
-                status: "idle",
+                status: returned ? "idle" : "stopping",
                 updatedAt: Date.now(),
-                blocks: settleLiveProcessBlocks(session.blocks),
+                blocks: returned ? settleLiveProcessBlocks(session.blocks) : session.blocks,
               },
             },
           });
         }
-        markPromptInFlight(activeId);
       }
     },
 
@@ -2796,10 +3623,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
     async executeRewind(point, mode) {
       const { activeId, sessions, sessionComposers } = get();
       if (!activeId || !sessions[activeId] || !isSessionTerminal(sessions[activeId].status)) throw new Error("请等待当前请求完成后再回退");
-      // Rewind results can contain server-side workflow reminders instead of
-      // the user's old prompt. A rewind must preserve the unsent composer as
-      // it was (including an intentionally empty composer), never turn that
-      // protocol text into a draft the user appears to have written.
+      // 用户已经写下的草稿优先于回退结果；没有未发送草稿时则恢复官方
+      // rewind 返回的原始 prompt。不能只清掉分支却留下空输入框，否则
+      // “回退并编辑”会造成用户可见的请求丢失。
       const draftBeforeRewind = sessionComposers[activeId]?.text ?? "";
       const result = await bridge.rewind(activeId, point.prompt_index, mode, true);
       if (!result.success) {
@@ -2835,7 +3661,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
       // which can resurrect the branch we just removed. Keep the atomically
       // pruned local snapshot as the visible source of truth instead.
       if (mode === "files_only") await bridge.loadSession(activeId);
-      if (mode !== "files_only") get().setDraft(draftBeforeRewind);
+      if (mode !== "files_only") {
+        get().setDraft(draftBeforeRewind || result.prompt_text?.trim() || point.prompt_preview || "");
+      }
       return result;
     },
 
@@ -2892,49 +3720,60 @@ export const useDesktop = create<DesktopState>((set, get) => {
       persistSessionComposers(next);
       set({ mode, sessionComposers: next });
       void bridge.setSessionMode(activeId, mode).catch((error) => {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
+        set({ startupError: errorText(error) });
       });
     },
     setPermissionMode: (permissionMode) => {
-      const { activeId, sessionComposers, model, effort, mode, computerUseEnabled } = get();
-      if (permissionMode === "bypass") {
-        const zh = document.documentElement.lang.startsWith("zh");
-        const confirmed = window.confirm(
-          zh
-            ? "Bypass/YOLO 会跳过工具审批，仅应在完全可信环境使用。确定启用？"
-            : "Bypass/YOLO skips tool approvals. Use only in fully trusted environments. Enable?",
-        );
-        if (!confirmed) return;
-        if (computerUseEnabled) {
-          bridge.setComputerUseEnabled(false);
-          set({ computerUseEnabled: false });
+      const targetSessionId = get().activeId;
+      void enqueueHostPrefsMutation(async () => {
+        try {
+          const prefs = await invoke<HostPrefsProjection>("host_prefs_set_permission_mode", { mode: permissionMode });
+          applyHostPrefs(prefs, targetSessionId);
+        } catch (cause) {
+          publishRuntimeError(cause, {
+            domain: "environment",
+            code: "HOST_PREFS_WRITE_FAILED",
+            message: "权限模式未能保存到 Host",
+            recoverable: true,
+            action: "检查应用数据目录后重试；当前权限不会扩大",
+          });
         }
-      }
-      localStorage.setItem("grok.permissionMode", permissionMode);
-      void invoke("host_prefs_set_permission_mode", { mode: permissionMode }).catch(() => {});
-      bridge.setPermissionMode(permissionMode);
-      if (!activeId) return set({ permissionMode });
-      const current = sessionComposers[activeId] ?? { text: "", attachments: [], model, effort, mode, permissionMode };
-      const next = { ...sessionComposers, [activeId]: { ...current, permissionMode } };
-      persistSessionComposers(next);
-      set({ permissionMode, sessionComposers: next });
+      });
     },
     setComputerUseEnabled(enabled) {
-      const { permissionMode } = get();
-      if (enabled && permissionMode === "bypass") {
-        localStorage.setItem("grok.permissionMode", "default");
-        bridge.setPermissionMode("default");
-        void invoke("host_prefs_set_permission_mode", { mode: "default" }).catch(() => {});
-        set({ permissionMode: "default" });
-      }
-      setComputerUseOperatorEnabled(enabled);
-      void invoke("host_prefs_set_computer_use", { enabled }).catch(() => {});
-      bridge.setComputerUseEnabled(enabled);
-      set({ computerUseEnabled: isComputerUseOperatorEnabled() });
+      const targetSessionId = get().activeId;
+      void enqueueHostPrefsMutation(async () => {
+        const previousHostMode = readStoredPermissionMode(localStorage.getItem("grok.permissionMode"));
+        try {
+          const prefs = await invoke<HostPrefsProjection>("host_prefs_set_computer_use", { enabled });
+          applyHostPrefs(prefs, targetSessionId, prefs.permissionMode !== previousHostMode);
+        } catch (cause) {
+          publishRuntimeError(cause, {
+            domain: "environment",
+            code: "HOST_PREFS_WRITE_FAILED",
+            message: "Computer Use 设置未能保存到 Host",
+            recoverable: true,
+            action: "检查应用数据目录后重试；Host 不会采用未保存的设置",
+          });
+        }
+      });
     },
     setBrowserUseEnabled(enabled) {
-      bridge.setBrowserUseEnabled(enabled);
-      set({ browserUseEnabled: enabled });
+      const targetSessionId = get().activeId;
+      void enqueueHostPrefsMutation(async () => {
+        try {
+          const prefs = await invoke<HostPrefsProjection>("host_prefs_set_browser_use", { enabled });
+          applyHostPrefs(prefs, targetSessionId, false);
+        } catch (cause) {
+          publishRuntimeError(cause, {
+            domain: "environment",
+            code: "HOST_PREFS_WRITE_FAILED",
+            message: "Browser Use 设置未能保存到 Host",
+            recoverable: true,
+            action: "检查应用数据目录后重试；Host 不会采用未保存的设置",
+          });
+        }
+      });
     },
     setDraft(text) {
       const { activeId, sessionComposers, model, effort, mode, permissionMode, sessions, workspace } = get();
@@ -2947,7 +3786,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const session = sessions[activeId];
       const cwd = session?.cwd || workspace;
       if (isDraftSessionId(activeId) || !session || isSessionTerminal(session.status)) {
-        saveDraftBuffer(cwd, text, current.attachments);
+        void saveDraftBuffer(cwd, text, current.attachments).catch(() => {});
       }
     },
     setComposerAttachments(attachments) {
@@ -2959,12 +3798,12 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const session = sessions[activeId];
       const cwd = session?.cwd || workspace;
       if (isDraftSessionId(activeId) || !session || isSessionTerminal(session.status)) {
-        saveDraftBuffer(cwd, current.text, attachments);
+        void saveDraftBuffer(cwd, current.text, attachments).catch(() => {});
       }
     },
     flushDurableState() {
       const state = get();
-      flushAllPendingSessionCaches(state.sessions);
+      flushAllPendingSessionJournals(state.sessions);
       if (catalogPersistTimer !== undefined) {
         window.clearTimeout(catalogPersistTimer);
         catalogPersistTimer = undefined;
@@ -2992,14 +3831,19 @@ export const useDesktop = create<DesktopState>((set, get) => {
         const attachments = composer?.attachments ?? [];
         const cwd = state.sessions[activeId]?.cwd || state.workspace;
         if (isDraftSessionId(activeId) || isSessionTerminal(state.sessions[activeId]?.status ?? "idle")) {
-          saveDraftBuffer(cwd, text, attachments);
+          void saveDraftBuffer(cwd, text, attachments).catch(() => {});
         }
       }
+      flushDraftPersistence();
     },
-    setInspectorTab: (inspectorTab) => set({ inspectorTab, inspectorOpen: true }),
-    setPlanPreviewOpen: (planPreviewOpen) => set({ planPreviewOpen, ...(planPreviewOpen ? { previewOpen: false } : {}) }),
-    toggleInspector: () => set((s) => ({ inspectorOpen: !s.inspectorOpen })),
-    toggleTerminal: () => set((s) => ({ terminalOpen: !s.terminalOpen })),
+    setInspectorTab: (inspectorTab) => set({ inspectorTab, inspectorOpen: true, terminalOpen: false, previewOpen: false, planPreviewOpen: false }),
+    setPlanPreviewOpen: (planPreviewOpen) => set({ planPreviewOpen, ...(planPreviewOpen ? { previewOpen: false, inspectorOpen: false, terminalOpen: false } : {}) }),
+    toggleInspector: () => set((state) => state.inspectorOpen
+      ? { inspectorOpen: false }
+      : { inspectorOpen: true, terminalOpen: false, previewOpen: false, planPreviewOpen: false }),
+    toggleTerminal: () => set((state) => state.terminalOpen
+      ? { terminalOpen: false }
+      : { terminalOpen: true, inspectorOpen: false, previewOpen: false, planPreviewOpen: false }),
     setPaletteOpen: (paletteOpen) => set({ paletteOpen }),
     setSettingsOpen: (settingsOpen) => set({ settingsOpen }),
     async refreshHistory() {
@@ -3021,7 +3865,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         } catch (error) {
           set({
             historySyncing: false,
-            historyError: error instanceof Error ? error.message : String(error),
+            historyError: errorText(error),
           });
         }
       })();

@@ -120,6 +120,8 @@ export class MockBridge implements GrokBridge {
     return this.workspace;
   }
 
+  invalidateWorkspaceSelection(): void {}
+
   async setWorkspace(cwd: string): Promise<void> {
     this.workspace = cwd;
   }
@@ -129,6 +131,8 @@ export class MockBridge implements GrokBridge {
   }
 
   async authenticate(): Promise<void> {}
+
+  async cancelAuthentication(): Promise<void> {}
 
   async logout(): Promise<void> {}
 
@@ -152,7 +156,7 @@ export class MockBridge implements GrokBridge {
   }
 
   async getProviderStatus() {
-    return { kind: "oauth" as const, hasApiKey: false };
+    return { kind: "oauth" as const, hasApiKey: false, secretBackend: "missing" as const };
   }
 
   async configureProvider(_config: ProviderConfig): Promise<void> {}
@@ -170,6 +174,7 @@ export class MockBridge implements GrokBridge {
       name: config.name,
       apiKey: "",
       hasApiKey: Boolean(config.apiKey?.trim()) || Boolean(existing?.hasApiKey),
+      secretBackend: config.apiKey?.trim() ? "keychain" : (existing?.secretBackend ?? "missing"),
       baseUrl: config.baseUrl,
       allowInsecureHttp: config.allowInsecureHttp,
       apiBackend: config.apiBackend,
@@ -208,7 +213,7 @@ export class MockBridge implements GrokBridge {
     ].map((document) => ({ ...document, content: this.configDrafts[document.id as ConfigDocument["id"]], exists: true })) as ConfigDocument[];
   }
 
-  async writeConfigDocument(document: ConfigDocument): Promise<ConfigDocument> {
+  async writeConfigDocument(document: ConfigDocument, _cwd: string): Promise<ConfigDocument> {
     this.configDrafts[document.id] = document.content;
     return { ...document, exists: true };
   }
@@ -252,6 +257,63 @@ export class MockBridge implements GrokBridge {
   }
 
   async newSession(cwd: string): Promise<void> {
+    await this.createSession(cwd, false);
+  }
+
+  async newBackgroundSession(cwd: string): Promise<string> {
+    return this.createSession(cwd, true);
+  }
+
+  async forkSession(sessionId: string, cwd: string, _title?: string) {
+    const source = this.sessions.get(sessionId);
+    if (!source) throw new Error(`找不到会话：${sessionId}`);
+    const now = Date.now();
+    const nextId = uid();
+    this.sessions.set(nextId, {
+      ...structuredClone(source),
+      id: nextId,
+      cwd,
+      parentId: sessionId,
+      createdAt: now,
+      updatedAt: now,
+      status: "idle",
+    });
+    return {
+      sessionId: nextId,
+      parentSessionId: sessionId,
+      cwd,
+      chatMessagesCopied: source.blocks.length,
+      updatesCopied: 0,
+    };
+  }
+
+  async forkSessionInNewWorktree(sessionId: string, cwd: string) {
+    const source = this.sessions.get(sessionId);
+    if (!source) throw new Error(`找不到会话：${sessionId}`);
+    const now = Date.now();
+    const nextId = uid();
+    const worktree = `${cwd.replace(/[\\/]$/, "")}-worktree-${nextId.slice(0, 8)}`;
+    this.sessions.set(nextId, {
+      ...structuredClone(source),
+      id: nextId,
+      cwd: worktree,
+      parentId: sessionId,
+      createdAt: now,
+      updatedAt: now,
+      status: "idle",
+    });
+    return {
+      sessionId: nextId,
+      parentSessionId: sessionId,
+      cwd: worktree,
+      worktreePath: worktree,
+      branch: `grox/worktree-${nextId.slice(0, 8)}`,
+      chatMessagesCopied: source.blocks.length,
+      updatesCopied: 0,
+    };
+  }
+
+  private async createSession(cwd: string, background: boolean): Promise<string> {
     const now = Date.now();
     const session: Session = {
       id: uid(),
@@ -265,7 +327,8 @@ export class MockBridge implements GrokBridge {
       status: "idle",
     };
     this.sessions.set(session.id, session);
-    this.emit({ type: "session_ready", session });
+    this.emit({ type: "session_ready", session, background });
+    return session.id;
   }
 
   async loadSession(id: string, options?: { background?: boolean }): Promise<void> {
@@ -425,7 +488,18 @@ export class MockBridge implements GrokBridge {
     this.runTurn(sessionId, text, firstTurn, ac.signal)
       .catch((err) => {
         if ((err as DOMException)?.name !== "AbortError") {
-          this.emit({ type: "error", sessionId, message: String(err) });
+          this.emit({
+            type: "error",
+            sessionId,
+            error: {
+              domain: "operation",
+              code: "MOCK_PROMPT_FAILED",
+              message: String(err),
+              recoverable: true,
+              fatal: true,
+              holdQueue: true,
+            },
+          });
         }
       })
       .finally(() => {

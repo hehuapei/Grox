@@ -74,6 +74,14 @@ export interface TerminalIO {
   exitCode?: number;
 }
 
+export interface ToolImage {
+  mime: string;
+  /** 仅存在于当前运行内；journal 不保存大体积 base64。 */
+  data?: string;
+  /** Host 管理的内容寻址文件，可在重启后恢复。 */
+  path?: string;
+}
+
 export interface ToolCall {
   id: string;
   kind: ToolKind;
@@ -92,7 +100,7 @@ export interface ToolCall {
   diff?: DiffHunk[];
   terminal?: TerminalIO;
   locations?: string[];
-  images?: { mime: string; data: string }[];
+  images?: ToolImage[];
 }
 
 export type PlanStepStatus = "pending" | "in_progress" | "completed";
@@ -249,10 +257,39 @@ export interface Usage {
   turns: number;
 }
 
-export type SessionStatus = "idle" | "running" | "awaiting_permission" | "awaiting_input" | "failed";
+export type SessionStatus =
+  | "connecting"
+  | "idle"
+  | "running"
+  | "awaiting_permission"
+  | "awaiting_input"
+  | "stopping"
+  | "cancelled"
+  | "disconnected"
+  | "failed";
 
-/** A terminal turn accepts a new prompt; `failed` remains visible until then. */
-export const isSessionTerminal = (status: SessionStatus) => status === "idle" || status === "failed";
+/** A terminal turn accepts a new prompt; failure/cancellation remain visible until then. */
+export const isSessionTerminal = (status: SessionStatus) => status === "idle" || status === "failed" || status === "cancelled";
+
+/** ACP 进程连接状态。它与单个会话的一轮是否结束是两条独立事实。 */
+export type RuntimeConnectionState = "starting" | "ready" | "reconnecting" | "offline";
+
+export type GroxErrorDomain = "protocol" | "operation" | "environment";
+
+/**
+ * 进入 UI 的稳定错误契约。`message` 面向用户，协议/环境细节留在 `detail`，
+ * 避免把所有失败都伪装成同一种“连接错误”。
+ */
+export interface GroxError {
+  domain: GroxErrorDomain;
+  code: string;
+  message: string;
+  recoverable: boolean;
+  fatal: boolean;
+  holdQueue: boolean;
+  action?: string;
+  detail?: string;
+}
 
 export interface SessionMeta {
   id: string;
@@ -272,6 +309,24 @@ export interface SessionMeta {
   demo?: boolean;
   pinned?: boolean;
   archived?: boolean;
+}
+
+export interface WorktreeForkResult {
+  sessionId: string;
+  parentSessionId: string;
+  cwd: string;
+  worktreePath: string;
+  branch: string;
+  chatMessagesCopied?: number;
+  updatesCopied?: number;
+}
+
+export interface SessionForkResult {
+  sessionId: string;
+  parentSessionId: string;
+  cwd: string;
+  chatMessagesCopied?: number;
+  updatesCopied?: number;
 }
 
 export interface Session extends SessionMeta {
@@ -330,6 +385,7 @@ export interface BillingInfo {
 
 export type ProviderKind = "oauth" | "official" | "compatible";
 export type ProviderApiBackend = "auto" | "responses" | "chat_completions";
+export type SecretBackendKind = "keychain" | "private_file" | "legacy_file" | "missing";
 
 export interface ProviderConfig {
   kind: ProviderKind;
@@ -340,6 +396,7 @@ export interface ProviderConfig {
 export interface ProviderStatus {
   kind: ProviderKind;
   hasApiKey: boolean;
+  secretBackend: SecretBackendKind;
   baseUrl?: string;
 }
 
@@ -349,6 +406,7 @@ export interface ProviderProfileSummary {
   /** Always empty from the native layer; use hasApiKey + blank-to-keep on save. */
   apiKey: string;
   hasApiKey: boolean;
+  secretBackend: SecretBackendKind;
   baseUrl: string;
   allowInsecureHttp: boolean;
   apiBackend: ProviderApiBackend;
@@ -441,7 +499,7 @@ export interface ConfigDocument {
 export interface PreviewFile {
   path: string;
   name: string;
-  kind: "markdown" | "html" | "image" | "text";
+  kind: "markdown" | "html" | "image" | "video" | "audio" | "pdf" | "text";
   mime: string;
   content: string;
   url?: string;
@@ -472,9 +530,71 @@ export const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type Effort = (typeof EFFORTS)[number];
 export type PermissionMode = "default" | "auto" | "bypass";
 
+/** 共享 ACP 进程的实时协议占用；不是物理进程池容量。 */
+export interface RuntimeOccupancy {
+  activeTurnSessionIds: string[];
+  lifecycleActive: boolean;
+  pendingLifecycle: number;
+}
+
+export interface AutomationSessionStarted {
+  automationId: string;
+  source: "scheduled" | "run_now";
+  claimedAt: number;
+  sessionId: string;
+  automation: {
+    id: string;
+    title: string;
+    prompt: string;
+    cwd: string;
+    model: string;
+    effort: Effort;
+    mode: AgentMode;
+    permissionMode: PermissionMode;
+    frequency: "once" | "daily" | "weekdays" | "weekly";
+    time: string;
+    weekday?: number;
+    enabled: boolean;
+    nextRunAt: number;
+    lastRunAt?: number;
+    lastSessionId?: string;
+    lastError?: string;
+  };
+  warnings: GroxError[];
+}
+
+export interface AutomationRunnerStatus {
+  checkedAt: number | null;
+  runtimeReady: boolean;
+  runtimeBusy: boolean;
+  activeAutomationId?: string | null;
+  activeSession?: AutomationSessionStarted | null;
+}
+
+export interface AutomationSessionSettled {
+  automationId: string;
+  source: "scheduled" | "run_now";
+  claimedAt: number;
+  sessionId?: string | null;
+  model?: string | null;
+  mode?: AgentMode | null;
+  requestedEffort?: Effort | null;
+  effectiveEffort?: Effort | null;
+  usage?: Record<string, unknown> | null;
+  automation?: AutomationSessionStarted["automation"] | null;
+  error?: GroxError | null;
+}
+
 /** Events a bridge pushes into the store. Wire-level naming kept close to ACP. */
 export type BridgeEvent =
   | { type: "auth_state"; state: AuthState }
+  | { type: "runtime_state"; state: RuntimeConnectionState }
+  | { type: "runtime_occupancy"; occupancy: RuntimeOccupancy }
+  | { type: "session_journal_checkpoint"; sessionId: string; streamId: string; sequence: number }
+  | { type: "prompt_queue_changed"; sessionId: string; itemId: string; queue: unknown[]; reason: "claimed" | "consumed" | "recovered" }
+  | { type: "automation_session_started"; started: AutomationSessionStarted }
+  | { type: "automation_session_settled"; settled: AutomationSessionSettled }
+  | { type: "automation_runner_tick"; status: AutomationRunnerStatus }
   | { type: "model_state"; state: ModelState }
   | { type: "mode_state"; sessionId: string; mode: AgentMode }
   | { type: "available_commands"; sessionId: string; commands: SlashCommand[] }
@@ -488,6 +608,7 @@ export type BridgeEvent =
   | { type: "plan_patch"; sessionId: string; blockId: string; steps: PlanStep[] }
   | { type: "assistant_append"; sessionId: string; blockId: string; delta: string }
   | { type: "thinking_append"; sessionId: string; blockId: string; delta: string }
+  | { type: "user_append"; sessionId: string; blockId: string; delta: string }
   | { type: "permission_request"; sessionId: string; blockId: string; req: PermissionRequest }
   | { type: "permission_resolved"; sessionId: string; blockId: string; option: PermissionOption }
   | { type: "question_request"; sessionId: string; blockId: string; req: QuestionRequest }
@@ -495,7 +616,7 @@ export type BridgeEvent =
   | { type: "status"; sessionId: string; status: SessionStatus }
   | { type: "usage"; sessionId: string; usage: Usage }
   | { type: "runtime_notice"; notice: RuntimeNotice }
-  | { type: "error"; sessionId: string; message: string };
+  | { type: "error"; sessionId: string; error: GroxError };
 
 export interface RuntimeNotice {
   id: string;
@@ -508,5 +629,9 @@ export interface PromptOptions {
   model: string;
   effort: Effort;
   mode: AgentMode;
+  /** 随这一轮发送，避免共享 ACP 进程中的权限模式串到其它会话。 */
+  permissionMode?: PermissionMode;
   attachments?: PromptAttachment[];
+  /** Host 原子领取并派发的持久化队列条目；普通发送不设置。 */
+  queueItemId?: string;
 }

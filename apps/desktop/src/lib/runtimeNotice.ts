@@ -58,6 +58,11 @@ export function cleanApiError(value: unknown): string {
       const message = cleanApiError(candidate);
       if (message && message !== "[object Object]") return message;
     }
+    for (const [label, candidate] of [["code", object.code], ["status", object.status], ["name", object.name]] as const) {
+      if (typeof candidate === "string" && candidate.trim()) return `${label}: ${candidate.trim()}`;
+      if (typeof candidate === "number" && Number.isFinite(candidate)) return `${label}: ${candidate}`;
+    }
+    return "未知错误";
   }
   return value == null ? "未知错误" : String(value);
 }

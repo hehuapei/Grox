@@ -50,7 +50,7 @@ export function deadSessionCopy(language: "zh-CN" | "en", sessionId: string): {
       title: "此会话已失效",
       body: "当前 Grok CLI 中已找不到对应任务，本机缓存与磁盘历史也没有可恢复的正文。侧栏条目可能是旧目录残留。",
       detail: `会话 ID：${sessionId}`,
-      remove: "从侧栏移除",
+      remove: "删除失效记录",
       home: "返回首页",
     };
   }
@@ -58,7 +58,7 @@ export function deadSessionCopy(language: "zh-CN" | "en", sessionId: string): {
     title: "Session no longer available",
     body: "The active Grok CLI no longer lists this mission, and no local cache or on-disk history could be restored. The sidebar row is likely a stale catalog entry.",
     detail: `Session ID: ${sessionId}`,
-    remove: "Remove from sidebar",
+    remove: "Delete unavailable record",
     home: "Back to home",
   };
 }
