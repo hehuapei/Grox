@@ -16,6 +16,8 @@ export function WorkbenchPanel() {
   const zh = language === "zh-CN";
   const [tab, setTab] = useState<Tab>("terminal");
   const [draft, setDraft] = useState("");
+  const [launching, setLaunching] = useState(false);
+  const [launchError, setLaunchError] = useState("");
   const toggleTerminal = useDesktop((state) => state.toggleTerminal);
   const activeId = useDesktop((state) => state.activeId);
   const session = useDesktop((state) => (state.activeId ? state.sessions[state.activeId] : null));
@@ -26,16 +28,25 @@ export function WorkbenchPanel() {
   const width = usePreferences((state) => state.inspectorWidth);
   const setWidth = usePreferences((state) => state.setInspectorWidth);
 
-  const launchSide = () => {
+  const launchSide = async () => {
     const text = draft.trim();
-    if (!text) return;
+    if (!text || launching) return;
     const context = session
       ? (zh
           ? `【并行侧任务】主会话 ${session.title} 仍在进行。请独立完成：\n${text}`
           : `[Side agent] Main mission "${session.title}" continues in parallel. Complete independently:\n${text}`)
       : text;
-    setDraft("");
-    void newSession({ text: context });
+    setLaunching(true);
+    setLaunchError("");
+    try {
+      await newSession({ text: context });
+      setDraft("");
+    } catch (cause) {
+      // 创建失败必须保留用户输入，否则一次运行时故障就会让侧任务草稿消失。
+      setLaunchError(cause instanceof Error ? cause.message : String(cause));
+    } finally {
+      setLaunching(false);
+    }
   };
 
   return (
@@ -45,6 +56,8 @@ export function WorkbenchPanel() {
       <div className="flex h-11 shrink-0 items-center gap-1 border-b border-line bg-panel px-2">
         <button
           onClick={() => setTab("terminal")}
+          role="tab"
+          aria-selected={tab === "terminal"}
           className={`flex h-8 items-center gap-1.5 rounded-full px-3 text-[12px] ${tab === "terminal" ? "bg-high text-fg" : "text-dim hover:text-fg2"}`}
         >
           <Icon name="terminal" size={11} />
@@ -52,6 +65,8 @@ export function WorkbenchPanel() {
         </button>
         <button
           onClick={() => setTab("side")}
+          role="tab"
+          aria-selected={tab === "side"}
           className={`flex h-8 items-center gap-1.5 rounded-full px-3 text-[12px] ${tab === "side" ? "bg-high text-fg" : "text-dim hover:text-fg2"}`}
         >
           <Icon name="layers" size={11} />
@@ -63,6 +78,7 @@ export function WorkbenchPanel() {
           onClick={toggleTerminal}
           className="flex h-6 w-6 items-center justify-center text-dim hover:bg-high hover:text-fg"
           title={zh ? "关闭工作台" : "Close workbench"}
+          aria-label={zh ? "关闭工作台" : "Close workbench"}
         >
           <Icon name="x" size={10} />
         </button>
@@ -84,19 +100,21 @@ export function WorkbenchPanel() {
             onChange={(event) => setDraft(event.target.value)}
             rows={4}
             placeholder={zh ? "描述侧任务…" : "Describe the side task…"}
+            aria-label={zh ? "并行侧任务描述" : "Parallel task description"}
             className="min-h-[160px] flex-1 resize-none rounded-[12px] border border-line2 bg-raise px-3 py-3 text-[13px] leading-relaxed text-fg outline-none placeholder:text-faint focus:border-line3"
           />
+          {launchError && <p role="alert" className="text-[10.5px] leading-relaxed text-red">{launchError}</p>}
           <div className="flex items-center justify-between">
             <span className="text-[11px] text-faint">
               {activeId ? (zh ? "基于当前任务" : "From current task") : (zh ? "独立任务" : "Independent task")}
             </span>
             <button
-              disabled={!draft.trim()}
-              onClick={launchSide}
+              disabled={!draft.trim() || launching}
+              onClick={() => void launchSide()}
               className="flex h-9 items-center gap-1.5 rounded-full bg-acc px-4 text-[12px] font-medium text-base disabled:opacity-35"
             >
               <Icon name="play" size={11} />
-              {zh ? "开始并行任务" : "Start task"}
+              {launching ? (zh ? "正在创建" : "Creating") : (zh ? "开始并行任务" : "Start task")}
             </button>
           </div>
         </div>

@@ -8,6 +8,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { bridge } from "../bridge";
 import { EFFORTS, isSessionTerminal, MODELS } from "../bridge/types";
 import { notifyDesktop } from "../lib/notify";
+import { createSerialMutationQueue } from "../lib/serialMutationQueue";
 import type {
   AgentMode,
   AccountInfo,
@@ -411,6 +412,9 @@ let pendingComposerStates: Record<string, SessionComposerState> | undefined;
 let workflowPersistTimer: number | undefined;
 let pendingWorkflowRuns: Record<string, WorkflowRun[]> | undefined;
 let historySyncPromise: Promise<void> | undefined;
+// 文件预览是可重入入口：快速点击 A→B 或关闭面板时，较慢的旧请求不能
+// 覆盖新文件，也不能在关闭后重新写入错误/内容。
+let previewRequestGeneration = 0;
 let viewNavigation: ViewNavigationIntent = { generation: 0, sessionId: null };
 let pendingForegroundNavigation: ViewNavigationIntent | null = null;
 
@@ -790,6 +794,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
   const errorText = (cause: unknown) => cleanApiError(cause);
   const formattedError = (cause: unknown, fallback: ErrorFallback) =>
     formatGroxError(toGroxError(cause, fallback));
+  // Host 偏好属于同一份权威快照。把三类写入按点击顺序提交，避免并发
+  // IPC 以不同顺序取得 Host mutex，最终状态背离最后一次用户选择。
+  const enqueueHostPrefsMutation = createSerialMutationQueue();
 
   const publishRuntimeError = (cause: unknown, fallback: ErrorFallback) => {
     const notice = runtimeNoticeFromError(toGroxError(cause, fallback));
@@ -2146,7 +2153,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
             }
 
             if (open) void get().openSession(open);
-            else if (prompt) void get().newSession({ text: prompt });
+            else if (prompt) void get().newSession({ text: prompt }).catch(() => {});
           } catch (error) {
             set({
               ready: true,
@@ -2528,6 +2535,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
           view: restored.view,
           startupError: errorText(error),
         });
+        // 调用方（首页、并行任务面板）只有收到拒绝，才能保留自己的输入
+        // 和附件。store 已恢复草稿壳并呈现错误，fire-and-forget 入口会
+        // 显式吞掉这个已处理的拒绝。
+        throw error;
       }
     },
 
@@ -3092,21 +3103,26 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async openPreview(path) {
+      const generation = ++previewRequestGeneration;
+      const cwd = get().workspace;
       set({ previewOpen: true, planPreviewOpen: false, inspectorOpen: false, terminalOpen: false, previewLoading: true, previewError: null });
       try {
         let previewFile = await invoke<PreviewFile>("read_preview_file", {
-          cwd: get().workspace,
+          cwd,
           path,
         });
+        if (generation !== previewRequestGeneration) return;
         if (["html", "image", "video", "audio", "pdf"].includes(previewFile.kind)) {
           const url = await invoke<string>("start_file_preview", {
-            cwd: get().workspace,
+            cwd,
             path,
           });
+          if (generation !== previewRequestGeneration) return;
           previewFile = { ...previewFile, url };
         }
         set({ previewFile, previewLoading: false });
       } catch (error) {
+        if (generation !== previewRequestGeneration) return;
         set({
           previewFile: null,
           previewLoading: false,
@@ -3115,7 +3131,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
       }
     },
 
-    closePreview: () => set({ previewOpen: false, previewFile: null, previewError: null }),
+    closePreview: () => {
+      previewRequestGeneration += 1;
+      set({ previewOpen: false, previewLoading: false, previewFile: null, previewError: null });
+    },
 
     async deleteSession(id) {
       markPromptInFlight(id);
@@ -3309,7 +3328,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           mode: modeOverride ?? composer.mode,
           permissionMode: composer.permissionMode,
         });
-        void get().newSession({ text: trimmed, attachments });
+        void get().newSession({ text: trimmed, attachments }).catch(() => {});
         return true;
       }
       if (!sessionAcceptsNewPrimaryPrompt({ status: session.status, blocks: session.blocks })) {
@@ -3581,10 +3600,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
     async executeRewind(point, mode) {
       const { activeId, sessions, sessionComposers } = get();
       if (!activeId || !sessions[activeId] || !isSessionTerminal(sessions[activeId].status)) throw new Error("请等待当前请求完成后再回退");
-      // Rewind results can contain server-side workflow reminders instead of
-      // the user's old prompt. A rewind must preserve the unsent composer as
-      // it was (including an intentionally empty composer), never turn that
-      // protocol text into a draft the user appears to have written.
+      // 用户已经写下的草稿优先于回退结果；没有未发送草稿时则恢复官方
+      // rewind 返回的原始 prompt。不能只清掉分支却留下空输入框，否则
+      // “回退并编辑”会造成用户可见的请求丢失。
       const draftBeforeRewind = sessionComposers[activeId]?.text ?? "";
       const result = await bridge.rewind(activeId, point.prompt_index, mode, true);
       if (!result.success) {
@@ -3620,7 +3638,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
       // which can resurrect the branch we just removed. Keep the atomically
       // pruned local snapshot as the visible source of truth instead.
       if (mode === "files_only") await bridge.loadSession(activeId);
-      if (mode !== "files_only") get().setDraft(draftBeforeRewind);
+      if (mode !== "files_only") {
+        get().setDraft(draftBeforeRewind || result.prompt_text?.trim() || point.prompt_preview || "");
+      }
       return result;
     },
 
@@ -3682,9 +3702,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
     setPermissionMode: (permissionMode) => {
       const targetSessionId = get().activeId;
-      void invoke<HostPrefsProjection>("host_prefs_set_permission_mode", { mode: permissionMode })
-        .then((prefs) => applyHostPrefs(prefs, targetSessionId))
-        .catch((cause) => {
+      void enqueueHostPrefsMutation(async () => {
+        try {
+          const prefs = await invoke<HostPrefsProjection>("host_prefs_set_permission_mode", { mode: permissionMode });
+          applyHostPrefs(prefs, targetSessionId);
+        } catch (cause) {
           publishRuntimeError(cause, {
             domain: "environment",
             code: "HOST_PREFS_WRITE_FAILED",
@@ -3692,18 +3714,17 @@ export const useDesktop = create<DesktopState>((set, get) => {
             recoverable: true,
             action: "检查应用数据目录后重试；当前权限不会扩大",
           });
-        });
+        }
+      });
     },
     setComputerUseEnabled(enabled) {
       const targetSessionId = get().activeId;
-      const previousHostMode = readStoredPermissionMode(localStorage.getItem("grok.permissionMode"));
-      void invoke<HostPrefsProjection>("host_prefs_set_computer_use", { enabled })
-        .then((prefs) => applyHostPrefs(
-          prefs,
-          targetSessionId,
-          prefs.permissionMode !== previousHostMode,
-        ))
-        .catch((cause) => {
+      void enqueueHostPrefsMutation(async () => {
+        const previousHostMode = readStoredPermissionMode(localStorage.getItem("grok.permissionMode"));
+        try {
+          const prefs = await invoke<HostPrefsProjection>("host_prefs_set_computer_use", { enabled });
+          applyHostPrefs(prefs, targetSessionId, prefs.permissionMode !== previousHostMode);
+        } catch (cause) {
           publishRuntimeError(cause, {
             domain: "environment",
             code: "HOST_PREFS_WRITE_FAILED",
@@ -3711,13 +3732,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
             recoverable: true,
             action: "检查应用数据目录后重试；Host 不会采用未保存的设置",
           });
-        });
+        }
+      });
     },
     setBrowserUseEnabled(enabled) {
       const targetSessionId = get().activeId;
-      void invoke<HostPrefsProjection>("host_prefs_set_browser_use", { enabled })
-        .then((prefs) => applyHostPrefs(prefs, targetSessionId, false))
-        .catch((cause) => {
+      void enqueueHostPrefsMutation(async () => {
+        try {
+          const prefs = await invoke<HostPrefsProjection>("host_prefs_set_browser_use", { enabled });
+          applyHostPrefs(prefs, targetSessionId, false);
+        } catch (cause) {
           publishRuntimeError(cause, {
             domain: "environment",
             code: "HOST_PREFS_WRITE_FAILED",
@@ -3725,7 +3749,8 @@ export const useDesktop = create<DesktopState>((set, get) => {
             recoverable: true,
             action: "检查应用数据目录后重试；Host 不会采用未保存的设置",
           });
-        });
+        }
+      });
     },
     setDraft(text) {
       const { activeId, sessionComposers, model, effort, mode, permissionMode, sessions, workspace } = get();

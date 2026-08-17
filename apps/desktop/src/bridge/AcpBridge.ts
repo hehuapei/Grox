@@ -2335,9 +2335,9 @@ export class AcpBridge implements GrokBridge {
             && (isWorkflowLaunchAcknowledgement(delta) || isWorkflowControlAcknowledgement(delta)))
           || (workflowCompletionContinuation && cancelledWorkflowCompletion)
         ) return;
-        this.liveAssistantSessions.add(sessionId);
         if (hostManaged) {
           if (!hostAssistant) return;
+          this.liveAssistantSessions.add(sessionId);
           this.emit({
             type: "block_add",
             sessionId,
@@ -2358,6 +2358,7 @@ export class AcpBridge implements GrokBridge {
           return;
         }
         if (!cursor) return;
+        this.liveAssistantSessions.add(sessionId);
         this.closeUser(sessionId);
         this.closeThinking(sessionId);
         if (!cursor.assistantId) {
@@ -3397,9 +3398,18 @@ export class AcpBridge implements GrokBridge {
       },
     });
     const now = Date.now();
+    const catalogueTitle = source?.title?.trim();
+    const requestedTitle = title?.trim();
+    const forkTitle = catalogueTitle && catalogueTitle !== "Untitled mission"
+      ? catalogueTitle
+      : requestedTitle || catalogueTitle || "Forked mission";
     this.catalogue.set(result.sessionId, {
       id: result.sessionId,
-      title: source?.title ?? title ?? "Forked mission",
+      // CLI catalogue rows can remain "Untitled mission" even after the UI
+      // has derived a useful title from the first prompt. Prefer that visible
+      // source title so a successful native fork does not look like an empty
+      // or unrelated task in the sidebar.
+      title: forkTitle,
       cwd: result.cwd,
       createdAt: now,
       updatedAt: now,

@@ -77,7 +77,7 @@ export function PlanPreviewPane() {
             </p>
           </div>
           {total > 0 && <span className="tnum text-[9.5px] text-gold">{done}/{total}</span>}
-          <button onClick={() => close(false)} className="flex h-6 w-6 items-center justify-center text-dim hover:text-fg" title={language === "zh-CN" ? "关闭计划预览" : "Close plan preview"}>
+          <button onClick={() => close(false)} className="flex h-6 w-6 items-center justify-center text-dim hover:text-fg" title={language === "zh-CN" ? "关闭计划预览" : "Close plan preview"} aria-label={language === "zh-CN" ? "关闭计划预览" : "Close plan preview"}>
             <Icon name="x" size={12} />
           </button>
         </header>

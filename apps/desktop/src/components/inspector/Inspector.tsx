@@ -20,7 +20,7 @@ import { openFileWithConfiguredApplication } from "../../lib/defaultOpen";
 const EMPTY_WORKFLOWS: WorkflowRun[] = [];
 
 export function Inspector() {
-  const { t } = useI18n();
+  const { t, language } = useI18n();
   const tab = useDesktop((s) => s.inspectorTab);
   const setTab = useDesktop((s) => s.setInspectorTab);
   const session = useDesktop((s) => (s.activeId ? s.sessions[s.activeId] : null));
@@ -38,10 +38,12 @@ export function Inspector() {
     <ResizeHandle side="left" value={width} onChange={setWidth} />
     <aside className="flex shrink-0 flex-col border-l border-line bg-panel" style={{ width }}>
       {/* tab strip */}
-      <div className="flex h-10 shrink-0 items-center gap-1 border-b border-line px-3">
+      <div role="tablist" aria-label={language === "zh-CN" ? "检查器" : "Inspector"} className="flex h-10 shrink-0 items-center gap-1 border-b border-line px-3">
         {tabs.map((t) => (
           <button
             key={t.id}
+            role="tab"
+            aria-selected={tab === t.id}
             onClick={() => setTab(t.id)}
             className={`relative h-full px-2 font-mono text-[10px] tracking-[0.14em] transition-colors ${
               tab === t.id ? "text-fg" : "text-dim hover:text-mute"

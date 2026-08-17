@@ -1455,14 +1455,18 @@ fn workspace_paths_match(left: &str, right: &str) -> bool {
     }
 }
 
-fn collect_session_directory_ids(directory: &Path, depth: usize, ids: &mut BTreeSet<String>) {
-    let Ok(entries) = fs::read_dir(directory) else {
-        return;
-    };
-    for entry in entries.filter_map(Result::ok) {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
+fn collect_session_directory_ids(
+    directory: &Path,
+    depth: usize,
+    ids: &mut BTreeSet<String>,
+) -> Result<(), String> {
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("无法枚举 Grok 会话目录 {}：{error}", directory.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("无法枚举 Grok 会话目录项：{error}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("无法读取 Grok 会话目录项：{error}"))?;
         if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
@@ -1474,30 +1478,36 @@ fn collect_session_directory_ids(directory: &Path, depth: usize, ids: &mut BTree
             continue;
         }
         if depth < 2 {
-            collect_session_directory_ids(&path, depth + 1, ids);
+            collect_session_directory_ids(&path, depth + 1, ids)?;
         }
     }
+    Ok(())
 }
 
-fn delete_project_session_history_data(grok: &Path, cwd: &str) -> Result<Vec<String>, String> {
+fn project_session_history_data(
+    grok: &Path,
+    cwd: &str,
+) -> Result<(Vec<String>, Vec<PathBuf>), String> {
     let wanted = workspace_identity(cwd);
     if wanted.is_empty() {
         return Err("工作目录不能为空".into());
     }
     let sessions = grok.join("sessions");
     if !sessions.is_dir() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let root = sessions
         .canonicalize()
         .map_err(|error| format!("无法读取 Grok 会话目录：{error}"))?;
     let mut ids = BTreeSet::new();
+    let mut directories = Vec::new();
     let entries =
         fs::read_dir(&root).map_err(|error| format!("无法枚举 Grok 会话目录：{error}"))?;
-    for entry in entries.filter_map(Result::ok) {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("无法枚举 Grok 会话目录项：{error}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("无法读取 Grok 会话目录项：{error}"))?;
         if !file_type.is_dir() || file_type.is_symlink() {
             continue;
         }
@@ -1517,11 +1527,20 @@ fn delete_project_session_history_data(grok: &Path, cwd: &str) -> Result<Vec<Str
         if directory.parent() != Some(root.as_path()) {
             return Err("拒绝删除会话根目录之外的路径".into());
         }
-        collect_session_directory_ids(&directory, 0, &mut ids);
+        collect_session_directory_ids(&directory, 0, &mut ids)?;
+        directories.push(directory);
+    }
+    Ok((ids.into_iter().collect(), directories))
+}
+
+#[cfg(test)]
+fn delete_project_session_history_data(grok: &Path, cwd: &str) -> Result<Vec<String>, String> {
+    let (ids, directories) = project_session_history_data(grok, cwd)?;
+    for directory in directories {
         fs::remove_dir_all(&directory)
             .map_err(|error| format!("无法删除项目会话历史 {}：{error}", directory.display()))?;
     }
-    Ok(ids.into_iter().collect())
+    Ok(ids)
 }
 
 fn history_file_in_session_dir(dir: &Path) -> Option<PathBuf> {
@@ -2694,16 +2713,58 @@ fn delete_project_session_data(
     worktrees: tauri::State<'_, WorktreeOwnershipStore>,
     cwd: String,
 ) -> Result<Vec<String>, String> {
-    let ids = delete_project_session_history_data(&grok_home()?, &cwd)?;
+    let (history_ids, directories) = project_session_history_data(&grok_home()?, &cwd)?;
+    let config = app
+        .path()
+        .app_config_dir()
+        .map_err(|error| format!("无法定位应用会话目录：{error}"))?;
+    let mut ids = history_ids.into_iter().collect::<BTreeSet<_>>();
+    // CLI 历史可能已被外部清理，但 Grox journal 仍能在冷启动时恢复侧栏。
+    // 这些孤儿会话必须和 CLI 会话进入同一 tombstone 事务。
+    ids.extend(worktree_ownership::journal_session_references(
+        &config,
+        Path::new(&cwd),
+    )?);
+    let ids = ids.into_iter().collect::<Vec<_>>();
+    // 先写 tombstone 并等待所有旧 writer 退出，再删任何目录。否则 journal
+    // 可在项目目录被删除后、门禁建立前重建会话，导致“删除后复活”。
     let _delete = storage.begin_delete_ids(&ids)?;
-    for id in &ids {
-        delete_session_journal_files(&app, id)?;
+    let mut errors = Vec::new();
+    for directory in directories {
+        if let Err(error) = fs::remove_dir_all(&directory) {
+            errors.push(format!("无法删除项目会话历史 {}：{error}", directory.display()));
+        }
     }
-    let path = prompt_queues_path(&app)?;
-    queues.delete_sessions(&path, &ids, PROMPT_QUEUES_MAX_BYTES)?;
-    let binding_path = worktree_bindings_path(&app)?;
-    worktrees.delete_sessions(&binding_path, &ids)?;
-    Ok(ids)
+    for id in &ids {
+        if let Err(error) = delete_session_journal_files(&app, id) {
+            errors.push(format!("无法删除会话 {id} 的应用 journal：{error}"));
+        }
+    }
+    match prompt_queues_path(&app) {
+        Ok(path) => {
+            if let Err(error) = queues.delete_sessions(&path, &ids, PROMPT_QUEUES_MAX_BYTES) {
+                errors.push(format!("无法删除项目会话提示队列：{error}"));
+            }
+        }
+        Err(error) => errors.push(format!("无法定位项目会话提示队列：{error}")),
+    }
+    // 任意存储清理失败时保留 worktree 引用，防止用户继续删除可能
+    // 仍含会话数据的工作树。
+    if errors.is_empty() {
+        match worktree_bindings_path(&app) {
+            Ok(path) => {
+                if let Err(error) = worktrees.delete_sessions(&path, &ids) {
+                    errors.push(format!("无法解除项目会话 worktree 关联：{error}"));
+                }
+            }
+            Err(error) => errors.push(format!("无法定位 worktree 会话索引：{error}")),
+        }
+    }
+    if errors.is_empty() {
+        Ok(ids)
+    } else {
+        Err(errors.join("；"))
+    }
 }
 
 fn scrub_session_journal_dirs(app: &tauri::AppHandle, minimum_age: Duration) -> Result<u32, String> {
@@ -5057,6 +5118,17 @@ fn prepare_git_push(
     confirms.issue_push(&path_for_webview(&root))
 }
 
+fn worktree_remove_confirmation(target: &Path, dirty: bool) -> String {
+    let path = path_for_webview(target);
+    if dirty {
+        format!(
+            "该 worktree 包含未提交变更，强制移除会使这些变更永久丢失。\n确认继续？\n{path}"
+        )
+    } else {
+        format!("确认强制移除 worktree？\n{path}")
+    }
+}
+
 #[tauri::command]
 fn prepare_git_worktree_remove(
     app: tauri::AppHandle,
@@ -5076,9 +5148,10 @@ fn prepare_git_worktree_remove(
         automations.inner(),
         &target,
     )?;
+    let dirty = !git_text(&target, &["status", "--porcelain"])?.is_empty();
     confirm_destructive_git_action(
         "Grox",
-        &format!("确认强制移除 worktree？\n{}", path_for_webview(&target)),
+        &worktree_remove_confirmation(&target, dirty),
     )?;
     confirms.issue_worktree_remove(&path_for_webview(&root), &path_for_webview(&target))
 }
@@ -10864,6 +10937,28 @@ mod tests {
     }
 
     #[test]
+    fn project_session_discovery_does_not_delete_before_storage_gate() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-project-session-discover-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let workspace = root
+            .join("sessions")
+            .join("%2FUsers%2Fdemo%2Ftarget");
+        let target = workspace.join("session-a");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("chat_history.jsonl"), "").unwrap();
+
+        let (ids, directories) =
+            project_session_history_data(&root, "/Users/demo/target").unwrap();
+
+        assert_eq!(ids, vec!["session-a"]);
+        assert_eq!(directories, vec![workspace.canonicalize().unwrap()]);
+        assert!(target.exists(), "枚举阶段不能抢在 tombstone 之前删除磁盘数据");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn session_history_search_matches_only_visible_user_and_assistant_text() {
         let history = concat!(
             "{\"type\":\"user\",\"content\":\"修复登录问题\"}\n",
@@ -10915,6 +11010,17 @@ mod tests {
             Path::new("/repo/project-worktree"),
             Some("refs/heads/feature/user-owned")
         ));
+    }
+
+    #[test]
+    fn dirty_worktree_confirmation_names_irrecoverable_changes() {
+        let message = worktree_remove_confirmation(Path::new("/repo/worktree"), true);
+        assert!(message.contains("未提交变更"));
+        assert!(message.contains("永久丢失"));
+        assert!(message.contains("/repo/worktree"));
+
+        let clean = worktree_remove_confirmation(Path::new("/repo/worktree"), false);
+        assert!(!clean.contains("未提交变更"));
     }
 
     #[test]

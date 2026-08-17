@@ -48,6 +48,7 @@ interface HostActiveBlockSnapshot {
 }
 
 interface InteractionInternals {
+  liveAssistantSessions: Set<string>;
   projectHostInteraction(interaction: HostInteraction): void;
   reconcileHostInteractions(interactions: HostInteraction[]): void;
   projectAutomationSessionStarted(started: AutomationSessionStarted): void;
@@ -68,6 +69,31 @@ function bridgeHarness() {
 }
 
 describe("AcpBridge Host interaction projection", () => {
+  it("does not suppress disk fallback for an unprojected assistant chunk", () => {
+    const { events, internal } = bridgeHarness();
+    internal.projectHostSessionEvent({
+      streamId: "host-stream-unprojected-assistant",
+      sequence: 1,
+      generation: 7,
+      receivedAt: 42,
+      sessionId: "session-a",
+      projection: {
+        kind: "session_update",
+        channel: "session",
+        sessionId: "session-a",
+        updateType: "agent_message_chunk",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: "persisted on disk" },
+        },
+        blockOps: [],
+      },
+    });
+
+    expect(internal.liveAssistantSessions.has("session-a")).toBe(false);
+    expect(events.some((event) => event.type === "block_add")).toBe(false);
+  });
+
   it("projects an opaque Host block id without retaining the wire rpc id", () => {
     const { events, internal } = bridgeHarness();
     const interaction: HostInteraction = {

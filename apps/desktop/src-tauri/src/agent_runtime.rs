@@ -101,9 +101,12 @@ pub(crate) async fn authenticate(
         },
         Err(_error) if plan.interactive_method_id.is_some() => interactive_auth_state(&plan, None),
         Err(error) => AgentAuthenticationState {
-            required: false,
+            // 非交互凭据失败时运行时虽然完成了握手，但不能发送请求。这里必须
+            // 保持发送门禁；否则首页只看到 required=false，会让用户进入一条
+            // 注定失败的 session/new / session/prompt 链路。
+            required: true,
             in_progress: false,
-            method_id: None,
+            method_id: Some(method_id.to_string()),
             label: None,
             error: Some(error.message),
         },
@@ -181,13 +184,12 @@ fn authentication_plan(initialize: &Value) -> AuthenticationPlan {
                 .iter()
                 .any(|method| method.get("id").and_then(Value::as_str) == Some(*default_id))
         });
-    let requires_interaction_first = matches!(first_id, Some("grok.com" | "oidc"));
-    let method_id = if requires_interaction_first {
-        first_id
-    } else {
-        default_id.or(first_id)
-    }
-    .map(str::to_string);
+    // authMethods 的数组顺序不是认证优先级；上游会通过 defaultAuthMethodId
+    // 指明已有缓存凭据。若 OAuth 恰好排在第一位，仍应先尝试明确的非交互
+    // 默认项，避免每次冷启动都错误要求重新登录。
+    let selected_id = default_id.or(first_id);
+    let requires_interaction_first = matches!(selected_id, Some("grok.com" | "oidc"));
+    let method_id = selected_id.map(str::to_string);
 
     AuthenticationPlan {
         method_id,
@@ -271,6 +273,25 @@ mod tests {
         assert!(plan.requires_interaction_first);
         assert_eq!(plan.method_id.as_deref(), Some("oidc"));
         assert_eq!(plan.interactive_method_id.as_deref(), Some("oidc"));
+    }
+
+    #[test]
+    fn explicit_cached_default_wins_even_when_oauth_is_listed_first() {
+        assert_eq!(
+            authentication_plan(&json!({
+                "authMethods": [
+                    { "id": "oidc", "name": "Sign in" },
+                    { "id": "cached_token", "name": "Cached token" }
+                ],
+                "_meta": { "defaultAuthMethodId": "cached_token" }
+            })),
+            AuthenticationPlan {
+                method_id: Some("cached_token".into()),
+                interactive_method_id: Some("oidc".into()),
+                interactive_label: Some("Sign in".into()),
+                requires_interaction_first: false,
+            }
+        );
     }
 
     #[test]

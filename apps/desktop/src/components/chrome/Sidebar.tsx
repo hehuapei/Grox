@@ -41,6 +41,7 @@ export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) 
   const [sessionQuery, setSessionQuery] = useState("");
   const [historyMatches, setHistoryMatches] = useState<Set<string>>(() => new Set());
   const [historySearching, setHistorySearching] = useState(false);
+  const [historySearchError, setHistorySearchError] = useState("");
   const accountRef = useRef<HTMLDivElement>(null);
   const [expandedProjectIds, setExpandedProjectIds] = useState<Set<string>>(
     () => new Set(activeProjectId ? [activeProjectId] : []),
@@ -88,18 +89,23 @@ export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) 
     if (!normalizedQuery) {
       setHistoryMatches(new Set());
       setHistorySearching(false);
+      setHistorySearchError("");
       return;
     }
     let cancelled = false;
     setHistorySearching(true);
+    setHistorySearchError("");
     const timeout = window.setTimeout(() => {
       void invoke<string[]>("search_session_history", {
         query: normalizedQuery,
         sessionIds: sessionIndex.map((session) => session.id),
       }).then((ids) => {
         if (!cancelled) setHistoryMatches(new Set(ids));
-      }).catch(() => {
-        if (!cancelled) setHistoryMatches(new Set());
+      }).catch((cause) => {
+        if (!cancelled) {
+          setHistoryMatches(new Set());
+          setHistorySearchError(cause instanceof Error ? cause.message : String(cause));
+        }
       }).finally(() => {
         if (!cancelled) setHistorySearching(false);
       });
@@ -185,9 +191,14 @@ export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) 
             })}
           />
         ))}
-        {normalizedQuery && !historySearching && matchedSessions.length === 0 && (
+        {normalizedQuery && !historySearching && !historySearchError && matchedSessions.length === 0 && (
           <p className="px-2 py-6 text-center font-mono text-[9.5px] text-faint">
             {language === "zh-CN" ? "没有匹配的历史会话" : "NO MATCHING SESSIONS"}
+          </p>
+        )}
+        {normalizedQuery && historySearchError && (
+          <p role="alert" className="px-2 pb-3 text-center font-mono text-[9.5px] leading-relaxed text-red">
+            {language === "zh-CN" ? `历史内容搜索失败：${historySearchError}` : `History search failed: ${historySearchError}`}
           </p>
         )}
       </div>
@@ -659,7 +670,7 @@ function ContextMenu({ children, close }: { children: React.ReactNode; close(): 
     };
   }, []);
   return (
-    <div ref={ref} className="absolute right-1 top-7 z-40 w-[min(192px,calc(100vw-24px))] overflow-hidden rounded-[5px] border border-line2 bg-raise p-1 shadow-2xl" onClick={(event) => { event.stopPropagation(); close(); }}>
+    <div ref={ref} role="menu" className="absolute right-1 top-7 z-40 w-[min(192px,calc(100vw-24px))] overflow-hidden rounded-[5px] border border-line2 bg-raise p-1 shadow-2xl" onClick={(event) => { event.stopPropagation(); close(); }}>
       {children}
     </div>
   );
@@ -671,7 +682,7 @@ function MenuDivider() {
 
 function MenuButton({ icon, label, onClick, tone = "text-fg2" }: { icon: React.ComponentProps<typeof Icon>["name"]; label: string; onClick(): void; tone?: string }) {
   return (
-    <button onClick={onClick} className={`flex h-7 w-full items-center gap-2 rounded-[3px] px-2 text-left text-[10px] hover:bg-high ${tone}`}>
+    <button role="menuitem" onClick={onClick} className={`flex h-7 w-full items-center gap-2 rounded-[3px] px-2 text-left text-[10px] hover:bg-high ${tone}`}>
       <Icon name={icon} size={11} className="text-dim" />
       {label}
     </button>

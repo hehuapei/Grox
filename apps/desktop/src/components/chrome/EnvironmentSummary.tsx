@@ -102,6 +102,7 @@ export function EnvironmentSummary() {
   const [showAllSources, setShowAllSources] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const loadGenerationRef = useRef(0);
   const workspace = useDesktop((state) => state.workspace);
   const runtimeOccupancy = useDesktop((state) => state.runtimeOccupancy);
   const activeId = useDesktop((state) => state.activeId);
@@ -136,6 +137,7 @@ export function EnvironmentSummary() {
   }, [composer?.attachments, session]);
 
   const loadSummary = async () => {
+    const generation = ++loadGenerationRef.current;
     setLoading(true);
     setError("");
     try {
@@ -146,11 +148,13 @@ export function EnvironmentSummary() {
           invoke<SessionJournalStatus>("session_journal_status"),
           invoke<AgentRuntimeStatus>("agent_runtime_status"),
         ]);
+        if (generation !== loadGenerationRef.current) return;
         setSummary(nextSummary);
         setWorktrees(nextWorktrees);
         setJournalStatus(nextJournalStatus);
         setRuntimeStatus(nextRuntimeStatus);
       } else {
+        if (generation !== loadGenerationRef.current) return;
         setSummary({
           isRepository: true,
           branch: "main",
@@ -168,14 +172,15 @@ export function EnvironmentSummary() {
         setRuntimeStatus({ topology: "shared_process", processCapacity: 1, running: true, ready: true, phase: "ready", generation: 1, pid: 12345, pendingRequests: 0, pendingInteractions: 0, pendingClientCallbacks: 0, boundClientSessions: 0, activeTerminals: 0, automaticReconnectActive: false, lastConnectConfigured: true, worktreeSessionBindings: 0 });
       }
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
+      if (generation === loadGenerationRef.current) setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
-      setLoading(false);
+      if (generation === loadGenerationRef.current) setLoading(false);
     }
   };
 
   useEffect(() => {
     if (open) void loadSummary();
+    else loadGenerationRef.current += 1;
   }, [open, workspace]);
 
   useEffect(() => {

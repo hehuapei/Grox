@@ -62,7 +62,7 @@ describe("sessionUnavailable", () => {
   });
 
   it("has zh/en copy for the empty dead state", () => {
-    expect(deadSessionCopy("zh-CN", "x").remove).toContain("移除");
-    expect(deadSessionCopy("en", "x").remove).toMatch(/Remove/i);
+    expect(deadSessionCopy("zh-CN", "x").remove).toContain("删除");
+    expect(deadSessionCopy("en", "x").remove).toMatch(/Delete/i);
   });
 });

@@ -295,7 +295,7 @@ function WorkspaceTabs({ mode, onChange }: { mode: "conversation" | "image" | "v
   const { language } = useI18n();
   const zh = language === "zh-CN";
   return (
-    <div className="absolute left-1/2 top-4 z-10 flex -translate-x-1/2 items-center gap-1 rounded-full border border-line2 bg-panel/90 p-1 shadow-lg backdrop-blur animate-mission-in" style={{ animationDelay: "0.02s" }}>
+    <div role="tablist" aria-label={zh ? "工作台类型" : "Workspace type"} className="absolute left-1/2 top-4 z-10 flex -translate-x-1/2 items-center gap-1 rounded-full border border-line2 bg-panel/90 p-1 shadow-lg backdrop-blur animate-mission-in" style={{ animationDelay: "0.02s" }}>
       {([
         ["conversation", zh ? "对话" : "CHAT"],
         ["image", zh ? "图片" : "IMAGE"],
@@ -304,6 +304,8 @@ function WorkspaceTabs({ mode, onChange }: { mode: "conversation" | "image" | "v
       ] as const).map(([id, label]) => (
         <button
           key={id}
+          role="tab"
+          aria-selected={mode === id}
           onClick={() => onChange(id)}
           className={`flex h-8 items-center gap-1.5 rounded-full px-4 text-[12px] transition-colors ${mode === id ? "bg-acc text-base" : "text-dim hover:bg-high hover:text-fg2"}`}
         >

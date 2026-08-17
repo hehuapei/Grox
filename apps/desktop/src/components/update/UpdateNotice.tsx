@@ -171,7 +171,7 @@ export function UpdateNotice() {
           <Wordmark size={11} withMark />
           <div className="flex items-center gap-3">
             {checking && <span className="flex items-center gap-1.5 font-mono text-[9px] tracking-[0.1em] text-acc"><Icon name="refresh" size={10} className="animate-orbit" />{zh ? "检查中" : "CHECKING"}</span>}
-            <button onClick={dismissForSession} className="flex h-6 w-6 items-center justify-center rounded-[3px] text-faint hover:bg-high hover:text-fg" title={zh ? "关闭" : "Close"}><Icon name="x" size={10} /></button>
+            <button onClick={dismissForSession} className="flex h-6 w-6 items-center justify-center rounded-[3px] text-faint hover:bg-high hover:text-fg" title={zh ? "关闭" : "Close"} aria-label={zh ? "关闭更新中心" : "Close update center"}><Icon name="x" size={10} /></button>
           </div>
         </div>
 

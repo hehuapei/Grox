@@ -94,7 +94,8 @@ export function AssistantMsg({ block, process = false }: { block: AssistantBlock
 
 function MessageActions({ text }: { text: string }) {
   const { language } = useI18n();
-  const newSession = useDesktop((state) => state.newSession);
+  const activeSessionId = useDesktop((state) => state.activeId);
+  const continueSessionInNewChat = useDesktop((state) => state.continueSessionInNewChat);
   const [copied, setCopied] = useState(false);
   const copy = () => {
     void navigator.clipboard.writeText(text).then(() => {
@@ -103,14 +104,11 @@ function MessageActions({ text }: { text: string }) {
     });
   };
   const continueInNewTask = () => {
-    const prefix = language === "zh-CN"
-      ? "请在新任务中继续处理以下上文：\n\n"
-      : "Continue this work in a new task using the following context:\n\n";
-    void newSession({ text: `${prefix}${text}` });
+    if (activeSessionId) void continueSessionInNewChat(activeSessionId);
   };
   return <div className="flex items-center gap-1 opacity-65 transition-opacity hover:opacity-100">
     <button onClick={copy} className="flex h-6 items-center gap-1 rounded-[3px] px-1.5 font-mono text-[8.5px] text-dim hover:bg-high hover:text-fg2" title={language === "zh-CN" ? "复制这条消息" : "Copy message"}><Icon name="copy" size={9} />{copied ? (language === "zh-CN" ? "已复制" : "COPIED") : (language === "zh-CN" ? "复制" : "COPY")}</button>
-    <button onClick={continueInNewTask} className="flex h-6 items-center gap-1 rounded-[3px] px-1.5 font-mono text-[8.5px] text-dim hover:bg-high hover:text-fg2" title={language === "zh-CN" ? "在一个新任务中继续" : "Continue in a new task"}><Icon name="branch" size={9} />{language === "zh-CN" ? "新任务继续" : "CONTINUE"}</button>
+    <button disabled={!activeSessionId} onClick={continueInNewTask} className="flex h-6 items-center gap-1 rounded-[3px] px-1.5 font-mono text-[8.5px] text-dim hover:bg-high hover:text-fg2 disabled:opacity-40" title={language === "zh-CN" ? "复制完整上下文到一个新任务" : "Fork the full context into a new task"}><Icon name="branch" size={9} />{language === "zh-CN" ? "新任务继续" : "CONTINUE"}</button>
   </div>;
 }
 

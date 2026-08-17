@@ -60,8 +60,11 @@ export function CommandPalette() {
       {
         id: "model",
         icon: "bolt",
-        label: `Cycle model — ${models.find((m) => m.id === model)?.label ?? model}`,
+        label: language === "zh-CN"
+          ? `切换模型 — ${models.find((m) => m.id === model)?.label ?? model}`
+          : `Cycle model — ${models.find((m) => m.id === model)?.label ?? model}`,
         run: close(() => {
+          if (models.length === 0) return;
           const i = models.findIndex((m) => m.id === model);
           setModel(models[(i + 1 + models.length) % models.length].id);
         }),
@@ -69,7 +72,7 @@ export function CommandPalette() {
       {
         id: "effort",
         icon: "layers",
-        label: `Cycle effort — ${effort.toUpperCase()}`,
+        label: language === "zh-CN" ? `切换推理强度 — ${effort.toUpperCase()}` : `Cycle effort — ${effort.toUpperCase()}`,
         run: close(() => {
           const i = EFFORTS.indexOf(effort);
           setEffort(EFFORTS[(i + 1) % EFFORTS.length]);
@@ -78,13 +81,13 @@ export function CommandPalette() {
       {
         id: "compact",
         icon: "refresh",
-        label: "Compact context",
+        label: language === "zh-CN" ? "压缩当前会话上下文" : "Compact context",
         run: close(compact),
       },
     ];
-    const missions: Item[] = [...sessionIndex]
+    const q = query.trim().toLowerCase();
+    const missionCandidates: Item[] = [...sessionIndex]
       .sort((a, b) => b.updatedAt - a.updatedAt)
-      .slice(0, 6)
       .map((m) => ({
         id: `s-${m.id}`,
         icon: "clock" as const,
@@ -93,9 +96,13 @@ export function CommandPalette() {
         run: close(() => openSession(m.id)),
       }));
 
-    const q = query.trim().toLowerCase();
-    const all = [...actions, ...missions];
-    return q ? all.filter((i) => i.label.toLowerCase().includes(q)) : all;
+    // 先搜索完整索引、再限制渲染数量；先截断会让较旧但精确匹配的任务消失。
+    const missions = q
+      ? missionCandidates.filter((item) => item.label.toLowerCase().includes(q)).slice(0, 50)
+      : missionCandidates.slice(0, 6);
+    return q
+      ? [...actions.filter((item) => item.label.toLowerCase().includes(q)), ...missions]
+      : [...actions, ...missions];
   }, [query, sessionIndex, model, models, effort, newProject, openSession, goHome, toggleInspector, setSettingsOpen, setModel, setEffort, compact, setOpen, language, t]);
 
   useEffect(() => setIdx(0), [query]);
@@ -118,6 +125,9 @@ export function CommandPalette() {
 
   return (
     <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={language === "zh-CN" ? "命令面板" : "Command palette"}
       className="fixed inset-0 z-50 bg-void/70 backdrop-blur-[2px]"
       onMouseDown={() => setOpen(false)}
     >
@@ -133,11 +143,13 @@ export function CommandPalette() {
             onChange={(e) => setQuery(e.target.value)}
             onKeyDown={onKey}
             placeholder={language === "zh-CN" ? "输入命令或搜索任务…" : "Type a command or search missions…"}
+            aria-label={language === "zh-CN" ? "输入命令或搜索任务" : "Type a command or search missions"}
+            aria-controls="command-palette-results"
             className="h-11 flex-1 bg-transparent font-mono text-[12px] text-fg placeholder:text-faint focus:outline-none"
           />
           <kbd className="lbl !text-[9.5px] !text-faint">ESC</kbd>
         </div>
-        <div className="max-h-[320px] overflow-y-auto py-1.5">
+        <div id="command-palette-results" role="listbox" className="max-h-[320px] overflow-y-auto py-1.5">
           {items.length === 0 && (
             <p className="px-4 py-6 text-center font-mono text-[11px] text-dim">
               {language === "zh-CN" ? "没有匹配结果。" : "No matches in this sector."}
@@ -146,6 +158,8 @@ export function CommandPalette() {
           {items.map((item, i) => (
             <button
               key={item.id}
+              role="option"
+              aria-selected={i === idx}
               onMouseEnter={() => setIdx(i)}
               onClick={item.run}
               className={`flex w-full items-center gap-3 px-3.5 py-2 text-left ${

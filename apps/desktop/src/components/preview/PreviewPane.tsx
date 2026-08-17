@@ -60,6 +60,7 @@ export function PreviewPane() {
             onClick={close}
             className="flex h-6 w-6 items-center justify-center text-dim hover:text-fg"
             title={t("closePreview")}
+            aria-label={t("closePreview")}
           >
             <Icon name="x" size={12} />
           </button>

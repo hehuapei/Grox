@@ -111,6 +111,9 @@ export function SettingsModal() {
 
   return (
     <div
+      role="dialog"
+      aria-modal="true"
+      aria-label={zh ? "设置" : "Settings"}
       className="settings-shell fixed inset-0 z-50 flex items-center justify-center bg-void/75 p-5 backdrop-blur-[3px]"
       onMouseDown={() => setOpen(false)}
     >
@@ -122,14 +125,14 @@ export function SettingsModal() {
           <div className="px-4 pb-3"><Wordmark size={12} withMark={false} /></div>
           <label className="mx-3 mb-4 flex h-9 items-center gap-2 rounded-[8px] border border-line2 bg-panel px-3 focus-within:border-line3">
             <Icon name="search" size={12} className="text-dim" />
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={zh ? "搜索设置" : "Search settings"} autoFocus className="min-w-0 flex-1 bg-transparent text-[12px] text-fg outline-none placeholder:text-faint" />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={zh ? "搜索设置" : "Search settings"} aria-label={zh ? "搜索设置" : "Search settings"} autoFocus className="min-w-0 flex-1 bg-transparent text-[12px] text-fg outline-none placeholder:text-faint" />
             {query && <button onClick={() => setQuery("")} aria-label={zh ? "清除搜索" : "Clear search"} className="text-faint hover:text-fg"><Icon name="x" size={10} /></button>}
           </label>
           {(["personal", "extensions"] as const).map((group) => (
             <div key={group} className="mb-3">
               <p className="px-4 pb-1 text-[10px] font-medium tracking-[0.08em] text-faint">{group === "personal" ? (zh ? "个人" : "PERSONAL") : (zh ? "扩展" : "EXTENSIONS")}</p>
               {sections.filter((item) => item.group === group).map((item) => (
-                <button key={item.id} onClick={() => selectSection(item.id)} className={`flex w-full items-center gap-2.5 px-4 py-2 text-left text-[12px] transition-colors ${section === item.id && !query ? "bg-high text-acc" : "text-dim hover:text-fg2"}`}>
+                <button key={item.id} aria-current={section === item.id && !query ? "page" : undefined} onClick={() => selectSection(item.id)} className={`flex w-full items-center gap-2.5 px-4 py-2 text-left text-[12px] transition-colors ${section === item.id && !query ? "bg-high text-acc" : "text-dim hover:text-fg2"}`}>
                   <Icon name={item.icon} size={12} />
                   <span className="truncate">{item.label}</span>
                 </button>
@@ -650,7 +653,7 @@ function Appearance() {
   </div>;
 }
 
-function Choice({ active, onClick, children }: { active: boolean; onClick(): void; children: React.ReactNode }) { return <button onClick={onClick} className={`flex h-8 items-center gap-1.5 rounded-[4px] border px-3 font-mono text-[9.5px] ${active ? "border-acc-dim bg-acc-wash text-acc" : "border-line2 text-dim"}`}>{children}</button>; }
+function Choice({ active, onClick, children }: { active: boolean; onClick(): void; children: React.ReactNode }) { return <button aria-pressed={active} onClick={onClick} className={`flex h-8 items-center gap-1.5 rounded-[4px] border px-3 font-mono text-[9.5px] ${active ? "border-acc-dim bg-acc-wash text-acc" : "border-line2 text-dim"}`}>{children}</button>; }
 
 function RangeControl({ value, min, max, step, display, label, onChange }: { value: number; min: number; max: number; step: number; display: string; label: string; onChange(value: number): void }) {
   return <div className="w-[260px]"><div className="mb-1 flex items-center justify-between font-mono text-[9.5px] text-faint"><span>{min}</span><output className="rounded-[3px] border border-line2 bg-void px-2 py-0.5 text-acc">{display}</output><span>{max}</span></div><input aria-label={label} className="grox-range block w-full appearance-none bg-transparent" type="range" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} /></div>;
