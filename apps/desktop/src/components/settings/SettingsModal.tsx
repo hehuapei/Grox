@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { bridge } from "../../bridge";
 import type { ConfigDocument, ProviderApiBackend, ProviderKind } from "../../bridge/types";
@@ -10,6 +10,7 @@ import { fmtBillingDate, fmtBillingValue } from "../../lib/format";
 import { Icon } from "../fx/Icon";
 import { Wordmark } from "../fx/Wordmark";
 import { ChipSelect } from "../common/ChipSelect";
+import { ConfirmDialog } from "../common/ConfirmDialog";
 
 type Section = "general" | "account" | "archives" | "appearance" | "mcp" | "skills" | "plugins" | "hooks";
 type Json = Record<string, unknown>;
@@ -48,8 +49,14 @@ export function SettingsModal() {
   ];
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-void/75 p-5 backdrop-blur-[3px]" onMouseDown={() => setOpen(false)}>
-      <div className="flex h-[min(820px,92vh)] w-[min(1180px,96vw)] overflow-hidden rounded-[9px] border border-line3 bg-panel shadow-2xl animate-fade-up" onMouseDown={(event) => event.stopPropagation()}>
+    <div
+      className="settings-shell fixed inset-0 z-50 flex items-center justify-center bg-void/75 p-5 backdrop-blur-[3px]"
+      onMouseDown={() => setOpen(false)}
+    >
+      <div
+        className="flex h-[min(820px,92vh)] w-[min(1180px,96vw)] overflow-hidden rounded-[9px] border border-line3 bg-panel shadow-2xl animate-fade-up"
+        onMouseDown={(event) => event.stopPropagation()}
+      >
         <nav className="flex w-[210px] shrink-0 flex-col border-r border-line bg-void py-3">
           <div className="px-4 pb-3"><Wordmark size={11} withMark={false} /></div>
           {sections.map((item) => (
@@ -223,6 +230,7 @@ function ArchiveManager() {
   const restore = useDesktop((state) => state.archiveSession);
   const remove = useDesktop((state) => state.deleteSession);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [confirmingSession, setConfirmingSession] = useState<string | null>(null);
   const [error, setError] = useState("");
 
   const destroy = async (id: string) => {
@@ -232,6 +240,7 @@ function ArchiveManager() {
       await remove(id);
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
+      throw cause;
     } finally {
       setDeletingId(null);
     }
@@ -255,11 +264,37 @@ function ArchiveManager() {
               <p className="mt-0.5 truncate font-mono text-[9px] text-faint">{session.cwd} · {new Date(session.updatedAt).toLocaleString(language === "zh-CN" ? "zh-CN" : "en-US")}</p>
             </div>
             <ActionButton onClick={() => restore(session.id)}>{zh ? "恢复" : "Restore"}</ActionButton>
-            <ActionButton tone="danger" disabled={deletingId === session.id} onClick={() => void destroy(session.id)}>{deletingId === session.id ? (zh ? "删除中" : "Deleting") : (zh ? "删除" : "Delete")}</ActionButton>
+            <ActionButton
+              tone="danger"
+              disabled={deletingId === session.id}
+              onClick={() => setConfirmingSession(session.id)}
+            >
+              {deletingId === session.id ? (zh ? "删除中" : "Deleting") : (zh ? "删除" : "Delete")}
+            </ActionButton>
           </div>
         ))}
       </div>
     )}
+    {confirmingSession && (() => {
+      const session = sessions.find((entry) => entry.id === confirmingSession);
+      if (!session) return null;
+      return (
+        <ConfirmDialog
+          title={zh ? "永久删除会话？" : "Delete conversation permanently?"}
+          description={zh
+            ? `“${session.title || "无标题会话"}”及其本地历史将被永久删除。`
+            : `“${session.title || "Untitled conversation"}” and its local history will be permanently deleted.`}
+          confirmLabel={zh ? "永久删除" : "Delete permanently"}
+          cancelLabel={zh ? "取消" : "Cancel"}
+          workingLabel={zh ? "删除中" : "Deleting"}
+          onCancel={() => setConfirmingSession(null)}
+          onConfirm={async () => {
+            await destroy(session.id);
+            setConfirmingSession(null);
+          }}
+        />
+      );
+    })()}
   </div>;
 }
 
@@ -316,6 +351,7 @@ function ProviderAndModels() {
   const [apiKey, setApiKey] = useState("");
   const [apiKeyHidden, setApiKeyHidden] = useState(false);
   const [baseUrl, setBaseUrl] = useState(provider.kind === "compatible" ? "" : (provider.baseUrl ?? ""));
+  const [allowInsecureHttp, setAllowInsecureHttp] = useState(false);
   const [apiBackend, setApiBackend] = useState<ProviderApiBackend>("auto");
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [residentModels, setResidentModels] = useState<string[]>([]);
@@ -336,6 +372,7 @@ function ProviderAndModels() {
     setEditingProfileId(profile.id);
     setProfileName(profile.name);
     setBaseUrl(profile.baseUrl);
+    setAllowInsecureHttp(profile.allowInsecureHttp);
     setApiBackend(profile.apiBackend);
     setAvailableModels(profile.availableModels);
     setResidentModels(profile.residentModels);
@@ -352,6 +389,7 @@ function ProviderAndModels() {
     setApiKey("");
     setApiKeyHidden(false);
     setBaseUrl("");
+    setAllowInsecureHttp(false);
     setApiBackend("auto");
     setAvailableModels([]);
     setResidentModels([]);
@@ -370,6 +408,7 @@ function ProviderAndModels() {
     setApiKey("");
     setApiKeyHidden(false);
     setBaseUrl("");
+    setAllowInsecureHttp(false);
     setAvailableModels([]);
     setResidentModels([]);
     setError("");
@@ -390,6 +429,7 @@ function ProviderAndModels() {
           name: profileName,
           apiKey: apiKey.trim() || undefined,
           baseUrl,
+          allowInsecureHttp,
           apiBackend,
           residentModels,
         });
@@ -418,7 +458,7 @@ function ProviderAndModels() {
         const refreshed = await refreshStoredModels(editingProfileId);
         setAvailableModels(refreshed.availableModels);
       } else {
-        const discovered = await fetchProfileModels({ apiKey, baseUrl });
+        const discovered = await fetchProfileModels({ apiKey, baseUrl, allowInsecureHttp });
         setAvailableModels(discovered);
       }
     } catch (cause) {
@@ -463,6 +503,7 @@ function ProviderAndModels() {
         <label className="block"><span className="lbl !text-[9px]">API KEY</span><SecretInput value={apiKey} onChange={(value) => { setApiKey(value); if (kind === "compatible") setAvailableModels([]); }} hidden={apiKeyHidden} onToggle={() => setApiKeyHidden((value) => !value)} placeholder={editingProfileId && profiles.find((item) => item.id === editingProfileId)?.hasApiKey ? (zh ? "已保存 · 留空则保持原密钥" : "Saved · leave blank to keep") : "xai-…"} /></label>
         {kind === "official" ? <div><span className="lbl !text-[9px]">BASE URL</span><div className="h-8 rounded-[4px] border border-line bg-void px-2.5 font-mono text-[10px] leading-8 text-dim">https://api.x.ai/v1</div></div> : <label className="block"><span className="lbl !text-[9px]">BASE URL</span><Input value={baseUrl} onChange={(value) => { setBaseUrl(value); setAvailableModels([]); setResidentModels([]); }} placeholder="https://example.com/v1" /></label>}
         {kind === "compatible" && <label className="block"><span className="lbl !text-[9px]">API BACKEND</span><ChipSelect variant="field" menuPlacement="down" fullWidth activeId={apiBackend} label={apiBackend === "auto" ? (zh ? "自动识别" : "Auto detect") : apiBackend === "responses" ? "Responses API" : "Chat Completions"} items={[{ id: "auto", label: zh ? "自动识别" : "Auto detect", hint: zh ? "标准服务默认 Chat Completions，已知 Responses 网关自动匹配" : "Chat Completions by default; known Responses gateways are detected" }, { id: "chat_completions", label: "Chat Completions", hint: "/chat/completions" }, { id: "responses", label: "Responses API", hint: "/responses" }]} onSelect={(id) => setApiBackend(id as ProviderApiBackend)} aria-label={zh ? "API 请求协议" : "API backend"} /></label>}
+        {kind === "compatible" && <div className={`col-span-2 flex items-start gap-3 rounded-[5px] border px-3 py-2.5 ${allowInsecureHttp ? "border-gold/45 bg-gold/5" : "border-line bg-void/60"}`}><Toggle on={allowInsecureHttp} onChange={setAllowInsecureHttp} /><button type="button" className="min-w-0 flex-1 text-left" onClick={() => setAllowInsecureHttp((value) => !value)}><span className={`block font-mono text-[9.5px] ${allowInsecureHttp ? "text-gold" : "text-fg2"}`}>{zh ? "允许远程 HTTP（不安全）" : "ALLOW REMOTE HTTP (INSECURE)"}</span><span className="mt-1 block text-[9.5px] leading-relaxed text-dim">{zh ? "仅用于无法提供 HTTPS 的可信中转；API Key 与请求内容会以明文经过网络。云元数据和链路本地地址仍会被拒绝。" : "Only for trusted gateways that cannot provide HTTPS. API keys and prompts travel in plaintext; metadata and link-local targets remain blocked."}</span></button></div>}
         {kind === "compatible" && <p className="col-span-2 rounded-[4px] border border-line bg-void/60 px-2.5 py-2 text-[9.5px] leading-relaxed text-dim">{zh ? "Grox 只把真实 Key 注入当前 ACP 子进程，并为当前模型与标题别名写入可恢复的 env_key、base_url 和所选 API 协议；切走供应商时原样恢复用户配置。" : "Grox injects the literal key only into the active ACP child and applies reversible env_key, base_url, and API backend overrides for the selected models and title alias."}</p>}
       </div>
       {kind === "compatible" && <div className="mt-4 grid grid-cols-2 gap-3 border-t border-line pt-4">
@@ -514,18 +555,41 @@ function Appearance() {
   const setTheme = usePreferences((state) => state.setTheme);
   const fontFamily = usePreferences((state) => state.fontFamily);
   const setFontFamily = usePreferences((state) => state.setFontFamily);
-  const fontSize = usePreferences((state) => state.fontSize);
-  const setFontSize = usePreferences((state) => state.setFontSize);
+  const fontScale = usePreferences((state) => state.fontScale);
+  const setFontScale = usePreferences((state) => state.setFontScale);
   const fontWeight = usePreferences((state) => state.fontWeight);
   const setFontWeight = usePreferences((state) => state.setFontWeight);
+  const contentDensity = usePreferences((state) => state.contentDensity);
+  const setContentDensity = usePreferences((state) => state.setContentDensity);
   const [reduceMotion, setReduceMotion] = useState(localStorage.getItem("grok.pref.reduceMotion") === "1");
   const updateMotion = (value: boolean) => { localStorage.setItem("grok.pref.reduceMotion", value ? "1" : "0"); document.documentElement.dataset.reduceMotion = value ? "1" : "0"; window.dispatchEvent(new Event("grox-motion-change")); setReduceMotion(value); };
   return <div><Heading title={t("appearance")} description={uiLanguage === "zh-CN" ? "语言默认为中文，主题默认为 GrokNight 暗黑模式。" : "The default language is Chinese and the default theme is GrokNight dark."} />
     <Row label={t("language")}><div className="flex gap-1"><Choice active={language === "zh-CN"} onClick={() => setLanguage("zh-CN")}>{t("chinese")}</Choice><Choice active={language === "en-US"} onClick={() => setLanguage("en-US")}>{t("english")}</Choice></div></Row>
     <Row label={t("theme")}><div className="flex gap-1"><Choice active={theme === "dark"} onClick={() => setTheme("dark")}><Icon name="moon" size={10} /> {t("dark")}</Choice><Choice active={theme === "light"} onClick={() => setTheme("light")}><Icon name="sun" size={10} /> {t("light")}</Choice></div></Row>
     <Row label={uiLanguage === "zh-CN" ? "界面字体" : "Interface font"} hint={uiLanguage === "zh-CN" ? "代码与终端保持等宽字体。" : "Code and terminals keep a monospaced font."}><div className="flex gap-1"><Choice active={fontFamily === "system"} onClick={() => setFontFamily("system")}>{uiLanguage === "zh-CN" ? "中文优化" : "System"}</Choice><Choice active={fontFamily === "geist"} onClick={() => setFontFamily("geist")}>Geist</Choice><Choice active={fontFamily === "serif"} onClick={() => setFontFamily("serif")}>{uiLanguage === "zh-CN" ? "宋体风格" : "Serif"}</Choice></div></Row>
-    <Row label={uiLanguage === "zh-CN" ? "字体大小" : "Font size"} hint={uiLanguage === "zh-CN" ? "统一调整正文、工具信息、侧栏标签和代码字号。" : "Adjust text, tool details, sidebar labels, and code together."}><RangeControl value={fontSize} min={0} max={6} step={0.25} display={`+${fontSize.toFixed(2).replace(/\.00$/, "").replace(/0$/, "")} px`} onChange={setFontSize} label={uiLanguage === "zh-CN" ? "字体大小" : "Font size"} /></Row>
-    <Row label={uiLanguage === "zh-CN" ? "字体粗细" : "Font weight"}><RangeControl value={fontWeight} min={400} max={700} step={25} display={String(fontWeight)} onChange={setFontWeight} label={uiLanguage === "zh-CN" ? "字体粗细" : "Font weight"} /></Row>
+    <Row
+      label={uiLanguage === "zh-CN" ? "阅读栏宽度" : "Reading width"}
+      hint={uiLanguage === "zh-CN" ? "仅改会话正文与输入框最大宽度（720 / 920 / 1120 / 铺满）；行距、内边距、侧栏与按钮不变。" : "Transcript + composer max-width only (720 / 920 / 1120 / fill). Spacing and chrome never change."}
+    >
+      <div className="flex flex-wrap gap-1">
+        <Choice active={contentDensity === "narrow"} onClick={() => setContentDensity("narrow")}>{uiLanguage === "zh-CN" ? "窄" : "Narrow"}</Choice>
+        <Choice active={contentDensity === "medium"} onClick={() => setContentDensity("medium")}>{uiLanguage === "zh-CN" ? "中" : "Medium"}</Choice>
+        <Choice active={contentDensity === "wide"} onClick={() => setContentDensity("wide")}>{uiLanguage === "zh-CN" ? "宽" : "Wide"}</Choice>
+        <Choice active={contentDensity === "fill"} onClick={() => setContentDensity("fill")}>{uiLanguage === "zh-CN" ? "铺满" : "Fill"}</Choice>
+      </div>
+    </Row>
+    <Row
+      label={uiLanguage === "zh-CN" ? "正文大小" : "Reading size"}
+      hint={uiLanguage === "zh-CN" ? "仅调整对话正文（整数像素）；侧栏、标题栏、按钮字号固定，避免布局错位与模糊。" : "Integer sizes for transcript only. Sidebar, title bar, and buttons stay fixed for sharp layout."}
+    >
+      <div className="flex flex-wrap gap-1">
+        <Choice active={fontScale === "sm"} onClick={() => setFontScale("sm")}>{uiLanguage === "zh-CN" ? "小" : "S"}</Choice>
+        <Choice active={fontScale === "md"} onClick={() => setFontScale("md")}>{uiLanguage === "zh-CN" ? "默认" : "M"}</Choice>
+        <Choice active={fontScale === "lg"} onClick={() => setFontScale("lg")}>{uiLanguage === "zh-CN" ? "大" : "L"}</Choice>
+        <Choice active={fontScale === "xl"} onClick={() => setFontScale("xl")}>{uiLanguage === "zh-CN" ? "更大" : "XL"}</Choice>
+      </div>
+    </Row>
+    <Row label={uiLanguage === "zh-CN" ? "字体粗细" : "Font weight"} hint={uiLanguage === "zh-CN" ? "建议 400 以获得更清晰的 WebView 渲染。" : "400 is usually sharpest in WebView2."}><RangeControl value={fontWeight} min={400} max={700} step={25} display={String(fontWeight)} onChange={setFontWeight} label={uiLanguage === "zh-CN" ? "字体粗细" : "Font weight"} /></Row>
     <Row label={uiLanguage === "zh-CN" ? "减少动态效果" : "Reduce motion"} hint={uiLanguage === "zh-CN" ? "停用轨道动画和进入过渡。" : "Disable orbital animations and entrance transitions."}><Toggle on={reduceMotion} onChange={updateMotion} /></Row>
   </div>;
 }
@@ -583,25 +647,29 @@ function McpPanel() {
 function SkillsPanel() {
   const { t, language } = useI18n(); const zh = language === "zh-CN"; const cwd = useDesktop((state) => state.workspace); const [path, setPath] = useState("");
   const state = useExtension(async () => object(await bridge.callExtension("x.ai/skills/list", { cwd })), [cwd]);
-  const skills = list(state.data?.skills).map(object);
+  const skills = list(state.data?.skills).map(object).sort((a, b) => text(a.displayName, text(a.name)).localeCompare(text(b.displayName, text(b.name))));
+  const groups = [...skills.reduce((result, skill) => { const scope = text(skill.scope, "other"); result.set(scope, [...(result.get(scope) ?? []), skill]); return result; }, new Map<string, Json[]>()).entries()].sort(([a], [b]) => a.localeCompare(b));
   const run = async (method: string, params: Json) => { await bridge.callExtension(method, { ...params, cwd }); state.reload(); };
   return <div><Heading title={t("skills")} description={zh ? "从 Grok Build 的用户、项目和插件作用域发现 Skill，可视化启停与移除。" : "Discover Skills from Grok Build user, project, and plugin scopes; toggle or remove them visually."} /><div className="mb-4 flex gap-2"><div className="flex-1"><Input value={path} onChange={setPath} placeholder={zh ? "C:\\path\\to\\skill 或 SKILL.md" : "C:\\path\\to\\skill or SKILL.md"} /></div><ActionButton tone="accent" onClick={() => void run("x.ai/skills/add", { path }).then(() => setPath(""))}>{t("add")}</ActionButton></div>
-    {skills.length === 0 ? <ExtensionState error={state.error} empty={zh ? "尚未发现 Skill" : "No Skills discovered"} /> : <div className="grid grid-cols-2 gap-2">{skills.map((skill) => { const name = text(skill.name); const enabled = skill.enabled !== false; return <div key={`${name}-${text(skill.path)}`} className="rounded-[5px] border border-line2 bg-raise p-3"><div className="flex items-start gap-2"><Icon name="bolt" size={12} className="mt-0.5 text-gold" /><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-fg2">{text(skill.displayName, name)}</p><p className="mt-1 line-clamp-2 text-[10px] leading-relaxed text-dim">{text(skill.description, text(skill.path))}</p></div><Toggle on={enabled} onChange={(value) => void run("x.ai/skills/toggle", { name, enabled: value })} /></div>{text(skill.scope) !== "bundled" && <button onClick={() => void run("x.ai/skills/remove", { path: text(skill.path) })} className="mt-2 font-mono text-[9.5px] text-red/70 hover:text-red">{t("remove")}</button>}</div>; })}</div>}
+    {skills.length === 0 ? <ExtensionState error={state.error} empty={zh ? "尚未发现 Skill" : "No Skills discovered"} /> : <div className="space-y-2">{groups.map(([scope, entries]) => <details key={scope} open className="rounded-[5px] border border-line2 bg-void/40"><summary className="cursor-pointer px-3 py-2 font-mono text-[9.5px] uppercase tracking-[0.08em] text-mute">{scope} · {entries.length}</summary><div className="grid grid-cols-2 gap-2 border-t border-line p-2">{entries.map((skill) => { const name = text(skill.name); const enabled = skill.enabled !== false; return <div key={`${name}-${text(skill.path)}`} className="rounded-[5px] border border-line2 bg-raise p-3"><div className="flex items-start gap-2"><Icon name="bolt" size={12} className="mt-0.5 text-gold" /><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-fg2">{text(skill.displayName, name)}</p><p className="mt-1 line-clamp-2 text-[10px] leading-relaxed text-dim">{text(skill.description, text(skill.path))}</p></div><Toggle on={enabled} onChange={(value) => void run("x.ai/skills/toggle", { name, enabled: value })} /></div>{text(skill.scope) !== "bundled" && <button onClick={() => void run("x.ai/skills/remove", { path: text(skill.path) })} className="mt-2 font-mono text-[9.5px] text-red/70 hover:text-red">{t("remove")}</button>}</div>; })}</div></details>)}</div>}
     <MarketLinks kind="skills" />
   </div>;
 }
 
 function PluginsPanel() {
   const { t, language } = useI18n(); const zh = language === "zh-CN"; const sessionId = useDesktop((state) => state.activeId);
+  const [actionBusy, setActionBusy] = useState(false);
+  const actionLocked = useRef(false);
   const pluginsState = useExtension(async () => sessionId ? object(await bridge.callExtension("x.ai/plugins/list", { sessionId })) : { plugins: [] }, [sessionId]);
   const marketState = useExtension(async () => object(await bridge.callExtension("x.ai/marketplace/list", sessionId ? { sessionId } : {})), [sessionId]);
   const plugins = list(pluginsState.data?.plugins).map(object);
   const sources = list(marketState.data?.sources).map(object);
-  const action = async (action: Json) => { if (!sessionId) throw new Error(zh ? "请先打开一个任务" : "Open a mission first"); await bridge.callExtension("x.ai/plugins/action", { sessionId, action }); pluginsState.reload(); marketState.reload(); };
-  const marketAction = async (source: Json, plugin: Json) => { if (!sessionId) throw new Error(zh ? "请先打开一个任务" : "Open a mission first"); await bridge.callExtension("x.ai/marketplace/action", { sessionId, action: { type: "install", source_url_or_path: text(source.sourceUrlOrPath), plugin_relative_path: text(plugin.relativePath) } }); pluginsState.reload(); marketState.reload(); };
+  const unlockLater = () => window.setTimeout(() => { actionLocked.current = false; setActionBusy(false); }, 500);
+  const action = async (action: Json) => { if (!sessionId) throw new Error(zh ? "请先打开一个任务" : "Open a mission first"); if (actionLocked.current) return; actionLocked.current = true; setActionBusy(true); try { await bridge.callExtension("x.ai/plugins/action", { sessionId, action }); pluginsState.reload(); marketState.reload(); } finally { unlockLater(); } };
+  const marketAction = async (source: Json, plugin: Json) => { if (!sessionId) throw new Error(zh ? "请先打开一个任务" : "Open a mission first"); if (actionLocked.current) return; actionLocked.current = true; setActionBusy(true); try { await bridge.callExtension("x.ai/marketplace/action", { sessionId, action: { type: "install", source_url_or_path: text(source.sourceUrlOrPath), plugin_relative_path: text(plugin.relativePath) } }); pluginsState.reload(); marketState.reload(); } finally { unlockLater(); } };
   return <div><Heading title={`${t("plugins")} / ${t("marketplace")}`} description={zh ? "使用 Grok Build 原生 Plugin 与 Marketplace 扩展，安装后可即时刷新技能、Hook 与 MCP。" : "Use native Grok Build Plugins and Marketplace sources; installed Skills, hooks, and MCP refresh immediately."} />
-    <h3 className="lbl mb-2 !text-[9.5px]">{t("plugins")}</h3>{!sessionId ? <ExtensionState error={null} empty={zh ? "请先打开一个项目任务后管理 Plugin" : "Open a project mission before managing Plugins"} /> : plugins.length === 0 ? <ExtensionState error={pluginsState.error} empty={zh ? "尚未安装 Plugin" : "No Plugins installed"} /> : <div className="grid grid-cols-2 gap-2">{plugins.map((plugin) => { const id = text(plugin.id); const enabled = plugin.enabled !== false; return <div key={id} className="rounded-[5px] border border-line2 bg-raise p-3"><div className="flex gap-2"><Icon name="layers" size={12} className="text-acc" /><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-fg2">{text(plugin.name, id)}</p><p className="mt-1 line-clamp-2 text-[9.5px] text-dim">{text(plugin.description)} · {Number(plugin.skillCount ?? 0)} skills</p></div><Toggle on={enabled} onChange={(value) => void action({ type: value ? "enable" : "disable", plugin_id: id })} /></div><button onClick={() => void action({ type: "uninstall", plugin_id: id, confirmed: true })} className="mt-2 font-mono text-[9.5px] text-red/70 hover:text-red">{t("uninstall")}</button></div>; })}</div>}
-    <h3 className="lbl mb-2 mt-6 !text-[9.5px]">{t("marketplace")}</h3><div className="space-y-3">{sources.flatMap((source) => list(source.plugins).map(object).slice(0, 30).map((plugin) => <div key={`${text(source.sourceName)}-${text(plugin.relativePath)}`} className="flex items-center gap-3 rounded-[5px] border border-line bg-raise px-3 py-2"><div className="min-w-0 flex-1"><p className="text-[10.5px] text-fg2">{text(plugin.name)}</p><p className="truncate text-[9.5px] text-dim">{text(plugin.description)} · {text(source.sourceName)}</p></div><span className="font-mono text-[9.5px] text-faint">{text(plugin.installStatus)}</span>{text(plugin.installStatus) === "not_installed" && <ActionButton disabled={!sessionId} onClick={() => void marketAction(source, plugin)}>{t("install")}</ActionButton>}</div>))}</div>
+    <h3 className="lbl mb-2 !text-[9.5px]">{t("plugins")}</h3>{!sessionId ? <ExtensionState error={null} empty={zh ? "请先打开一个项目任务后管理 Plugin" : "Open a project mission before managing Plugins"} /> : plugins.length === 0 ? <ExtensionState error={pluginsState.error} empty={zh ? "尚未安装 Plugin" : "No Plugins installed"} /> : <div className="grid grid-cols-2 gap-2">{plugins.map((plugin) => { const id = text(plugin.id); const enabled = plugin.enabled !== false; return <div key={id} className="rounded-[5px] border border-line2 bg-raise p-3"><div className="flex gap-2"><Icon name="layers" size={12} className="text-acc" /><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-fg2">{text(plugin.name, id)}</p><p className="mt-1 line-clamp-2 text-[9.5px] text-dim">{text(plugin.description)} · {Number(plugin.skillCount ?? 0)} skills</p></div><Toggle on={enabled} disabled={actionBusy} onChange={(value) => void action({ type: value ? "enable" : "disable", plugin_id: id })} /></div><button disabled={actionBusy} onClick={() => void action({ type: "uninstall", plugin_id: id, confirmed: true })} className="mt-2 font-mono text-[9.5px] text-red/70 hover:text-red disabled:opacity-40">{t("uninstall")}</button></div>; })}</div>}
+    <h3 className="lbl mb-2 mt-6 !text-[9.5px]">{t("marketplace")}</h3><div className="space-y-3">{sources.flatMap((source) => list(source.plugins).map(object).slice(0, 30).map((plugin) => <div key={`${text(source.sourceName)}-${text(plugin.relativePath)}`} className="flex items-center gap-3 rounded-[5px] border border-line bg-raise px-3 py-2"><div className="min-w-0 flex-1"><p className="text-[10.5px] text-fg2">{text(plugin.name)}</p><p className="truncate text-[9.5px] text-dim">{text(plugin.description)} · {text(source.sourceName)}</p></div><span className="font-mono text-[9.5px] text-faint">{text(plugin.installStatus)}</span>{text(plugin.installStatus) === "not_installed" && <ActionButton disabled={!sessionId || actionBusy} onClick={() => void marketAction(source, plugin)}>{t("install")}</ActionButton>}</div>))}</div>
     {sources.length === 0 && <ExtensionState error={marketState.error} empty={zh ? "Marketplace 暂无可用来源" : "No Marketplace sources available"} />}<MarketLinks kind="plugins" />
   </div>;
 }

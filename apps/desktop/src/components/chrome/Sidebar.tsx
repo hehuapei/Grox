@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useDesktop, type ProjectMeta } from "../../state/store";
 import { usePreferences } from "../../state/preferences";
@@ -9,10 +9,16 @@ import { Icon } from "../fx/Icon";
 import type { Session, SessionMeta, SessionStatus } from "../../bridge/types";
 import { BlackHole } from "../fx/BlackHole";
 import { normalizeSessionQuery, sessionMatchesLoadedContent } from "../../lib/sessionSearch";
+import { projectId, samePath } from "../../lib/projectCatalog";
+import { ConfirmDialog } from "../common/ConfirmDialog";
 
-export function Sidebar() {
+export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) {
   const { t, language } = useI18n();
   const width = usePreferences((state) => state.sidebarWidth);
+  const theme = usePreferences((state) => state.theme);
+  const setLanguage = usePreferences((state) => state.setLanguage);
+  const setTheme = usePreferences((state) => state.setTheme);
+  const toggleSidebar = usePreferences((state) => state.toggleSidebar);
   const sessionIndex = useDesktop((state) => state.sessionIndex);
   const sessions = useDesktop((state) => state.sessions);
   const activeId = useDesktop((state) => state.activeId);
@@ -67,17 +73,15 @@ export function Sidebar() {
   );
   const sessionSearchIdsKey = sessionIndex.map((session) => session.id).join("\n");
   const normalizedQuery = normalizeSessionQuery(sessionQuery);
+  const sidebarSessions = orderedSessions.filter((session) => !session.archived);
   const matchedSessions = normalizedQuery
-    ? orderedSessions.filter((meta) =>
+    ? sidebarSessions.filter((meta) =>
         historyMatches.has(meta.id) || sessionMatchesLoadedContent(meta, sessions[meta.id], normalizedQuery)
       )
-    : orderedSessions;
-  const matchedWorkspaceKeys = new Set(matchedSessions.map((session) => workspaceKey(session.cwd)));
+    : sidebarSessions;
+  const matchedWorkspaceKeys = new Set(matchedSessions.map((session) => projectId(session.cwd)));
   const activeProjects = orderedProjects.filter(
-    (project) => !project.archived && (!normalizedQuery || matchedWorkspaceKeys.has(workspaceKey(project.path))),
-  );
-  const archivedProjects = orderedProjects.filter(
-    (project) => project.archived && (!normalizedQuery || matchedWorkspaceKeys.has(workspaceKey(project.path))),
+    (project) => !normalizedQuery || matchedWorkspaceKeys.has(projectId(project.path)),
   );
 
   useEffect(() => {
@@ -111,6 +115,15 @@ export function Sidebar() {
       <div className="flex h-14 items-center border-b border-line px-4">
         <button onClick={goHome} className="transition-opacity hover:opacity-70" title="Home">
           <Wordmark size={14} markSpin={view === "home" ? "slow" : false} />
+        </button>
+        <button
+          type="button"
+          onClick={onRequestHide ?? toggleSidebar}
+          className="ml-auto flex h-7 w-7 items-center justify-center rounded-[3px] text-dim hover:bg-high hover:text-fg"
+          title={language === "zh-CN" ? "隐藏侧栏（Ctrl/⌘B）" : "Hide sidebar (Ctrl/⌘B)"}
+          aria-label={language === "zh-CN" ? "隐藏侧栏" : "Hide sidebar"}
+        >
+          <Icon name="panelLeft" size={12} />
         </button>
       </div>
 
@@ -160,8 +173,7 @@ export function Sidebar() {
             project={project}
             active={project.id === activeProjectId}
             expanded={Boolean(normalizedQuery) || expandedProjectIds.has(project.id)}
-            sessions={matchedSessions.filter((session) => sameWorkspace(session.cwd, project.path))}
-            showArchived={Boolean(normalizedQuery)}
+            sessions={matchedSessions.filter((session) => samePath(session.cwd, project.path))}
             activeId={activeId}
             loadedSessions={sessions}
             onOpenSession={(id) => void openSession(id)}
@@ -173,29 +185,6 @@ export function Sidebar() {
             })}
           />
         ))}
-        {archivedProjects.length > 0 && (
-          <ArchiveGroup label={t("archived")} forceOpen={Boolean(normalizedQuery)}>
-            {archivedProjects.map((project) => (
-              <ProjectGroup
-                key={project.id}
-                project={project}
-                active={project.id === activeProjectId}
-                expanded={Boolean(normalizedQuery) || expandedProjectIds.has(project.id)}
-                sessions={matchedSessions.filter((session) => sameWorkspace(session.cwd, project.path))}
-                showArchived={Boolean(normalizedQuery)}
-                activeId={activeId}
-                loadedSessions={sessions}
-                onOpenSession={(id) => void openSession(id)}
-                onToggle={() => setExpandedProjectIds((current) => {
-                  const next = new Set(current);
-                  if (next.has(project.id)) next.delete(project.id);
-                  else next.add(project.id);
-                  return next;
-                })}
-              />
-            ))}
-          </ArchiveGroup>
-        )}
         {normalizedQuery && !historySearching && matchedSessions.length === 0 && (
           <p className="px-2 py-6 text-center font-mono text-[9.5px] text-faint">
             {language === "zh-CN" ? "没有匹配的历史会话" : "NO MATCHING SESSIONS"}
@@ -227,9 +216,29 @@ export function Sidebar() {
           </p>
         </button>
         <button
+          type="button"
+          onClick={() => setLanguage(language === "zh-CN" ? "en-US" : "zh-CN")}
+          className="flex h-7 min-w-7 shrink-0 items-center justify-center rounded-[3px] px-1 font-mono text-[9px] text-dim transition-colors hover:bg-high hover:text-fg focus-visible:outline focus-visible:outline-1 focus-visible:outline-acc"
+          title={language === "zh-CN" ? "切换至 English" : "Switch to 简体中文"}
+          aria-label={language === "zh-CN" ? "切换至 English" : "Switch to 简体中文"}
+        >
+          {language === "zh-CN" ? "中" : "EN"}
+        </button>
+        <button
+          type="button"
+          onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[3px] text-dim transition-colors hover:bg-high hover:text-fg focus-visible:outline focus-visible:outline-1 focus-visible:outline-acc"
+          title={theme === "dark" ? (language === "zh-CN" ? "切换至明亮主题" : "Switch to light theme") : (language === "zh-CN" ? "切换至暗黑主题" : "Switch to dark theme")}
+          aria-label={theme === "dark" ? (language === "zh-CN" ? "切换至明亮主题" : "Switch to light theme") : (language === "zh-CN" ? "切换至暗黑主题" : "Switch to dark theme")}
+        >
+          <Icon name={theme === "dark" ? "moon" : "sun"} size={12} />
+        </button>
+        <button
+          type="button"
           onClick={() => setSettingsOpen(true)}
-          className="flex h-7 w-7 items-center justify-center text-dim hover:text-fg"
+          className="flex h-7 w-7 shrink-0 items-center justify-center rounded-[3px] text-dim transition-colors hover:bg-high hover:text-fg focus-visible:outline focus-visible:outline-1 focus-visible:outline-acc"
           title={t("settings")}
+          aria-label={t("settings")}
         >
           <Icon name="gear" size={13} />
         </button>
@@ -270,12 +279,6 @@ export function Sidebar() {
   );
 }
 
-const sameWorkspace = (left: string, right: string) =>
-  left.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase() ===
-  right.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
-
-const workspaceKey = (path: string) => path.replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
-
 function ProjectGroup({
   project,
   active,
@@ -283,7 +286,6 @@ function ProjectGroup({
   sessions,
   activeId,
   loadedSessions,
-  showArchived,
   onOpenSession,
   onToggle,
 }: {
@@ -293,11 +295,10 @@ function ProjectGroup({
   sessions: SessionMeta[];
   activeId: string | null;
   loadedSessions: Record<string, Session>;
-  showArchived?: boolean;
   onOpenSession(id: string): void;
   onToggle(): void;
 }) {
-  const visible = showArchived ? sessions : sessions.filter((session) => !session.archived);
+  const visible = sessions.filter((session) => !session.archived);
   return (
     <div className="mb-1">
       <ProjectRow
@@ -335,18 +336,6 @@ function SectionTitle({ label, count }: { label: string; count: number }) {
   );
 }
 
-function ArchiveGroup({ label, children, forceOpen = false }: { label: string; children: React.ReactNode; forceOpen?: boolean }) {
-  return (
-    <details className="group/archive mt-1" open={forceOpen || undefined}>
-      <summary className="flex cursor-pointer items-center gap-1.5 px-2 py-1 font-mono text-[9.5px] text-faint hover:text-mute">
-        <Icon name="chevronRight" size={8} className="transition-transform group-open/archive:rotate-90" />
-        {label}
-      </summary>
-      {children}
-    </details>
-  );
-}
-
 function ProjectRow({ project, active, expanded, count, onToggle }: { project: ProjectMeta; active: boolean; expanded: boolean; count: number; onToggle(): void }) {
   const { t, language } = useI18n();
   const openProject = useDesktop((state) => state.openProject);
@@ -358,8 +347,17 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
   const removeProject = useDesktop((state) => state.removeProject);
   const openExplorer = useDesktop((state) => state.openProjectInExplorer);
   const createWorktree = useDesktop((state) => state.createProjectWorktree);
+  // Zustand selector 必须返回稳定快照；在 selector 内 filter 会让 React 19
+  // 持续看到新数组并触发 Maximum update depth exceeded（#29）。
+  const sessionIndex = useDesktop((state) => state.sessionIndex);
+  const projectSessions = useMemo(
+    () => sessionIndex.filter((session) => samePath(session.cwd, project.path)),
+    [project.path, sessionIndex],
+  );
+  const allArchived = projectSessions.length > 0 && projectSessions.every((session) => session.archived);
   const [menu, setMenu] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const [draft, setDraft] = useState(project.name);
   const commit = () => {
     setEditing(false);
@@ -408,7 +406,12 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
       >
         <Icon name="plus" size={12} />
       </button>
-      <button onClick={() => setMenu((open) => !open)} className="hidden h-5 w-5 items-center justify-center text-dim hover:text-fg group-hover:flex">
+      <button
+        onClick={() => setMenu((open) => !open)}
+        className="flex h-5 w-5 shrink-0 items-center justify-center text-dim opacity-0 transition-opacity hover:text-fg group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100"
+        aria-label={language === "zh-CN" ? "项目操作" : "Project actions"}
+        aria-expanded={menu}
+      >
         <Icon name="more" size={12} />
       </button>
       {menu && (
@@ -418,12 +421,42 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
           <MenuButton icon="branch" label={language === "zh-CN" ? "创建永久工作树" : "Create permanent worktree"} onClick={() => void createWorktree(project.id)} />
           <MenuButton icon="gear" label={language === "zh-CN" ? "编辑项目" : "Edit project"} onClick={() => setEditing(true)} />
           <MenuDivider />
-          <MenuButton icon="archive" label={project.archived ? t("unarchive") : (language === "zh-CN" ? "归档项目" : "Archive project")} onClick={() => archiveProject(project.id)} />
-          <MenuButton icon="x" label={t("remove")} tone="text-red" onClick={() => removeProject(project.id)} />
+          <MenuButton icon="archive" label={allArchived ? (language === "zh-CN" ? "恢复项目会话" : "Restore project sessions") : (language === "zh-CN" ? "归档项目内全部会话" : "Archive all project sessions")} onClick={() => void archiveProject(project.id)} />
+          <MenuButton
+            icon="trash"
+            label={language === "zh-CN" ? "删除项目及会话" : "Delete project and sessions"}
+            tone="text-red"
+            onClick={() => setConfirmDelete(true)}
+          />
         </ContextMenu>
+      )}
+      {confirmDelete && (
+        <ConfirmDialog
+          title={language === "zh-CN" ? "永久删除项目会话？" : "Delete project conversations permanently?"}
+          description={language === "zh-CN"
+            ? `将删除“${project.name}”的全部会话和本地历史；项目源码文件不会被删除。`
+            : `All conversations and local history for “${project.name}” will be deleted. Workspace files will be kept.`}
+          confirmLabel={language === "zh-CN" ? "永久删除" : "Delete permanently"}
+          cancelLabel={language === "zh-CN" ? "取消" : "Cancel"}
+          workingLabel={language === "zh-CN" ? "删除中" : "Deleting"}
+          onCancel={() => setConfirmDelete(false)}
+          onConfirm={async () => {
+            await removeProject(project.id);
+            setConfirmDelete(false);
+          }}
+        />
       )}
     </div>
   );
+}
+
+function missionTitle(meta: SessionMeta, language: string): string {
+  const title = meta.title?.trim();
+  if (title) return title;
+  const summary = meta.summary?.trim();
+  if (summary) return summary.slice(0, 48);
+  const shortId = meta.id.length > 12 ? `${meta.id.slice(0, 8)}…` : meta.id;
+  return language === "zh-CN" ? `无标题会话（${shortId}）` : `Untitled (${shortId})`;
 }
 
 function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: { meta: SessionMeta; status: SessionStatus; completionUnread: boolean; active: boolean; tokens: number; onOpen(): void }) {
@@ -432,13 +465,16 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
   const pinSession = useDesktop((state) => state.pinSession);
   const archiveSession = useDesktop((state) => state.archiveSession);
   const markSessionUnread = useDesktop((state) => state.markSessionUnread);
+  const removeFromSidebar = useDesktop((state) => state.removeSessionFromSidebar);
   const continueInNewChat = useDesktop((state) => state.continueSessionInNewChat);
   const continueInWorktree = useDesktop((state) => state.continueSessionInNewWorktree);
   const openInNewWindow = useDesktop((state) => state.openSessionInNewWindow);
   const copySessionValue = useDesktop((state) => state.copySessionValue);
   const [editing, setEditing] = useState(false);
   const [menu, setMenu] = useState(false);
-  const [draft, setDraft] = useState(meta.title);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const displayTitle = missionTitle(meta, language);
+  const [draft, setDraft] = useState(displayTitle);
   const commit = () => {
     setEditing(false);
     const title = draft.trim();
@@ -461,12 +497,22 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
         {editing ? (
           <input autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={commit} onKeyDown={(event) => event.key === "Enter" && commit()} onClick={(event) => event.stopPropagation()} className="min-w-0 flex-1 border border-line3 bg-void px-1 text-[11px] text-fg outline-none" />
         ) : (
-          <span className="min-w-0 flex-1 truncate text-[11px] text-fg2">{meta.title}</span>
+          <span className={`min-w-0 flex-1 truncate text-[11px] ${meta.title?.trim() ? "text-fg2" : "text-faint italic"}`} title={meta.id}>
+            {displayTitle}
+          </span>
         )}
-        <button onClick={(event) => { event.stopPropagation(); setMenu((open) => !open); }} className="hidden h-5 w-5 items-center justify-center text-dim hover:text-fg group-hover:flex">
+        <button
+          onClick={(event) => { event.stopPropagation(); setMenu((open) => !open); }}
+          className="flex h-5 w-5 shrink-0 items-center justify-center text-dim opacity-0 transition-opacity hover:text-fg group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100"
+          aria-label={language === "zh-CN" ? "会话操作" : "Session actions"}
+          aria-expanded={menu}
+        >
           <Icon name="more" size={12} />
         </button>
       </div>
+      {meta.summary && meta.summary !== meta.title && (
+        <p className="mt-0.5 truncate pl-3.5 text-[9.5px] leading-tight text-mute" title={meta.summary}>{meta.summary}</p>
+      )}
       <div className="mt-0.5 flex items-center justify-between pl-3.5">
         <span className="font-mono text-[9.5px] text-faint">{fmtRelTime(meta.updatedAt)}</span>
         {tokens > 0 && <span className="tnum text-[9.5px] text-faint">{fmtTokens(tokens)} TOK</span>}
@@ -478,16 +524,40 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
           <MenuButton icon="archive" label={t("archive")} onClick={() => archiveSession(meta.id)} />
           <MenuButton icon="dot" label={language === "zh-CN" ? "标记为未读" : "Mark as unread"} onClick={() => markSessionUnread(meta.id)} />
           <MenuDivider />
-          <MenuButton icon="external" label={language === "zh-CN" ? "在 Finder 中显示" : "Show in Finder"} onClick={() => void useDesktop.getState().openProjectInExplorer(workspaceKey(meta.cwd))} />
+          <MenuButton icon="external" label={language === "zh-CN" ? "在 Finder 中显示" : "Show in Finder"} onClick={() => void useDesktop.getState().openProjectInExplorer(projectId(meta.cwd))} />
           <MenuButton icon="folder" label={language === "zh-CN" ? "复制工作目录" : "Copy working directory"} onClick={() => void copySessionValue(meta.id, "cwd")} />
           <MenuButton icon="copy" label={language === "zh-CN" ? "复制会话 ID" : "Copy session ID"} onClick={() => void copySessionValue(meta.id, "id")} />
           <MenuButton icon="external" label={language === "zh-CN" ? "复制深度链接" : "Copy deep link"} onClick={() => void copySessionValue(meta.id, "link")} />
+          <MenuButton icon="summary" label={language === "zh-CN" ? "导出会话诊断" : "Export session trace"} onClick={() => void invoke<string>("export_session_trace", { sessionId: meta.id }).then((path) => navigator.clipboard.writeText(path))} />
           <MenuDivider />
           <MenuButton icon="arrowRight" label={language === "zh-CN" ? "在新聊天中继续" : "Continue in new chat"} onClick={() => void continueInNewChat(meta.id)} />
           <MenuButton icon="branch" label={language === "zh-CN" ? "在新工作树中继续" : "Continue in new worktree"} onClick={() => void continueInWorktree(meta.id)} />
           <MenuDivider />
           <MenuButton icon="external" label={language === "zh-CN" ? "在新窗口中打开" : "Open in new window"} onClick={() => void openInNewWindow(meta.id)} />
+          <MenuDivider />
+          <MenuButton
+            icon="trash"
+            label={language === "zh-CN" ? "永久删除会话" : "Delete conversation permanently"}
+            tone="text-red"
+            onClick={() => setConfirmDelete(true)}
+          />
         </ContextMenu>
+      )}
+      {confirmDelete && (
+        <ConfirmDialog
+          title={language === "zh-CN" ? "永久删除会话？" : "Delete conversation permanently?"}
+          description={language === "zh-CN"
+            ? `“${displayTitle}”及其本地历史将被永久删除。`
+            : `“${displayTitle}” and its local history will be permanently deleted.`}
+          confirmLabel={language === "zh-CN" ? "永久删除" : "Delete permanently"}
+          cancelLabel={language === "zh-CN" ? "取消" : "Cancel"}
+          workingLabel={language === "zh-CN" ? "删除中" : "Deleting"}
+          onCancel={() => setConfirmDelete(false)}
+          onConfirm={async () => {
+            await removeFromSidebar(meta.id);
+            setConfirmDelete(false);
+          }}
+        />
       )}
     </div>
   );

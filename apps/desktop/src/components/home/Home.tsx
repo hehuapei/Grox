@@ -10,7 +10,6 @@ import { fmtRelTime, fmtTokens } from "../../lib/format";
 import { MAX_ATTACHMENTS, prepareAttachment, validateAttachmentSet } from "../../lib/attachments";
 import { attachExplicitPromptImages } from "../../lib/pathAttachments";
 import { BlackHole } from "../fx/BlackHole";
-import { Starfield } from "../fx/Starfield";
 import { StageTransition } from "../fx/StageTransition";
 import { Icon } from "../fx/Icon";
 import { ChipSelect } from "../common/ChipSelect";
@@ -130,7 +129,6 @@ export function Home() {
   if (workspaceMode !== "conversation") {
     return (
       <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden bg-base">
-        <Starfield density={90} interactive={false} className="opacity-50" />
         <div className="home-nebula opacity-40" />
         <WorkspaceTabs mode={workspaceMode} onChange={setWorkspaceMode} />
         <StageTransition stageKey={workspaceMode} variant="panel" className="relative z-[1]">
@@ -142,15 +140,13 @@ export function Home() {
 
   return (
     <div className="relative flex-1 overflow-hidden bg-base">
-      <Starfield density={190} interactive />
+      {/* CSS nebula only — canvas starfield rAF competed with first clicks (case B). */}
       <div className="home-nebula" />
       <WorkspaceTabs mode={workspaceMode} onChange={setWorkspaceMode} />
 
       {/* engineering crosshairs */}
       <Crosshair className="left-3 top-3 animate-mission-in" style={{ animationDelay: "0.05s" }} />
       <Crosshair className="right-3 top-3 animate-mission-in" style={{ animationDelay: "0.08s" }} />
-      <Crosshair className="bottom-3 left-3 animate-mission-in" style={{ animationDelay: "0.1s" }} />
-      <Crosshair className="bottom-3 right-3 animate-mission-in" style={{ animationDelay: "0.12s" }} />
 
       <div className="relative z-[1] flex h-full flex-col items-center justify-center px-10 pb-16">
         <div className="animate-mission-in" style={{ animationDelay: "0.04s" }}>
@@ -281,11 +277,6 @@ export function Home() {
         )}
       </div>
 
-      {/* ground strip */}
-      <div className="absolute inset-x-0 bottom-0 z-[1] flex h-9 animate-mission-in items-center justify-between px-5" style={{ animationDelay: "0.55s" }}>
-        <span className="tnum max-w-[60%] truncate text-[10.5px] text-mute">{workspace}</span>
-        <span className="lbl !text-[10px]">⌘K {language === "zh-CN" ? "命令" : "PALETTE"} · ⌘N {t("newProject")}</span>
-      </div>
     </div>
   );
 }

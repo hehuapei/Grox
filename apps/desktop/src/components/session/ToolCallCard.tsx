@@ -61,6 +61,8 @@ const kindMeta: Partial<Record<ToolKind, { icon: IconProps["name"]; tone: string
   skill: { icon: "bolt", tone: "text-fg" },
   use_tool: { icon: "layers", tone: "text-fg" },
   goal_update: { icon: "check", tone: "text-green" },
+  voice: { icon: "mic", tone: "text-acc" },
+  finance: { icon: "summary", tone: "text-green" },
   image_gen: { icon: "file", tone: "text-acc" },
   video_gen: { icon: "play", tone: "text-acc" },
   image_to_video: { icon: "play", tone: "text-acc" },
@@ -80,7 +82,7 @@ export function ToolCallCard({ block }: { block: ToolBlock }) {
   const meta = kindMeta[call.kind] ?? { icon: "bolt" as const, tone: "text-dim" };
   const duration = call.endedAt ? call.endedAt - call.startedAt : Date.now() - call.startedAt;
   const title = language === "zh-CN"
-    ? ({ "Web search:": "网页搜索", "X search:": "X 搜索", "Model search:": "模型搜索" } as Record<string, string>)[call.title] ?? call.title
+    ? ({ "Web search:": "网页搜索", "X search:": "X 搜索", "Model search:": "模型搜索", Voice: "语音", Finance: "金融行情" } as Record<string, string>)[call.title] ?? call.title
     : call.title;
   const failure = call.status === "error" && call.output
     ? toolFailureSummary(call.output, language)
@@ -93,6 +95,11 @@ export function ToolCallCard({ block }: { block: ToolBlock }) {
         <button onClick={() => setOpen((v) => !v)} className="flex h-7 w-full items-center gap-1.5 text-left">
           <Icon name={meta.icon} size={12} className={`shrink-0 ${meta.tone}`} />
           <span className="max-w-[42%] truncate font-mono text-[10.5px] text-fg2">{title}</span>
+          {call.readOnly && (
+            <span className="shrink-0 rounded-[3px] border border-line2 px-1 py-0.5 font-mono text-[8px] tracking-[0.08em] text-faint">
+              {language === "zh-CN" ? "只读" : "READ ONLY"}
+            </span>
+          )}
           {call.detail && (
             <span className="min-w-0 flex-1 truncate font-mono text-[9.5px] text-mute">
               {call.detail}

@@ -49,11 +49,13 @@ import type {
   WorkflowRun,
 } from "./types";
 import { readStoredPermissionMode } from "../lib/permissionMode";
+import { cleanApiError, toolCanonicalKind, toolReadOnly, versionMismatchNotice } from "../lib/runtimeNotice";
 
 export const ACP_METHODS = {
   initialize: "initialize",
   sessionNew: "session/new",
   sessionLoad: "session/load",
+  sessionClose: "session/close",
   sessionPrompt: "session/prompt",
   sessionCancel: "session/cancel",
   sessionSetMode: "session/set_mode",
@@ -68,6 +70,7 @@ export const ACP_METHODS = {
   gitStatus: "x.ai/git/status",
   gitDiffs: "x.ai/git/diffs",
   sessionFork: "x.ai/session/fork",
+  modelsList: "x.ai/models/list",
   compact: "x.ai/compact_conversation",
   promptHistory: "x.ai/prompt_history",
 } as const;
@@ -338,12 +341,7 @@ function array(value: unknown): unknown[] {
 }
 
 function errorText(value: unknown): string {
-  const object = record(value);
-  return (
-    string(object?.message) ??
-    string(object?.data) ??
-    (value instanceof Error ? value.message : String(value))
-  );
+  return cleanApiError(value);
 }
 
 function jsonText(value: unknown): string | undefined {
@@ -519,7 +517,7 @@ const TOOL_KINDS = new Set<ToolKind>([
   "kill_task_action", "list", "skill", "memory_search", "memory_get", "task", "enter_plan",
   "exit_plan", "ask_user", "image_gen", "video_gen", "image_to_video", "reference_to_video", "computer",
   "deploy_app", "search_tool", "use_tool", "monitor", "goal_update", "terminal", "web",
-  "think", "switch_mode", "other",
+  "think", "switch_mode", "voice", "finance", "other",
 ]);
 
 function mapToolKind(kindValue: unknown, titleValue: unknown): ToolKind {
@@ -527,6 +525,8 @@ function mapToolKind(kindValue: unknown, titleValue: unknown): ToolKind {
   if (TOOL_KINDS.has(exact as ToolKind)) return exact as ToolKind;
   if (exact === "fetch") return "web_fetch";
   const source = `${exact} ${string(titleValue) ?? ""}`.toLowerCase();
+  if (/\b(voice|speech|audio|transcri(?:be|ption))\b/.test(source)) return "voice";
+  if (/\b(finance|market|stock|quote|ticker)\b/.test(source)) return "finance";
   if (
     /\bcomputer_(screenshot|mouse|click|drag|scroll|key|type|wait)\b/.test(source) ||
     (
@@ -960,6 +960,7 @@ function applyToSession(session: Session, event: BridgeEvent): Session {
     case "available_commands":
     case "workflow_update":
     case "workflow_trace_update":
+    case "runtime_notice":
       return session;
     case "session_meta":
       return { ...session, ...event.patch };
@@ -1112,17 +1113,34 @@ export class AcpBridge implements GrokBridge {
   // the parent session. Its report is stale by definition, so remember the
   // cancelled run across live updates and transcript replay.
   private cancelledWorkflowRuns = new Map<string, Set<string>>();
-  private ready: Promise<void>;
+  /**
+   * Shared connect/initialize promise. Starts only on first ensureReady() so
+   * module import + first React paint are not blocked by spawning `grok agent`.
+   */
+  private boot: Promise<void> | null = null;
 
   constructor() {
-    this.ready = this.connect();
-    void this.ready.then(() => {
-      if (localStorage.getItem("grox.pendingOAuth") !== "1") return;
-      localStorage.removeItem("grox.pendingOAuth");
-      void this.authenticate().catch(() => {
-        // authenticate() already publishes the actionable error through auth_state.
-      });
-    });
+    // Lazy connect — see ensureReady(). Constructor must stay free of IPC.
+  }
+
+  /** Idempotent boot. All RPC paths await this instead of connecting at import. */
+  ensureReady(): Promise<void> {
+    if (!this.boot) {
+      this.boot = this.connect()
+        .then(() => {
+          if (localStorage.getItem("grox.pendingOAuth") !== "1") return;
+          localStorage.removeItem("grox.pendingOAuth");
+          void this.authenticate().catch(() => {
+            // authenticate() already publishes the actionable error through auth_state.
+          });
+        })
+        .catch((error) => {
+          // Allow a later caller to retry after a failed first boot.
+          this.boot = null;
+          throw error;
+        });
+    }
+    return this.boot;
   }
 
   subscribe(callback: (event: BridgeEvent) => void) {
@@ -1271,6 +1289,16 @@ export class AcpBridge implements GrokBridge {
     this.captureModelState(response);
     this.captureRuntimeCommands(response);
     await this.configureAuthentication(response);
+    // v1 source snapshots make startup structurally non-blocking: initialize
+    // may expose a cached/bundled catalog before the authenticated fetch ends.
+    // Refresh in the background so desktop readiness never waits on network.
+    void this.requestRaw(ACP_METHODS.modelsList, {}, 30_000)
+      .then((catalog) => this.captureModelState(catalog))
+      .catch((error) => {
+        if (!isMethodUnavailable(error)) {
+          this.diagnostics.push(`模型目录后台刷新失败：${errorText(error)}`);
+        }
+      });
   }
 
   /** Best-effort version of the spawned `grok` CLI ("grok 0.2.106 (abc) [stable]" → "0.2.106"). */
@@ -1314,7 +1342,7 @@ export class AcpBridge implements GrokBridge {
     this.runtimeCommands = [];
     this.runtimeCommandTags.clear();
     const next = this.initializeAgent();
-    this.ready = next;
+    this.boot = next;
     await next;
   }
 
@@ -1441,7 +1469,7 @@ export class AcpBridge implements GrokBridge {
       throw new Error(lastError);
     })();
     this.reconnecting = reconnect.finally(() => { this.reconnecting = null; });
-    this.ready = this.reconnecting;
+    this.boot = this.reconnecting;
     void this.reconnecting.catch(() => {});
   }
 
@@ -1595,6 +1623,11 @@ export class AcpBridge implements GrokBridge {
   }
 
   private onNotification(method: string, paramsValue: unknown) {
+    if (method === "x.ai/leader/version_mismatch") {
+      const notice = versionMismatchNotice(paramsValue);
+      if (notice) this.emit({ type: "runtime_notice", notice });
+      return;
+    }
     if (method === "session/update" || method === "x.ai/session/update") {
       const params = record(paramsValue);
       const sessionId = string(params?.sessionId);
@@ -1865,11 +1898,13 @@ export class AcpBridge implements GrokBridge {
     const blockId = cursor.toolBlocks.get(toolCallId) ?? uid();
     cursor.toolBlocks.set(toolCallId, blockId);
     const content = array(update.content);
-    const kind = mapToolKind(update.kind, update.title);
+    const canonicalKind = toolCanonicalKind(update);
+    const kind = mapToolKind(canonicalKind ?? update.kind, update.title);
     const call: ToolCall = {
       id: toolCallId,
       kind,
-      rawKind: string(update.kind),
+      rawKind: canonicalKind ?? string(update.kind),
+      readOnly: toolReadOnly(update),
       title: string(update.title) ?? "tool",
       detail: string(update.detail),
       status: mapToolStatus(update.status),
@@ -1910,14 +1945,17 @@ export class AcpBridge implements GrokBridge {
     }
     const status = mapToolStatus(update.status);
     const content = array(update.content);
+    const canonicalKind = toolCanonicalKind(update);
     const terminal = extractTerminal(
-      mapToolKind(update.kind, update.title),
+      mapToolKind(canonicalKind ?? update.kind, update.title),
       update.title,
       update.rawInput,
       update.rawOutput,
       content,
     );
-    const kind = mapToolKind(update.kind, update.title);
+    const kind = mapToolKind(canonicalKind ?? update.kind, update.title);
+    const hasSpecificKind = canonicalKind !== undefined
+      || (update.kind !== undefined && string(update.kind) !== "other");
     const computerToolKey = `${sessionId}:${toolCallId}`;
     const isComputerTool = kind === "computer" || this.activeComputerToolCalls.has(computerToolKey);
     if (isComputerTool) {
@@ -1938,8 +1976,8 @@ export class AcpBridge implements GrokBridge {
       sessionId,
       blockId,
       call: {
-        ...(update.kind !== undefined || update.title !== undefined ? { kind } : {}),
-        ...(update.kind !== undefined ? { rawKind: string(update.kind) } : {}),
+        ...(hasSpecificKind ? { kind, rawKind: canonicalKind ?? string(update.kind) } : {}),
+        ...(toolReadOnly(update) !== undefined ? { readOnly: toolReadOnly(update) } : {}),
         status,
         ...(status === "done" || status === "error" || status === "cancelled" ? { endedAt: Date.now() } : {}),
         ...(update.title !== undefined ? { title: string(update.title) } : {}),
@@ -2350,12 +2388,12 @@ export class AcpBridge implements GrokBridge {
   }
 
   private async request(method: string, params: unknown, timeoutMs = 30_000): Promise<unknown> {
-    await this.ready;
+    await this.ensureReady();
     return this.requestRaw(method, params, timeoutMs);
   }
 
   private async notify(method: string, params: unknown): Promise<void> {
-    await this.ready;
+    await this.ensureReady();
     await this.sendRaw({ jsonrpc: "2.0", method: wireMethod(method), params });
   }
 
@@ -2420,6 +2458,7 @@ export class AcpBridge implements GrokBridge {
     return {
       id,
       title,
+      summary: string(row.summary),
       cwd: string(row.cwd) ?? fallbackCwd,
       createdAt: parseTimestamp(row.createdAt),
       updatedAt: parseTimestamp(row.lastActiveAt ?? row.updatedAt),
@@ -2429,12 +2468,12 @@ export class AcpBridge implements GrokBridge {
   }
 
   async getAuthState(): Promise<AuthState> {
-    await this.ready;
+    await this.ensureReady();
     return { ...this.authState };
   }
 
   async getModelState(): Promise<ModelState> {
-    await this.ready;
+    await this.ensureReady();
     return { ...this.modelState, models: [...this.modelState.models] };
   }
 
@@ -2576,7 +2615,7 @@ export class AcpBridge implements GrokBridge {
   }
 
   async authenticate(): Promise<void> {
-    await this.ready;
+    await this.ensureReady();
     // A click on "Sign in to Grok" is an explicit choice of the subscription
     // path. Make that choice durable before opening the browser, otherwise a
     // previously selected API gateway can keep owning the next ACP child.
@@ -2624,7 +2663,7 @@ export class AcpBridge implements GrokBridge {
   }
 
   async getAccountInfo(): Promise<AccountInfo> {
-    await this.ready;
+    await this.ensureReady();
     let authInfo: JsonObject = {};
     let subscription: JsonObject = {};
     try {
@@ -2760,12 +2799,12 @@ export class AcpBridge implements GrokBridge {
   }
 
   async getWorkspace(): Promise<string> {
-    await this.ready;
+    await this.ensureReady();
     return this.workspace;
   }
 
   async setWorkspace(cwd: string): Promise<void> {
-    await this.ready;
+    await this.ensureReady();
     const validated = await invoke<string>("validate_workspace", { cwd });
     this.workspace = validated;
     localStorage.setItem("grok.workspace", validated);
@@ -3274,7 +3313,7 @@ export class AcpBridge implements GrokBridge {
     this.activePromptSessions.add(sessionId);
     let terminalStatus: SessionStatus = "idle";
     try {
-      await this.ready;
+      await this.ensureReady();
       if (!this.knownSessions.has(sessionId)) {
         await this.loadSession(sessionId, { background: true });
       }
@@ -3425,7 +3464,7 @@ export class AcpBridge implements GrokBridge {
   }
 
   async interject(sessionId: string, text: string, options: PromptOptions): Promise<boolean> {
-    await this.ready;
+    await this.ensureReady();
     const trimmed = text.trim();
     if (!trimmed && (options.attachments?.length ?? 0) === 0) return false;
     const id = uid();
@@ -3642,6 +3681,21 @@ export class AcpBridge implements GrokBridge {
     this.sessionOptions.delete(sessionId);
     this.usage.delete(sessionId);
     this.forgetRewoundSession(sessionId);
+  }
+
+  async closeSession(id: string): Promise<void> {
+    if (!this.knownSessions.has(id)) return;
+    try {
+      await this.request(ACP_METHODS.sessionClose, { sessionId: id });
+    } catch (error) {
+      // Grok Build v1 also retains the pre-ACP spelling for older clients.
+      if (!isMethodUnavailable(error)) throw error;
+      await this.request("x.ai/session/close", { sessionId: id });
+    }
+    this.knownSessions.delete(id);
+    this.sessionWorkspaces.delete(id);
+    this.cursors.delete(id);
+    this.usage.delete(id);
   }
 
   private async refreshSessionInfo(sessionId: string): Promise<void> {

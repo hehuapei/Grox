@@ -57,3 +57,18 @@ export function sanitizeSessionForOpen(_session: {
 }): { status: "idle" } {
   return { status: "idle" };
 }
+
+export function shouldCloseDetachedSession(args: {
+  currentId: string | null;
+  nextId?: string | null;
+  status?: string;
+}): args is { currentId: string; nextId?: string | null; status: string } {
+  return Boolean(
+    args.currentId
+    // Local draft / pending shells are never ACP-attached.
+    && !args.currentId.startsWith("pending-")
+    && !args.currentId.startsWith("draft-")
+    && args.currentId !== args.nextId
+    && (args.status === "idle" || args.status === "failed"),
+  );
+}

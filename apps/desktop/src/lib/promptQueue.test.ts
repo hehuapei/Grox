@@ -5,6 +5,7 @@ import {
   filterQueueGhostsByLiveText,
   filterQueueGhostsByLiveTexts,
   mergeCliQueueWithLocal,
+  moveQueueEntry,
   nextLocalDrainIndex,
   normalizeQueueText,
   queueHasSameText,
@@ -304,4 +305,10 @@ describe("queueHasSameText", () => {
     expect(queueHasSameText([{ text: "a" }, { text: " b " }], "b")).toBe(true);
     expect(queueHasSameText([{ text: "a" }], "b")).toBe(false);
   });
+});
+
+it("reorders queued slash commands and attachment rows without dropping data", () => {
+  const queue = [{ id: "slash", text: "/compact" }, { id: "image", text: "", image: "a.png" }];
+  expect(moveQueueEntry(queue, 1, -1)).toEqual([queue[1], queue[0]]);
+  expect(moveQueueEntry(queue, 0, -1)).toEqual(queue);
 });

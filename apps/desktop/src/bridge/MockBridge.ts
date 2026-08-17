@@ -173,6 +173,7 @@ export class MockBridge implements GrokBridge {
       apiKey: "",
       hasApiKey: Boolean(config.apiKey?.trim()) || Boolean(existing?.hasApiKey),
       baseUrl: config.baseUrl,
+      allowInsecureHttp: config.allowInsecureHttp,
       apiBackend: config.apiBackend,
       availableModels: existing?.availableModels ?? ["grok-4.5", "grok-code-fast"],
       residentModels: config.residentModels,
@@ -285,6 +286,8 @@ export class MockBridge implements GrokBridge {
       background: options?.background,
     });
   }
+
+  async closeSession(_id: string): Promise<void> {}
 
   async renameSession(id: string, title: string): Promise<void> {
     const s = this.sessions.get(id);

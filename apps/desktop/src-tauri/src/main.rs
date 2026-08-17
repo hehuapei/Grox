@@ -18,7 +18,7 @@ mod process_job;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
-    io::Write as _,
+    io::{Read as _, Write as _},
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::{
@@ -338,6 +338,7 @@ struct ReleaseSummary {
     notes: String,
     release_url: String,
     published_at: Option<String>,
+    installable: bool,
 }
 
 #[derive(Serialize)]
@@ -347,6 +348,7 @@ struct UpdateStatus {
     update_available: bool,
     latest: UpdateInfo,
     history: Vec<ReleaseSummary>,
+    rollback: Option<ReleaseSummary>,
 }
 
 #[derive(Clone, Serialize)]
@@ -457,6 +459,8 @@ struct StoredProviderProfile {
     api_key: String,
     base_url: String,
     #[serde(default)]
+    allow_insecure_http: bool,
+    #[serde(default)]
     api_backend: ProviderApiBackend,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     models_url: Option<String>,
@@ -534,6 +538,7 @@ struct ProviderProfileSummary {
     api_key: String,
     has_api_key: bool,
     base_url: String,
+    allow_insecure_http: bool,
     api_backend: ProviderApiBackend,
     available_models: Vec<String>,
     resident_models: Vec<String>,
@@ -553,6 +558,8 @@ struct SaveProviderProfile {
     name: String,
     api_key: Option<String>,
     base_url: String,
+    #[serde(default)]
+    allow_insecure_http: bool,
     #[serde(default)]
     api_backend: ProviderApiBackend,
     #[serde(default)]
@@ -678,6 +685,14 @@ fn parse_session_disk_preview(
     })
 }
 
+/// History file names used by current and older Grok CLI layouts.
+const SESSION_HISTORY_FILENAMES: &[&str] = &[
+    "chat_history.jsonl",
+    "history.jsonl",
+    "session.jsonl",
+    "transcript.jsonl",
+];
+
 fn session_history_path(grok: &Path, session_id: &str) -> Result<Option<PathBuf>, String> {
     let mut components = Path::new(session_id).components();
     if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
@@ -690,19 +705,254 @@ fn session_history_path(grok: &Path, session_id: &str) -> Result<Option<PathBuf>
     let sessions = sessions
         .canonicalize()
         .map_err(|error| format!("无法读取 Grok 会话目录：{error}"))?;
-    let direct = sessions.join(session_id).join("chat_history.jsonl");
-    let candidates = std::iter::once(direct).chain(
-        fs::read_dir(&sessions)
-            .map_err(|error| format!("无法扫描 Grok 会话目录：{error}"))?
-            .filter_map(Result::ok)
-            .map(|entry| entry.path().join(session_id).join("chat_history.jsonl")),
-    );
-    for candidate in candidates {
-        let Ok(candidate) = candidate.canonicalize() else {
+    let wanted = session_id.to_ascii_lowercase();
+
+    // Fast path: known layouts.
+    for name in SESSION_HISTORY_FILENAMES {
+        let direct = sessions.join(session_id).join(name);
+        if let Ok(candidate) = direct.canonicalize() {
+            if candidate.starts_with(&sessions) && candidate.is_file() {
+                return Ok(Some(candidate));
+            }
+        }
+        let Ok(entries) = fs::read_dir(&sessions) else {
+            break;
+        };
+        for entry in entries.filter_map(Result::ok) {
+            let candidate = entry.path().join(session_id).join(name);
+            if let Ok(candidate) = candidate.canonicalize() {
+                if candidate.starts_with(&sessions) && candidate.is_file() {
+                    return Ok(Some(candidate));
+                }
+            }
+        }
+    }
+
+    // Slow path: case-insensitive id match + one extra nesting level
+    // (workspace / batch / session-id / history).
+    if let Some(path) = find_session_history_by_scan(&sessions, &wanted)? {
+        return Ok(Some(path));
+    }
+    Ok(None)
+}
+
+fn session_directory_path(grok: &Path, session_id: &str) -> Result<Option<PathBuf>, String> {
+    if !valid_session_id(session_id) {
+        return Err("无效会话 ID".into());
+    }
+    let sessions = grok.join("sessions");
+    if !sessions.is_dir() {
+        return Ok(None);
+    }
+    let root = sessions
+        .canonicalize()
+        .map_err(|error| format!("无法读取 Grok 会话目录：{error}"))?;
+    let wanted = session_id.to_ascii_lowercase();
+    let mut pending = vec![(root.clone(), 0usize)];
+    while let Some((directory, depth)) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&directory) else {
             continue;
         };
-        if candidate.starts_with(&sessions) && candidate.is_file() {
-            return Ok(Some(candidate));
+        for entry in entries.filter_map(Result::ok) {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Ok(canonical) = path.canonicalize() else {
+                continue;
+            };
+            if !canonical.starts_with(&root) {
+                continue;
+            }
+            // 工作区目录名也可能碰巧等于会话 ID。必须看到已知历史文件才把
+            // 它视为会话目录，宁可留下无数据的空目录，也不能误删父级容器。
+            let is_session_directory = history_file_in_session_dir(&canonical).is_some();
+            if dir_name_eq_ci(&canonical, &wanted) && is_session_directory {
+                return Ok(Some(canonical));
+            }
+            // 当前和旧版布局最多为 workspace / batch / session-id。
+            if depth < 2 {
+                pending.push((canonical, depth + 1));
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn delete_session_history_data(grok: &Path, session_id: &str) -> Result<bool, String> {
+    let Some(directory) = session_directory_path(grok, session_id)? else {
+        return Ok(false);
+    };
+    fs::remove_dir_all(&directory)
+        .map_err(|error| format!("无法删除会话历史 {}：{error}", directory.display()))?;
+    Ok(true)
+}
+
+fn workspace_identity(path: &str) -> String {
+    let mut value = path.trim().replace('\\', "/");
+    if value.starts_with("//?/") {
+        value = value[4..].to_string();
+    }
+    while value.contains("//") {
+        value = value.replace("//", "/");
+    }
+    while value.len() > 1
+        && value.ends_with('/')
+        && !(value.len() == 3 && value.as_bytes().get(1) == Some(&b':'))
+    {
+        value.pop();
+    }
+    value.to_lowercase()
+}
+
+fn workspace_paths_match(left: &str, right: &str) -> bool {
+    match (
+        Path::new(left).canonicalize(),
+        Path::new(right).canonicalize(),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => workspace_identity(left) == workspace_identity(right),
+    }
+}
+
+fn collect_session_directory_ids(directory: &Path, depth: usize, ids: &mut BTreeSet<String>) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let path = entry.path();
+        if history_file_in_session_dir(&path).is_some() {
+            if let Some(id) = entry.file_name().to_str().filter(|id| valid_session_id(id)) {
+                ids.insert(id.to_string());
+            }
+            continue;
+        }
+        if depth < 2 {
+            collect_session_directory_ids(&path, depth + 1, ids);
+        }
+    }
+}
+
+fn delete_project_session_history_data(grok: &Path, cwd: &str) -> Result<Vec<String>, String> {
+    let wanted = workspace_identity(cwd);
+    if wanted.is_empty() {
+        return Err("工作目录不能为空".into());
+    }
+    let sessions = grok.join("sessions");
+    if !sessions.is_dir() {
+        return Ok(Vec::new());
+    }
+    let root = sessions
+        .canonicalize()
+        .map_err(|error| format!("无法读取 Grok 会话目录：{error}"))?;
+    let mut ids = BTreeSet::new();
+    let entries =
+        fs::read_dir(&root).map_err(|error| format!("无法枚举 Grok 会话目录：{error}"))?;
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() || file_type.is_symlink() {
+            continue;
+        }
+        let Some(encoded) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        let Ok(decoded) = percent_decode_str(&encoded).decode_utf8() else {
+            continue;
+        };
+        if !workspace_paths_match(&decoded, cwd) {
+            continue;
+        }
+        let directory = entry
+            .path()
+            .canonicalize()
+            .map_err(|error| format!("无法读取项目会话目录：{error}"))?;
+        if directory.parent() != Some(root.as_path()) {
+            return Err("拒绝删除会话根目录之外的路径".into());
+        }
+        collect_session_directory_ids(&directory, 0, &mut ids);
+        fs::remove_dir_all(&directory)
+            .map_err(|error| format!("无法删除项目会话历史 {}：{error}", directory.display()))?;
+    }
+    Ok(ids.into_iter().collect())
+}
+
+fn history_file_in_session_dir(dir: &Path) -> Option<PathBuf> {
+    for name in SESSION_HISTORY_FILENAMES {
+        let candidate = dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn dir_name_eq_ci(path: &Path, wanted_lower: &str) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.to_ascii_lowercase() == wanted_lower)
+}
+
+/// Depth-limited scan under `~/.grok/sessions` for a folder matching session id.
+fn find_session_history_by_scan(sessions: &Path, wanted_lower: &str) -> Result<Option<PathBuf>, String> {
+    let Ok(level1) = fs::read_dir(sessions) else {
+        return Ok(None);
+    };
+    for entry in level1.filter_map(Result::ok) {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if dir_name_eq_ci(&path, wanted_lower) {
+            if let Some(file) = history_file_in_session_dir(&path) {
+                if let Ok(canonical) = file.canonicalize() {
+                    if canonical.starts_with(sessions) {
+                        return Ok(Some(canonical));
+                    }
+                }
+            }
+        }
+        // workspace-encoded / nested batch folders
+        let Ok(level2) = fs::read_dir(&path) else {
+            continue;
+        };
+        for child in level2.filter_map(Result::ok) {
+            let child_path = child.path();
+            if !child_path.is_dir() {
+                continue;
+            }
+            if dir_name_eq_ci(&child_path, wanted_lower) {
+                if let Some(file) = history_file_in_session_dir(&child_path) {
+                    if let Ok(canonical) = file.canonicalize() {
+                        if canonical.starts_with(sessions) {
+                            return Ok(Some(canonical));
+                        }
+                    }
+                }
+            }
+            // rare: workspace / group / session-id
+            let Ok(level3) = fs::read_dir(&child_path) else {
+                continue;
+            };
+            for grand in level3.filter_map(Result::ok) {
+                let grand_path = grand.path();
+                if grand_path.is_dir() && dir_name_eq_ci(&grand_path, wanted_lower) {
+                    if let Some(file) = history_file_in_session_dir(&grand_path) {
+                        if let Ok(canonical) = file.canonicalize() {
+                            if canonical.starts_with(sessions) {
+                                return Ok(Some(canonical));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(None)
@@ -888,6 +1138,82 @@ fn read_bounded_text(path: &Path, max_bytes: u64) -> Result<String, String> {
     fs::read_to_string(path).map_err(|error| format!("无法读取 {}：{error}", path.display()))
 }
 
+/// Platform-aware atomic replace of `to` with `from` (same volume).
+/// - Unix: `rename` replaces the destination atomically.
+/// - Windows: `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` avoids the
+///   final→bak then temp→final crash window of a two-step rename.
+fn replace_file_atomic(from: &Path, to: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows::core::PCWSTR;
+        use windows::Win32::Storage::FileSystem::{
+            MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+        };
+        // Wide, NUL-terminated paths kept alive for the duration of the call.
+        let from_wide: Vec<u16> = from.as_os_str().encode_wide().chain(Some(0)).collect();
+        let to_wide: Vec<u16> = to.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: `from_wide` / `to_wide` are valid NUL-terminated UTF-16 for the
+        // whole call; `MoveFileExW` only reads those pointers and does not retain
+        // them. Same-directory replace keeps the operation on one volume so
+        // MOVEFILE_REPLACE_EXISTING is an in-place metadata replace, not a copy.
+        unsafe {
+            MoveFileExW(
+                PCWSTR(from_wide.as_ptr()),
+                PCWSTR(to_wide.as_ptr()),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+            .map_err(|error| {
+                format!(
+                    "无法原子替换 {} → {}：{error}",
+                    from.display(),
+                    to.display()
+                )
+            })
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to).map_err(|error| {
+            format!(
+                "无法原子替换 {} → {}：{error}",
+                from.display(),
+                to.display()
+            )
+        })
+    }
+}
+
+/// Parse `.name.grox-pid-nonce.bak` / `.tmp` → original final file name.
+fn atomic_orphan_final_name(orphan_name: &str) -> Option<&str> {
+    if !orphan_name.starts_with('.') || !orphan_name.contains(".grox-") {
+        return None;
+    }
+    let stem = orphan_name
+        .strip_suffix(".bak")
+        .or_else(|| orphan_name.strip_suffix(".tmp"))?;
+    // stem = ".{file}.grox-{pid}-{nonce}"
+    let rest = stem.strip_prefix('.')?;
+    let marker = rest.rfind(".grox-")?;
+    let file_name = &rest[..marker];
+    if file_name.is_empty() {
+        return None;
+    }
+    Some(file_name)
+}
+
+/// Parse writer pid from `.name.grox-{pid}-{nonce}.tmp|.bak`.
+fn atomic_orphan_writer_pid(orphan_name: &str) -> Option<u32> {
+    let stem = orphan_name
+        .strip_suffix(".bak")
+        .or_else(|| orphan_name.strip_suffix(".tmp"))?;
+    let rest = stem.strip_prefix('.')?;
+    let marker = rest.rfind(".grox-")?;
+    let after = &rest[marker + ".grox-".len()..];
+    let pid = after.split('-').next()?;
+    pid.parse().ok()
+}
+
 fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
     if content.len() as u64 > MAX_CONFIG_BYTES {
         return Err("配置文档不能超过 4 MB".into());
@@ -897,13 +1223,16 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
         .ok_or_else(|| "配置路径缺少父目录".to_string())?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("无法创建 {}：{error}", parent.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("config");
+    let nonce = CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed);
     let temp = parent.join(format!(
         ".{}.grox-{}-{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("config"),
+        file_name,
         std::process::id(),
-        CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed),
+        nonce,
     ));
     {
         let mut file = fs::OpenOptions::new()
@@ -920,11 +1249,109 @@ fn atomic_write(path: &Path, content: &str) -> Result<(), String> {
             return Err(format!("无法写入配置 {}：{error}", temp.display()));
         }
     }
-    if path.exists() {
-        fs::remove_file(path)
-            .map_err(|error| format!("无法替换配置 {}：{error}", path.display()))?;
+    // Single platform-native replace — never leave a window where `path` is
+    // missing while only a `.bak` remains (the previous two-step rename).
+    if let Err(error) = replace_file_atomic(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(error);
     }
-    fs::rename(&temp, path).map_err(|error| format!("无法保存配置 {}：{error}", path.display()))
+    Ok(())
+}
+
+/// Drop orphan atomic-write temps; restore recovery copies when final is missing.
+///
+/// Rules:
+/// - Never touch `.tmp` still owned by **this** process (may be mid-write).
+/// - Final missing + `.bak`/aged foreign `.tmp` → promote to final (do not delete
+///   the only copy if promote fails).
+/// - Final present + aged leftover → delete.
+fn scrub_atomic_write_orphans(dir: &Path, max_age: std::time::Duration) -> u32 {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    let now = std::time::SystemTime::now();
+    let self_pid = std::process::id();
+    let mut removed = 0u32;
+    for entry in entries.filter_map(Result::ok) {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let is_orphan = name.starts_with('.')
+            && (name.ends_with(".tmp") || name.ends_with(".bak"))
+            && name.contains(".grox-");
+        if !is_orphan {
+            continue;
+        }
+        // Live writer temps use our pid in the name — age-0 scrub must not
+        // steal them between sync_all and replace.
+        if name.ends_with(".tmp") {
+            if let Some(pid) = atomic_orphan_writer_pid(name) {
+                if pid == self_pid {
+                    continue;
+                }
+            }
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        let aged = meta
+            .modified()
+            .ok()
+            .map(|modified| now.duration_since(modified).unwrap_or_default() >= max_age)
+            .unwrap_or(true);
+
+        if name.ends_with(".bak") {
+            if let Some(final_name) = atomic_orphan_final_name(name) {
+                let final_path = dir.join(final_name);
+                if !final_path.exists() {
+                    // Crash mid-replace left only the recovery copy — restore it.
+                    if fs::rename(&path, &final_path).is_ok() {
+                        removed += 1;
+                    }
+                    // Rename failed: leave bak (only copy). Never delete.
+                    continue;
+                }
+            }
+            // Final exists: only drop aged bak leftovers.
+            if aged && fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+            continue;
+        }
+
+        // .tmp from a dead writer.
+        if let Some(final_name) = atomic_orphan_final_name(name) {
+            let final_path = dir.join(final_name);
+            if !final_path.exists() {
+                // First-write crash: promote complete temp instead of deleting
+                // the only snapshot.
+                if aged && fs::rename(&path, &final_path).is_ok() {
+                    removed += 1;
+                }
+                continue;
+            }
+        }
+        if aged && fs::remove_file(&path).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn scrub_session_cache_dir(app: &tauri::AppHandle) {
+    let Ok(dir) = app.path().app_config_dir().map(|d| d.join("session-cache")) else {
+        return;
+    };
+    if !dir.is_dir() {
+        return;
+    }
+    // Temps older than 30s are safe leftovers; immediate cleanup of all .tmp
+    // is fine because live writers hold exclusive create_new names.
+    let removed = scrub_atomic_write_orphans(&dir, std::time::Duration::from_secs(30));
+    if removed > 0 {
+        eprintln!("grox: scrubbed {removed} orphan session-cache temp/bak files");
+    }
 }
 
 const SESSION_CACHE_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -979,6 +1406,47 @@ fn delete_session_cache(app: tauri::AppHandle, id: String) -> Result<(), String>
     Ok(())
 }
 
+#[tauri::command]
+fn delete_session_data(app: tauri::AppHandle, id: String) -> Result<bool, String> {
+    if !valid_session_id(&id) {
+        return Err("无效会话 ID".into());
+    }
+    let history = grok_home().and_then(|home| delete_session_history_data(&home, &id));
+    let cache = delete_session_cache(app, id);
+    match (history, cache) {
+        (Ok(removed), Ok(())) => Ok(removed),
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Err(history_error), Err(cache_error)) => {
+            Err(format!("{history_error}；同时无法删除会话缓存：{cache_error}"))
+        }
+    }
+}
+
+#[tauri::command]
+fn delete_project_session_data(app: tauri::AppHandle, cwd: String) -> Result<Vec<String>, String> {
+    let ids = delete_project_session_history_data(&grok_home()?, &cwd)?;
+    for id in &ids {
+        delete_session_cache(app.clone(), id.clone())?;
+    }
+    Ok(ids)
+}
+
+#[tauri::command]
+fn scrub_session_cache_orphans(app: tauri::AppHandle) -> Result<u32, String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map(|directory| directory.join("session-cache"))
+        .map_err(|error| format!("无法定位会话缓存目录：{error}"))?;
+    if !dir.is_dir() {
+        return Ok(0);
+    }
+    Ok(scrub_atomic_write_orphans(
+        &dir,
+        std::time::Duration::from_secs(0),
+    ))
+}
+
 #[cfg(unix)]
 fn restrict_private_file(path: &Path) -> Result<(), String> {
     use std::os::unix::fs::PermissionsExt as _;
@@ -993,7 +1461,8 @@ fn restrict_private_file(path: &Path) -> Result<(), String> {
     // in depth for shared or relocated config folders.
     let path_text = path.to_string_lossy();
     let user = std::env::var("USERNAME").unwrap_or_else(|_| String::from("%USERNAME%"));
-    let status = std::process::Command::new("icacls")
+    let mut command = std::process::Command::new("icacls");
+    command
         .args([
             path_text.as_ref(),
             "/inheritance:r",
@@ -1002,8 +1471,13 @@ fn restrict_private_file(path: &Path) -> Result<(), String> {
         ])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000);
+    }
+    let status = command.status();
     match status {
         Ok(code) if code.success() => Ok(()),
         Ok(code) => {
@@ -1350,7 +1824,11 @@ fn is_blocked_service_host(host: Option<&str>) -> bool {
     }
 }
 
-fn checked_service_url(value: &str, label: &str) -> Result<String, String> {
+fn checked_service_url_with_policy(
+    value: &str,
+    label: &str,
+    allow_insecure_http: bool,
+) -> Result<String, String> {
     let value = value.trim().trim_end_matches('/');
     let parsed = url::Url::parse(value).map_err(|error| format!("无效{label}：{error}"))?;
     if !parsed.username().is_empty() || parsed.password().is_some() {
@@ -1360,14 +1838,21 @@ fn checked_service_url(value: &str, label: &str) -> Result<String, String> {
         return Err(format!("{label}不能指向云元数据或链路本地地址"));
     }
     let secure = parsed.scheme() == "https";
-    let local_http = parsed.scheme() == "http" && is_loopback_host(parsed.host_str());
-    if !secure && !local_http {
-        return Err(format!("{label}必须使用 HTTPS；仅本机回环地址允许 HTTP"));
+    let allowed_http = parsed.scheme() == "http"
+        && (is_loopback_host(parsed.host_str()) || allow_insecure_http);
+    if !secure && !allowed_http {
+        return Err(format!(
+            "{label}必须使用 HTTPS；远程 HTTP 需要显式启用不安全连接"
+        ));
     }
     // Use url's serialized representation instead of the original input.
     // URL parsers may tolerate ASCII whitespace that would otherwise become a
     // second line in the managed dotenv block.
     Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
+fn checked_service_url(value: &str, label: &str) -> Result<String, String> {
+    checked_service_url_with_policy(value, label, false)
 }
 
 fn checked_api_key(value: &str) -> Result<&str, String> {
@@ -1742,11 +2227,46 @@ fn acp_write_text_file(cwd: String, path: String, content: String) -> Result<(),
 struct FetchProviderModels {
     api_key: String,
     base_url: String,
+    #[serde(default)]
+    allow_insecure_http: bool,
 }
 
 #[tauri::command]
 fn grok_runtime_info(app: tauri::AppHandle) -> GrokRuntimeInfo {
     configured_grok_command(&app)
+}
+
+#[tauri::command]
+async fn export_session_trace(app: tauri::AppHandle, session_id: String) -> Result<String, String> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() || session_id.len() > 128 || !session_id.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '-') {
+        return Err("会话 ID 格式无效".into());
+    }
+    let runtime = configured_grok_command(&app);
+    let mut command = Command::new(&runtime.path);
+    command.args(["trace", session_id, "--local", "--json"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = command.output().await.map_err(|error| format!("无法启动会话诊断导出：{error}"))?;
+    if !output.status.success() {
+        return Err(format!("会话诊断导出失败：{}", String::from_utf8_lossy(&output.stderr).trim()));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim())
+        .map_err(|error| format!("无法解析会话诊断导出结果：{error}"))?;
+    let path = value.get("path")
+        .or_else(|| value.get("outputPath"))
+        .or_else(|| value.get("local_path"))
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "会话诊断已导出，但官方 CLI 未返回文件路径".to_string())?;
+    Ok(path.to_string())
 }
 
 fn is_trusted_cli_install_host(host: Option<&str>) -> bool {
@@ -2299,6 +2819,50 @@ fn optional_git_text(root: &Path, args: &[&str]) -> Option<String> {
     git_text(root, args).ok().filter(|value| !value.is_empty())
 }
 
+fn text_file_line_count(path: &Path) -> u64 {
+    let Ok(mut file) = fs::File::open(path) else {
+        return 0;
+    };
+    let mut buffer = [0_u8; 16 * 1024];
+    let mut lines = 0_u64;
+    let mut has_content = false;
+    let mut ends_with_newline = false;
+    loop {
+        let Ok(read) = file.read(&mut buffer) else {
+            return 0;
+        };
+        if read == 0 {
+            break;
+        }
+        let chunk = &buffer[..read];
+        // 与 Git numstat 一致，二进制文件不计文本增删行。
+        if chunk.contains(&0) {
+            return 0;
+        }
+        has_content = true;
+        ends_with_newline = chunk.last() == Some(&b'\n');
+        lines = lines.saturating_add(chunk.iter().filter(|byte| **byte == b'\n').count() as u64);
+    }
+    lines + u64::from(has_content && !ends_with_newline)
+}
+
+fn untracked_added_lines(root: &Path) -> u64 {
+    let Ok(output) = git_command(root, &["ls-files", "--others", "--exclude-standard", "-z"])
+    else {
+        return 0;
+    };
+    if !output.status.success() {
+        return 0;
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| root.join(String::from_utf8_lossy(path).as_ref()))
+        .map(|path| text_file_line_count(&path))
+        .fold(0_u64, u64::saturating_add)
+}
+
 #[tauri::command]
 fn git_summary(cwd: String) -> Result<GitSummary, String> {
     let root = checked_workspace(&cwd)?;
@@ -2323,7 +2887,8 @@ fn git_summary(cwd: String) -> Result<GitSummary, String> {
     let branches = optional_git_text(&root, &["branch", "--format=%(refname:short)"])
         .map(|value| value.lines().map(str::to_string).collect())
         .unwrap_or_default();
-    let status = optional_git_text(&root, &["status", "--porcelain=v1"]).unwrap_or_default();
+    let status = optional_git_text(&root, &["status", "--porcelain=v1", "--untracked-files=all"])
+        .unwrap_or_default();
     let changed_files = status
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -2331,7 +2896,7 @@ fn git_summary(cwd: String) -> Result<GitSummary, String> {
     let numstat = optional_git_text(&root, &["diff", "--numstat", "HEAD"])
         .or_else(|| optional_git_text(&root, &["diff", "--numstat"]))
         .unwrap_or_default();
-    let (added, removed) = numstat
+    let (tracked_added, removed) = numstat
         .lines()
         .fold((0_u64, 0_u64), |(added, removed), line| {
             let mut columns = line.split('\t');
@@ -2345,6 +2910,7 @@ fn git_summary(cwd: String) -> Result<GitSummary, String> {
                 .unwrap_or(0);
             (added + next_added, removed + next_removed)
         });
+    let added = tracked_added.saturating_add(untracked_added_lines(&root));
     let remote_url = optional_git_text(&root, &["remote", "get-url", "origin"]);
     let default_branch = optional_git_text(
         &root,
@@ -3810,7 +4376,7 @@ fn desktop_command_for_file(path: &Path, file: &Path) -> Result<(String, Vec<Str
 
 /// Enumerate installed editor and terminal applications on the host.
 #[tauri::command]
-fn list_open_applications() -> Result<Vec<OpenApplicationOption>, String> {
+fn list_open_applications_sync() -> Result<Vec<OpenApplicationOption>, String> {
     #[cfg(target_os = "macos")]
     {
         let mut applications = discovered_application_paths()
@@ -3834,6 +4400,16 @@ fn list_open_applications() -> Result<Vec<OpenApplicationOption>, String> {
     {
         Ok(Vec::new())
     }
+}
+
+/// Enumerate installable "Open with" targets. Must be async: on Windows this
+/// shells out to PowerShell and extracts icons — a sync command freezes the
+/// WebView for 2–3s on cold open (UI painted, clicks dead).
+#[tauri::command]
+async fn list_open_applications() -> Result<Vec<OpenApplicationOption>, String> {
+    tauri::async_runtime::spawn_blocking(list_open_applications_sync)
+        .await
+        .map_err(|error| format!("应用发现任务失败：{error}"))?
 }
 
 #[cfg(target_os = "macos")]
@@ -3980,10 +4556,17 @@ fn create_permanent_worktree(cwd: String) -> Result<String, String> {
         .unwrap_or_default()
         .as_millis();
     let branch = format!("grox/worktree-{timestamp}");
-    let output = std::process::Command::new("git")
+    let mut command = std::process::Command::new("git");
+    command
         .current_dir(&root)
         .args(["worktree", "add", "-b", &branch])
-        .arg(&target)
+        .arg(&target);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000);
+    }
+    let output = command
         .output()
         .map_err(|error| format!("无法执行 git worktree：{error}"))?;
     if !output.status.success() {
@@ -4844,14 +5427,19 @@ fn provider_profile_summary(profile: &StoredProviderProfile) -> ProviderProfileS
         api_key: String::new(),
         has_api_key: !profile.api_key.is_empty(),
         base_url: profile.base_url.clone(),
+        allow_insecure_http: profile.allow_insecure_http,
         api_backend: profile.api_backend,
         available_models: profile.available_models.clone(),
         resident_models,
     }
 }
 
-fn compatible_models_url(base_url: &str) -> Result<String, String> {
-    let base = checked_service_url(base_url, "服务地址")?;
+fn compatible_models_url(base_url: &str, allow_insecure_http: bool) -> Result<String, String> {
+    let base = checked_service_url_with_policy(
+        base_url,
+        "服务地址",
+        allow_insecure_http,
+    )?;
     let mut parsed = url::Url::parse(&base).map_err(|error| format!("无效服务地址：{error}"))?;
     let path = parsed.path().trim_end_matches('/');
     if !path.ends_with("/models") {
@@ -4885,18 +5473,23 @@ fn checked_model_ids(models: Vec<String>) -> Result<Vec<String>, String> {
 fn compatible_provider_env(
     api_key: &str,
     base_url: &str,
+    allow_insecure_http: bool,
 ) -> Result<String, String> {
     let key = checked_api_key(api_key.trim())?;
     if key.is_empty() {
         return Err("API Key 不能为空".into());
     }
-    let base = checked_service_url(base_url.trim(), "服务地址")?;
+    let base = checked_service_url_with_policy(
+        base_url.trim(),
+        "服务地址",
+        allow_insecure_http,
+    )?;
     let lines = vec![
         format!("XAI_API_KEY={}", env_value(key)),
         format!("GROK_MODELS_BASE_URL={}", env_value(&base)),
         format!(
             "GROK_MODELS_LIST_URL={}",
-            env_value(&compatible_models_url(&base)?)
+            env_value(&compatible_models_url(&base, allow_insecure_http)?)
         ),
     ];
     Ok(lines.join("\n"))
@@ -4964,9 +5557,13 @@ fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfile
         .filter(|key| !key.is_empty())
         .or_else(|| existing.map(|profile| profile.api_key.as_str()))
         .ok_or("API Key 不能为空")?;
-    compatible_provider_env(key, &request.base_url)?;
+    compatible_provider_env(key, &request.base_url, request.allow_insecure_http)?;
     let mut resident_models = checked_model_ids(request.resident_models)?;
-    let base_url = checked_service_url(&request.base_url, "服务地址")?;
+    let base_url = checked_service_url_with_policy(
+        &request.base_url,
+        "服务地址",
+        request.allow_insecure_http,
+    )?;
     let available_models = existing
         .filter(|profile| profile.base_url == base_url && profile.api_key == key)
         .map(|profile| profile.available_models.clone())
@@ -4992,6 +5589,7 @@ fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfile
         name: name.to_owned(),
         api_key: checked_api_key(key)?.to_owned(),
         base_url: base_url.clone(),
+        allow_insecure_http: request.allow_insecure_http,
         api_backend: request.api_backend,
         models_url: None,
         model: resident_models.first().cloned(),
@@ -5007,21 +5605,28 @@ fn save_provider_profile(request: SaveProviderProfile) -> Result<ProviderProfile
     Ok(provider_profile_summary(&profile))
 }
 
-async fn fetch_compatible_models(api_key: &str, base_url: &str) -> Result<Vec<String>, String> {
+async fn fetch_compatible_models(
+    api_key: &str,
+    base_url: &str,
+    allow_insecure_http: bool,
+) -> Result<Vec<String>, String> {
     let key = checked_api_key(api_key.trim())?;
     if key.is_empty() {
         return Err("API Key 不能为空".into());
     }
-    let endpoint = compatible_models_url(base_url)?;
+    let endpoint = compatible_models_url(base_url, allow_insecure_http)?;
     let mut response = network_client_builder(Duration::from_secs(15))?
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
             if attempt.previous().len() >= 3 {
                 return attempt.error("provider redirect limit exceeded");
             }
             let url = attempt.url();
             let allowed = match url.scheme() {
                 "https" => !is_blocked_service_host(url.host_str()),
-                "http" => is_loopback_host(url.host_str()),
+                "http" => {
+                    !is_blocked_service_host(url.host_str())
+                        && (is_loopback_host(url.host_str()) || allow_insecure_http)
+                }
                 _ => false,
             };
             if allowed {
@@ -5081,7 +5686,12 @@ async fn fetch_compatible_models(api_key: &str, base_url: &str) -> Result<Vec<St
 
 #[tauri::command]
 async fn fetch_provider_models(request: FetchProviderModels) -> Result<Vec<String>, String> {
-    fetch_compatible_models(&request.api_key, &request.base_url).await
+    fetch_compatible_models(
+        &request.api_key,
+        &request.base_url,
+        request.allow_insecure_http,
+    )
+    .await
 }
 
 #[tauri::command]
@@ -5091,7 +5701,12 @@ async fn refresh_provider_models(id: String) -> Result<ProviderProfileSummary, S
         .into_iter()
         .find(|profile| profile.id == id)
         .ok_or("供应商档案不存在")?;
-    let models = fetch_compatible_models(&profile.api_key, &profile.base_url).await?;
+    let models = fetch_compatible_models(
+        &profile.api_key,
+        &profile.base_url,
+        profile.allow_insecure_http,
+    )
+    .await?;
 
     let mut value = read_provider_profiles_file()?;
     let stored = value
@@ -5132,7 +5747,11 @@ fn activate_provider_profile(id: String) -> Result<(), String> {
         .ok_or("供应商没有可用模型；请先获取模型目录并选择一个模型")?;
     let backend = profile.api_backend.config_value(&profile.name, &profile.base_url);
     apply_grox_provider_backend_overrides(&model_ids, &profile.base_url, primary_model, backend)?;
-    let replacement = compatible_provider_env(&profile.api_key, &profile.base_url)?;
+    let replacement = compatible_provider_env(
+        &profile.api_key,
+        &profile.base_url,
+        profile.allow_insecure_http,
+    )?;
     let path = grok_home()?.join(".env");
     let current = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
     atomic_write(&path, &replace_managed_env_block(&current, &replacement))?;
@@ -5217,7 +5836,7 @@ fn configure_provider(request: ProviderConfig) -> Result<(), String> {
         "compatible" => {
             let base_url = request.base_url.as_deref().unwrap_or_default();
             let key = requested_key.or(saved_key).ok_or("API Key 不能为空")?;
-            let replacement = compatible_provider_env(key, base_url)?;
+            let replacement = compatible_provider_env(key, base_url, false)?;
             restore_grox_provider_auth_overrides()?;
             restore_grox_provider_backend_overrides()?;
             replacement
@@ -6059,6 +6678,19 @@ fn update_available(current: &str, latest: &str) -> Result<bool, String> {
     Ok(release_version(latest)? > release_version(current)?)
 }
 
+fn previous_release<'a>(current: &str, releases: &'a [GitHubRelease]) -> Option<&'a GitHubRelease> {
+    let current = release_version(current).ok()?;
+    releases
+        .iter()
+        .filter(|release| !release.draft && !release.prerelease)
+        .filter_map(|release| {
+            let version = release_version(&release.tag_name).ok()?;
+            (version < current && version.pre.is_empty()).then_some((version, release))
+        })
+        .max_by(|(left, _), (right, _)| left.cmp(right))
+        .map(|(_, release)| release)
+}
+
 fn update_asset_matches(name: &str, platform: &str, architecture: &str) -> bool {
     let name = name.to_ascii_lowercase();
     match platform {
@@ -6105,7 +6737,7 @@ async fn latest_release() -> Result<GitHubRelease, String> {
 async fn release_history() -> Result<Vec<GitHubRelease>, String> {
     let releases = network_http_client(Duration::from_secs(30))?
         .get(RELEASES_URL)
-        .query(&[("per_page", "8")])
+        .query(&[("per_page", "30")])
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
@@ -6118,7 +6750,6 @@ async fn release_history() -> Result<Vec<GitHubRelease>, String> {
     Ok(releases
         .into_iter()
         .filter(|release| !release.draft && !release.prerelease)
-        .take(8)
         .collect())
 }
 
@@ -6169,6 +6800,7 @@ fn release_summary(release: &GitHubRelease) -> ReleaseSummary {
             .collect(),
         release_url: release.html_url.clone(),
         published_at: release.published_at.clone(),
+        installable: update_asset(release).is_some(),
     }
 }
 
@@ -6188,9 +6820,11 @@ async fn get_update_status() -> Result<UpdateStatus, String> {
     // keep the two lightweight GitHub requests sequential instead of relying
     // on `tokio::try_join!` (which is not compiled into this build).
     let latest = latest_release().await?;
-    let history = release_history().await?;
-    let mut history = history
+    let releases = release_history().await?;
+    let rollback = previous_release(CLIENT_VERSION, &releases).map(release_summary);
+    let mut history = releases
         .iter()
+        .take(8)
         .map(release_summary)
         .collect::<Vec<_>>();
     if !history.iter().any(|release| release.version == latest.tag_name.trim().trim_start_matches(['v', 'V'])) {
@@ -6201,6 +6835,7 @@ async fn get_update_status() -> Result<UpdateStatus, String> {
         update_available: update_available(CLIENT_VERSION, &latest.tag_name)?,
         latest: update_info(&latest),
         history,
+        rollback,
     })
 }
 
@@ -6428,6 +7063,22 @@ fn launch_update_helper(
     Err("当前平台暂不支持一键更新".into())
 }
 
+async fn install_release(
+    app: &tauri::AppHandle,
+    version: &str,
+    release: &GitHubRelease,
+) -> Result<(), String> {
+    let asset =
+        update_asset(release).ok_or_else(|| "此版本没有适用于当前系统的安装包".to_string())?;
+    let work = update_temp_dir(version)?;
+    let installer = work.join(&asset.name);
+    if let Err(error) = download_update_asset(asset, &installer).await {
+        let _ = fs::remove_dir_all(&work);
+        return Err(error);
+    }
+    launch_update_helper(app, &installer, &work)
+}
+
 #[tauri::command]
 async fn install_update(app: tauri::AppHandle, version: String) -> Result<(), String> {
     let expected = release_version(&version)?;
@@ -6437,15 +7088,19 @@ async fn install_update(app: tauri::AppHandle, version: String) -> Result<(), St
     {
         return Err("更新版本已变化，请重新检查更新".into());
     }
-    let asset =
-        update_asset(&release).ok_or_else(|| "此版本没有适用于当前系统的安装包".to_string())?;
-    let work = update_temp_dir(&version)?;
-    let installer = work.join(&asset.name);
-    if let Err(error) = download_update_asset(asset, &installer).await {
-        let _ = fs::remove_dir_all(&work);
-        return Err(error);
+    install_release(&app, &version, &release).await
+}
+
+#[tauri::command]
+async fn rollback_update(app: tauri::AppHandle, version: String) -> Result<(), String> {
+    let expected = release_version(&version)?;
+    let releases = release_history().await?;
+    let release = previous_release(CLIENT_VERSION, &releases)
+        .ok_or_else(|| "没有可回退的正式版本".to_string())?;
+    if release_version(&release.tag_name)? != expected {
+        return Err("可回退版本已变化，请重新检查更新日志".into());
     }
-    launch_update_helper(&app, &installer, &work)
+    install_release(&app, &version, release).await
 }
 
 fn main() {
@@ -6473,7 +7128,15 @@ fn main() {
     if let Err(error) = synchronize_active_provider_backend() {
         eprintln!("grox: 无法同步当前供应商的协议覆盖：{error}");
     }
+    let window_state_flags = tauri_plugin_window_state::StateFlags::POSITION
+        | tauri_plugin_window_state::StateFlags::SIZE
+        | tauri_plugin_window_state::StateFlags::MAXIMIZED;
     tauri::Builder::default()
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(window_state_flags)
+                .build(),
+        )
         .manage(Arc::new(AcpState::default()))
         .manage(Arc::new(PreviewState::default()))
         .manage(Arc::new(FilePreviewState::default()))
@@ -6485,9 +7148,17 @@ fn main() {
                 window.set_icon(icon)?;
             }
             register_computer_emergency_shortcut(app.handle().clone());
-            if let Err(error) = provision_grox_deep_research_workflow() {
-                eprintln!("grox: 无法安装完整 deep-research 工作流：{error}");
-            }
+            // Never block setup (window interactivity) on disk / provisioning.
+            // These can take seconds with large session-cache dirs and freeze
+            // the first 2–3s of operator input.
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                if let Err(error) = provision_grox_deep_research_workflow() {
+                    eprintln!("grox: 无法安装完整 deep-research 工作流：{error}");
+                }
+                // Crash / BSOD leftovers: orphan .tmp/.bak under session-cache.
+                scrub_session_cache_dir(&handle);
+            });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -6497,6 +7168,9 @@ fn main() {
             read_session_cache,
             write_session_cache,
             delete_session_cache,
+            delete_session_data,
+            delete_project_session_data,
+            scrub_session_cache_orphans,
             validate_workspace,
             pick_workspace,
             list_workspace_files,
@@ -6539,10 +7213,12 @@ fn main() {
             activate_provider_profile,
             delete_provider_profile,
             grok_runtime_info,
+            export_session_trace,
             install_official_grok_cli,
             check_for_update,
             get_update_status,
             install_update,
+            rollback_update,
             open_external,
             open_media_external,
             start_project_preview,
@@ -6586,6 +7262,46 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn test_release(tag_name: &str, draft: bool, prerelease: bool) -> GitHubRelease {
+        GitHubRelease {
+            tag_name: tag_name.to_string(),
+            name: None,
+            body: None,
+            html_url: format!("https://github.com/dandandujie/Grox/releases/tag/{tag_name}"),
+            published_at: None,
+            draft,
+            prerelease,
+            assets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn git_summary_includes_untracked_text_in_diff_stats() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-git-summary-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        git_text(&root, &["init", "-b", "main"]).unwrap();
+        git_text(&root, &["config", "user.name", "Grox Test"]).unwrap();
+        git_text(&root, &["config", "user.email", "test@grox.local"]).unwrap();
+        fs::write(root.join("README.md"), "old\n").unwrap();
+        fs::write(root.join(".gitignore"), "ignored.txt\n").unwrap();
+        git_text(&root, &["add", "README.md", ".gitignore"]).unwrap();
+        git_text(&root, &["commit", "-m", "init"]).unwrap();
+
+        fs::write(root.join("README.md"), "new\nsecond\n").unwrap();
+        fs::write(root.join("new.txt"), "one\ntwo\nthree").unwrap();
+        fs::write(root.join("binary.dat"), [0_u8, 1, 2]).unwrap();
+        fs::write(root.join("ignored.txt"), "hidden\n").unwrap();
+
+        let summary = git_summary(path_for_webview(&root)).unwrap();
+        assert_eq!(summary.changed_files, 3);
+        assert_eq!(summary.added, 5);
+        assert_eq!(summary.removed, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn session_disk_preview_keeps_recent_visible_conversation() {
         let history = concat!(
@@ -6616,6 +7332,146 @@ mod tests {
     }
 
     #[test]
+    fn atomic_write_replaces_without_delete_first_gap() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-atomic-write-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("payload.json");
+        atomic_write(&path, "{\"v\":1}").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"v\":1}");
+        atomic_write(&path, "{\"v\":2}").unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{\"v\":2}");
+        // No lingering temps/baks for a clean replace.
+        let leftovers: Vec<_> = fs::read_dir(&root)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".grox-"))
+            .collect();
+        assert!(leftovers.is_empty(), "leftovers: {leftovers:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scrub_atomic_write_orphans_removes_tmp_and_aged_bak_when_final_exists() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-scrub-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        // Foreign pid so age-0 scrub is allowed to touch the temp.
+        let tmp = root.join(".x.json.grox-1-2.tmp");
+        let bak = root.join(".x.json.grox-1-3.bak");
+        let keep = root.join("x.json");
+        fs::write(&tmp, b"tmp").unwrap();
+        fs::write(&bak, b"bak").unwrap();
+        fs::write(&keep, b"keep").unwrap();
+        let removed = scrub_atomic_write_orphans(&root, std::time::Duration::from_secs(0));
+        assert!(removed >= 2);
+        assert!(!tmp.exists());
+        assert!(!bak.exists());
+        assert!(keep.exists());
+        assert_eq!(fs::read_to_string(&keep).unwrap(), "keep");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scrub_restores_bak_when_final_missing_crash_mid_replace() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-scrub-restore-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let final_path = root.join("session.json");
+        let bak = root.join(".session.json.grox-9-9.bak");
+        // Simulate crash after final → bak, before temp → final.
+        fs::write(&bak, b"{\"recovered\":true}").unwrap();
+        assert!(!final_path.exists());
+        let touched = scrub_atomic_write_orphans(&root, std::time::Duration::from_secs(0));
+        assert!(touched >= 1);
+        assert!(final_path.exists(), "final must be restored from bak");
+        assert!(!bak.exists(), "bak consumed by restore");
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "{\"recovered\":true}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scrub_promotes_foreign_tmp_when_final_missing_first_write_crash() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-scrub-promote-tmp-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let final_path = root.join("session.json");
+        // Dead writer pid (not this process).
+        let tmp = root.join(".session.json.grox-4242-7.tmp");
+        fs::write(&tmp, b"{\"first\":true}").unwrap();
+        assert!(!final_path.exists());
+        let touched = scrub_atomic_write_orphans(&root, std::time::Duration::from_secs(0));
+        assert!(touched >= 1);
+        assert!(final_path.exists());
+        assert!(!tmp.exists());
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "{\"first\":true}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scrub_skips_live_process_tmp_even_with_max_age_zero() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-scrub-live-tmp-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let pid = std::process::id();
+        let tmp = root.join(format!(".session.json.grox-{pid}-99.tmp"));
+        fs::write(&tmp, b"in-flight").unwrap();
+        let removed = scrub_atomic_write_orphans(&root, std::time::Duration::from_secs(0));
+        assert_eq!(removed, 0);
+        assert!(tmp.exists(), "live writer temp must survive concurrent scrub");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn scrub_keeps_fresh_bak_when_final_present_until_aged() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-scrub-keep-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let final_path = root.join("payload.json");
+        fs::write(&final_path, b"live").unwrap();
+        let bak2 = root.join(".payload.json.grox-1-2.bak");
+        fs::write(&bak2, b"stale-but-fresh").unwrap();
+        let removed = scrub_atomic_write_orphans(&root, std::time::Duration::from_secs(3600));
+        assert_eq!(removed, 0, "fresh bak with final present must not be scrubbed");
+        assert!(bak2.exists());
+        assert_eq!(fs::read_to_string(&final_path).unwrap(), "live");
+        // Concurrent-style second scrub with age=0 should drop aged bak only.
+        let removed2 = scrub_atomic_write_orphans(&root, std::time::Duration::from_secs(0));
+        assert!(removed2 >= 1);
+        assert!(!bak2.exists());
+        assert!(final_path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn atomic_orphan_final_name_parses_bak_and_tmp() {
+        assert_eq!(
+            atomic_orphan_final_name(".payload.json.grox-12-3.bak"),
+            Some("payload.json")
+        );
+        assert_eq!(
+            atomic_orphan_final_name(".x.json.grox-1-2.tmp"),
+            Some("x.json")
+        );
+        assert_eq!(atomic_orphan_final_name("payload.json"), None);
+        assert_eq!(atomic_orphan_final_name(".nope.bak"), None);
+        assert_eq!(atomic_orphan_writer_pid(".x.json.grox-42-9.tmp"), Some(42));
+    }
+
+    #[test]
     fn session_history_path_rejects_traversal() {
         assert!(session_history_path(Path::new("unused"), "../session").is_err());
         assert!(session_history_path(Path::new("unused"), "folder/session").is_err());
@@ -6638,6 +7494,93 @@ mod tests {
             session_history_path(&root, "session-id").unwrap(),
             Some(history.canonicalize().unwrap())
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn session_history_path_finds_nested_and_alternate_filenames() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-session-scan-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let history = root
+            .join("sessions")
+            .join("ws-a")
+            .join("batch")
+            .join("019fdc55-nested-id")
+            .join("history.jsonl");
+        fs::create_dir_all(history.parent().unwrap()).unwrap();
+        fs::write(&history, "{\"type\":\"user\",\"content\":\"hello\"}\n").unwrap();
+        assert_eq!(
+            session_history_path(&root, "019fdc55-nested-id").unwrap(),
+            Some(history.canonicalize().unwrap())
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_session_history_data_removes_only_the_requested_session_directory() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-session-delete-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let target = root.join("sessions").join("workspace").join("session-a");
+        let sibling = root.join("sessions").join("workspace").join("session-b");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(target.join("chat_history.jsonl"), "").unwrap();
+        fs::write(sibling.join("chat_history.jsonl"), "").unwrap();
+
+        assert!(delete_session_history_data(&root, "session-a").unwrap());
+        assert!(!target.exists());
+        assert!(sibling.exists());
+        assert!(!delete_session_history_data(&root, "session-a").unwrap());
+        assert!(delete_session_history_data(&root, "../workspace").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_session_history_data_never_treats_workspace_container_as_session() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-session-delete-container-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let workspace = root.join("sessions").join("session-a");
+        let nested_session = workspace.join("actual-session");
+        fs::create_dir_all(&nested_session).unwrap();
+        fs::write(nested_session.join("chat_history.jsonl"), "").unwrap();
+
+        assert!(!delete_session_history_data(&root, "session-a").unwrap());
+        assert!(workspace.exists());
+        assert!(nested_session.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn delete_project_session_history_data_removes_only_matching_workspace() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-project-session-delete-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let target = root
+            .join("sessions")
+            .join("%2FUsers%2Fdemo%2Ftarget")
+            .join("session-a");
+        let sibling = root
+            .join("sessions")
+            .join("%2FUsers%2Fdemo%2Fsibling")
+            .join("session-b");
+        fs::create_dir_all(&target).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        fs::write(target.join("chat_history.jsonl"), "").unwrap();
+        fs::write(sibling.join("chat_history.jsonl"), "").unwrap();
+
+        assert_eq!(
+            delete_project_session_history_data(&root, "/Users/demo/target/").unwrap(),
+            vec!["session-a"]
+        );
+        assert!(!target.exists());
+        assert!(sibling.exists());
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -6679,7 +7622,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn discovers_installed_open_applications_from_host() {
-        let applications = list_open_applications().unwrap();
+        let applications = list_open_applications_sync().unwrap();
         assert!(applications.iter().any(|item| item.id == "com.apple.finder"));
         assert!(applications.iter().all(|item| {
             !item.id.trim().is_empty()
@@ -6993,6 +7936,18 @@ OPENAI_API_KEY=******** # keep env comment
         assert!(checked_service_url("http://127.0.0.1:11434/v1", "服务地址").is_ok());
         assert!(checked_service_url("http://[::1]:11434/v1", "服务地址").is_ok());
         assert!(checked_service_url("http://api.example.com/v1", "服务地址").is_err());
+        assert!(checked_service_url_with_policy(
+            "http://api.example.com/v1",
+            "服务地址",
+            true,
+        )
+        .is_ok());
+        assert!(checked_service_url_with_policy(
+            "http://169.254.169.254/latest",
+            "服务地址",
+            true,
+        )
+        .is_err());
         assert!(checked_service_url("https://user:secret@example.com/v1", "服务地址").is_err());
         let normalized =
             checked_service_url("https://api.example.com/v1\n?model=grok", "服务地址").unwrap();
@@ -7002,7 +7957,12 @@ OPENAI_API_KEY=******** # keep env comment
 
     #[test]
     fn compatible_provider_environment_is_validated_and_complete() {
-        let env = compatible_provider_env("sk-test", "https://gateway.example.com/v1").unwrap();
+        let env = compatible_provider_env(
+            "sk-test",
+            "https://gateway.example.com/v1",
+            false,
+        )
+        .unwrap();
         assert!(env.contains("XAI_API_KEY=\"sk-test\""));
         assert!(env.contains("GROK_MODELS_BASE_URL=\"https://gateway.example.com/v1\""));
         assert!(env.contains("GROK_MODELS_LIST_URL=\"https://gateway.example.com/v1/models\""));
@@ -7010,13 +7970,22 @@ OPENAI_API_KEY=******** # keep env comment
         assert!(compatible_provider_env(
             "",
             "https://gateway.example.com/v1",
+            false,
         )
         .is_err());
         assert!(compatible_provider_env(
             "sk-test",
             "http://gateway.example.com/v1",
+            false,
         )
         .is_err());
+        let insecure = compatible_provider_env(
+            "sk-test",
+            "http://gateway.example.com/v1",
+            true,
+        )
+        .unwrap();
+        assert!(insecure.contains("GROK_MODELS_BASE_URL=\"http://gateway.example.com/v1\""));
     }
 
     #[test]
@@ -7187,6 +8156,7 @@ UNRELATED=value
         let compatible = compatible_provider_env(
             "gateway-key",
             "https://gateway.example/v1",
+            false,
         )
         .unwrap();
         fs::write(&path, replace_managed_env_block("", &compatible)).unwrap();
@@ -7212,6 +8182,22 @@ UNRELATED=value
         assert!(!update_available("0.2.0", "V0.2.0").unwrap());
         assert!(!update_available("0.3.0", "v0.2.9").unwrap());
         assert!(update_available("0.2.0-beta.1", "v0.2.0").unwrap());
+    }
+
+    #[test]
+    fn selects_highest_stable_release_below_current_for_rollback() {
+        let releases = vec![
+            test_release("v0.2.9", false, false),
+            test_release("v0.2.12", false, false),
+            test_release("not-semver", false, false),
+            test_release("v0.2.10", false, false),
+            test_release("v0.2.10-beta.1", false, false),
+            test_release("v0.2.10-hotfix.1", true, false),
+        ];
+
+        let selected = previous_release("0.2.11", &releases).unwrap();
+        assert_eq!(selected.tag_name, "v0.2.10");
+        assert!(previous_release("0.2.9", &[test_release("v0.2.9", false, false)]).is_none());
     }
 
     #[test]

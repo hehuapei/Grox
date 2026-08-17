@@ -9,6 +9,7 @@ import { baseName } from "../../lib/format";
 import { Icon } from "../fx/Icon";
 import { useI18n } from "../../lib/i18n";
 import { EnvironmentSummary } from "./EnvironmentSummary";
+import { usePreferences } from "../../state/preferences";
 import {
   getAvailableOpenApplications,
   getDefaultOpenApplication,
@@ -36,6 +37,11 @@ export function TitleBar() {
   const bridgeKind = useDesktop((s) => s.bridgeKind);
   const provider = useDesktop((s) => s.provider);
   const billing = useDesktop((s) => s.billing);
+  const draftSession = useDesktop((s) => {
+    const id = s.activeId;
+    if (!id || !id.startsWith("draft-")) return null;
+    return s.sessions[id] ?? null;
+  });
   const toggleInspector = useDesktop((s) => s.toggleInspector);
   const inspectorOpen = useDesktop((s) => s.inspectorOpen);
   const toggleTerminal = useDesktop((s) => s.toggleTerminal);
@@ -44,23 +50,47 @@ export function TitleBar() {
   const quotaUsed = provider.kind === "oauth" && billing?.creditUsagePercent !== undefined
     ? Math.min(100, Math.max(0, Math.round(billing.creditUsagePercent)))
     : null;
+  const sidebarVisible = usePreferences((s) => s.sidebarVisible);
+  const toggleSidebar = usePreferences((s) => s.toggleSidebar);
+  const breadcrumbCwd = meta?.cwd ?? draftSession?.cwd;
+  const breadcrumbTitle = meta?.title
+    || (draftSession
+      ? (language === "zh-CN" ? "新会话" : "New session")
+      : null);
+  const windows = isWindows();
 
   return (
     <header
       data-tauri-drag-region
-      className="relative z-40 flex h-10 shrink-0 items-center border-b border-line bg-void pl-[78px] pr-2 select-none"
+      className={`titlebar relative z-40 flex h-10 shrink-0 items-center border-b border-line bg-void pr-2 select-none ${windows ? "pl-2" : "pl-[78px]"}`}
     >
-      {/* center — mission breadcrumb */}
+      {!sidebarVisible && (
+        <div
+          data-tauri-drag-region="false"
+          className={`absolute flex items-center ${windows ? "left-2" : "left-[78px]"}`}
+        >
+          <button
+            className="chip"
+            onClick={toggleSidebar}
+            title={language === "zh-CN" ? "显示侧栏（Ctrl/⌘B）" : "Show sidebar (Ctrl/⌘B)"}
+            aria-label={language === "zh-CN" ? "显示侧栏" : "Show sidebar"}
+          >
+            <Icon name="panelLeft" size={12} />
+          </button>
+        </div>
+      )}
+
+      {/* center — mission breadcrumb (drag only; not interactive) */}
       <div
         data-tauri-drag-region
         className="pointer-events-none flex min-w-0 flex-1 items-center justify-center px-3"
       >
         <div className="flex min-w-0 max-w-full items-center gap-2 overflow-hidden whitespace-nowrap text-[11px]">
-          {activeId && meta ? (
+          {activeId && breadcrumbCwd && breadcrumbTitle !== null ? (
             <>
-              <span className="lbl max-w-[35%] shrink-0 truncate">{baseName(meta.cwd)}</span>
+              <span className="lbl max-w-[35%] shrink-0 truncate">{baseName(breadcrumbCwd)}</span>
               <span className="shrink-0 text-faint">/</span>
-              <span className="min-w-0 truncate text-fg2">{meta.title}</span>
+              <span className="min-w-0 truncate text-fg2">{breadcrumbTitle}</span>
             </>
           ) : (
             <span className="lbl" style={{ letterSpacing: "0.3em" }}>
@@ -70,8 +100,8 @@ export function TitleBar() {
         </div>
       </div>
 
-      {/* right cluster */}
-      <div className="flex shrink-0 items-center gap-1">
+      {/* right cluster — must be no-drag or buttons eat drag and never click */}
+      <div data-tauri-drag-region="false" className="titlebar-actions flex shrink-0 items-center gap-1">
         {quotaUsed !== null && (
           <span
             className="mr-1 flex items-center gap-1.5 font-mono text-[10px] text-dim"
@@ -135,7 +165,7 @@ export function TitleBar() {
           <Icon name="panelRight" size={12} />
         </button>
 
-        {isWindows() && (
+        {windows && (
           <div className="ml-1 flex items-center">
             <WinBtn onClick={() => winCtl("min")} label="—" />
             <WinBtn onClick={() => winCtl("max")} label="▢" />
@@ -155,7 +185,6 @@ function DefaultOpenMenu({ language }: { language: "zh-CN" | "en-US" }) {
   const zh = language === "zh-CN";
 
   useEffect(() => {
-    let alive = true;
     const syncApplications = (event: Event) => {
       const value = (event as CustomEvent<OpenApplicationOption[]>).detail;
       if (Array.isArray(value)) setApplications(value);
@@ -172,13 +201,10 @@ function DefaultOpenMenu({ language }: { language: "zh-CN" | "en-US" }) {
     window.addEventListener("grox:default-open-application", sync);
     document.addEventListener("pointerdown", close, true);
     document.addEventListener("keydown", escape);
-    void refreshOpenApplications().then((next) => {
-      if (!alive) return;
-      setApplications(next);
-      setApplication(getDefaultOpenApplication());
-    });
+    // Do NOT call refreshOpenApplications() on mount. On Windows it runs a
+    // full PowerShell registry+icon scan that freezes the shell for 2–3s
+    // (UI visible, clicks dead). Discover apps only when the menu opens.
     return () => {
-      alive = false;
       window.removeEventListener("grox:open-applications", syncApplications);
       window.removeEventListener("grox:default-open-application", sync);
       document.removeEventListener("pointerdown", close, true);
@@ -252,6 +278,8 @@ function DefaultOpenMenu({ language }: { language: "zh-CN" | "en-US" }) {
 function WinBtn({ onClick, label, danger }: { onClick: () => void; label: string; danger?: boolean }) {
   return (
     <button
+      type="button"
+      data-tauri-drag-region="false"
       onClick={onClick}
       className={`flex h-8 w-11 items-center justify-center text-[10px] text-mute transition-colors ${
         danger ? "hover:bg-red hover:text-base" : "hover:bg-high hover:text-fg"

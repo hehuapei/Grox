@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type {
   QuestionAnswers,
   QuestionNotes,
@@ -35,6 +35,18 @@ export function QuestionCard({
   const [answers, setAnswers] = useState<QuestionAnswers>({});
   const [notes, setNotes] = useState<QuestionNotes>({});
   const resolved = block.response;
+  const isActive = useDesktop((state) => Boolean(state.activeId && state.sessions[state.activeId]?.status === "awaiting_input"));
+
+  useEffect(() => {
+    if (resolved || !isActive) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      resolveQuestion(block.id, { outcome: "cancelled" });
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [block.id, isActive, resolveQuestion, resolved]);
 
   const normalizedAnswers = useMemo(() => {
     const next: QuestionAnswers = {};

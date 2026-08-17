@@ -40,6 +40,12 @@ export interface GrokBridge {
   /** Subscribe to agent events. Returns an unsubscribe fn. */
   subscribe(cb: (e: BridgeEvent) => void): () => void;
 
+  /**
+   * Warm the agent process (spawn CLI / ACP initialize). Must not run during
+   * module import — call after the shell has painted. Optional on mock.
+   */
+  ensureReady?(): Promise<void>;
+
   /** Session catalogue (recent first). */
   listSessions(cwd?: string): Promise<SessionMeta[]>;
 
@@ -93,6 +99,9 @@ export interface GrokBridge {
 
   /** ACP: session/load — emits session_ready with the restored transcript. */
   loadSession(id: string, options?: { background?: boolean }): Promise<void>;
+
+  /** ACP: session/close — releases an attached session without deleting history. */
+  closeSession(id: string): Promise<void>;
 
   /** ACP: session/prompt — streams events until the turn settles. */
   prompt(sessionId: string, text: string, opts: PromptOptions): Promise<void>;
