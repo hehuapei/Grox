@@ -834,6 +834,18 @@ function MarketLinks({ kind }: { kind: "mcp" | "skills" | "plugins" }) {
   return <div className="mt-5 flex items-center gap-2 border-t border-line pt-4"><span className="lbl !text-[9.5px]">{language === "zh-CN" ? "发现更多" : "DISCOVER"}</span>{links.map((link) => <button key={link.url} onClick={() => void invoke("open_external", { url: link.url })} className="chip">{link.label}<Icon name="external" size={9} /></button>)}</div>;
 }
 
+export function configOverlayNotice(document: ConfigDocument | undefined, zh: boolean): string | undefined {
+  if (document?.id !== "config" || !document.overlay || document.overlay.source === "none") return undefined;
+  if (document.overlay.source === "path") {
+    return zh
+      ? `启动环境配置了 GROK_CONFIG_PATH（${document.overlay.path ?? "路径不可用"}）。若 Grok Build 校验通过，该额外配置层优先于 config.toml；此处保存不会修改该 overlay。`
+      : `The launch environment configured GROK_CONFIG_PATH (${document.overlay.path ?? "path unavailable"}). If Grok Build accepts it, that additional layer has higher priority than config.toml; saving here does not modify the overlay.`;
+  }
+  return zh
+    ? "启动环境配置了 GROK_CONFIG。其内容为安全起见不会显示；若 Grok Build 校验通过，该额外配置层优先于 config.toml。此处保存不会修改该 overlay。"
+    : "The launch environment configured GROK_CONFIG. Its contents stay hidden for safety; if Grok Build accepts it, that additional layer has higher priority than config.toml. Saving here does not modify the overlay.";
+}
+
 function ConfigDocumentsPanel() {
   const { t, language } = useI18n();
   const zh = language === "zh-CN";
@@ -868,6 +880,7 @@ function ConfigDocumentsPanel() {
   }, [cwd, dirty]);
   const document = useMemo(() => documents.find((item) => item.id === active), [documents, active]);
   const canApply = !activeId || !activeStatus || activeStatus === "idle" || activeStatus === "failed" || activeStatus === "cancelled";
+  const overlayNotice = configOverlayNotice(document, zh);
   const save = async () => {
     if (!document || !canApply || saving) return;
     setSaving(true);
@@ -888,5 +901,5 @@ function ConfigDocumentsPanel() {
       setSaving(false);
     }
   };
-  return <div className="flex min-h-[520px] flex-col"><Heading title={t("configuration")} description={zh ? "这里直接编辑 Grok Build 的真实配置：config.toml 保存前校验 TOML，保存后会重启 ACP 并重新载入空闲任务；系统提示词和项目 AGENTS.md 也会立即重新载入。每 1.5 秒同步磁盘上的外部修改。" : "Edit Grok Build's real configuration here: config.toml is validated before save, then ACP restarts and an idle mission reloads; system prompts and project AGENTS.md reload immediately too. External disk edits are synchronized every 1.5 seconds."} /><div className="flex gap-1 border-b border-line">{documents.map((item) => <button key={item.id} onClick={() => setActive(item.id)} className={`border-b px-3 py-2 font-mono text-[9.5px] ${active === item.id ? "border-acc text-acc" : "border-transparent text-dim"}`}>{item.label}{dirty[item.id] ? " •" : ""}</button>)}</div>{document ? <><div className="flex items-center gap-2 py-2"><span className="min-w-0 flex-1 truncate font-mono text-[9.5px] text-faint">{document.path}</span><span className="font-mono text-[9.5px] text-dim">{document.exists ? zh ? "已同步" : "SYNCED" : zh ? "新建" : "NEW"}</span><ActionButton tone="accent" disabled={saving || !canApply} onClick={() => void save()}>{saving ? (zh ? "应用中" : "APPLYING") : t("save")}</ActionButton></div>{!canApply && <p className="mb-2 rounded-[4px] border border-gold/25 bg-gold/5 px-3 py-2 text-[9.5px] leading-relaxed text-gold">{zh ? "为保证当前请求不被重启中断，请在任务完成后保存配置。" : "To avoid interrupting the current request, save configuration after the mission becomes idle."}</p>}<textarea disabled={saving} value={drafts[document.id] ?? ""} onChange={(event) => { setDrafts((current) => ({ ...current, [document.id]: event.target.value })); setDirty((current) => ({ ...current, [document.id]: true })); }} spellCheck={false} className="min-h-[360px] flex-1 resize-none rounded-[5px] border border-line2 bg-void p-3 font-mono text-[10.5px] leading-relaxed text-fg2 outline-none focus:border-acc-dim disabled:opacity-60" /></> : <ExtensionState error={null} empty={t("loading")} />}{status && <p className="mt-2 font-mono text-[9.5px] text-dim">{status}</p>}</div>;
+  return <div className="flex min-h-[520px] flex-col"><Heading title={t("configuration")} description={zh ? "这里直接编辑 Grok Build 的真实配置：config.toml 保存前校验 TOML，保存后会重启 ACP 并重新载入空闲任务；系统提示词和项目 AGENTS.md 也会立即重新载入。每 1.5 秒同步磁盘上的外部修改。" : "Edit Grok Build's real configuration here: config.toml is validated before save, then ACP restarts and an idle mission reloads; system prompts and project AGENTS.md reload immediately too. External disk edits are synchronized every 1.5 seconds."} /><div className="flex gap-1 border-b border-line">{documents.map((item) => <button key={item.id} onClick={() => setActive(item.id)} className={`border-b px-3 py-2 font-mono text-[9.5px] ${active === item.id ? "border-acc text-acc" : "border-transparent text-dim"}`}>{item.label}{dirty[item.id] ? " •" : ""}</button>)}</div>{document ? <><div className="flex items-center gap-2 py-2"><span className="min-w-0 flex-1 truncate font-mono text-[9.5px] text-faint">{document.path}</span><span className="font-mono text-[9.5px] text-dim">{document.exists ? zh ? "已同步" : "SYNCED" : zh ? "新建" : "NEW"}</span><ActionButton tone="accent" disabled={saving || !canApply} onClick={() => void save()}>{saving ? (zh ? "应用中" : "APPLYING") : t("save")}</ActionButton></div>{!canApply && <p className="mb-2 rounded-[4px] border border-gold/25 bg-gold/5 px-3 py-2 text-[9.5px] leading-relaxed text-gold">{zh ? "为保证当前请求不被重启中断，请在任务完成后保存配置。" : "To avoid interrupting the current request, save configuration after the mission becomes idle."}</p>}{overlayNotice && <p role="status" className="mb-2 rounded-[4px] border border-gold/25 bg-gold/5 px-3 py-2 text-[9.5px] leading-relaxed text-gold">{overlayNotice}</p>}<textarea disabled={saving} value={drafts[document.id] ?? ""} onChange={(event) => { setDrafts((current) => ({ ...current, [document.id]: event.target.value })); setDirty((current) => ({ ...current, [document.id]: true })); }} spellCheck={false} className="min-h-[360px] flex-1 resize-none rounded-[5px] border border-line2 bg-void p-3 font-mono text-[10.5px] leading-relaxed text-fg2 outline-none focus:border-acc-dim disabled:opacity-60" /></> : <ExtensionState error={null} empty={t("loading")} />}{status && <p className="mt-2 font-mono text-[9.5px] text-dim">{status}</p>}</div>;
 }

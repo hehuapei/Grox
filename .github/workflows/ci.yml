@@ -14,6 +14,22 @@ permissions:
   contents: read
 
 jobs:
+  upstream-tracker:
+    name: Upstream tracker
+    runs-on: ubuntu-22.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+
+      - name: Install Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+
+      - name: Test upstream integration state and tracker
+        run: node --test scripts/upstream-tracker.test.mjs
+
   frontend:
     name: Frontend
     runs-on: ubuntu-22.04

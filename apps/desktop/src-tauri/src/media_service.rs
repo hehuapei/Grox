@@ -1200,7 +1200,7 @@ async fn run_media_generation(
     {
         emit_snapshot(app, &snapshot);
     }
-    let runtime = configured_grok_command(app);
+    let runtime = configured_grok_command();
     let mut command = Command::new(&runtime.path);
     command
         .arg("--single")

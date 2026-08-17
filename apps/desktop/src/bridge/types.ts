@@ -494,6 +494,11 @@ export interface ConfigDocument {
   content: string;
   exists: boolean;
   language: string;
+  /** Best-effort configured source; Grok Build remains authoritative. Inline contents never cross IPC. */
+  overlay?: {
+    source: "none" | "inline" | "path";
+    path?: string;
+  };
 }
 
 export interface PreviewFile {

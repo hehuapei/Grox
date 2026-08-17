@@ -1,16 +1,16 @@
 {
-  "schemaVersion": 3,
+  "schemaVersion": 4,
   "repository": "https://github.com/xai-org/grok-build",
   "branch": "main",
   "stable": "https://x.ai/cli/stable",
   "latestObserved": {
-    "commit": "e5fd4816d43260c15ba785f103990c1ed6cea230",
-    "sourceRevision": "ea094a8c369475f97c85540d01730baec0dce5d6",
-    "publicVersion": "1.0.3",
-    "packageVersion": "1.0.3",
-    "observedAt": "2026-08-13",
-    "officialLatestPublicVersion": "1.0.3",
-    "releaseStatus": "verified"
+    "commit": "9fabadea800fa6e2ed8ec91c4f45f02b7e2504f4",
+    "sourceRevision": "7bd63df3c9bb1bf98e7a9b3486f4a0189ea94e55",
+    "publicVersion": "1.0.5",
+    "packageVersion": "1.0.5",
+    "observedAt": "2026-08-17",
+    "officialLatestPublicVersion": "1.0.5",
+    "releaseStatus": "pending-verification"
   },
   "verifiedIntegration": {
     "commit": "e5fd4816d43260c15ba785f103990c1ed6cea230",
@@ -23,16 +23,32 @@
     "platforms": ["windows-x64", "macos-arm64", "macos-x64"]
   },
   "integrationTarget": {
-    "baseCommit": "afbc0fb710320c7add294c2106d447ecc3e3af2e",
-    "commit": "e5fd4816d43260c15ba785f103990c1ed6cea230",
-    "sourceRevision": "ea094a8c369475f97c85540d01730baec0dce5d6",
-    "publicVersion": "1.0.3",
-    "packageVersion": "1.0.3",
-    "status": "complete",
-    "issue": 31,
-    "groxCommit": "94b044259fe4038ab2953170d4a7de4ae6f97559",
-    "workflowRun": "https://github.com/dandandujie/Grox/actions/runs/31682364776"
+    "baseCommit": "e5fd4816d43260c15ba785f103990c1ed6cea230",
+    "commit": "9fabadea800fa6e2ed8ec91c4f45f02b7e2504f4",
+    "sourceRevision": "7bd63df3c9bb1bf98e7a9b3486f4a0189ea94e55",
+    "publicVersion": "1.0.5",
+    "packageVersion": "1.0.5",
+    "status": "pending-verification",
+    "issues": [35, 36]
   },
+  "pendingIntegrations": [
+    {
+      "publicVersion": "1.0.4",
+      "packageVersion": "1.0.3",
+      "commit": "eb267feff13129e568df38fb6fdf0ceb65f735d6",
+      "sourceRevision": "e6a67a5408288c98380cd13f3b1fe1fbc01c9f1f",
+      "status": "pending-verification",
+      "issue": 35
+    },
+    {
+      "publicVersion": "1.0.5",
+      "packageVersion": "1.0.5",
+      "commit": "9fabadea800fa6e2ed8ec91c4f45f02b7e2504f4",
+      "sourceRevision": "7bd63df3c9bb1bf98e7a9b3486f4a0189ea94e55",
+      "status": "pending-verification",
+      "issue": 36
+    }
+  ],
   "invalidatedClaim": {
     "commit": "393430ee4934bc791b0d538f304a21691c517433",
     "claimedAt": "2026-08-07",

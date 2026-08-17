@@ -44,6 +44,52 @@ export function shouldTrackRelease(state, publicVersion) {
   return state.verifiedIntegration?.publicVersion !== publicVersion;
 }
 
+export function validateIntegrationState(state) {
+  if (!state || typeof state !== "object") throw new Error("official CLI state 必须是对象");
+  if (state.schemaVersion !== 4) throw new Error("official CLI state schemaVersion 必须为 4");
+  const verifiedVersion = state.verifiedIntegration?.publicVersion;
+  const targetVersion = state.integrationTarget?.publicVersion;
+  if (typeof verifiedVersion !== "string" || typeof targetVersion !== "string") {
+    throw new Error("official CLI state 缺少 verifiedIntegration/integrationTarget 版本");
+  }
+  const targetStatus = state.integrationTarget.status;
+  if (!new Set(["pending-verification", "complete"]).has(targetStatus)) {
+    throw new Error("integrationTarget 状态无效");
+  }
+  if (targetStatus === "pending-verification" && verifiedVersion === targetVersion) {
+    throw new Error("pending integrationTarget 不能覆盖 verifiedIntegration");
+  }
+  if (targetStatus === "complete" && verifiedVersion !== targetVersion) {
+    throw new Error("complete integrationTarget 必须与 verifiedIntegration 一致");
+  }
+  const pending = Array.isArray(state.pendingIntegrations) ? state.pendingIntegrations : [];
+  const versions = new Set();
+  const issueNumbers = new Set();
+  for (const entry of pending) {
+    if (typeof entry?.publicVersion !== "string" || typeof entry?.issue !== "number") {
+      throw new Error("pendingIntegrations 条目缺少版本或 issue");
+    }
+    if (entry.status !== "pending-verification") throw new Error("pendingIntegrations 状态无效");
+    if (versions.has(entry.publicVersion)) throw new Error(`pendingIntegrations 版本重复：${entry.publicVersion}`);
+    if (issueNumbers.has(entry.issue)) throw new Error(`pendingIntegrations issue 重复：#${entry.issue}`);
+    versions.add(entry.publicVersion);
+    issueNumbers.add(entry.issue);
+  }
+  if (targetStatus === "pending-verification" && !versions.has(targetVersion)) {
+    throw new Error("pendingIntegrations 必须保留当前 integrationTarget");
+  }
+  if (targetStatus === "pending-verification") {
+    const targetIssues = state.integrationTarget.issues;
+    const pendingIssues = pending.map((entry) => entry.issue);
+    if (!Array.isArray(targetIssues)
+      || targetIssues.length !== pendingIssues.length
+      || targetIssues.some((issue, index) => issue !== pendingIssues[index])) {
+      throw new Error("integrationTarget.issues 必须与 pendingIntegrations issue 严格一致");
+    }
+  }
+  return state;
+}
+
 export function normalizeChanges(value) {
   if (!Array.isArray(value)) return [];
   return value.flatMap((item, index) => {
@@ -200,9 +246,15 @@ ${sourceFiles}
 `;
 }
 
-export function findTrackedIssue(issues, publicVersion) {
+export function findTrackedIssue(issues, publicVersion, knownIssueNumber) {
   const marker = `${MARKER_PREFIX}${publicVersion} -->`;
+  const expectedTitle = `Grok Build v${publicVersion}`;
   return issues.find((issue) => typeof issue.body === "string" && issue.body.includes(marker))
+    ?? (Number.isInteger(knownIssueNumber)
+      ? issues.find((issue) => issue.number === knownIssueNumber
+        && typeof issue.title === "string"
+        && issue.title.includes(expectedTitle))
+      : null)
     ?? null;
 }
 
@@ -246,7 +298,7 @@ function gh(args, options = {}) {
 
 async function main() {
   const statePath = fileURLToPath(new URL("../.grox/official-cli.json", import.meta.url));
-  const state = JSON.parse(readFileSync(statePath, "utf8"));
+  const state = validateIntegrationState(JSON.parse(readFileSync(statePath, "utf8")));
   const token = process.env.GH_TOKEN;
   const repository = process.env.GITHUB_REPOSITORY;
   if (!token || !repository) throw new Error("GH_TOKEN 与 GITHUB_REPOSITORY 必须存在");
@@ -267,7 +319,8 @@ async function main() {
   const issues = JSON.parse(gh([
     "issue", "list", "--repo", repository, "--state", "all", "--limit", "200", "--json", "number,title,body,state",
   ]) || "[]");
-  const existing = findTrackedIssue(issues, publicVersion);
+  const knownPending = (state.pendingIntegrations ?? []).find((entry) => entry.publicVersion === publicVersion);
+  const existing = findTrackedIssue(issues, publicVersion, knownPending?.issue);
   if (existing) {
     if (existing.state === "CLOSED") {
       gh(["issue", "reopen", String(existing.number), "--repo", repository]);
