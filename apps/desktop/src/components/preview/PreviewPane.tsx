@@ -49,7 +49,10 @@ export function PreviewPane() {
             </div>}
             <div className="ml-1 flex max-w-[62%] shrink-0 items-center gap-0.5 overflow-x-auto border-l border-line pl-1">
               <PreviewAction label={languageLabel(language, "files")} icon="folder" onClick={() => setInspectorTab("files")} />
-              <PreviewAction label={languageLabel(language, "copyPath")} icon="copy" onClick={() => run(() => navigator.clipboard.writeText(file.path).then(() => undefined))} />
+              <PreviewAction label={languageLabel(language, "copyPath")} icon="copy" onClick={() => run(async () => {
+                const fullPath = await invoke<string>("workspace_file_path", { cwd: workspace, path: file.path });
+                await navigator.clipboard.writeText(fullPath);
+              })} />
               {!(["image", "video", "audio", "pdf"] as string[]).includes(file.kind) && <PreviewAction label={languageLabel(language, "copyContents")} icon="copy" onClick={() => run(() => navigator.clipboard.writeText(file.content).then(() => undefined))} />}
               <PreviewAction label={languageLabel(language, "reveal")} icon="folder" onClick={() => run(() => invoke("reveal_in_explorer", { cwd: workspace, path: file.path }))} />
               <PreviewAction label={languageLabel(language, "openDefault")} icon="external" onClick={() => run(() => openFileWithConfiguredApplication(workspace, file.path))} />

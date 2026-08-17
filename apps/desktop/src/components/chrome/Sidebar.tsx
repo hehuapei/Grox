@@ -169,6 +169,11 @@ export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) 
             : (language === "zh-CN" ? "导入 CLI 历史" : "IMPORT CLI HISTORY")}
           {historyCount > 0 && <span className="ml-auto text-faint">{historyCount}</span>}
         </button>
+        {historyError && (
+          <p role="alert" className="px-2 pt-1.5 font-mono text-[9px] leading-relaxed text-red">
+            {language === "zh-CN" ? `CLI 历史导入失败：${historyError}` : `CLI history import failed: ${historyError}`}
+          </p>
+        )}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
@@ -401,7 +406,7 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
           />
         </div>
       ) : (
-        <button onClick={() => void openProject(project.id)} className="flex min-w-0 flex-1 items-center gap-2 text-left">
+        <button onClick={() => void openProject(project.id).catch(() => {})} className="flex min-w-0 flex-1 items-center gap-2 text-left">
           <Icon name={project.pinned ? "pin" : "folder"} size={11} className={project.pinned ? "text-acc" : "text-dim"} />
           <span className="truncate text-[12px]">{project.name}</span>
         </button>
@@ -413,7 +418,7 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
           void (async () => {
             if (activeProjectId !== project.id) await openProject(project.id);
             await newSession();
-          })();
+          })().catch(() => {});
         }}
         className="flex h-5 w-5 shrink-0 items-center justify-center rounded-[3px] text-acc transition-colors hover:bg-acc/10 hover:text-fg"
         title={language === "zh-CN" ? "在此项目中新建会话" : "New session in this project"}

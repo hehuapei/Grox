@@ -140,11 +140,17 @@ export function EnvironmentSummary() {
     const generation = ++loadGenerationRef.current;
     setLoading(true);
     setError("");
+    // 切换工作区后旧快照不能继续提供可点击的 worktree 目标；若新目录读取
+    // 失败，应呈现真实错误，而不是让旧数据挂在新的 cwd 下。
+    setSummary(null);
+    setWorktrees([]);
+    setJournalStatus(null);
+    setRuntimeStatus(null);
     try {
       if (inTauri()) {
         const [nextSummary, nextWorktrees, nextJournalStatus, nextRuntimeStatus] = await Promise.all([
           invoke<GitSummary>("git_summary", { cwd: workspace }),
-          invoke<GitWorktree[]>("git_worktrees", { cwd: workspace }).catch(() => [] as GitWorktree[]),
+          invoke<GitWorktree[]>("git_worktrees", { cwd: workspace }),
           invoke<SessionJournalStatus>("session_journal_status"),
           invoke<AgentRuntimeStatus>("agent_runtime_status"),
         ]);
@@ -532,32 +538,44 @@ export function EnvironmentSummary() {
                     <p className="text-[10px] text-faint">{zh ? "暂无附加 worktree" : "No linked worktrees"}</p>
                   ) : (
                     <div className="mb-2 space-y-1">
-                      {worktrees.map((item) => (
+                      {worktrees.map((item, index) => {
+                        const primary = index === 0;
+                        const current = samePath(item.path, workspace);
+                        return (
                         <div key={item.path} className="flex items-center gap-2 rounded-[4px] px-1.5 py-1 hover:bg-high">
                           <span className="min-w-0 flex-1 truncate font-mono text-[9.5px] text-fg2">{item.branch ?? (item.detached ? "DETACHED" : baseName(item.path))}</span>
                           <button
                             disabled={busy !== null}
-                            onClick={() => void useDesktop.getState().setWorkspace(item.path)}
+                            onClick={() => {
+                              setError("");
+                              setNotice("");
+                              void useDesktop.getState().setWorkspace(item.path).catch((cause) => {
+                                setError(cause instanceof Error ? cause.message : String(cause));
+                              });
+                            }}
                             className="text-[9px] text-acc hover:text-fg"
                           >
                             {zh ? "打开" : "Open"}
                           </button>
                           <button
-                            disabled={busy !== null || samePath(item.path, workspace)}
+                            disabled={busy !== null || current || primary}
                             onClick={() => {
                               setError("");
                               setNotice("");
                               setConfirmWorktree(item);
                             }}
                             className="text-[9px] text-faint hover:text-red disabled:cursor-not-allowed disabled:opacity-30"
-                            title={samePath(item.path, workspace)
+                            title={current
                               ? (zh ? "不能删除当前工作树" : "Cannot delete the current worktree")
+                              : primary
+                                ? (zh ? "不能删除仓库主工作树" : "Cannot delete the primary worktree")
                               : (zh ? "删除工作树" : "Remove worktree")}
                           >
                             {zh ? "删除" : "Remove"}
                           </button>
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   )}
                   <div className="flex gap-1.5">

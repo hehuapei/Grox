@@ -412,6 +412,9 @@ let pendingComposerStates: Record<string, SessionComposerState> | undefined;
 let workflowPersistTimer: number | undefined;
 let pendingWorkflowRuns: Record<string, WorkflowRun[]> | undefined;
 let historySyncPromise: Promise<void> | undefined;
+// 项目预览检测/启动会跨进程等待。快速重试、手动输入 URL 或切换工作区后，
+// 旧请求只能结束自己的 IPC，不能再覆盖用户当前看到的预览状态。
+let projectPreviewRequestGeneration = 0;
 // 文件预览是可重入入口：快速点击 A→B 或关闭面板时，较慢的旧请求不能
 // 覆盖新文件，也不能在关闭后重新写入错误/内容。
 let previewRequestGeneration = 0;
@@ -2558,7 +2561,13 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const project = get().projects.find(
         (entry) => entry.id === id || samePath(entry.path, id) || entry.id === projectId(id),
       );
-      if (project) await get().setWorkspace(project.path);
+      if (!project) return;
+      try {
+        await get().setWorkspace(project.path);
+      } catch (error) {
+        set({ startupError: errorText(error) });
+        throw error;
+      }
     },
 
     renameProject(id, name) {
@@ -2677,7 +2686,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
       const project = id
         ? get().projects.find((entry) => entry.id === id)
         : get().projects.find((entry) => entry.id === get().activeProjectId);
-      await invoke("open_in_explorer", { cwd: project?.path ?? get().workspace, path: null });
+      try {
+        await invoke("open_in_explorer", { cwd: project?.path ?? get().workspace, path: null });
+      } catch (error) {
+        set({ startupError: errorText(error) });
+      }
     },
 
     async createProjectWorktree(id) {
@@ -2760,6 +2773,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
 
     async logout() {
       await bridge.logout();
+      const auth = await bridge.getAuthState();
+      set({ auth, account: null, billing: null, startupError: null });
+      await get().refreshAccount();
     },
 
     async refreshAccount() {
@@ -3074,21 +3090,25 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     async refreshProjectPreview(start = false) {
+      const generation = ++projectPreviewRequestGeneration;
+      const cwd = get().workspace;
       if (bridge.kind === "mock") {
         set({ projectPreview: { status: "none" } });
         return;
       }
       try {
         const projectPreview = await invoke<ProjectPreview>("start_project_preview", {
-          cwd: get().workspace,
+          cwd,
           start,
         });
+        if (generation !== projectPreviewRequestGeneration || get().workspace !== cwd) return;
         const shouldOpen = start && (projectPreview.status === "starting" || projectPreview.status === "ready");
         set({
           projectPreview,
           ...(shouldOpen ? { inspectorOpen: true, inspectorTab: "preview" as InspectorTab, terminalOpen: false, previewOpen: false, planPreviewOpen: false } : {}),
         });
       } catch (error) {
+        if (generation !== projectPreviewRequestGeneration || get().workspace !== cwd) return;
         set({
           projectPreview: {
             status: "error",
@@ -3099,6 +3119,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     setProjectPreviewUrl(url) {
+      projectPreviewRequestGeneration += 1;
       set({ projectPreview: { ...get().projectPreview, status: "ready", url } });
     },
 
@@ -3193,7 +3214,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
     },
 
     renameSession(id, title) {
-      void bridge.renameSession(id, title);
+      void bridge.renameSession(id, title).catch((error) => {
+        set({ startupError: `会话标题仅在本机更新，CLI 重命名失败：${errorText(error)}` });
+      });
       const { sessionIndex, sessions } = get();
       const nextIndex = sessionIndex.map((m) => (m.id === id ? { ...m, title } : m));
       persistSessionCatalog(nextIndex);

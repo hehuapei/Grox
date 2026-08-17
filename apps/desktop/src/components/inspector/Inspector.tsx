@@ -16,6 +16,7 @@ import { usePreferences } from "../../state/preferences";
 import { useI18n } from "../../lib/i18n";
 import { Icon } from "../fx/Icon";
 import { openFileWithConfiguredApplication } from "../../lib/defaultOpen";
+import { projectPreviewUrl } from "../../lib/projectPreviewUrl";
 
 const EMPTY_WORKFLOWS: WorkflowRun[] = [];
 
@@ -496,16 +497,19 @@ function PreviewTab() {
   const setUrl = useDesktop((state) => state.setProjectPreviewUrl);
   const [draft, setDraft] = useState(preview.url ?? "");
   const [frameKey, setFrameKey] = useState(0);
-  useEffect(() => setDraft(preview.url ?? ""), [preview.url]);
+  const [navigationError, setNavigationError] = useState("");
+  useEffect(() => {
+    setDraft(preview.url ?? "");
+    setNavigationError("");
+  }, [preview.url]);
   const zh = language === "zh-CN";
   const navigate = (event: FormEvent) => {
     event.preventDefault();
     try {
-      const url = new URL(draft);
-      if (!/^https?:$/.test(url.protocol)) return;
-      setUrl(url.toString());
-    } catch {
-      // Keep the current page when the address is incomplete.
+      setUrl(projectPreviewUrl(draft));
+      setNavigationError("");
+    } catch (cause) {
+      setNavigationError(cause instanceof Error ? cause.message : String(cause));
     }
   };
   return (
@@ -516,11 +520,17 @@ function PreviewTab() {
         </button>
         <input value={draft} onChange={(event) => setDraft(event.target.value)} placeholder="http://localhost:5173" className="h-6 min-w-0 flex-1 rounded-[3px] border border-line bg-raise px-2 font-mono text-[9.5px] text-fg2 outline-none focus:border-line3" />
         {preview.url && (
-          <button type="button" onClick={() => void invoke("open_external", { url: preview.url })} className="flex h-6 w-6 items-center justify-center text-dim hover:text-fg" title={zh ? "在浏览器打开" : "Open in browser"}>
+          <button type="button" onClick={() => {
+            setNavigationError("");
+            void invoke("open_external", { url: preview.url }).catch((cause) => {
+              setNavigationError(cause instanceof Error ? cause.message : String(cause));
+            });
+          }} className="flex h-6 w-6 items-center justify-center text-dim hover:text-fg" title={zh ? "在浏览器打开" : "Open in browser"}>
             <Icon name="external" size={11} />
           </button>
         )}
       </form>
+      {navigationError && <p role="alert" className="shrink-0 border-b border-red/25 bg-red/5 px-3 py-2 font-mono text-[9px] leading-relaxed text-red">{navigationError}</p>}
       {preview.status === "ready" && preview.url ? (
         <iframe key={`${preview.url}-${frameKey}`} src={preview.url} title="Project preview" className="min-h-0 flex-1 border-0 bg-white" sandbox="allow-scripts allow-same-origin allow-forms allow-modals" />
       ) : (

@@ -74,7 +74,7 @@ export interface GrokBridge {
 
   /** Local Grok configuration documents kept in two-way sync by the shell. */
   readConfigDocuments(cwd: string): Promise<ConfigDocument[]>;
-  writeConfigDocument(document: ConfigDocument): Promise<ConfigDocument>;
+  writeConfigDocument(document: ConfigDocument, cwd: string): Promise<ConfigDocument>;
 
   /** Typed access to Grok Build x.ai extensions used by visual settings. */
   callExtension<T>(method: string, params?: unknown): Promise<T>;

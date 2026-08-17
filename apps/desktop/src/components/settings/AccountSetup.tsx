@@ -25,7 +25,7 @@ export function AccountSetup() {
   const installOfficialRuntime = useDesktop((state) => state.installOfficialRuntime);
   const [kind, setKind] = useState<ProviderKind>("oauth");
   const [apiKey, setApiKey] = useState("");
-  const [apiKeyHidden, setApiKeyHidden] = useState(false);
+  const [apiKeyHidden, setApiKeyHidden] = useState(true);
   const [providerName, setProviderName] = useState("");
   const [baseUrl, setBaseUrl] = useState("");
   const [busy, setBusy] = useState(false);
@@ -112,6 +112,15 @@ export function AccountSetup() {
     setOpen(false);
   };
 
+  const cancelSignIn = async () => {
+    setError(null);
+    try {
+      await cancelAuthentication();
+    } catch (cause) {
+      setError(providerErrorText(cause));
+    }
+  };
+
   return (
     <div className="settings-shell fixed inset-0 z-[70] flex items-center justify-center bg-void/80 p-5 backdrop-blur-[4px]">
       <div className="w-full max-w-[560px] rounded-[9px] border border-line3 bg-panel p-6 shadow-2xl animate-fade-up">
@@ -166,7 +175,7 @@ export function AccountSetup() {
         {error && <p className="mt-3 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{error}</p>}
 
         <div className="mt-5 flex items-center justify-between gap-3 border-t border-line pt-4">
-          <button onClick={() => auth.inProgress ? void cancelAuthentication() : deferSetup()} disabled={busy && !auth.inProgress} className="h-9 rounded-full px-3 text-[12px] text-dim hover:bg-high hover:text-fg2 disabled:opacity-50">
+          <button onClick={() => auth.inProgress ? void cancelSignIn() : deferSetup()} disabled={busy && !auth.inProgress} className="h-9 rounded-full px-3 text-[12px] text-dim hover:bg-high hover:text-fg2 disabled:opacity-50">
             {auth.inProgress
               ? (language === "zh-CN" ? "取消登录" : "Cancel sign-in")
               : (language === "zh-CN" ? "稍后设置，先进入应用" : "Set up later")}

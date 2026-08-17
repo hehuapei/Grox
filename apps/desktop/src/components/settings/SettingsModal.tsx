@@ -34,6 +34,11 @@ const providerErrorText = (cause: unknown) => formatGroxError(toGroxError(cause,
   code: "PROVIDER_OPERATION_FAILED",
 }));
 
+const extensionErrorText = (cause: unknown) => formatGroxError(toGroxError(cause, {
+  domain: "operation",
+  code: "EXTENSION_OPERATION_FAILED",
+}));
+
 function secretBackendLabel(backend: SecretBackendKind, zh: boolean) {
   switch (backend) {
     case "keychain": return zh ? "系统凭据库" : "System credential store";
@@ -194,21 +199,13 @@ function Input({ value, onChange, placeholder, type = "text" }: { value: string;
 function HooksPanel() {
   const { language } = useI18n();
   const zh = language === "zh-CN";
-  const [enabled, setEnabled] = useState<Record<string, boolean>>(() => {
-    try { return JSON.parse(localStorage.getItem("grox.hooks") ?? "{}") as Record<string, boolean>; } catch { return {}; }
-  });
   const hooks = [
     ["session.start", zh ? "任务开始时初始化上下文" : "Initialize context when a mission starts"],
     ["tool.before", zh ? "工具调用前检查权限与参数" : "Check permissions and arguments before tools"],
     ["tool.after", zh ? "工具完成后记录结果摘要" : "Record a compact result after tools"],
     ["session.stop", zh ? "任务结束时整理产物与日志" : "Collect artifacts and logs when done"],
   ];
-  const toggle = (id: string) => setEnabled((current) => {
-    const next = { ...current, [id]: !current[id] };
-    localStorage.setItem("grox.hooks", JSON.stringify(next));
-    return next;
-  });
-  return <div><Heading title="Hooks" description={zh ? "管理 Grok Build 生命周期钩子。开关会保存到本机，并在下一次任务启动时生效。" : "Manage Grok Build lifecycle hooks. Changes are stored locally and apply to the next mission."} /><div className="space-y-2">{hooks.map(([id, description]) => <div key={id} className="flex items-center gap-3 rounded-[6px] border border-line2 bg-raise px-3 py-3"><Icon name="bolt" size={12} className={enabled[id] ? "text-gold" : "text-faint"} /><div className="min-w-0 flex-1"><p className="font-mono text-[10.5px] text-fg2">{id}</p><p className="mt-0.5 text-[10px] text-dim">{description}</p></div><Toggle label={id} on={Boolean(enabled[id])} onChange={() => toggle(id)} /></div>)}</div><div className="mt-5 rounded-[5px] border border-gold/20 bg-gold/5 px-3 py-2 text-[10px] leading-relaxed text-dim">{zh ? "提示：Hooks 与 Plugin、Skills、MCP 共用 Grok Build 扩展目录；启用后无需额外服务。" : "Hooks share the Grok Build extension directory with Plugins, Skills, and MCP; no extra service is required."}</div></div>;
+  return <div><Heading title="Hooks" description={zh ? "预览 Grok Build 生命周期钩子入口。" : "Preview Grok Build lifecycle hook entry points."} /><div role="status" className="mb-4 rounded-[5px] border border-gold/30 bg-gold/5 px-3 py-2 text-[10px] leading-relaxed text-gold">{zh ? "运行时尚未接入，本版本仅展示、不生效。" : "Runtime integration is not available yet. These controls are display-only in this version."}</div><div className="space-y-2">{hooks.map(([id, description]) => <div key={id} className="flex items-center gap-3 rounded-[6px] border border-line2 bg-raise px-3 py-3 opacity-70"><Icon name="bolt" size={12} className="text-faint" /><div className="min-w-0 flex-1"><p className="font-mono text-[10.5px] text-fg2">{id}</p><p className="mt-0.5 text-[10px] text-dim">{description}</p></div><Toggle label={id} on={false} disabled onChange={() => {}} /></div>)}</div></div>;
 }
 
 function SecretInput({ value, onChange, hidden, onToggle, placeholder }: { value: string; onChange(value: string): void; hidden: boolean; onToggle(): void; placeholder?: string }) {
@@ -357,6 +354,7 @@ function Account() {
   const refresh = useDesktop((state) => state.refreshAccount);
   const openSetup = useDesktop((state) => state.setAccountSetupOpen);
   const logout = useDesktop((state) => state.logout);
+  const [actionError, setActionError] = useState("");
   return <div>
     <Heading title={zh ? "账户与配置" : "Account & configuration"} description={zh ? "身份、模型服务与 Grok 本地配置集中在这里管理。OAuth 目录实时跟随 Grok，API 模式由你控制端点与常驻模型。" : "Manage identity, model providers, and local Grok configuration in one place. OAuth follows Grok live; API modes keep endpoints and the resident model under your control."} />
     <div className="rounded-[6px] border border-line2 bg-raise p-4">
@@ -369,7 +367,8 @@ function Account() {
       </> : <><Metric label={zh ? "密钥存储" : "Secret storage"} value={secretBackendLabel(provider.secretBackend, zh)} /><Metric label={zh ? "可用模型" : "Available models"} value={`${models.length}`} /></>}</div>
       {provider.kind === "oauth" && <p className="mt-3 text-[10px] leading-relaxed text-dim">{billing?.creditUsagePercent !== undefined ? (zh ? `订阅额度已使用 ${Math.round(billing.creditUsagePercent)}%。` : `${Math.round(billing.creditUsagePercent)}% of plan quota used.`) : (zh ? "Grok Build 当前未公开五小时或订阅剩余额度；这里展示 CLI 实际返回的订阅周期与按量额度。" : "Grok Build does not currently expose five-hour or remaining subscription quota; the values above are the billing data actually returned by the CLI.")}</p>}
     </div>
-    <div className="mt-3 flex gap-2">{provider.kind === "oauth" && !account?.authenticated && <ActionButton tone="accent" onClick={() => openSetup(true)}>{t("login")}</ActionButton>}{provider.kind === "oauth" && account?.authenticated && <ActionButton tone="danger" onClick={() => void logout()}>{t("logout")}</ActionButton>}<ActionButton onClick={() => void invoke("open_external", { url: "https://grok.com/supergrok?referrer=grok-build" })}>{t("upgrade")}</ActionButton></div>
+    <div className="mt-3 flex gap-2">{provider.kind === "oauth" && !account?.authenticated && <ActionButton tone="accent" onClick={() => openSetup(true)}>{t("login")}</ActionButton>}{provider.kind === "oauth" && account?.authenticated && <ActionButton tone="danger" onClick={() => { setActionError(""); void logout().catch((cause) => setActionError(providerErrorText(cause))); }}>{t("logout")}</ActionButton>}<ActionButton onClick={() => { setActionError(""); void invoke("open_external", { url: "https://grok.com/supergrok?referrer=grok-build" }).catch((cause) => setActionError(providerErrorText(cause))); }}>{t("upgrade")}</ActionButton></div>
+    {actionError && <p role="alert" className="mt-2 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{actionError}</p>}
     <ProviderAndModels />
     <div className="mt-8 border-t border-line pt-6"><ConfigDocumentsPanel /></div>
   </div>;
@@ -397,7 +396,7 @@ function ProviderAndModels() {
   const [editingProfileId, setEditingProfileId] = useState<string | undefined>();
   const [profileName, setProfileName] = useState("");
   const [apiKey, setApiKey] = useState("");
-  const [apiKeyHidden, setApiKeyHidden] = useState(false);
+  const [apiKeyHidden, setApiKeyHidden] = useState(true);
   const [baseUrl, setBaseUrl] = useState(provider.kind === "compatible" ? "" : (provider.baseUrl ?? ""));
   const [allowInsecureHttp, setAllowInsecureHttp] = useState(false);
   const [apiBackend, setApiBackend] = useState<ProviderApiBackend>("auto");
@@ -436,7 +435,7 @@ function ProviderAndModels() {
     setEditingProfileId(undefined);
     setProfileName("");
     setApiKey("");
-    setApiKeyHidden(false);
+    setApiKeyHidden(true);
     setBaseUrl("");
     setAllowInsecureHttp(false);
     setApiBackend("auto");
@@ -455,7 +454,7 @@ function ProviderAndModels() {
     setKind(next);
     setEditingProfileId(undefined);
     setApiKey("");
-    setApiKeyHidden(false);
+    setApiKeyHidden(true);
     setBaseUrl("");
     setAllowInsecureHttp(false);
     setAvailableModels([]);
@@ -659,15 +658,26 @@ function RangeControl({ value, min, max, step, display, label, onChange }: { val
   return <div className="w-[260px]"><div className="mb-1 flex items-center justify-between font-mono text-[9.5px] text-faint"><span>{min}</span><output className="rounded-[3px] border border-line2 bg-void px-2 py-0.5 text-acc">{display}</output><span>{max}</span></div><input aria-label={label} className="grox-range block w-full appearance-none bg-transparent" type="range" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} /></div>;
 }
 
-function useExtension<T>(loader: () => Promise<T>, dependencies: unknown[]) {
+export function useExtension<T>(loader: () => Promise<T>, dependencies: unknown[]) {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
   const [version, setVersion] = useState(0);
-  useEffect(() => { let live = true; setError(null); void loader().then((value) => live && setData(value)).catch((cause) => live && setError(cause instanceof Error ? cause.message : String(cause))); return () => { live = false; }; }, [...dependencies, version]);
-  return { data, error, reload: () => setVersion((value) => value + 1) };
+  useEffect(() => {
+    let live = true;
+    setData(null);
+    setError(null);
+    setLoading(true);
+    void loader()
+      .then((value) => { if (live) setData(value); })
+      .catch((cause) => { if (live) setError(extensionErrorText(cause)); })
+      .finally(() => { if (live) setLoading(false); });
+    return () => { live = false; };
+  }, [...dependencies, version]);
+  return { data, error, loading, reload: () => setVersion((value) => value + 1) };
 }
 
-function ExtensionState({ error, empty }: { error: string | null; empty: string }) { return error ? <p className="rounded-[5px] border border-red/30 bg-red/5 p-3 text-[10px] text-red">{error}</p> : <p className="rounded-[5px] border border-line bg-raise p-5 text-center text-[10px] text-dim">{empty}</p>; }
+function ExtensionState({ error, empty, loading = false }: { error: string | null; empty: string; loading?: boolean }) { return error ? <p role="alert" className="rounded-[5px] border border-red/30 bg-red/5 p-3 text-[10px] text-red">{error}</p> : <p className="rounded-[5px] border border-line bg-raise p-5 text-center text-[10px] text-dim">{loading ? "…" : empty}</p>; }
 
 function McpPanel() {
   const { t, language } = useI18n();
@@ -678,7 +688,7 @@ function McpPanel() {
   const [actionError, setActionError] = useState("");
   const state = useExtension(async () => object(await bridge.callExtension("x.ai/mcp/list", { ...(sessionId ? { sessionId } : {}), cache: false })), [sessionId]);
   const servers = list(state.data?.servers).map(object);
-  const action = async (method: string, params: Json) => { setActionError(""); try { if (!sessionId) throw new Error(zh ? "请先打开一个项目任务，以便 Grok Build 创建运行时上下文。" : "Open a project mission first so Grok Build can create its runtime context."); await bridge.callExtension(method, { session_id: sessionId, ...params }); state.reload(); } catch (cause) { setActionError(cause instanceof Error ? cause.message : String(cause)); throw cause; } };
+  const action = async (method: string, params: Json) => { setActionError(""); try { if (!sessionId) throw new Error(zh ? "请先打开一个项目任务，以便 Grok Build 创建运行时上下文。" : "Open a project mission first so Grok Build can create its runtime context."); await bridge.callExtension(method, { session_id: sessionId, ...params }); state.reload(); } catch (cause) { setActionError(extensionErrorText(cause)); throw cause; } };
   const add = async () => { if (!name.trim() || !endpoint.trim()) return; await action("x.ai/mcp/upsert", { server_name: name.trim(), ...(kind === "http" ? { type: "http", url: endpoint.trim(), enabled: true } : { command: endpoint.trim(), args: [], enabled: true }) }); setName(""); setEndpoint(""); };
   return <div><Heading title={t("mcp")} description={zh ? "直接读写 Grok Build 的 MCP 配置；启停和删除会同步到 config.toml。" : "Manage Grok Build MCP configuration directly; toggles and deletions sync to config.toml."} />
     <div className="mb-4 grid grid-cols-[120px_1fr_110px_auto] items-center gap-2">
@@ -698,9 +708,9 @@ function McpPanel() {
         onSelect={(id) => setKind(id as typeof kind)}
         aria-label={zh ? "MCP 类型" : "MCP kind"}
       />
-      <ActionButton tone="accent" disabled={!sessionId} onClick={() => void add().catch(() => {})}>{t("add")}</ActionButton>
+      <ActionButton tone="accent" disabled={!sessionId || !name.trim() || !endpoint.trim()} onClick={() => void add().catch(() => {})}>{t("add")}</ActionButton>
     </div>
-    {servers.length === 0 ? <ExtensionState error={state.error} empty={zh ? "尚未配置 MCP Server" : "No MCP servers configured"} /> : <div className="space-y-2">{servers.map((server) => { const session = object(server.session); const enabled = bool(session.enabled); const serverName = text(server.name); return <div key={serverName} className="flex items-center gap-3 rounded-[5px] border border-line2 bg-raise p-3"><Icon name="globe" size={13} className="text-mute" /><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-fg2">{text(server.displayName, serverName)}</p><p className="truncate font-mono text-[9.5px] text-dim">{text(server.url) || text(server.command) || text(server.sourceLabel)}</p></div><span className="font-mono text-[9.5px] text-faint">{text(session.status).toUpperCase()}</span><Toggle label={`${serverName} MCP`} on={enabled} disabled={!sessionId} onChange={(value) => void action("x.ai/mcp/toggle", { server_name: serverName, enabled: value }).catch(() => {})} />{text(server.source) === "local" && <ActionButton tone="danger" disabled={!sessionId} onClick={() => setConfirmingServer(serverName)}>{t("delete")}</ActionButton>}</div>; })}</div>}
+    {servers.length === 0 ? <ExtensionState error={state.error} loading={state.loading} empty={zh ? "尚未配置 MCP Server" : "No MCP servers configured"} /> : <div className="space-y-2">{servers.map((server) => { const session = object(server.session); const enabled = bool(session.enabled); const serverName = text(server.name); return <div key={serverName} className="flex items-center gap-3 rounded-[5px] border border-line2 bg-raise p-3"><Icon name="globe" size={13} className="text-mute" /><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-fg2">{text(server.displayName, serverName)}</p><p className="truncate font-mono text-[9.5px] text-dim">{text(server.url) || text(server.command) || text(server.sourceLabel)}</p></div><span className="font-mono text-[9.5px] text-faint">{text(session.status).toUpperCase()}</span><Toggle label={`${serverName} MCP`} on={enabled} disabled={!sessionId} onChange={(value) => void action("x.ai/mcp/toggle", { server_name: serverName, enabled: value }).catch(() => {})} />{text(server.source) === "local" && <ActionButton tone="danger" disabled={!sessionId} onClick={() => setConfirmingServer(serverName)}>{t("delete")}</ActionButton>}</div>; })}</div>}
     {actionError && <p className="mt-2 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{actionError}</p>}
     <MarketLinks kind="mcp" />
     {confirmingServer && <ConfirmDialog
@@ -725,9 +735,9 @@ function SkillsPanel() {
   const state = useExtension(async () => object(await bridge.callExtension("x.ai/skills/list", { cwd })), [cwd]);
   const skills = list(state.data?.skills).map(object).sort((a, b) => text(a.displayName, text(a.name)).localeCompare(text(b.displayName, text(b.name))));
   const groups = [...skills.reduce((result, skill) => { const scope = text(skill.scope, "other"); result.set(scope, [...(result.get(scope) ?? []), skill]); return result; }, new Map<string, Json[]>()).entries()].sort(([a], [b]) => a.localeCompare(b));
-  const run = async (method: string, params: Json) => { setActionError(""); try { await bridge.callExtension(method, { ...params, cwd }); state.reload(); } catch (cause) { setActionError(cause instanceof Error ? cause.message : String(cause)); throw cause; } };
-  return <div><Heading title={t("skills")} description={zh ? "从 Grok Build 的用户、项目和插件作用域发现 Skill，可视化启停与移除。" : "Discover Skills from Grok Build user, project, and plugin scopes; toggle or remove them visually."} /><div className="mb-4 flex gap-2"><div className="flex-1"><Input value={path} onChange={setPath} placeholder={zh ? "C:\\path\\to\\skill 或 SKILL.md" : "C:\\path\\to\\skill or SKILL.md"} /></div><ActionButton tone="accent" onClick={() => void run("x.ai/skills/add", { path }).then(() => setPath("")).catch(() => {})}>{t("add")}</ActionButton></div>
-    {skills.length === 0 ? <ExtensionState error={state.error} empty={zh ? "尚未发现 Skill" : "No Skills discovered"} /> : <div className="space-y-2">{groups.map(([scope, entries]) => <details key={scope} open className="rounded-[5px] border border-line2 bg-void/40"><summary className="cursor-pointer px-3 py-2 font-mono text-[9.5px] uppercase tracking-[0.08em] text-mute">{scope} · {entries.length}</summary><div className="grid grid-cols-2 gap-2 border-t border-line p-2">{entries.map((skill) => { const name = text(skill.name); const skillPath = text(skill.path); const enabled = skill.enabled !== false; return <div key={`${name}-${skillPath}`} className="rounded-[5px] border border-line2 bg-raise p-3"><div className="flex items-start gap-2"><Icon name="bolt" size={12} className="mt-0.5 text-gold" /><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-fg2">{text(skill.displayName, name)}</p><p className="mt-1 line-clamp-2 text-[10px] leading-relaxed text-dim">{text(skill.description, skillPath)}</p></div><Toggle label={`${name} Skill`} on={enabled} onChange={(value) => void run("x.ai/skills/toggle", { name, enabled: value }).catch(() => {})} /></div>{text(skill.scope) !== "bundled" && <button onClick={() => setConfirmingSkill({ name, path: skillPath })} className="mt-2 font-mono text-[9.5px] text-red/70 hover:text-red">{t("remove")}</button>}</div>; })}</div></details>)}</div>}
+  const run = async (method: string, params: Json) => { setActionError(""); try { await bridge.callExtension(method, { ...params, cwd }); state.reload(); } catch (cause) { setActionError(extensionErrorText(cause)); throw cause; } };
+  return <div><Heading title={t("skills")} description={zh ? "从 Grok Build 的用户、项目和插件作用域发现 Skill，可视化启停与移除。" : "Discover Skills from Grok Build user, project, and plugin scopes; toggle or remove them visually."} /><div className="mb-4 flex gap-2"><div className="flex-1"><Input value={path} onChange={setPath} placeholder={zh ? "C:\\path\\to\\skill 或 SKILL.md" : "C:\\path\\to\\skill or SKILL.md"} /></div><ActionButton tone="accent" disabled={!path.trim()} onClick={() => void run("x.ai/skills/add", { path }).then(() => setPath("")).catch(() => {})}>{t("add")}</ActionButton></div>
+    {skills.length === 0 ? <ExtensionState error={state.error} loading={state.loading} empty={zh ? "尚未发现 Skill" : "No Skills discovered"} /> : <div className="space-y-2">{groups.map(([scope, entries]) => <details key={scope} open className="rounded-[5px] border border-line2 bg-void/40"><summary className="cursor-pointer px-3 py-2 font-mono text-[9.5px] uppercase tracking-[0.08em] text-mute">{scope} · {entries.length}</summary><div className="grid grid-cols-2 gap-2 border-t border-line p-2">{entries.map((skill) => { const name = text(skill.name); const skillPath = text(skill.path); const enabled = skill.enabled !== false; return <div key={`${name}-${skillPath}`} className="rounded-[5px] border border-line2 bg-raise p-3"><div className="flex items-start gap-2"><Icon name="bolt" size={12} className="mt-0.5 text-gold" /><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-fg2">{text(skill.displayName, name)}</p><p className="mt-1 line-clamp-2 text-[10px] leading-relaxed text-dim">{text(skill.description, skillPath)}</p></div><Toggle label={`${name} Skill`} on={enabled} onChange={(value) => void run("x.ai/skills/toggle", { name, enabled: value }).catch(() => {})} /></div>{text(skill.scope) !== "bundled" && <button onClick={() => setConfirmingSkill({ name, path: skillPath })} className="mt-2 font-mono text-[9.5px] text-red/70 hover:text-red">{t("remove")}</button>}</div>; })}</div></details>)}</div>}
     {actionError && <p className="mt-2 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{actionError}</p>}
     <MarketLinks kind="skills" />
     {confirmingSkill && <ConfirmDialog
@@ -771,7 +781,7 @@ function PluginsPanel() {
       pluginsState.reload();
       marketState.reload();
     } catch (cause) {
-      setActionError(cause instanceof Error ? cause.message : String(cause));
+      setActionError(extensionErrorText(cause));
       throw cause;
     } finally {
       unlockLater();
@@ -792,17 +802,17 @@ function PluginsPanel() {
       pluginsState.reload();
       marketState.reload();
     } catch (cause) {
-      setActionError(cause instanceof Error ? cause.message : String(cause));
+      setActionError(extensionErrorText(cause));
       throw cause;
     } finally {
       unlockLater();
     }
   };
   return <div><Heading title={`${t("plugins")} / ${t("marketplace")}`} description={zh ? "使用 Grok Build 原生 Plugin 与 Marketplace 扩展，安装后可即时刷新技能、Hook 与 MCP。" : "Use native Grok Build Plugins and Marketplace sources; installed Skills, hooks, and MCP refresh immediately."} />
-    <h3 className="lbl mb-2 !text-[9.5px]">{t("plugins")}</h3>{!sessionId ? <ExtensionState error={null} empty={zh ? "请先打开一个项目任务后管理 Plugin" : "Open a project mission before managing Plugins"} /> : plugins.length === 0 ? <ExtensionState error={pluginsState.error} empty={zh ? "尚未安装 Plugin" : "No Plugins installed"} /> : <div className="grid grid-cols-2 gap-2">{plugins.map((plugin) => { const id = text(plugin.id); const name = text(plugin.name, id); const enabled = plugin.enabled !== false; return <div key={id} className="rounded-[5px] border border-line2 bg-raise p-3"><div className="flex gap-2"><Icon name="layers" size={12} className="text-acc" /><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-fg2">{name}</p><p className="mt-1 line-clamp-2 text-[9.5px] text-dim">{text(plugin.description)} · {Number(plugin.skillCount ?? 0)} skills</p></div><Toggle label={`${name} Plugin`} on={enabled} disabled={actionBusy} onChange={(value) => void action({ type: value ? "enable" : "disable", plugin_id: id }).catch(() => {})} /></div><button disabled={actionBusy} onClick={() => setConfirmingPlugin({ id, name })} className="mt-2 font-mono text-[9.5px] text-red/70 hover:text-red disabled:opacity-40">{t("uninstall")}</button></div>; })}</div>}
+    <h3 className="lbl mb-2 !text-[9.5px]">{t("plugins")}</h3>{!sessionId ? <ExtensionState error={null} empty={zh ? "请先打开一个项目任务后管理 Plugin" : "Open a project mission before managing Plugins"} /> : plugins.length === 0 ? <ExtensionState error={pluginsState.error} loading={pluginsState.loading} empty={zh ? "尚未安装 Plugin" : "No Plugins installed"} /> : <div className="grid grid-cols-2 gap-2">{plugins.map((plugin) => { const id = text(plugin.id); const name = text(plugin.name, id); const enabled = plugin.enabled !== false; return <div key={id} className="rounded-[5px] border border-line2 bg-raise p-3"><div className="flex gap-2"><Icon name="layers" size={12} className="text-acc" /><div className="min-w-0 flex-1"><p className="truncate text-[11px] text-fg2">{name}</p><p className="mt-1 line-clamp-2 text-[9.5px] text-dim">{text(plugin.description)} · {Number(plugin.skillCount ?? 0)} skills</p></div><Toggle label={`${name} Plugin`} on={enabled} disabled={actionBusy} onChange={(value) => void action({ type: value ? "enable" : "disable", plugin_id: id }).catch(() => {})} /></div><button disabled={actionBusy} onClick={() => setConfirmingPlugin({ id, name })} className="mt-2 font-mono text-[9.5px] text-red/70 hover:text-red disabled:opacity-40">{t("uninstall")}</button></div>; })}</div>}
     <h3 className="lbl mb-2 mt-6 !text-[9.5px]">{t("marketplace")}</h3><div className="space-y-3">{sources.flatMap((source) => list(source.plugins).map(object).slice(0, 30).map((plugin) => <div key={`${text(source.sourceName)}-${text(plugin.relativePath)}`} className="flex items-center gap-3 rounded-[5px] border border-line bg-raise px-3 py-2"><div className="min-w-0 flex-1"><p className="text-[10.5px] text-fg2">{text(plugin.name)}</p><p className="truncate text-[9.5px] text-dim">{text(plugin.description)} · {text(source.sourceName)}</p></div><span className="font-mono text-[9.5px] text-faint">{text(plugin.installStatus)}</span>{text(plugin.installStatus) === "not_installed" && <ActionButton disabled={!sessionId || actionBusy} onClick={() => void marketAction(source, plugin).catch(() => {})}>{t("install")}</ActionButton>}</div>))}</div>
     {actionError && <p className="mt-2 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{actionError}</p>}
-    {sources.length === 0 && <ExtensionState error={marketState.error} empty={zh ? "Marketplace 暂无可用来源" : "No Marketplace sources available"} />}<MarketLinks kind="plugins" />
+    {sources.length === 0 && <ExtensionState error={marketState.error} loading={marketState.loading} empty={zh ? "Marketplace 暂无可用来源" : "No Marketplace sources available"} />}<MarketLinks kind="plugins" />
     {confirmingPlugin && <ConfirmDialog
       title={zh ? "卸载 Plugin？" : "Uninstall Plugin?"}
       description={zh ? `将卸载“${confirmingPlugin.name}”，并移除它提供的 Skills、Hooks 与 MCP 配置。` : `This uninstalls “${confirmingPlugin.name}” and removes its Skills, hooks, and MCP configuration.`}
@@ -865,7 +875,7 @@ function ConfigDocumentsPanel() {
       ? (zh ? "正在验证并重启 Grok Build…" : "Validating and restarting Grok Build…")
       : (zh ? "正在保存并重新载入当前任务…" : "Saving and reloading the current mission…"));
     try {
-      const saved = await bridge.writeConfigDocument({ ...document, content: drafts[document.id] ?? "" });
+      const saved = await bridge.writeConfigDocument({ ...document, content: drafts[document.id] ?? "" }, cwd);
       setDocuments((items) => items.map((item) => item.id === saved.id ? saved : item));
       setDirty((current) => ({ ...current, [saved.id]: false }));
       if (activeId) await bridge.loadSession(activeId);

@@ -213,7 +213,7 @@ export class MockBridge implements GrokBridge {
     ].map((document) => ({ ...document, content: this.configDrafts[document.id as ConfigDocument["id"]], exists: true })) as ConfigDocument[];
   }
 
-  async writeConfigDocument(document: ConfigDocument): Promise<ConfigDocument> {
+  async writeConfigDocument(document: ConfigDocument, _cwd: string): Promise<ConfigDocument> {
     this.configDrafts[document.id] = document.content;
     return { ...document, exists: true };
   }

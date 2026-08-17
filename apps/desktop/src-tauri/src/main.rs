@@ -4607,7 +4607,9 @@ fn git_worktrees(cwd: String) -> Result<Vec<GitWorktree>, String> {
     if !is_repository {
         return Ok(Vec::new());
     }
-    let porcelain = optional_git_text(&root, &["worktree", "list", "--porcelain"]).unwrap_or_default();
+    // 即使没有附加 worktree，Git 仍会返回主工作树。这里若降级为空数组，
+    // 只会把 Git/进程错误伪装成“没有工作树”，让后续操作基于假状态执行。
+    let porcelain = git_text(&root, &["worktree", "list", "--porcelain"])?;
     let mut items = Vec::new();
     let mut current: Option<GitWorktree> = None;
     for line in porcelain.lines() {
@@ -4651,6 +4653,7 @@ fn git_worktree_add(cwd: String, name: String, branch: Option<String>) -> Result
     let root = checked_workspace(&cwd)?;
     let name = name.trim();
     if name.is_empty()
+        || matches!(name, "." | "..")
         || name.len() > 64
         || name.chars().any(|character| {
             character.is_control()
@@ -11021,6 +11024,22 @@ mod tests {
 
         let clean = worktree_remove_confirmation(Path::new("/repo/worktree"), false);
         assert!(!clean.contains("未提交变更"));
+    }
+
+    #[test]
+    fn worktree_name_rejects_current_and_parent_directory_components() {
+        let root = std::env::temp_dir().join(format!(
+            "grox-worktree-name-gate-{}-{}",
+            std::process::id(),
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let cwd = path_for_webview(&root);
+
+        assert!(git_worktree_add(cwd.clone(), ".".into(), None).is_err());
+        assert!(git_worktree_add(cwd, "..".into(), None).is_err());
+
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

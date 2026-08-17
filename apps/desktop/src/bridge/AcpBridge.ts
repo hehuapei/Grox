@@ -3305,9 +3305,12 @@ export class AcpBridge implements GrokBridge {
     return invoke<ConfigDocument[]>("read_config_documents", { cwd });
   }
 
-  async writeConfigDocument(document: ConfigDocument): Promise<ConfigDocument> {
+  async writeConfigDocument(document: ConfigDocument, cwd: string): Promise<ConfigDocument> {
+    // 保存目标必须由打开编辑器时的工作区决定，不能在异步重启后读取
+    // 可能已变化的 this.workspace，否则快速切换项目会写错 AGENTS.md。
+    const targetCwd = cwd;
     const write = () => invoke<ConfigDocument>("write_config_document", {
-      request: { id: document.id, cwd: this.workspace, content: document.content },
+      request: { id: document.id, cwd: targetCwd, content: document.content },
     });
     return document.id === "config" ? this.reconfigureRuntime(write) : write();
   }
