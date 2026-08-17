@@ -101,8 +101,8 @@ use session_event_journal::{
 use session_journal_store::{SessionJournalStore, SessionJournalWriteError};
 use session_runtime::{
     browser_shutdown_all_leases, close_agent_session, computer_emergency_stop_session,
-    computer_shutdown_all_leases, delete_agent_session, fork_agent_session_in_worktree,
-    open_agent_session,
+    computer_shutdown_all_leases, delete_agent_session, fork_agent_session,
+    fork_agent_session_in_worktree, open_agent_session,
     shutdown_all_mcp_resources,
 };
 use session_storage::SessionStorageState;
@@ -10234,6 +10234,7 @@ fn main() {
             automation_runner_status,
             run_automation_now,
             open_agent_session,
+            fork_agent_session,
             fork_agent_session_in_worktree,
             close_agent_session,
             delete_agent_session,

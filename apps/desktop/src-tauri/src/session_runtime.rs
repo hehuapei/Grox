@@ -52,6 +52,24 @@ pub(crate) struct ForkAgentSessionInWorktreeRequest {
     pub(crate) generation: u64,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ForkAgentSessionRequest {
+    pub(crate) source_session_id: String,
+    pub(crate) source_cwd: String,
+    pub(crate) generation: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ForkAgentSessionResult {
+    pub(crate) session_id: String,
+    pub(crate) parent_session_id: String,
+    pub(crate) cwd: String,
+    pub(crate) chat_messages_copied: Option<u64>,
+    pub(crate) updates_copied: Option<u64>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ForkAgentSessionInWorktreeResult {
@@ -328,14 +346,18 @@ fn session_fork_params(
     source_session_id: &str,
     source_cwd: &str,
     new_cwd: &str,
+    session_kind: Option<&str>,
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut params = serde_json::json!({
         "sourceSessionId": source_session_id,
         "sourceCwd": source_cwd,
         "newCwd": new_cwd,
-        "sessionKind": "worktree",
         "sourceWorkspaceDir": source_cwd,
-    })
+    });
+    if let Some(session_kind) = session_kind {
+        params["sessionKind"] = serde_json::Value::String(session_kind.to_string());
+    }
+    params
 }
 
 fn prepare_session_extensions(
@@ -645,6 +667,84 @@ async fn rollback_created_worktree(created: crate::CreatedManagedWorktree) -> Op
     }
 }
 
+/// 在同一工作区原生分叉完整 Grok Build 会话。分叉不发送合成提示，
+/// 也不会擅自启动新一轮；用户进入复制后的上下文再决定下一步。
+#[tauri::command]
+pub(crate) async fn fork_agent_session(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, Arc<AcpState>>,
+    leases: tauri::State<'_, Arc<McpLeaseStore>>,
+    request: ForkAgentSessionRequest,
+) -> Result<ForkAgentSessionResult, AcpHostError> {
+    ensure_main_acp_owner(window.label())
+        .map_err(|error| AcpHostError::operation("ACP_WINDOW_NOT_OWNER", error))?;
+    {
+        let process = state.process.lock().await;
+        if !process
+            .as_ref()
+            .is_some_and(|process| process.generation == request.generation)
+        {
+            return Err(AcpHostError::environment(
+                "ACP_CHANNEL_REPLACED",
+                "ACP 通道已切换，无法在旧运行时分叉会话",
+                true,
+                true,
+                "等待 Agent 重连完成后重试",
+            ));
+        }
+    }
+    let source_session_id = checked_session_value(
+        &request.source_session_id,
+        "sourceSessionId",
+        512,
+    )?;
+    let source_cwd = checked_workspace(&request.source_cwd).map_err(|error| {
+        AcpHostError::environment(
+            "SESSION_WORKSPACE_INVALID",
+            error,
+            false,
+            false,
+            "重新选择源会话的项目目录",
+        )
+    })?;
+    let permit = state.sessions.acquire_lifecycle(request.generation).await?;
+    let source_text = path_for_webview(&source_cwd);
+    let response = request_acp_json(
+        state.inner(),
+        leases.inner(),
+        "x.ai/session/fork",
+        session_fork_params(&source_session_id, &source_text, &source_text, None),
+        request.generation,
+        2 * 60_000,
+        Some(permit.token()),
+    )
+    .await?;
+    let session_id = response
+        .get("newSessionId")
+        .or_else(|| response.get("sessionId"))
+        .and_then(serde_json::Value::as_str)
+        .map(|value| checked_session_value(value, "fork sessionId", 512))
+        .transpose()?
+        .filter(|session_id| session_id != &source_session_id)
+        .ok_or_else(|| {
+            AcpHostError::protocol(
+                "ACP_INVALID_FORK_RESPONSE",
+                "x.ai/session/fork 未返回新的 sessionId",
+            )
+        })?;
+    Ok(ForkAgentSessionResult {
+        session_id,
+        parent_session_id: source_session_id,
+        cwd: source_text,
+        chat_messages_copied: response
+            .get("chatMessagesCopied")
+            .and_then(serde_json::Value::as_u64),
+        updates_copied: response
+            .get("updatesCopied")
+            .and_then(serde_json::Value::as_u64),
+    })
+}
+
 /// 在干净 linked worktree 中原生分叉完整 Grok Build 会话。创建目录、复制
 /// session、写入 Host 所有权必须作为一个结果呈现；失败时只回滚本次创建的
 /// 唯一 worktree/branch，绝不删除源会话或用户已有目录。
@@ -756,7 +856,12 @@ pub(crate) async fn fork_agent_session_in_worktree(
         state.inner(),
         leases.inner(),
         "x.ai/session/fork",
-        session_fork_params(&source_session_id, &source_text, &fork_cwd_text),
+        session_fork_params(
+            &source_session_id,
+            &source_text,
+            &fork_cwd_text,
+            Some("worktree"),
+        ),
         request.generation,
         2 * 60_000,
         Some(permit.token()),
@@ -989,12 +1094,25 @@ mod tests {
     #[test]
     fn worktree_fork_uses_grok_build_native_context_copy_contract() {
         assert_eq!(
-            session_fork_params("source-1", "/repo", "/managed/worktree"),
+            session_fork_params("source-1", "/repo", "/managed/worktree", Some("worktree")),
             serde_json::json!({
                 "sourceSessionId": "source-1",
                 "sourceCwd": "/repo",
                 "newCwd": "/managed/worktree",
                 "sessionKind": "worktree",
+                "sourceWorkspaceDir": "/repo",
+            })
+        );
+    }
+
+    #[test]
+    fn same_workspace_fork_does_not_claim_worktree_semantics() {
+        assert_eq!(
+            session_fork_params("source-1", "/repo", "/repo", None),
+            serde_json::json!({
+                "sourceSessionId": "source-1",
+                "sourceCwd": "/repo",
+                "newCwd": "/repo",
                 "sourceWorkspaceDir": "/repo",
             })
         );

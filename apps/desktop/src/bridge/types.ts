@@ -321,6 +321,14 @@ export interface WorktreeForkResult {
   updatesCopied?: number;
 }
 
+export interface SessionForkResult {
+  sessionId: string;
+  parentSessionId: string;
+  cwd: string;
+  chatMessagesCopied?: number;
+  updatesCopied?: number;
+}
+
 export interface Session extends SessionMeta {
   blocks: SessionBlock[];
   usage: Usage;

@@ -3,7 +3,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { useDesktop } from "../../state/store";
 import { MAX_ATTACHMENTS, prepareAttachment, validateAttachmentSet } from "../../lib/attachments";
 import { baseName } from "../../lib/format";
+import { samePath } from "../../lib/projectCatalog";
 import { useI18n } from "../../lib/i18n";
+import { ConfirmDialog } from "../common/ConfirmDialog";
 import { Icon } from "../fx/Icon";
 import { ChipSelect } from "../common/ChipSelect";
 
@@ -96,6 +98,7 @@ export function EnvironmentSummary() {
   const [commitOpen, setCommitOpen] = useState(false);
   const [commitMessage, setCommitMessage] = useState("");
   const [worktreeName, setWorktreeName] = useState("");
+  const [confirmWorktree, setConfirmWorktree] = useState<GitWorktree | null>(null);
   const [showAllSources, setShowAllSources] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
@@ -263,6 +266,33 @@ export function EnvironmentSummary() {
     }
   };
 
+  const removeWorktree = async (item: GitWorktree) => {
+    setBusy("worktree");
+    setError("");
+    setNotice("");
+    try {
+      const result = inTauri()
+        ? await (async () => {
+            const confirmToken = await invoke<string>("prepare_git_worktree_remove", {
+              cwd: workspace,
+              path: item.path,
+            });
+            return invoke<string>("git_worktree_remove", {
+              request: { cwd: workspace, path: item.path, confirmToken },
+            });
+          })()
+        : (zh ? "Worktree 已移除" : "Worktree removed");
+      setNotice(result);
+      setConfirmWorktree(null);
+      await loadSummary();
+    } catch (cause) {
+      setError(cause instanceof Error ? cause.message : String(cause));
+      throw cause;
+    } finally {
+      setBusy(null);
+    }
+  };
+
   const visibleSources = showAllSources ? sources : sources.slice(0, 4);
   const compareAvailable = Boolean(
     githubBaseUrl(summary?.remoteUrl)
@@ -313,6 +343,7 @@ export function EnvironmentSummary() {
               onClick={() => void loadSummary()}
               className="ml-auto flex h-7 w-7 items-center justify-center text-dim hover:bg-high hover:text-fg"
               title={zh ? "刷新" : "Refresh"}
+              aria-label={zh ? "刷新环境信息" : "Refresh environment"}
             >
               <Icon name="refresh" size={11} className={loading ? "animate-orbit" : ""} />
             </button>
@@ -430,7 +461,11 @@ export function EnvironmentSummary() {
               ))}
             </div>
 
-            <SummaryRow icon="branch" label={summary?.isRepository ? (summary.branch ?? "DETACHED HEAD") : (zh ? "非 Git 仓库" : "Not a Git repository")}>
+            <SummaryRow icon="branch" label={summary === null
+              ? (loading ? (zh ? "正在读取 Git…" : "Reading Git…") : "Git")
+              : summary.isRepository
+                ? (summary.branch ?? "DETACHED HEAD")
+                : (zh ? "非 Git 仓库" : "Not a Git repository")}>
               {summary?.isRepository && (
                 <ChipSelect
                   variant="ghost"
@@ -503,28 +538,18 @@ export function EnvironmentSummary() {
                             {zh ? "打开" : "Open"}
                           </button>
                           <button
-                            disabled={busy !== null}
+                            disabled={busy !== null || samePath(item.path, workspace)}
                             onClick={() => {
-                              void runAction("worktree", async () => {
-                                if (!inTauri()) return zh ? "Worktree 已移除" : "Worktree removed";
-                                // Host 在确认前和执行前都按持久会话、活动绑定与自动化
-                                // 重新检查引用；页面状态不再承担安全门禁。
-                                const confirmToken = await invoke<string>("prepare_git_worktree_remove", {
-                                  cwd: workspace,
-                                  path: item.path,
-                                });
-                                return invoke<string>("git_worktree_remove", {
-                                  request: {
-                                    cwd: workspace,
-                                    path: item.path,
-                                    confirmToken,
-                                  },
-                                });
-                              });
+                              setError("");
+                              setNotice("");
+                              setConfirmWorktree(item);
                             }}
-                            className="text-[9px] text-faint hover:text-red"
+                            className="text-[9px] text-faint hover:text-red disabled:cursor-not-allowed disabled:opacity-30"
+                            title={samePath(item.path, workspace)
+                              ? (zh ? "不能删除当前工作树" : "Cannot delete the current worktree")
+                              : (zh ? "删除工作树" : "Remove worktree")}
                           >
-                            {zh ? "删" : "RM"}
+                            {zh ? "删除" : "Remove"}
                           </button>
                         </div>
                       ))}
@@ -533,7 +558,11 @@ export function EnvironmentSummary() {
                   <div className="flex gap-1.5">
                     <input
                       value={worktreeName}
-                      onChange={(event) => setWorktreeName(event.target.value)}
+                      onChange={(event) => {
+                        setWorktreeName(event.target.value);
+                        setError("");
+                        setNotice("");
+                      }}
                       placeholder={zh ? "名称，如 fix-auth" : "name, e.g. fix-auth"}
                       className="h-7 min-w-0 flex-1 rounded-[4px] border border-line2 bg-raise px-2 font-mono text-[10px] text-fg2 outline-none"
                     />
@@ -571,6 +600,7 @@ export function EnvironmentSummary() {
                 onClick={() => fileRef.current?.click()}
                 className="ml-auto flex h-7 w-7 items-center justify-center text-dim hover:bg-high hover:text-fg disabled:opacity-30"
                 title={zh ? "添加到当前消息" : "Add to current message"}
+                aria-label={zh ? "添加来源到当前消息" : "Add source to current message"}
               >
                 <Icon name="plus" size={13} />
               </button>
@@ -612,6 +642,19 @@ export function EnvironmentSummary() {
             )}
           </div>
         </section>
+      )}
+      {confirmWorktree && (
+        <ConfirmDialog
+          title={zh ? "删除工作树？" : "Remove worktree?"}
+          description={zh
+            ? `将删除“${confirmWorktree.branch ?? baseName(confirmWorktree.path)}”的工作树目录。Host 会再次检查会话和自动化引用；Git 分支不会被删除。`
+            : `The worktree directory for “${confirmWorktree.branch ?? baseName(confirmWorktree.path)}” will be removed. The Host will recheck session and automation references; the Git branch is kept.`}
+          confirmLabel={zh ? "删除工作树" : "Remove worktree"}
+          cancelLabel={zh ? "取消" : "Cancel"}
+          workingLabel={zh ? "删除中" : "Removing"}
+          onCancel={() => setConfirmWorktree(null)}
+          onConfirm={() => removeWorktree(confirmWorktree)}
+        />
       )}
     </div>
   );

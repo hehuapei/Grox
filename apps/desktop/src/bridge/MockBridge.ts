@@ -264,6 +264,29 @@ export class MockBridge implements GrokBridge {
     return this.createSession(cwd, true);
   }
 
+  async forkSession(sessionId: string, cwd: string, _title?: string) {
+    const source = this.sessions.get(sessionId);
+    if (!source) throw new Error(`找不到会话：${sessionId}`);
+    const now = Date.now();
+    const nextId = uid();
+    this.sessions.set(nextId, {
+      ...structuredClone(source),
+      id: nextId,
+      cwd,
+      parentId: sessionId,
+      createdAt: now,
+      updatedAt: now,
+      status: "idle",
+    });
+    return {
+      sessionId: nextId,
+      parentSessionId: sessionId,
+      cwd,
+      chatMessagesCopied: source.blocks.length,
+      updatesCopied: 0,
+    };
+  }
+
   async forkSessionInNewWorktree(sessionId: string, cwd: string) {
     const source = this.sessions.get(sessionId);
     if (!source) throw new Error(`找不到会话：${sessionId}`);

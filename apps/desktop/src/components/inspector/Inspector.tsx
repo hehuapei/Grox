@@ -577,7 +577,7 @@ function UsageTab({ session }: { session: Session }) {
       <Readout label={t("turns")} value={String(u.turns)} />
       <Readout label={t("model")} value={session.model.toUpperCase()} tone="text-fg2" />
       <Readout
-        label={t("elapsed")}
+        label={t("sessionSpan")}
         value={fmtDuration(Math.max(0, session.updatedAt - session.createdAt))}
       />
 

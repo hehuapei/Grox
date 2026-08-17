@@ -375,22 +375,26 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
       <button onClick={onToggle} className="flex h-6 w-5 shrink-0 items-center justify-center text-faint hover:text-fg" title={expanded ? "Collapse" : "Expand"}>
         <Icon name="chevronRight" size={9} className={`transition-transform ${expanded ? "rotate-90" : ""}`} />
       </button>
-      <button onClick={() => void openProject(project.id)} className="flex min-w-0 flex-1 items-center gap-2 text-left">
-        <Icon name={project.pinned ? "pin" : "folder"} size={11} className={project.pinned ? "text-acc" : "text-dim"} />
-        {editing ? (
+      {editing ? (
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <Icon name={project.pinned ? "pin" : "folder"} size={11} className={project.pinned ? "text-acc" : "text-dim"} />
           <input
             autoFocus
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             onBlur={commit}
-            onKeyDown={(event) => event.key === "Enter" && commit()}
-            onClick={(event) => event.stopPropagation()}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") event.currentTarget.blur();
+            }}
             className="min-w-0 flex-1 border border-line3 bg-void px-1 text-[10.5px] outline-none"
           />
-        ) : (
+        </div>
+      ) : (
+        <button onClick={() => void openProject(project.id)} className="flex min-w-0 flex-1 items-center gap-2 text-left">
+          <Icon name={project.pinned ? "pin" : "folder"} size={11} className={project.pinned ? "text-acc" : "text-dim"} />
           <span className="truncate text-[12px]">{project.name}</span>
-        )}
-      </button>
+        </button>
+      )}
       {count > 0 && <span className="tnum text-[9px] text-faint">{count}</span>}
       <button
         onClick={(event) => {
@@ -419,7 +423,16 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
           <MenuButton icon="pin" label={project.pinned ? t("unpin") : t("pin")} onClick={() => pinProject(project.id)} />
           <MenuButton icon="external" label={t("openExplorer")} onClick={() => void openExplorer(project.id)} />
           <MenuButton icon="branch" label={language === "zh-CN" ? "创建永久工作树" : "Create permanent worktree"} onClick={() => void createWorktree(project.id)} />
-          <MenuButton icon="gear" label={language === "zh-CN" ? "编辑项目" : "Edit project"} onClick={() => setEditing(true)} />
+          <MenuButton
+            icon="gear"
+            label={language === "zh-CN" ? "编辑项目" : "Edit project"}
+            onClick={() => {
+              setDraft(project.name);
+              setMenu(false);
+              // 等菜单点击完成后再聚焦，避免菜单卸载把输入框立即 blur。
+              window.setTimeout(() => setEditing(true), 0);
+            }}
+          />
           <MenuDivider />
           <MenuButton icon="archive" label={allArchived ? (language === "zh-CN" ? "恢复项目会话" : "Restore project sessions") : (language === "zh-CN" ? "归档项目内全部会话" : "Archive all project sessions")} onClick={() => void archiveProject(project.id)} />
           <MenuButton

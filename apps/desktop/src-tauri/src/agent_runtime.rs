@@ -9,7 +9,9 @@ use crate::{
     acp_host::AcpHostError, request_acp_json, AcpState, McpLeaseStore, UPSTREAM_CLI_CLIENT_NAME,
 };
 
-const INITIALIZE_TIMEOUT_MS: u64 = 15_000;
+// 冷启动需要加载本地会话索引和 MCP 配置；15 秒会在较大历史库上误判
+// CLI 死亡，随后一次用户操作却能立即重连成功。握手仍有明确上限。
+const INITIALIZE_TIMEOUT_MS: u64 = 45_000;
 const AUTHENTICATE_TIMEOUT_MS: u64 = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]

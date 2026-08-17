@@ -44,6 +44,39 @@ describe("Sidebar", () => {
     await act(async () => root.unmount());
   });
 
+  it("编辑项目会在菜单关闭后保留可聚焦的名称输入框", async () => {
+    useDesktop.setState({
+      activeProjectId: "project-existing",
+      projects: [{
+        id: "project-existing",
+        path: "C:/workspace/existing",
+        name: "已有项目",
+        pinned: false,
+        archived: false,
+        createdAt: 1,
+        lastOpenedAt: 2,
+      }],
+      sessionIndex: [],
+    });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    await act(async () => root.render(<Sidebar />));
+    await act(async () => container.querySelector<HTMLButtonElement>('button[aria-label="项目操作"]')?.click());
+    const edit = [...container.querySelectorAll<HTMLButtonElement>("button")]
+      .find((button) => button.textContent?.includes("编辑项目"));
+    await act(async () => {
+      edit?.click();
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+
+    const input = container.querySelector<HTMLInputElement>('input[value="已有项目"]');
+    expect(input).not.toBeNull();
+    expect(input?.closest("button")).toBeNull();
+    await act(async () => root.unmount());
+  });
+
   it("永久删除会话使用应用内确认框并触发删除动作", async () => {
     const removeSessionFromSidebar = vi.fn(async () => {});
     useDesktop.setState({

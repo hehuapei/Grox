@@ -1215,7 +1215,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
         }
         break;
       case "runtime_state":
-        set({ runtimeConnection: e.state });
+        set((state) => ({
+          runtimeConnection: e.state,
+          // 同一 Bridge 随后成功握手，先前的可恢复连接错误已经失效，
+          // 不能继续悬挂在界面上让用户误以为当前仍离线。
+          runtimeNotices: e.state === "ready"
+            ? state.runtimeNotices.filter((notice) => ![
+                "error-environment-ACP_REQUEST_TIMEOUT",
+                "error-environment-ACP_START_FAILED",
+                "error-environment-ACP_SPAWN_FAILED",
+              ].includes(notice.id))
+            : state.runtimeNotices,
+        }));
         break;
       case "runtime_occupancy":
         set((state) => {
@@ -1528,7 +1539,6 @@ export const useDesktop = create<DesktopState>((set, get) => {
             : e.background && existing && existing.blocks.length > filteredSession.blocks.length
               ? { ...filteredSession, blocks: existing.blocks }
             : filteredSession;
-        const { blocks: _b, usage: _u, status: _st, preview: _preview, ...meta } = readySession;
         const launch = e.background ? undefined : pendingLaunch;
         if (!e.background) pendingLaunch = undefined;
         const optimistic = e.background
@@ -1548,6 +1558,9 @@ export const useDesktop = create<DesktopState>((set, get) => {
               status: "running" as const,
             }
           : readySession;
+        // pending launch 的标题只存在于 nextSession；索引必须使用同一份快照，
+        // 否则侧栏会一直显示上游的 Untitled mission。
+        const { blocks: _b, usage: _u, status: _st, preview: _preview, ...meta } = nextSession;
         const previousMeta = sessionIndex.find((item) => item.id === readySession.id);
         const indexedMeta = {
           ...decorateSessions([meta])[0],
@@ -3229,19 +3242,16 @@ export const useDesktop = create<DesktopState>((set, get) => {
     async continueSessionInNewChat(id) {
       const meta = get().sessionIndex.find((entry) => entry.id === id);
       if (!meta) return;
-      const session = get().sessions[id];
-      const lastUser = [...(session?.blocks ?? [])].reverse().find((block) => block.type === "user");
-      const lastAssistant = [...(session?.blocks ?? [])].reverse().find((block) => block.type === "assistant");
-      const userText = lastUser?.type === "user" ? lastUser.text : meta.title;
-      const assistantText = lastAssistant?.type === "assistant" ? lastAssistant.text.slice(-1200) : "";
-      const text = [
-        "请在新会话中继续处理下面这个任务，并保留必要的上下文。",
-        `原始请求：${userText}`,
-        assistantText ? `上一会话的最新回复：${assistantText}` : "",
-      ].filter(Boolean).join("\n\n");
       try {
         if (!samePath(meta.cwd, get().workspace)) await get().setWorkspace(meta.cwd);
-        await get().newSession({ text });
+        // 原生 fork 复制完整上下文但不启动新一轮，避免合成提示被全局
+        // AGENTS/user_rules 改写意图，也避免用户只想查看时产生模型费用。
+        const forked = await bridge.forkSession(id, meta.cwd, meta.title);
+        // fork 的完整历史已经写入 CLI 会话目录。先以后台恢复路径合并
+        // 磁盘历史，再切换视图；仅依赖 session/load 通知会把复制成功的
+        // 会话短暂显示成空白对话。
+        await bridge.loadSession(forked.sessionId, { background: true });
+        await get().openSession(forked.sessionId);
       } catch (error) {
         set({ startupError: errorText(error) });
       }
