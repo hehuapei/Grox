@@ -18,7 +18,7 @@
     "publicVersion": "1.0.5",
     "packageVersion": "1.0.5",
     "verifiedAt": "2026-08-18",
-    "groxCommit": "bc3b8fcb7c4de63acf2877c43eb4609f7e44f967",
+    "groxCommit": "49c92630247ae73b71cf22eb358d6e7b5456674d",
     "workflowRun": "https://github.com/dandandujie/Grox/actions/runs/32036501780",
     "platforms": ["windows-x64", "linux-x64", "macos-arm64", "macos-x64"]
   },
@@ -30,7 +30,7 @@
     "packageVersion": "1.0.5",
     "status": "complete",
     "issues": [35, 36],
-    "groxCommit": "bc3b8fcb7c4de63acf2877c43eb4609f7e44f967",
+    "groxCommit": "49c92630247ae73b71cf22eb358d6e7b5456674d",
     "workflowRun": "https://github.com/dandandujie/Grox/actions/runs/32036501780"
   },
   "pendingIntegrations": [],
