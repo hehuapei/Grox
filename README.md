@@ -1,23 +1,36 @@
 <h1><img src="apps/desktop/src-tauri/icons/icon.png" width="48" height="48" align="center" alt="Grox 图标"> Grox</h1>
 
-Grox 是以 [xai-org/grok-build](https://github.com/xai-org/grok-build) 为核心打造的桌面端 Agent。它通过 ACP（Agent Client Protocol）连接真实的 Grok Build 运行时，在 Tauri 桌面窗口中提供会话恢复、流式思考、工具调用、代码差异、权限审批、结构化问答和用量统计。
+Grox 是 [xai-org/grok-build](https://github.com/xai-org/grok-build) 的本机桌面工作台。打开应用，选择项目或直接描述任务，Grok Build 会在可恢复的会话中完成分析、代码修改、工具调用和验证；需要批准或补充信息时，Grox 会把决定清楚地交还给你。
 
 当前仓库只保留 Grox 桌面应用源码。Grox 不分叉、不内置也不维护替代运行时，始终通过官方发布的 `grok` CLI 使用完整的 Agent harness、工具与 ACP 能力。
 <img width="2160" height="1350" alt="image" src="https://github.com/user-attachments/assets/4ad47a9a-b705-48dd-b20a-6e1f193fae7d" />
 <img width="1226" height="1010" alt="image" src="https://github.com/user-attachments/assets/08fa287b-9822-4bee-ba95-135fe0521c22" />
 
 
+## 下载与首次使用
+
+从 [GitHub Releases](https://github.com/dandandujie/Grox/releases) 下载对应平台的安装包：
+
+| 平台 | 发布资产 |
+|---|---|
+| Windows x64 | NSIS、MSI、便携 ZIP |
+| macOS Apple Silicon | aarch64 DMG |
+| macOS Intel | x64 DMG |
+| Linux x64 | AppImage、deb、rpm |
+
+发布页同时提供 `SHA256SUMS`。Grox 首次启动会检测官方 `grok` CLI：未安装时按界面引导安装；已有 CLI 的用户会直接复用同一套配置和历史。账户设置可以稍后完成，但发送第一个任务前需要登录 Grok 或配置 API 服务。
+
 ## 已实现能力
 
 - 真实 ACP JSON-RPC 链路：原生进程托管、请求响应、通知流和异常退出处理
 - 中英文界面与明暗主题：默认简体中文和 GrokNight 暗黑模式
 - 项目与任务目录：项目可置顶、在资源管理器打开、重命名、归档和移除；任务可置顶与归档
-- Agent 时间线：回答、思考、计划、工具调用、终端输出与文件 Diff；任务完成后自动收纳处理过程，工具详情默认折叠
+- Agent 时间线：回答、思考、计划、工具调用、终端输出与文件 Diff；任务完成后自动收纳处理过程，工具详情默认折叠；离线恢复会按真实调用 ID 保留已落盘的公开工具输入与结果
 - Deep Research：原生启动 `/deep-research` 后台工作流，在任务检查器实时展示研究阶段、并行代理、代理预算、耗时、暂停原因和结果摘要，并可暂停、恢复或停止
 - Computer Use（Windows）：默认开启，可在设置中关闭；窗口级截图、UI Automation、元素与坐标操作、水平/垂直滚动、键盘布局映射、暂停/继续，以及界面按钮和 `Ctrl+Alt+Esc` 粘性紧急停止
 - 安全预览侧栏：支持 Markdown、静态 HTML、图片与文本文件，可拖动调整侧栏、检查器和预览区宽度
 - 交互闭环：对话框可直接切换模型、权限和思考强度，支持文件上传、剪贴板图片粘贴、计划批准及结构化问答
-- 并行侧任务工作台：终端输出与侧任务启动器同屏；多会话可在同一 ACP 进程上并行推进，切走不打断后台 turn
+- 统一右侧工作区：文件、计划、预览、终端和并行任务互斥展示；多会话可并行推进，切走不打断后台 turn；环境摘要会明确显示当前共享 CLI 进程拓扑，不把多会话复用伪装成进程隔离
 - Worktree / Git：环境摘要支持分支切换、提交推送、worktree 新建/打开/移除；状态栏显示当前分支
 - 一键打开：Cursor、VS Code、系统终端与资源管理器/Finder
 - 桌面通知：窗口在后台时，权限批准与问答可弹出系统通知（设置中可关）
@@ -29,7 +42,7 @@ Grox 是以 [xai-org/grok-build](https://github.com/xai-org/grok-build) 为核�
 - 配置同步：账户模块内的 `config.toml`、`system-prompt.md` 与项目 `AGENTS.md` 支持双向编辑和外部变更热同步，不暴露原始环境变量编辑栏
 - 动态模型：OAuth 实时跟随 Grok 模型目录；官方及兼容 API 可拉取模型列表并持久选择常驻模型
 - 桌面安全：Markdown 清洗、CSP、HTTP(S) 外链校验、无控制台子进程；Computer Use 默认开启且可在设置关闭；HTML 文件预览禁用同源沙箱并强制预览令牌
-- 发布链：构建 Windows / macOS / Linux（AppImage、deb、rpm）桌面安装包，并提供应用内更新提醒
+- 发布链：构建 Windows / macOS / Linux 桌面安装包、Windows 便携包和 SHA-256 校验文件，并提供应用内更新提醒
 - 离线 Mock：浏览器开发时可完整演示主要界面状态
 
 ## 架构
@@ -47,7 +60,7 @@ Rust 原生进程层
 grok agent stdio
 ```
 
-WebView 不直接启动任意命令。Rust 层只托管已解析的 Grok Build 可执行文件，并把逐行 ACP 消息转发给前端。
+WebView 不直接启动任意命令。Rust Host 托管已解析的 Grok Build 可执行文件，负责连接锁、CLI 初始化与非交互认证、ACP 请求归属、进程代次、会话门禁和后台自动化回合；前端只消费运行时快照、会话事件与已归属结果。
 
 ## 快速开始
 

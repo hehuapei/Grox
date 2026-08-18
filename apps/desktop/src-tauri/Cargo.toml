@@ -1,6 +1,6 @@
 [package]
 name = "grox-desktop"
-version = "0.3.1"
+version = "0.3.2"
 description = "Grox desktop agent powered by Grok Build"
 edition = "2021"
 rust-version = "1.77.2"
@@ -14,11 +14,12 @@ rust-version = "1.77.2"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["image-png", "protocol-asset"] }
+tauri = { version = "2", features = ["image-png", "protocol-asset", "tray-icon"] }
+tauri-plugin-single-instance = "2"
 tauri-plugin-window-state = "2.4.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["io-util", "net", "process", "sync", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "net", "process", "sync", "time"] }
 url = "2"
 base64 = "0.22"
 getrandom = "0.3"
@@ -29,6 +30,20 @@ semver = "1"
 sha2 = "0.10"
 image = { version = "0.25", default-features = false, features = ["png"] }
 toml_edit = "0.20.2"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+keyring = { version = "3.6", features = [
+  "apple-native",
+  "windows-native",
+  "sync-secret-service",
+  "crypto-rust",
+] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [

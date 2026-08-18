@@ -24,4 +24,6 @@ it("reads the canonical kind when the generic ACP kind is less specific", () => 
 it("turns nested API JSON into a clean desktop message", () => {
   expect(cleanApiError('{"error":{"message":"Service temporarily unavailable"}}'))
     .toBe("Service temporarily unavailable");
+  expect(cleanApiError({})).toBe("未知错误");
+  expect(cleanApiError({ code: "ACP_DOWN" })).toBe("code: ACP_DOWN");
 });

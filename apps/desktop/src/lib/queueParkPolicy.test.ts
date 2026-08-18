@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { isQueueDrainParked, nextQueueDrainParked } from "./queueParkPolicy";
+import { isQueueDrainParked, nextQueueDrainParked } from "./sessionRuntime";
 
 describe("queueParkPolicy", () => {
   it("parks and unparks without clobbering other sessions", () => {

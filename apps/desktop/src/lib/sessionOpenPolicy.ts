@@ -1,3 +1,5 @@
+import type { SessionStatus } from "../bridge/types";
+
 /**
  * Policy for opening old missions after a desktop shell upgrade.
  *
@@ -58,6 +60,12 @@ export function sanitizeSessionForOpen(_session: {
   return { status: "idle" };
 }
 
+/** 进程已重启时，上一进程的瞬时状态不可能仍然成立。 */
+export function sanitizeCatalogStatusOnColdStart(status?: SessionStatus): SessionStatus | undefined {
+  if (!status || status === "idle" || status === "failed" || status === "cancelled") return status;
+  return "disconnected";
+}
+
 export function shouldCloseDetachedSession(args: {
   currentId: string | null;
   nextId?: string | null;
@@ -69,6 +77,6 @@ export function shouldCloseDetachedSession(args: {
     && !args.currentId.startsWith("pending-")
     && !args.currentId.startsWith("draft-")
     && args.currentId !== args.nextId
-    && (args.status === "idle" || args.status === "failed"),
+    && (args.status === "idle" || args.status === "failed" || args.status === "cancelled"),
   );
 }

@@ -74,7 +74,7 @@ describe("computerUse opt-in", () => {
   });
 
   it("computerLeaseIfAttached accepts mcp server without Authorization headers (0.2.29)", () => {
-    // Host injects Bearer on acp_send; FE only needs non-empty mcpServers + lease.
+    // Host injects Bearer on the outbound ACP channel; FE only needs non-empty mcpServers + lease.
     expect(
       computerLeaseIfAttached({
         mcpServers: [{ type: "http", name: "grok_desktop_computer", url: "http://127.0.0.1:1/mcp" }],

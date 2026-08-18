@@ -4,7 +4,7 @@ import {
   statusAfterGateResolve,
   topPendingPermissionId,
   topPendingQuestionId,
-} from "./sessionGate";
+} from "./sessionRuntime";
 import type { Session, SessionBlock } from "../bridge/types";
 
 const perm = (id: string, resolved?: "allow_once"): SessionBlock => ({
@@ -67,6 +67,10 @@ describe("reconcileIncomingStatus", () => {
   it("lets idle settle even with unresolved gates (Stop / turn end)", () => {
     const blocks = [perm("p1")];
     expect(reconcileIncomingStatus(blocks, "awaiting_permission", "idle")).toBe("idle");
+  });
+
+  it("keeps an explicit user stop visible when a stale idle event follows", () => {
+    expect(reconcileIncomingStatus([], "cancelled", "idle")).toBe("cancelled");
   });
 
   it("passes through running when no gates are open", () => {

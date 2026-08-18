@@ -66,9 +66,10 @@ impl ProcessJob {
     }
 
     /// Force-kill every process currently in the job (including grandchildren).
-    pub fn terminate_tree(&self) {
+    pub fn terminate_tree(&self) -> Result<(), String> {
         unsafe {
-            let _ = TerminateJobObject(self.handle, 1);
+            TerminateJobObject(self.handle, 1)
+                .map_err(|e| format!("TerminateJobObject failed: {e}"))
         }
     }
 }

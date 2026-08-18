@@ -1,9 +1,26 @@
 import { createInterface } from "node:readline";
 import { spawn, spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const command = process.env.GROK_COMMAND || "grok";
-const expectedVersion = process.env.GROK_EXPECTED_VERSION || "1.0.0";
+const forbiddenInheritedConfig = [
+  "GROK_CONFIG", "GROK_CONFIG_PATH", "GROK_MODEL", "GROK_DEFAULT_MODEL",
+  "GROK_REASONING_EFFORT", "GROK_DEFAULT_REASONING_EFFORT", "GROK_PLUGIN_DIRS", "GROK_PLUGINS",
+];
+if (process.env.GROK_SMOKE_ASSERT_CLEAN_ENV === "1") {
+  const inherited = forbiddenInheritedConfig.filter((key) => process.env[key] !== undefined);
+  if (inherited.length > 0) throw new Error(`hermetic smoke 继承了配置变量：${inherited.join(", ")}`);
+}
+const integrationState = JSON.parse(readFileSync(
+  new URL("../.grox/official-cli.json", import.meta.url),
+  "utf8",
+));
+const expectedVersion = process.env.GROK_EXPECTED_VERSION
+  || integrationState.integrationTarget?.publicVersion;
+if (typeof expectedVersion !== "string" || !expectedVersion) {
+  throw new Error(".grox/official-cli.json 缺少 integrationTarget.publicVersion");
+}
 const versionRun = spawnSync(command, ["--version"], { encoding: "utf8", shell: process.platform === "win32" });
 const versionText = `${versionRun.stdout ?? ""}${versionRun.stderr ?? ""}`.trim();
 if (!new RegExp(`\\bgrok ${expectedVersion.replaceAll(".", "\\.")}\\b`).test(versionText)) {
@@ -82,6 +99,18 @@ try {
     _meta: { clientIdentifier: "grok-shell", clientType: "shell", clientVersion: "1.0.0" },
   }, 45_000);
   if (!initialized || typeof initialized !== "object") throw new Error("initialize 未返回对象");
+  const authMethods = Array.isArray(initialized.authMethods) ? initialized.authMethods : [];
+  const firstAuthId = authMethods[0]?.id;
+  if (firstAuthId === "grok.com" || firstAuthId === "oidc") {
+    throw new Error("在线 smoke 需要先在 Grox 中完成显式登录；脚本不会擅自打开 OAuth");
+  }
+  const defaultAuthId = initialized?._meta?.defaultAuthMethodId;
+  const authMethodId = authMethods.some((method) => method?.id === defaultAuthId)
+    ? defaultAuthId
+    : firstAuthId;
+  if (typeof authMethodId === "string" && authMethodId) {
+    await request("authenticate", { methodId: authMethodId }, 30_000);
+  }
 
   const listed = unwrapExtension(await request("x.ai/session/list", { cwd: workspace, limit: 5 }));
   if (!listed || typeof listed !== "object" || !Array.isArray(listed.sessions)) throw new Error("x.ai/session/list 返回结构不正确");
@@ -99,8 +128,13 @@ try {
 
   const infoBefore = unwrapExtension(await request("x.ai/session/info", { sessionId }, 30_000));
   if (infoBefore?.sessionId !== sessionId) throw new Error("x.ai/session/info 未返回当前会话");
+  await request("session/set_model", {
+    sessionId,
+    modelId: process.env.GROK_SMOKE_MODEL || "grok-build",
+    _meta: { reasoningEffort: "low" },
+  });
   await request("session/set_mode", { sessionId, modeId: "plan" });
-  await request("session/set_mode", { sessionId, modeId: "agent" });
+  await request("session/set_mode", { sessionId, modeId: "default" });
 
   let mcp = unwrapExtension(await request("x.ai/mcp/list", { sessionId, cache: true }, 45_000));
   if (!mcp || !Array.isArray(mcp.servers)) throw new Error("x.ai/mcp/list 返回结构不正确");
@@ -128,7 +162,11 @@ try {
     if (!transcript.includes("GROX_V1_SMOKE_OK")) throw new Error("在线 prompt 未返回约定文本");
     prompt = true;
     if (process.env.GROK_SMOKE_EXPECT_IMAGE === "1") {
-      if (!transcript.includes("GROX_LARGE_IMAGE_OK")) throw new Error("大型 MCP 图片工具未成功执行");
+      // Grok Build 会把 ACP 回放中的图片内容替换为占位符；外层隔离验证仍会
+      // 从实际模型请求确认 data:image 与原始文本均已被转发。
+      const imageResultVisible = transcript.includes("GROX_LARGE_IMAGE_OK")
+        || transcript.includes("[image content will be provided separately]");
+      if (!imageResultVisible) throw new Error("大型 MCP 图片工具未成功执行");
       largeMcpImage = true;
     }
   }
@@ -143,16 +181,48 @@ try {
   }, 60_000));
   const forkedSessionId = forked?.newSessionId;
   if (typeof forkedSessionId !== "string" || !forkedSessionId) throw new Error("x.ai/session/fork 未返回新会话 ID");
-  await request("session/load", { sessionId: forkedSessionId, cwd: workspace, mcpServers: [] }, 60_000);
+  await request("session/load", {
+    sessionId: forkedSessionId,
+    cwd: workspace,
+    mcpServers: [],
+    _meta: { reasoningEffort: "high" },
+  }, 60_000);
+  const resumedBefore = unwrapExtension(await request("x.ai/session/info", { sessionId: forkedSessionId }, 30_000));
+  const resumed = await request("session/prompt", {
+    sessionId: forkedSessionId,
+    prompt: [{ type: "text", text: "After resuming, reply only GROX_V1_RESUME_OK." }],
+  }, 120_000);
+  if (!JSON.stringify([resumed, notifications]).includes("GROX_V1_RESUME_OK")) {
+    throw new Error("恢复后的会话未继续完成约定 prompt");
+  }
+  const resumedAfter = unwrapExtension(await request("x.ai/session/info", { sessionId: forkedSessionId }, 30_000));
+  if (!(Number(resumedAfter?.turns) > Number(resumedBefore?.turns))) {
+    throw new Error(`恢复后的 session info turns 未推进：${JSON.stringify({ resumedBefore, resumedAfter })}`);
+  }
   await request("session/close", { sessionId: forkedSessionId }, 45_000);
   await request("session/close", { sessionId }, 45_000);
+  const versionMismatchNotifications = notifications.filter((message) => message.method.includes("version_mismatch")).length;
+  if (versionMismatchNotifications !== 0) throw new Error(`收到 ${versionMismatchNotifications} 个版本不匹配通知`);
+  const sessionSummaryTitles = notifications.flatMap((message) => {
+    if (!message.method.endsWith("x.ai/session_notification")) return [];
+    const update = message.params?.update;
+    if (update?.sessionUpdate !== "session_summary_generated") return [];
+    const title = update.session_summary ?? update.sessionSummary;
+    return typeof title === "string" ? [title] : [];
+  });
+  const expectedTitle = process.env.GROK_SMOKE_EXPECT_TITLE?.trim();
+  if (expectedTitle && !sessionSummaryTitles.includes(expectedTitle)) {
+    throw new Error(`未收到预期 session_summary_generated：${JSON.stringify({ expectedTitle, sessionSummaryTitles })}`);
+  }
   console.log(JSON.stringify({
     ok: true,
     version: versionText,
     initialize: true,
+    authenticate: authMethodId || "not_required",
     sessionList: true,
     sessionNew: true,
     sessionInfo: true,
+    modelEffortBound: true,
     modePlanAgent: true,
     mcpList: true,
     skillsList: true,
@@ -160,11 +230,17 @@ try {
     prompt,
     largeMcpImage,
     sessionForkLoadClose: true,
+    resumeContinuation: true,
+    resumedTurnsBefore: Number(resumedBefore?.turns),
+    resumedTurnsAfter: Number(resumedAfter?.turns),
     sessionClose: true,
     sessionId,
     forkedSessionId,
-    versionMismatchNotifications: notifications.filter((message) => message.method.includes("version_mismatch")).length,
+    versionMismatchNotifications,
+    sessionSummaryGenerated: expectedTitle ? sessionSummaryTitles.includes(expectedTitle) : sessionSummaryTitles.length > 0,
+    sessionSummaryTitles,
     permissionRequests,
+    environmentIsolated: process.env.GROK_SMOKE_ASSERT_CLEAN_ENV === "1",
   }, null, 2));
 } finally {
   lines.close();

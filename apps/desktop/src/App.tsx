@@ -156,13 +156,13 @@ export default function App() {
               )}
             </StageTransition>
           </main>
-          {terminalOpen && <WorkbenchPanel />}
         </div>
         {inspectorOpen && !planPreviewOpen && inSession && session && <Inspector />}
+        {terminalOpen && <WorkbenchPanel />}
         {previewOpen && <PreviewPane />}
         {planPreviewOpen && inSession && session && <PlanPreviewPane />}
       </div>
-      <StatusBar />
+      {inSession && <StatusBar />}
       <CommandPalette />
       <SettingsModal />
       <AccountSetup />

@@ -1,7 +1,7 @@
 //! Holds Computer/Browser MCP endpoint credentials outside the WebView.
 //!
-//! Session create/load messages may only reference lease ids; `acp_send`
-//! injects the real Authorization headers before the line reaches the CLI.
+//! Session create/load messages may only reference lease ids; Host outbound channels
+//! inject the real Authorization headers before the line reaches the CLI.
 
 use serde_json::{json, Value};
 use std::{
@@ -9,6 +9,8 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant},
 };
+
+use crate::{browser_mcp, computer_mcp};
 
 const MAX_LEASES_PER_KIND: usize = 32;
 const LEASE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -23,32 +25,30 @@ struct LeaseEntry {
 pub struct McpLeaseStore {
     computer: Mutex<HashMap<String, LeaseEntry>>,
     browser: Mutex<HashMap<String, LeaseEntry>>,
+    sessions: Mutex<HashMap<String, SessionLeaseBinding>>,
 }
 
-/// Frontend `claimPendingBrowserLease` contract — keep in sync with
-/// `apps/desktop/src/bridge/browserLeaseBind.ts`.
-pub fn claim_pending_browser_lease(
-    leases: &mut HashMap<String, String>,
-    session_id: &str,
-    browser_lease_id: &str,
-) {
-    if browser_lease_id.is_empty() {
-        return;
-    }
-    let pending_key = format!("pending:{browser_lease_id}");
-    match leases.get(&pending_key) {
-        Some(id) if id == browser_lease_id => {
-            leases.remove(&pending_key);
-            leases.insert(session_id.to_string(), browser_lease_id.to_string());
-        }
-        _ => {}
-    }
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SessionLeaseBinding {
+    pub computer: Option<String>,
+    pub browser: Option<String>,
 }
 
-fn prune_leases(map: &mut HashMap<String, LeaseEntry>) {
+fn prune_leases(
+    map: &mut HashMap<String, LeaseEntry>,
+    reserve_slot: bool,
+) -> Vec<String> {
     let now = Instant::now();
-    map.retain(|_, entry| now.duration_since(entry.created) < LEASE_TTL);
-    while map.len() >= MAX_LEASES_PER_KIND {
+    let mut removed = map
+        .iter()
+        .filter_map(|(lease_id, entry)| {
+            (now.duration_since(entry.created) >= LEASE_TTL).then(|| lease_id.clone())
+        })
+        .collect::<Vec<_>>();
+    for lease_id in &removed {
+        map.remove(lease_id);
+    }
+    while reserve_slot && map.len() >= MAX_LEASES_PER_KIND {
         let Some(oldest) = map
             .iter()
             .min_by_key(|(_, entry)| entry.created)
@@ -57,7 +57,9 @@ fn prune_leases(map: &mut HashMap<String, LeaseEntry>) {
             break;
         };
         map.remove(&oldest);
+        removed.push(oldest);
     }
+    removed
 }
 
 impl McpLeaseStore {
@@ -66,7 +68,7 @@ impl McpLeaseStore {
             .computer
             .lock()
             .map_err(|_| "Computer Use 租约表锁定失败".to_string())?;
-        prune_leases(&mut guard);
+        let removed = prune_leases(&mut guard, true);
         guard.insert(
             lease_id,
             LeaseEntry {
@@ -74,6 +76,11 @@ impl McpLeaseStore {
                 created: Instant::now(),
             },
         );
+        drop(guard);
+        for lease_id in removed {
+            self.clear_computer_binding(&lease_id);
+            computer_mcp::shutdown_http(&lease_id);
+        }
         Ok(())
     }
 
@@ -82,7 +89,7 @@ impl McpLeaseStore {
             .browser
             .lock()
             .map_err(|_| "Browser Use 租约表锁定失败".to_string())?;
-        prune_leases(&mut guard);
+        let removed = prune_leases(&mut guard, true);
         guard.insert(
             lease_id,
             LeaseEntry {
@@ -90,31 +97,171 @@ impl McpLeaseStore {
                 created: Instant::now(),
             },
         );
+        drop(guard);
+        for lease_id in removed {
+            self.clear_browser_binding(&lease_id);
+            browser_mcp::shutdown_http(&lease_id);
+        }
         Ok(())
     }
 
     pub fn get_computer(&self, lease_id: &str) -> Option<Value> {
-        let mut guard = self.computer.lock().ok()?;
-        prune_leases(&mut guard);
-        guard.get(lease_id).map(|entry| entry.server.clone())
+        let (server, removed) = {
+            let mut guard = self.computer.lock().ok()?;
+            let removed = prune_leases(&mut guard, false);
+            let server = guard.get(lease_id).map(|entry| entry.server.clone());
+            (server, removed)
+        };
+        for lease_id in removed {
+            self.clear_computer_binding(&lease_id);
+            computer_mcp::shutdown_http(&lease_id);
+        }
+        server
     }
 
     pub fn get_browser(&self, lease_id: &str) -> Option<Value> {
-        let mut guard = self.browser.lock().ok()?;
-        prune_leases(&mut guard);
-        guard.get(lease_id).map(|entry| entry.server.clone())
+        let (server, removed) = {
+            let mut guard = self.browser.lock().ok()?;
+            let removed = prune_leases(&mut guard, false);
+            let server = guard.get(lease_id).map(|entry| entry.server.clone());
+            (server, removed)
+        };
+        for lease_id in removed {
+            self.clear_browser_binding(&lease_id);
+            browser_mcp::shutdown_http(&lease_id);
+        }
+        server
     }
 
     pub fn remove_computer(&self, lease_id: &str) {
         if let Ok(mut guard) = self.computer.lock() {
             guard.remove(lease_id);
         }
+        self.clear_computer_binding(lease_id);
     }
 
     pub fn remove_browser(&self, lease_id: &str) {
         if let Ok(mut guard) = self.browser.lock() {
             guard.remove(lease_id);
         }
+        self.clear_browser_binding(lease_id);
+    }
+
+    /// 提交一次成功的 session/new|load 资源事务，并返回旧绑定供 Host 停止被替换的 MCP。
+    pub fn bind_session(
+        &self,
+        session_id: String,
+        binding: SessionLeaseBinding,
+    ) -> SessionLeaseBinding {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if binding.computer.is_none() && binding.browser.is_none() {
+            sessions.remove(&session_id).unwrap_or_default()
+        } else {
+            sessions.insert(session_id, binding).unwrap_or_default()
+        }
+    }
+
+    pub fn take_session(&self, session_id: &str) -> SessionLeaseBinding {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id)
+            .unwrap_or_default()
+    }
+
+    pub fn computer_for_session(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .and_then(|binding| binding.computer.clone())
+    }
+
+    pub fn drain_computer(&self) -> Vec<String> {
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for binding in sessions.values_mut() {
+                binding.computer = None;
+            }
+            sessions.retain(|_, binding| binding.browser.is_some());
+        }
+        let mut computer = self
+            .computer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        computer.drain().map(|(lease_id, _)| lease_id).collect()
+    }
+
+    pub fn drain_browser(&self) -> Vec<String> {
+        {
+            let mut sessions = self
+                .sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for binding in sessions.values_mut() {
+                binding.browser = None;
+            }
+            sessions.retain(|_, binding| binding.computer.is_some());
+        }
+        let mut browser = self
+            .browser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        browser.drain().map(|(lease_id, _)| lease_id).collect()
+    }
+
+    pub fn drain_all(&self) -> (Vec<String>, Vec<String>) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        let computer = self
+            .computer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+            .map(|(lease_id, _)| lease_id)
+            .collect();
+        let browser = self
+            .browser
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+            .map(|(lease_id, _)| lease_id)
+            .collect();
+        (computer, browser)
+    }
+
+    fn clear_computer_binding(&self, lease_id: &str) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for binding in sessions.values_mut() {
+            if binding.computer.as_deref() == Some(lease_id) {
+                binding.computer = None;
+            }
+        }
+        sessions.retain(|_, binding| binding.browser.is_some());
+    }
+
+    fn clear_browser_binding(&self, lease_id: &str) {
+        let mut sessions = self
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for binding in sessions.values_mut() {
+            if binding.browser.as_deref() == Some(lease_id) {
+                binding.browser = None;
+            }
+        }
+        sessions.retain(|_, binding| binding.computer.is_some());
     }
 }
 
@@ -221,38 +368,62 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_session_new_binds_only_matching_pending_browser_lease() {
-        let mut leases = HashMap::new();
-        leases.insert("pending:lease-a".into(), "lease-a".into());
-        leases.insert("pending:lease-b".into(), "lease-b".into());
-
-        // First session/new returns — must claim only lease-a.
-        claim_pending_browser_lease(&mut leases, "session-1", "lease-a");
-        assert_eq!(leases.get("session-1").map(String::as_str), Some("lease-a"));
-        assert!(!leases.contains_key("pending:lease-a"));
-        assert_eq!(leases.get("pending:lease-b").map(String::as_str), Some("lease-b"));
-
-        // Second concurrent session claims its own lease.
-        claim_pending_browser_lease(&mut leases, "session-2", "lease-b");
-        assert_eq!(leases.get("session-1").map(String::as_str), Some("lease-a"));
-        assert_eq!(leases.get("session-2").map(String::as_str), Some("lease-b"));
-        assert!(!leases.contains_key("pending:lease-b"));
-    }
-
-    #[test]
-    fn empty_or_unknown_browser_lease_leaves_pending_untouched() {
-        let mut leases = HashMap::new();
-        leases.insert("pending:lease-a".into(), "lease-a".into());
-        claim_pending_browser_lease(&mut leases, "session-1", "");
-        claim_pending_browser_lease(&mut leases, "session-1", "lease-missing");
-        assert_eq!(leases.get("pending:lease-a").map(String::as_str), Some("lease-a"));
-        assert!(!leases.contains_key("session-1"));
+    fn session_bindings_replace_atomically_and_drain_by_kind() {
+        let store = McpLeaseStore::default();
+        store
+            .put_computer(
+                "computer-a".into(),
+                computer_server_config("http://127.0.0.1:9/mcp", "tok"),
+            )
+            .unwrap();
+        store
+            .put_browser(
+                "browser-a".into(),
+                browser_server_config("http://127.0.0.1:9/mcp", "tok"),
+            )
+            .unwrap();
+        assert_eq!(
+            store.bind_session(
+                "session-1".into(),
+                SessionLeaseBinding {
+                    computer: Some("computer-a".into()),
+                    browser: Some("browser-a".into()),
+                },
+            ),
+            SessionLeaseBinding::default()
+        );
+        assert_eq!(
+            store.computer_for_session("session-1").as_deref(),
+            Some("computer-a")
+        );
+        assert_eq!(store.drain_browser(), ["browser-a"]);
+        assert!(store.get_browser("browser-a").is_none());
+        assert_eq!(
+            store.take_session("session-1"),
+            SessionLeaseBinding {
+                computer: Some("computer-a".into()),
+                browser: None,
+            }
+        );
     }
 
     #[test]
     fn lease_store_enforces_capacity_by_evicting_oldest() {
         let store = McpLeaseStore::default();
-        for index in 0..(MAX_LEASES_PER_KIND + 4) {
+        store
+            .put_computer(
+                "lease-0".into(),
+                computer_server_config("http://127.0.0.1:9/mcp", "tok"),
+            )
+            .unwrap();
+        store.bind_session(
+            "session-old".into(),
+            SessionLeaseBinding {
+                computer: Some("lease-0".into()),
+                browser: None,
+            },
+        );
+        for index in 1..(MAX_LEASES_PER_KIND + 4) {
             store
                 .put_computer(
                     format!("lease-{index}"),
@@ -264,5 +435,11 @@ mod tests {
         assert!(guard.len() <= MAX_LEASES_PER_KIND);
         assert!(!guard.contains_key("lease-0"));
         assert!(guard.contains_key(&format!("lease-{}", MAX_LEASES_PER_KIND + 3)));
+        drop(guard);
+        assert!(store.computer_for_session("session-old").is_none());
+        assert!(store
+            .get_computer(&format!("lease-{}", MAX_LEASES_PER_KIND + 3))
+            .is_some());
+        assert_eq!(store.computer.lock().unwrap().len(), MAX_LEASES_PER_KIND);
     }
 }
