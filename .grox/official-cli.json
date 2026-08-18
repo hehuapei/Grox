@@ -4,17 +4,17 @@
   "branch": "main",
   "stable": "https://x.ai/cli/stable",
   "latestObserved": {
-    "commit": "9fabadea800fa6e2ed8ec91c4f45f02b7e2504f4",
-    "sourceRevision": "7bd63df3c9bb1bf98e7a9b3486f4a0189ea94e55",
+    "commit": "d71f6e0c1f5acc5469e503e192fe14824e6f8c90",
+    "sourceRevision": "c2dab005c2b53c99209dc6faf82153d782f76ee4",
     "publicVersion": "1.0.5",
     "packageVersion": "1.0.5",
-    "observedAt": "2026-08-17",
+    "observedAt": "2026-08-18",
     "officialLatestPublicVersion": "1.0.5",
     "releaseStatus": "verified"
   },
   "verifiedIntegration": {
-    "commit": "9fabadea800fa6e2ed8ec91c4f45f02b7e2504f4",
-    "sourceRevision": "7bd63df3c9bb1bf98e7a9b3486f4a0189ea94e55",
+    "commit": "d71f6e0c1f5acc5469e503e192fe14824e6f8c90",
+    "sourceRevision": "c2dab005c2b53c99209dc6faf82153d782f76ee4",
     "publicVersion": "1.0.5",
     "packageVersion": "1.0.5",
     "verifiedAt": "2026-08-18",
@@ -23,9 +23,9 @@
     "platforms": ["windows-x64", "linux-x64", "macos-arm64", "macos-x64"]
   },
   "integrationTarget": {
-    "baseCommit": "e5fd4816d43260c15ba785f103990c1ed6cea230",
-    "commit": "9fabadea800fa6e2ed8ec91c4f45f02b7e2504f4",
-    "sourceRevision": "7bd63df3c9bb1bf98e7a9b3486f4a0189ea94e55",
+    "baseCommit": "9fabadea800fa6e2ed8ec91c4f45f02b7e2504f4",
+    "commit": "d71f6e0c1f5acc5469e503e192fe14824e6f8c90",
+    "sourceRevision": "c2dab005c2b53c99209dc6faf82153d782f76ee4",
     "publicVersion": "1.0.5",
     "packageVersion": "1.0.5",
     "status": "complete",

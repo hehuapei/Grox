@@ -4540,6 +4540,31 @@ fn optional_git_text(root: &Path, args: &[&str]) -> Option<String> {
     git_text(root, args).ok().filter(|value| !value.is_empty())
 }
 
+/// HEAD as `git rev-parse HEAD` prints it. Reads the ref only; the named
+/// object may be absent on a truncated or corrupt pack.
+fn git_head_sha(root: &Path) -> Option<String> {
+    optional_git_text(root, &["rev-parse", "--verify", "HEAD"])
+}
+
+fn git_object_exists(root: &Path, oid: &str) -> bool {
+    let oid = oid.trim();
+    if oid.len() != 40 || !oid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return false;
+    }
+    optional_git_text(root, &["cat-file", "-t", oid]).is_some()
+}
+
+fn git_numstat_for_summary(root: &Path) -> String {
+    if let Some(sha) = git_head_sha(root) {
+        if git_object_exists(root, &sha) {
+            if let Some(numstat) = optional_git_text(root, &["diff", "--numstat", "HEAD"]) {
+                return numstat;
+            }
+        }
+    }
+    optional_git_text(root, &["diff", "--numstat"]).unwrap_or_default()
+}
+
 fn text_file_line_count(path: &Path) -> u64 {
     let Ok(mut file) = fs::File::open(path) else {
         return 0;
@@ -4614,9 +4639,7 @@ fn git_summary(cwd: String) -> Result<GitSummary, String> {
         .lines()
         .filter(|line| !line.trim().is_empty())
         .count();
-    let numstat = optional_git_text(&root, &["diff", "--numstat", "HEAD"])
-        .or_else(|| optional_git_text(&root, &["diff", "--numstat"]))
-        .unwrap_or_default();
+    let numstat = git_numstat_for_summary(&root);
     let (tracked_added, removed) = numstat
         .lines()
         .fold((0_u64, 0_u64), |(added, removed), line| {
@@ -11058,6 +11081,35 @@ mod tests {
         assert_eq!(summary.changed_files, 3);
         assert_eq!(summary.added, 5);
         assert_eq!(summary.removed, 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn git_summary_reads_head_from_refs_when_the_object_is_missing() {
+        const MISSING_OID: &str = "0123456789abcdef0123456789abcdef01234567";
+        let root = std::env::temp_dir().join(format!(
+            "grox-git-head-refs-{}",
+            CONFIG_WRITE_NONCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&root).unwrap();
+        git_text(&root, &["init", "-b", "main"]).unwrap();
+        git_text(&root, &["config", "user.name", "Grox Test"]).unwrap();
+        git_text(&root, &["config", "user.email", "test@grox.local"]).unwrap();
+        git_text(&root, &["commit", "--allow-empty", "-m", "init"]).unwrap();
+
+        let live = git_head_sha(&root).expect("live HEAD");
+        assert!(git_object_exists(&root, &live));
+        fs::write(root.join(".git").join("refs").join("heads").join("main"), format!("{MISSING_OID}\n"))
+            .unwrap();
+
+        assert_eq!(git_head_sha(&root).as_deref(), Some(MISSING_OID));
+        assert!(!git_object_exists(&root, MISSING_OID));
+
+        let summary = git_summary(path_for_webview(&root)).unwrap();
+        assert!(summary.is_repository);
+        assert_eq!(summary.branch.as_deref(), Some("main"));
+        assert_eq!(summary.added, 0);
+        assert_eq!(summary.removed, 0);
         fs::remove_dir_all(root).unwrap();
     }
 
