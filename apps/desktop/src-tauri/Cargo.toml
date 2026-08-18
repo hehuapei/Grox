@@ -1,6 +1,6 @@
 [package]
 name = "grox-desktop"
-version = "0.3.2"
+version = "0.3.3"
 description = "Grox desktop agent powered by Grok Build"
 edition = "2021"
 rust-version = "1.77.2"
