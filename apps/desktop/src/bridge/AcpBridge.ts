@@ -2727,8 +2727,10 @@ export class AcpBridge implements GrokBridge {
       }
       case "session_summary_generated": {
         const meta = this.catalogue.get(sessionId);
-        const title = string(update.session_summary);
-        if (meta && title) {
+        // Grok Build has emitted both snake_case and camelCase payload keys
+        // across replay/live paths. A repeated refresh is idempotent.
+        const title = string(update.session_summary) ?? string(update.sessionSummary);
+        if (meta && title && meta.title !== title) {
           this.catalogue.set(sessionId, { ...meta, title });
           this.emit({ type: "session_meta", sessionId, patch: { title } });
         }
@@ -3596,6 +3598,7 @@ export class AcpBridge implements GrokBridge {
           cwd: meta.cwd,
           generation: this.acpGeneration,
           sessionId: id,
+          reasoningEffort: storedEffort(),
           permissionMode: this.permissionMode,
           computerUseEnabled: this.computerUseEnabled,
           browserUseEnabled: this.browserUseEnabled,

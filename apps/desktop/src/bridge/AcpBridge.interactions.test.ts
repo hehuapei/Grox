@@ -49,6 +49,7 @@ interface HostActiveBlockSnapshot {
 
 interface InteractionInternals {
   liveAssistantSessions: Set<string>;
+  catalogue: Map<string, { id: string; title: string; cwd: string; createdAt: number; updatedAt: number; model: string; turns: number }>;
   projectHostInteraction(interaction: HostInteraction): void;
   reconcileHostInteractions(interactions: HostInteraction[]): void;
   projectAutomationSessionStarted(started: AutomationSessionStarted): void;
@@ -69,6 +70,46 @@ function bridgeHarness() {
 }
 
 describe("AcpBridge Host interaction projection", () => {
+  it("projects early and resumed session summaries idempotently across payload casing", () => {
+    const { events, internal } = bridgeHarness();
+    internal.catalogue.set("session-a", {
+      id: "session-a",
+      title: "Original",
+      cwd: "/project",
+      createdAt: 1,
+      updatedAt: 1,
+      model: "grok-build",
+      turns: 1,
+    });
+    const projectSummary = (sequence: number, update: unknown) => internal.projectHostSessionEvent({
+      streamId: "host-stream-summary",
+      sequence,
+      generation: 7,
+      receivedAt: 42 + sequence,
+      sessionId: "session-a",
+      updateType: "session_summary_generated",
+      journalRecoverable: true,
+      projection: {
+        kind: "session_update",
+        channel: "notification",
+        sessionId: "session-a",
+        updateType: "session_summary_generated",
+        update,
+        blockOps: [],
+      },
+    });
+
+    projectSummary(1, { sessionUpdate: "session_summary_generated", session_summary: "Early title" });
+    projectSummary(2, { sessionUpdate: "session_summary_generated", sessionSummary: "Early title" });
+    projectSummary(3, { sessionUpdate: "session_summary_generated", sessionSummary: "Resumed recap title" });
+
+    expect(internal.catalogue.get("session-a")?.title).toBe("Resumed recap title");
+    expect(events.filter((event) => event.type === "session_meta")).toEqual([
+      { type: "session_meta", sessionId: "session-a", patch: { title: "Early title" } },
+      { type: "session_meta", sessionId: "session-a", patch: { title: "Resumed recap title" } },
+    ]);
+  });
+
   it("does not suppress disk fallback for an unprojected assistant chunk", () => {
     const { events, internal } = bridgeHarness();
     internal.projectHostSessionEvent({

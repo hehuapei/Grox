@@ -303,12 +303,14 @@ fn session_open_params(
         if let Some(model) = preferred_model {
             meta.insert("modelId".into(), serde_json::Value::String(model.into()));
         }
-        if let Some(effort) = reasoning_effort {
-            meta.insert(
-                "reasoningEffort".into(),
-                serde_json::Value::String(effort.into()),
-            );
-        }
+    }
+    // Grok Build 1.0.5 accepts an ACP client's effort hint when either
+    // opening or resuming a session. Model selection remains new-session only.
+    if let Some(effort) = reasoning_effort {
+        meta.insert(
+            "reasoningEffort".into(),
+            serde_json::Value::String(effort.into()),
+        );
     }
     if !attempt.plugin_dirs.is_empty() {
         meta.insert("pluginDirs".into(), serde_json::json!(attempt.plugin_dirs));
@@ -1078,7 +1080,7 @@ mod tests {
         );
         assert_eq!(load_params["sessionId"], "session-a");
         assert!(load_params["_meta"].get("modelId").is_none());
-        assert!(load_params["_meta"].get("reasoningEffort").is_none());
+        assert_eq!(load_params["_meta"]["reasoningEffort"], "max");
     }
 
     #[test]

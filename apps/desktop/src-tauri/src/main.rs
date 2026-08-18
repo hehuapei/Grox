@@ -680,6 +680,15 @@ fn session_gate_release(
     Ok(state.sessions.release(token, generation))
 }
 
+#[derive(Clone, Serialize, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+struct ConfigOverlayMetadata {
+    /// Best-effort configured source. Grok Build performs the authoritative
+    /// parse/allowlist pipeline; inline contents never cross the IPC boundary.
+    source: &'static str,
+    path: Option<String>,
+}
+
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ConfigDocument {
@@ -689,6 +698,8 @@ struct ConfigDocument {
     content: String,
     exists: bool,
     language: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overlay: Option<ConfigOverlayMetadata>,
 }
 
 #[derive(Serialize)]
@@ -2893,6 +2904,41 @@ fn config_path(id: &str, cwd: &Path) -> Result<(PathBuf, &'static str, &'static 
     }
 }
 
+fn config_overlay_metadata_from(
+    inline: Option<std::ffi::OsString>,
+    path: Option<std::ffi::OsString>,
+) -> ConfigOverlayMetadata {
+    if inline
+        .as_ref()
+        .and_then(|value| value.to_str())
+        .and_then(|value| serde_json::from_str::<serde_json::Value>(value.trim()).ok())
+        .and_then(|value| value.as_object().cloned())
+        .is_some_and(|value| !value.is_empty())
+    {
+        return ConfigOverlayMetadata {
+            source: "inline",
+            path: None,
+        };
+    }
+    if let Some(path) = path.filter(|value| !value.is_empty()) {
+        return ConfigOverlayMetadata {
+            source: "path",
+            path: Some(path_for_webview(Path::new(&path))),
+        };
+    }
+    ConfigOverlayMetadata {
+        source: "none",
+        path: None,
+    }
+}
+
+fn config_overlay_metadata() -> ConfigOverlayMetadata {
+    config_overlay_metadata_from(
+        std::env::var_os("GROK_CONFIG"),
+        std::env::var_os("GROK_CONFIG_PATH"),
+    )
+}
+
 fn parse_env_text(content: &str) -> BTreeMap<String, String> {
     content
         .lines()
@@ -3416,7 +3462,7 @@ fn runtime_info(
     }
 }
 
-fn configured_grok_command(_app: &tauri::AppHandle) -> GrokRuntimeInfo {
+fn configured_grok_command() -> GrokRuntimeInfo {
     let executable = if cfg!(windows) { "grok.exe" } else { "grok" };
     let system = system_grok_candidates(executable)
         .into_iter()
@@ -3607,8 +3653,8 @@ struct FetchProviderModels {
 }
 
 #[tauri::command]
-fn grok_runtime_info(app: tauri::AppHandle) -> GrokRuntimeInfo {
-    configured_grok_command(&app)
+fn grok_runtime_info(_app: tauri::AppHandle) -> GrokRuntimeInfo {
+    configured_grok_command()
 }
 
 #[tauri::command]
@@ -3619,12 +3665,12 @@ async fn export_session_trace(app: tauri::AppHandle, session_id: String) -> Resu
 }
 
 async fn export_official_session_trace(
-    app: &tauri::AppHandle,
+    _app: &tauri::AppHandle,
     session_id: &str,
 ) -> Result<PathBuf, String> {
     let session_id = session_id.trim();
     safe_session_storage_id(session_id)?;
-    let runtime = configured_grok_command(app);
+    let runtime = configured_grok_command();
     let mut command = Command::new(&runtime.path);
     command.args(["trace", session_id, "--local", "--json"])
         .stdin(Stdio::null())
@@ -3719,7 +3765,7 @@ async fn export_session_support_bundle(
         return Err("客户端诊断快照必须是 JSON 对象".into());
     }
 
-    let runtime_info = configured_grok_command(&app);
+    let runtime_info = configured_grok_command();
     let worktree_ownership = match worktree_bindings_path(&app).and_then(|path| {
         app.state::<WorktreeOwnershipStore>().count(&path)
     }) {
@@ -3925,7 +3971,7 @@ async fn download_official_install_script(script_url: &str) -> Result<String, St
 
 #[tauri::command]
 async fn install_official_grok_cli(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     state: tauri::State<'_, Arc<AcpState>>,
 ) -> Result<GrokRuntimeInfo, String> {
     // Windows cannot replace a running executable. Stop the official CLI
@@ -4025,7 +4071,7 @@ async fn install_official_grok_cli(
                 .map_or_else(|| "unknown".into(), |code| code.to_string())
         ));
     }
-    let runtime = configured_grok_command(&app);
+    let runtime = configured_grok_command();
     if runtime.system_path.is_none() {
         return Err("安装程序已完成，但 Grox 尚未在标准位置检测到 grok；请重启后重试".into());
     }
@@ -4403,7 +4449,7 @@ fn confirm_bypass_permission_mode() -> bool {
 
 #[tauri::command]
 fn desktop_environment(app: tauri::AppHandle) -> DesktopEnvironment {
-    let runtime = configured_grok_command(&app);
+    let runtime = configured_grok_command();
     // Warm host prefs cache at first environment probe.
     if let Err(error) = host_prefs::load_prefs(&host_prefs_dir_for_app(&app)) {
         tracing::error!(target: "grox::preferences", error = %error, "Host preferences warmup failed");
@@ -6833,6 +6879,7 @@ fn read_config_documents(cwd: String) -> Result<Vec<ConfigDocument>, String> {
                 },
                 exists,
                 language,
+                overlay: (id == "config").then(config_overlay_metadata),
             })
         })
         .collect()
@@ -6878,6 +6925,7 @@ fn write_config_document(request: WriteConfigDocument) -> Result<ConfigDocument,
         },
         exists: true,
         language,
+        overlay: (id == "config").then(config_overlay_metadata),
     })
 }
 
@@ -8757,7 +8805,7 @@ async fn spawn_acp_process(
         terminate_process(old).await;
     }
 
-    let runtime = configured_grok_command(app);
+    let runtime = configured_grok_command();
     let client_version = runtime
         .version
         .as_deref()
@@ -10441,6 +10489,51 @@ mod tests {
                 error: None,
             },
         }
+    }
+
+    #[test]
+    #[ignore = "set GROK_DESKTOP_CLI to an official binary for opt-in integration"]
+    fn configured_grok_command_launches_opt_in_official_binary() {
+        let configured = std::env::var_os("GROK_DESKTOP_CLI")
+            .filter(|value| !value.is_empty())
+            .expect("GROK_DESKTOP_CLI must point to the official test binary");
+        let expected_path = PathBuf::from(configured).canonicalize().unwrap();
+        let runtime = configured_grok_command();
+        assert_eq!(runtime.source, "override");
+        assert_eq!(PathBuf::from(&runtime.path).canonicalize().unwrap(), expected_path);
+        let version = runtime.version.expect("configured binary must answer --version");
+        let expected_version = std::env::var("GROK_EXPECTED_VERSION").unwrap_or_else(|_| "1.0.5".into());
+        assert!(
+            version.contains(&format!("grok {expected_version}")),
+            "unexpected official CLI version: {version}"
+        );
+    }
+
+    #[test]
+    fn config_overlay_metadata_reports_likely_configured_source_without_inline_contents() {
+        let inline = config_overlay_metadata_from(
+            Some(std::ffi::OsString::from("{\"models\":{\"default\":\"secret-model-id\"}}")),
+            Some(std::ffi::OsString::from("/fallback/config.toml")),
+        );
+        assert_eq!(inline.source, "inline");
+        assert_eq!(inline.path, None);
+        assert!(!serde_json::to_string(&inline).unwrap().contains("secret-model-id"));
+
+        let path = config_overlay_metadata_from(
+            Some(std::ffi::OsString::from("   ")),
+            Some(std::ffi::OsString::from("/launcher/overlay.toml")),
+        );
+        assert_eq!(path.source, "path");
+        assert!(path.path.as_deref().unwrap().ends_with("overlay.toml"));
+
+        let path = config_overlay_metadata_from(
+            Some(std::ffi::OsString::new()),
+            Some(std::ffi::OsString::from("/launcher/overlay.toml")),
+        );
+        assert_eq!(path.source, "path");
+        assert!(path.path.as_deref().unwrap().ends_with("overlay.toml"));
+
+        assert_eq!(config_overlay_metadata_from(None, None).source, "none");
     }
 
     #[test]

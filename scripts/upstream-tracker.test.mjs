@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import {
   buildIssueBody,
@@ -12,6 +13,7 @@ import {
   parseSourceRevision,
   parseSourceRevisionFile,
   shouldTrackRelease,
+  validateIntegrationState,
 } from "./upstream-tracker.mjs";
 
 test("parses only the package version", () => {
@@ -95,6 +97,31 @@ test("tracks public releases, not source commits or repeated package versions", 
   assert.equal(shouldTrackRelease(state, "1.1.0"), true);
 });
 
+test("preserves pending 1.0.4 and 1.0.5 history without advancing the verified baseline", () => {
+  const state = validateIntegrationState(JSON.parse(readFileSync(new URL("../.grox/official-cli.json", import.meta.url))));
+  assert.equal(state.verifiedIntegration.publicVersion, "1.0.3");
+  assert.equal(state.integrationTarget.publicVersion, "1.0.5");
+  assert.equal(state.integrationTarget.status, "pending-verification");
+  assert.deepEqual(state.integrationTarget.issues, [35, 36]);
+  assert.deepEqual(state.pendingIntegrations.map(({ publicVersion, issue }) => ({ publicVersion, issue })), [
+    { publicVersion: "1.0.4", issue: 35 },
+    { publicVersion: "1.0.5", issue: 36 },
+  ]);
+
+  assert.throws(() => validateIntegrationState({
+    ...state,
+    verifiedIntegration: { ...state.verifiedIntegration, publicVersion: "1.0.5" },
+  }), /不能覆盖 verifiedIntegration/);
+  assert.throws(() => validateIntegrationState({
+    ...state,
+    pendingIntegrations: state.pendingIntegrations.map((entry) => ({ ...entry, issue: 35 })),
+  }), /issue 重复/);
+  assert.throws(() => validateIntegrationState({
+    ...state,
+    integrationTarget: { ...state.integrationTarget, issues: [36, 35] },
+  }), /严格一致/);
+});
+
 test("uses the source snapshot change list when no public changelog exists", () => {
   assert.deepEqual(parseCommitChanges("Synced from monorepo\n\nChanges:\n- Fix queue loss\n- Bound startup"), [
     { id: "SRC-001", category: "source snapshot", description: "Fix queue loss", breakingChange: false },
@@ -133,6 +160,9 @@ test("issue body makes observation and verified integration distinct", () => {
   assert.doesNotMatch(body, /适配矩阵已提交到仓库/);
   assert.equal(findTrackedIssue([{ number: 16, body, state: "CLOSED" }], "1.0.0")?.number, 16);
   assert.equal(findTrackedIssue([{ number: 16, body: "legacy", state: "CLOSED" }], "1.0.0"), null);
+  assert.equal(findTrackedIssue([{ number: 36, title: "Grok Build v1.0.5 出了", body: "", state: "OPEN" }], "1.0.5", 36)?.number, 36);
+  assert.equal(findTrackedIssue([{ number: 36, title: "Unrelated issue", body: "", state: "CLOSED" }], "1.0.5", 36), null);
+  assert.equal(findTrackedIssue([{ number: 36, title: "Grok Build v1.0.4", body: "", state: "CLOSED" }], "1.0.5", 36), null);
   assert.equal(findTrackedIssue([{
     number: 16,
     body: "<!-- grox-upstream-commit:old-verified-commit -->",
