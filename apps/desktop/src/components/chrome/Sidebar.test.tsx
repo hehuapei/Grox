@@ -178,6 +178,7 @@ describe("Sidebar", () => {
 
   it("永久删除会话使用应用内确认框并触发删除动作", async () => {
     const removeSessionFromSidebar = vi.fn(async () => {});
+    const openSession = vi.fn(async () => {});
     useDesktop.setState({
       activeProjectId: "c:/workspace/existing",
       projects: [{
@@ -197,6 +198,7 @@ describe("Sidebar", () => {
         updatedAt: 2,
         model: "grok-build",
       }],
+      openSession,
       removeSessionFromSidebar,
     });
     const container = document.createElement("div");
@@ -217,6 +219,7 @@ describe("Sidebar", () => {
     await act(async () => confirm?.click());
 
     expect(removeSessionFromSidebar).toHaveBeenCalledWith("session-existing");
+    expect(openSession).not.toHaveBeenCalled();
     await act(async () => root.unmount());
   });
 

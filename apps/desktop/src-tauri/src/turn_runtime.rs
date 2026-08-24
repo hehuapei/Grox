@@ -28,6 +28,19 @@ pub(crate) async fn bind_model(
     tracker: Option<&dyn AcpRequestTracker>,
 ) -> Result<String, AcpHostError> {
     let mut last_error = None;
+    // 界面给的是上游模型名；CLI 认的是 config.toml 段名。中转档案借用官方
+    // 模型名时两者不同，必须在这里收口，否则请求会落到官方段上。
+    let model = crate::grok_home()
+        .and_then(|home| crate::resolve_agent_model_id(&home, model))
+        .map_err(|error| {
+            AcpHostError::environment(
+                "PROVIDER_MODEL_RESOLVE_FAILED",
+                error,
+                false,
+                false,
+                "检查 ~/.grok/config.toml 是否可读，然后重新选择供应商",
+            )
+        })?;
     for effort in effort_fallback_chain(preferred_effort) {
         match request_acp_json_tracked(
             state,

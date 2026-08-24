@@ -74,6 +74,7 @@ describe("durable deletion", () => {
     mocks.deleteSession.mockImplementation(() => new Promise(() => {}));
     useDesktop.setState({
       activeId: "session-a",
+      restoringSessionId: "session-a",
       view: "session",
       sessionIndex: [{
         id: "session-a",
@@ -89,6 +90,7 @@ describe("durable deletion", () => {
 
     expect(useDesktop.getState().sessionIndex).toEqual([]);
     expect(useDesktop.getState().activeId).toBeNull();
+    expect(useDesktop.getState().restoringSessionId).toBeNull();
     expect(useDesktop.getState().view).toBe("home");
     expect(mocks.deleteSession).toHaveBeenCalledWith("session-a");
     expect(mocks.cancel).toHaveBeenCalledWith("session-a");

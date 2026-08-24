@@ -34,7 +34,6 @@ import type {
   ProviderProfileSummary,
   SaveProviderProfile,
   FetchProviderModels,
-  NetworkProxyConfig,
   GrokRuntimeInfo,
   WorkspaceEntry,
   RewindMode,
@@ -158,37 +157,6 @@ export type InspectorTab = "files" | "tasks" | "preview" | "usage";
 
 const isWorkflowTerminal = (status: string) =>
   ["complete", "failed", "cancelled", "interrupted"].includes(status);
-
-const MAX_LOADED_SESSIONS = 8;
-
-function pruneLoadedSessions(
-  sessions: Record<string, Session>,
-  activeId: string | null,
-  workflows: Record<string, WorkflowRun[]>,
-): Record<string, Session> {
-  const entries = Object.entries(sessions);
-  if (entries.length <= MAX_LOADED_SESSIONS) return sessions;
-
-  const keep = new Set<string>();
-  const terminal: [string, Session][] = [];
-  for (const [id, session] of entries) {
-    const hasLiveWorkflow = (workflows[id] ?? []).some((workflow) => !isWorkflowTerminal(workflow.status));
-    if (id === activeId || id.startsWith("pending-") || !isSessionTerminal(session.status) || hasLiveWorkflow) {
-      keep.add(id);
-    } else {
-      terminal.push([id, session]);
-    }
-  }
-
-  const terminalBudget = Math.max(0, MAX_LOADED_SESSIONS - keep.size);
-  terminal
-    .sort(([, left], [, right]) => right.updatedAt - left.updatedAt)
-    .slice(0, terminalBudget)
-    .forEach(([id]) => keep.add(id));
-
-  if (keep.size === entries.length) return sessions;
-  return Object.fromEntries(entries.filter(([id]) => keep.has(id)));
-}
 
 // `hideFromScrollback` is a wire-level flag, so old clients may already have
 // persisted internal workflow traffic as normal user blocks. Keep a
@@ -360,7 +328,6 @@ interface DesktopState {
   refreshAccount(): Promise<void>;
   refreshModels(): Promise<void>;
   configureProvider(config: ProviderConfig): Promise<void>;
-  configureNetworkProxy(config: NetworkProxyConfig): Promise<void>;
   refreshProviderProfiles(): Promise<void>;
   saveProviderProfile(config: SaveProviderProfile): Promise<ProviderProfileSummary>;
   fetchProviderModels(config: FetchProviderModels): Promise<string[]>;
@@ -763,7 +730,6 @@ function providerDefaultModel(profile?: ProviderProfileSummary) {
 /* StrictMode mounts effects twice in dev — subscribe once, ever. */
 let bridgeSubscribed = false;
 let workspaceWatchTimer: number | undefined;
-let billingRefreshTimer: number | undefined;
 let workspaceWatchTick = 0;
 let pendingLaunch: { text: string; attachments: PromptAttachment[] } | undefined;
 let providerRestoreGeneration = 0;
@@ -781,7 +747,6 @@ function scheduleSessionCatalog(metas: SessionMeta[]) {
 if (import.meta.hot) {
   import.meta.hot.dispose(() => {
     if (workspaceWatchTimer !== undefined) window.clearInterval(workspaceWatchTimer);
-    if (billingRefreshTimer !== undefined) window.clearInterval(billingRefreshTimer);
     if (catalogPersistTimer !== undefined) window.clearTimeout(catalogPersistTimer);
     if (composerPersistTimer !== undefined) window.clearTimeout(composerPersistTimer);
     if (workflowPersistTimer !== undefined) window.clearTimeout(workflowPersistTimer);
@@ -1641,11 +1606,6 @@ export const useDesktop = create<DesktopState>((set, get) => {
         const nextSessions = e.background
           ? sessions
           : Object.fromEntries(Object.entries(sessions).filter(([id]) => !isEphemeralSessionId(id)));
-        const loadedSessions = pruneLoadedSessions(
-          { ...nextSessions, [readySession.id]: nextSession },
-          readySession.id,
-          state.workflows,
-        );
         const readyProjectId = projects.some((project) => samePath(project.path, readySession.cwd))
           ? projectId(readySession.cwd)
           : null;
@@ -1653,7 +1613,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
           viewNavigation = nextViewNavigation(viewNavigation, readySession.id, readySession.cwd);
         }
         set({
-          sessions: loadedSessions,
+          sessions: { ...nextSessions, [readySession.id]: nextSession },
           sessionIndex: nextIndex,
           projects,
           sessionComposers,
@@ -1906,7 +1866,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
   // so the first request cannot target a dead child process.
   const restoreActiveSessionAfterProviderSwitch = () => {
     const { activeId, sessions } = get();
-    if (!activeId || activeId.startsWith("pending-") || !sessions[activeId]) {
+    if (!activeId || isEphemeralSessionId(activeId) || !sessions[activeId]) {
       set({ restoringSessionId: null });
       resumePromptQueues();
       return;
@@ -2071,7 +2031,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
               });
             });
 
-            const [hostPrefsLoad, envOn, env, promptQueueLoad, automationLoad] = await Promise.all([
+            const [hostPrefsLoad, envOn, env, promptQueueLoad, automationLoad, providerLoad] = await Promise.all([
               invoke<HostPrefsProjection>("host_prefs_get").then(
                 (value) => ({ value, error: null as unknown }),
                 (error: unknown) => ({ value: null, error }),
@@ -2086,6 +2046,10 @@ export const useDesktop = create<DesktopState>((set, get) => {
                 (value) => ({ value, error: null as unknown }),
                 (error: unknown) => ({ value: null, error }),
               ),
+              Promise.all([bridge.getProviderStatus(), bridge.listProviderProfiles()]).then(
+                ([provider, profiles]) => ({ value: { provider, profiles }, error: null as unknown }),
+                (error: unknown) => ({ value: null, error }),
+              ),
             ]);
             setComputerUseHostEnvEnabled(Boolean(envOn));
             if (hostPrefsLoad.value) applyHostPrefs(hostPrefsLoad.value);
@@ -2098,11 +2062,17 @@ export const useDesktop = create<DesktopState>((set, get) => {
                 ? { promptQueues: mergeHydratedPromptQueues(promptQueueLoad.value, state.promptQueues) }
                 : {}),
               ...(automationLoad.value ? { automations: automationLoad.value } : {}),
+              ...(providerLoad.value ? {
+                provider: providerLoad.value.provider,
+                providerProfiles: providerLoad.value.profiles.profiles,
+                activeProviderProfileId: providerLoad.value.profiles.activeId,
+              } : {}),
             }));
             for (const [code, message, error] of [
               ["HOST_PREFS_READ_FAILED", "无法读取 Host 权限偏好", hostPrefsLoad.error],
               ["PROMPT_QUEUE_READ_FAILED", "无法恢复已持久化的提示队列", promptQueueLoad.error],
               ["AUTOMATION_READ_FAILED", "无法恢复已安排任务", automationLoad.error],
+              ["PROVIDER_PROFILES_READ_FAILED", "无法读取模型服务配置", providerLoad.error],
             ] as const) {
               if (!error) continue;
               const notice = runtimeNoticeFromError(toGroxError(error, {
@@ -2169,22 +2139,6 @@ export const useDesktop = create<DesktopState>((set, get) => {
             });
 
             if (!auth.required) void get().refreshAccount();
-            void get().refreshProviderProfiles();
-
-            if (billingRefreshTimer === undefined) {
-              billingRefreshTimer = window.setInterval(() => {
-                const state = get();
-                if (
-                  document.visibilityState !== "visible"
-                  || state.auth.inProgress
-                  || state.accountLoading
-                  || state.provider.kind !== "oauth"
-                  || !state.account?.authenticated
-                ) return;
-                void state.refreshAccount();
-              }, 60_000);
-            }
-
             window.setTimeout(() => {
               if (get().auth.inProgress) return;
               void get().refreshWorkspaceFiles();
@@ -2298,11 +2252,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({
           activeId: id,
           view: "session",
-          sessions: pruneLoadedSessions(
-            { ...state.sessions, [id]: existing },
-            id,
-            state.workflows,
-          ),
+          sessions: { ...state.sessions, [id]: existing },
           ...(composer ? {
             model: composer.model,
             effort: composer.effort,
@@ -2314,7 +2264,6 @@ export const useDesktop = create<DesktopState>((set, get) => {
         set({
           activeId: id,
           view: "session",
-          sessions: pruneLoadedSessions(state.sessions, id, state.workflows),
           ...(composer ? {
             model: composer.model,
             effort: composer.effort,
@@ -2912,27 +2861,18 @@ export const useDesktop = create<DesktopState>((set, get) => {
       });
     },
 
-    async configureNetworkProxy(config) {
-      const activeId = get().activeId;
-      set({ providerSwitching: true });
+    async refreshProviderProfiles() {
       try {
-        await bridge.setNetworkProxy(config);
-        if (activeId) await bridge.loadSession(activeId);
-        set({ providerSwitching: false, startupError: null });
+        const result = await bridge.listProviderProfiles();
+        set({ providerProfiles: result.profiles, activeProviderProfileId: result.activeId });
       } catch (error) {
-        set({ providerSwitching: false });
+        set({ startupError: formattedError(error, {
+          domain: "environment",
+          code: "PROVIDER_PROFILES_READ_FAILED",
+          action: "检查 ~/.grok/grox-providers.json 与系统凭据库后重试",
+        }) });
         throw error;
       }
-      try {
-        await Promise.all([get().refreshAccount(), get().refreshModels()]);
-      } catch (error) {
-        set({ startupError: error instanceof Error ? error.message : String(error) });
-      }
-    },
-
-    async refreshProviderProfiles() {
-      const result = await bridge.listProviderProfiles();
-      set({ providerProfiles: result.profiles, activeProviderProfileId: result.activeId });
     },
 
     async saveProviderProfile(config) {
@@ -3257,6 +3197,11 @@ export const useDesktop = create<DesktopState>((set, get) => {
       savePromptQueues(promptQueues);
       const nextIndex = sessionIndex.filter((m) => m.id !== id);
       persistSessionCatalog(nextIndex);
+      if (activeId === id) {
+        // 作废仍在等待 workspace/ACP 的旧 openSession；否则它会在删除后
+        // 重新提交 activeId，留下没有实体的“正在恢复任务”页面。
+        viewNavigation = nextViewNavigation(viewNavigation, null);
+      }
       set({
         sessionIndex: nextIndex,
         sessions: rest,
@@ -3265,7 +3210,7 @@ export const useDesktop = create<DesktopState>((set, get) => {
         promptQueues,
         pendingSessionModels,
         startupError: null,
-        ...(activeId === id ? { activeId: null, view: "home" as View } : {}),
+        ...(activeId === id ? { activeId: null, view: "home" as View, restoringSessionId: null } : {}),
       });
 
       // 先通知运行中的回合停止写入，降低 Windows 上历史文件仍被占用的概率。

@@ -5,6 +5,7 @@ import { MAX_ATTACHMENTS, prepareAttachment, validateAttachmentSet } from "../..
 import { baseName } from "../../lib/format";
 import { samePath } from "../../lib/projectCatalog";
 import { useI18n } from "../../lib/i18n";
+import { useImeGuard } from "../../lib/ime";
 import { ConfirmDialog } from "../common/ConfirmDialog";
 import { Icon } from "../fx/Icon";
 import { ChipSelect } from "../common/ChipSelect";
@@ -86,6 +87,7 @@ const linksFromText = (text: string) =>
 export function EnvironmentSummary() {
   const { language } = useI18n();
   const zh = language === "zh-CN";
+  const { onCompositionStart, onCompositionEnd, isImeBlocking } = useImeGuard();
   const [open, setOpen] = useState(false);
   const [summary, setSummary] = useState<GitSummary | null>(null);
   const [worktrees, setWorktrees] = useState<GitWorktree[]>([]);
@@ -509,7 +511,12 @@ export function EnvironmentSummary() {
                     <input
                       value={commitMessage}
                       onChange={(event) => setCommitMessage(event.target.value)}
-                      onKeyDown={(event) => event.key === "Enter" && commit()}
+                      onCompositionStart={onCompositionStart}
+                      onCompositionEnd={onCompositionEnd}
+                      onKeyDown={(event) => {
+                        if (isImeBlocking(event)) return;
+                        if (event.key === "Enter") commit();
+                      }}
                       placeholder={zh ? "提交说明…" : "Commit message…"}
                       maxLength={200}
                       className="h-8 w-full rounded-[4px] border border-line2 bg-raise px-2.5 text-[10.5px] text-fg2 outline-none focus:border-line3"

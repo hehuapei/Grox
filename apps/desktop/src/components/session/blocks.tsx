@@ -60,6 +60,7 @@ export function UserMsg({ block, rewindPromptIndex }: { block: UserBlock; rewind
 
 /** Agent message — an editorial transcript with a quiet identity rail. */
 export function AssistantMsg({ block, process = false }: { block: AssistantBlock; process?: boolean }) {
+  const streaming = block.streaming ?? false;
   if (process) {
     return (
       <div className="process-text mb-2 animate-fade-up">
@@ -67,10 +68,10 @@ export function AssistantMsg({ block, process = false }: { block: AssistantBlock
         <div className="min-w-0 flex-1">
           <Markdown
             text={block.text}
-            streaming={block.streaming ?? false}
+            streaming={streaming}
             className="process-prose text-mute"
           />
-          {block.streaming && <span className="stream-caret" />}
+          {streaming && <span className="stream-caret" />}
         </div>
       </div>
     );
@@ -80,13 +81,13 @@ export function AssistantMsg({ block, process = false }: { block: AssistantBlock
     <article className="assistant-message mb-4 animate-fade-up">
       <div className="assistant-message__content min-w-0 flex-1">
         <div className="mb-2 flex items-center gap-2">
-          <BlackHole size={15} spin={block.streaming ?? false} />
+          <BlackHole size={15} spin={streaming} />
           <span className="font-mono text-[9px] font-semibold tracking-[0.16em] text-dim">GROX</span>
-          {block.streaming && <span className="text-[9px] text-faint">正在输出</span>}
+          {streaming && <span className="text-[9px] text-faint">正在输出</span>}
         </div>
-        <Markdown text={block.text} streaming={block.streaming ?? false} className="assistant-prose text-fg2" />
-        {block.streaming && <span className="stream-caret" />}
-        {!block.streaming && <div className="mt-1.5 flex justify-end"><MessageActions text={block.text} /></div>}
+        <Markdown text={block.text} streaming={streaming} className="assistant-prose text-fg2" />
+        {streaming && <span className="stream-caret" />}
+        {!streaming && <div className="mt-1.5 flex justify-end"><MessageActions text={block.text} /></div>}
       </div>
     </article>
   );

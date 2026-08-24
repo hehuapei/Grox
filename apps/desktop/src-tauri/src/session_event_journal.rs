@@ -43,7 +43,11 @@ pub(crate) struct HostSessionEvent {
 }
 
 #[derive(Clone, Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
 pub(crate) enum HostSessionProjection {
     SessionUpdate {
         channel: &'static str,
@@ -634,9 +638,15 @@ fn project_block_identity(
             }
         }
         "agent_message_chunk" => {
+            let (delta, complete) = content_text(update.get("content").unwrap_or(&Value::Null));
+            // 空 tick 既不是内容，也不该打断正在累积的思考。放行的话，模型
+            // 每次「想一点 → 空 tick → 再想一点」都会切出一个新的思考块，
+            // 界面上就是一串碎片而不是一段连贯的思考。
+            if delta.is_empty() {
+                return;
+            }
             close_block(&mut projection.user, "user", block_ops);
             close_block(&mut projection.thinking, "thinking", block_ops);
-            let (delta, complete) = content_text(update.get("content").unwrap_or(&Value::Null));
             project_stream_block(
                 &stream_id,
                 sequence,
@@ -649,9 +659,13 @@ fn project_block_identity(
             );
         }
         "agent_thought_chunk" => {
+            let (delta, complete) = content_text(update.get("content").unwrap_or(&Value::Null));
+            // 同上：空的思考 tick 不该把正在流式输出的正文切断。
+            if delta.is_empty() {
+                return;
+            }
             close_block(&mut projection.user, "user", block_ops);
             close_block(&mut projection.assistant, "assistant", block_ops);
-            let (delta, complete) = content_text(update.get("content").unwrap_or(&Value::Null));
             project_stream_block(
                 &stream_id,
                 sequence,
@@ -1064,7 +1078,7 @@ mod tests {
         let journal = SessionEventJournal::default();
         let first = journal.append(
             7,
-            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk"}}}"#.into(),
+            r#"{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"t"}}}}"#.into(),
         );
         let second = journal.append(
             7,
@@ -1155,6 +1169,25 @@ mod tests {
     }
 
     #[test]
+    fn public_projection_uses_webview_field_names() {
+        let journal = SessionEventJournal::default();
+        let event = journal.append(
+            4,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"why"}}}}"#.into(),
+        );
+
+        let public = serde_json::to_value(event).unwrap();
+        assert_eq!(public.pointer("/projection/sessionId"), Some(&json!("s1")));
+        assert_eq!(
+            public.pointer("/projection/updateType"),
+            Some(&json!("agent_thought_chunk"))
+        );
+        assert!(public.pointer("/projection/blockOps/0/blockType").is_some());
+        assert!(public.pointer("/projection/session_id").is_none());
+        assert!(public.pointer("/projection/block_ops").is_none());
+    }
+
+    #[test]
     fn status_exposes_replay_window_without_event_bodies() {
         let journal = SessionEventJournal::default();
         journal.append(1, r#"{"method":"notice"}"#.into());
@@ -1206,15 +1239,57 @@ mod tests {
     }
 
     #[test]
+    fn empty_ticks_do_not_fragment_a_thinking_run() {
+        // 模型常见地「想一点 → 空 tick → 再想一点」。若空 tick 也关闭思考块，
+        // 界面上就会出现思考 1 / 思考 2 / 思考 3 一串碎片。
+        let journal = SessionEventJournal::default();
+        let first = journal.append(
+            5,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"先想一点"}}}}"#.into(),
+        );
+        let thinking_id = block_ops(&first)[0].block_id.clone();
+
+        // 空的正文 tick：不产生任何块操作。
+        let empty = journal.append(
+            5,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":""}}}}"#.into(),
+        );
+        assert!(
+            block_ops(&empty).is_empty(),
+            "空 tick 不能产生块操作：{:?}",
+            block_ops(&empty)
+        );
+
+        // 后续思考必须回到同一个块，而不是新开一个。
+        let second = journal.append(
+            5,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"再想一点"}}}}"#.into(),
+        );
+        assert_eq!(block_ops(&second)[0].action, "update");
+        assert_eq!(block_ops(&second)[0].block_id, thinking_id);
+
+        // 真正有内容的正文才结束这段思考。
+        let body = journal.append(
+            5,
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"答案"}}}}"#.into(),
+        );
+        let ops = block_ops(&body);
+        assert!(
+            ops.iter().any(|op| op.action == "close" && op.block_id == thinking_id),
+            "有内容的正文应当结束思考块：{ops:?}"
+        );
+    }
+
+    #[test]
     fn isolates_parallel_session_projection_state() {
         let journal = SessionEventJournal::default();
         let first = journal.append(
             9,
-            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_thought_chunk"}}}"#.into(),
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"t"}}}}"#.into(),
         );
         let second = journal.append(
             9,
-            r#"{"method":"session/update","params":{"sessionId":"s2","update":{"sessionUpdate":"agent_thought_chunk"}}}"#.into(),
+            r#"{"method":"session/update","params":{"sessionId":"s2","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"t"}}}}"#.into(),
         );
         assert_ne!(
             block_ops(&first)[0].block_id,
@@ -1229,7 +1304,7 @@ mod tests {
         );
         let continued = journal.append(
             9,
-            r#"{"method":"session/update","params":{"sessionId":"s2","update":{"sessionUpdate":"agent_thought_chunk"}}}"#.into(),
+            r#"{"method":"session/update","params":{"sessionId":"s2","update":{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"t"}}}}"#.into(),
         );
         assert_eq!(block_ops(&continued)[0].action, "update");
         assert_eq!(
@@ -1271,11 +1346,11 @@ mod tests {
         let journal = SessionEventJournal::default();
         journal.append(
             5,
-            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk"}}}"#.into(),
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"t"}}}}"#.into(),
         );
         let current = journal.append(
             6,
-            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk"}}}"#.into(),
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"t"}}}}"#.into(),
         );
         assert_eq!(block_ops(&current)[0].action, "open");
 
@@ -1283,7 +1358,7 @@ mod tests {
         assert!(block_ops(&stale_finish).is_empty());
         let continued = journal.append(
             6,
-            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk"}}}"#.into(),
+            r#"{"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"t"}}}}"#.into(),
         );
         assert_eq!(block_ops(&continued)[0].action, "update");
         assert_eq!(

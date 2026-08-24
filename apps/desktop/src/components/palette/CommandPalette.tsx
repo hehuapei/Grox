@@ -9,6 +9,7 @@ import { EFFORTS } from "../../bridge/types";
 import { fmtRelTime } from "../../lib/format";
 import { Icon, type IconProps } from "../fx/Icon";
 import { useI18n } from "../../lib/i18n";
+import { useImeGuard } from "../../lib/ime";
 
 interface Item {
   id: string;
@@ -38,6 +39,7 @@ export function CommandPalette() {
   const [query, setQuery] = useState("");
   const [idx, setIdx] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const { onCompositionStart, onCompositionEnd, isImeBlocking } = useImeGuard();
 
   useEffect(() => {
     if (open) {
@@ -110,6 +112,7 @@ export function CommandPalette() {
   if (!open) return null;
 
   const onKey = (e: React.KeyboardEvent) => {
+    if (isImeBlocking(e)) return;
     if (e.key === "Escape") setOpen(false);
     else if (e.key === "ArrowDown") {
       e.preventDefault();
@@ -141,6 +144,8 @@ export function CommandPalette() {
             ref={inputRef}
             value={query}
             onChange={(e) => setQuery(e.target.value)}
+            onCompositionStart={onCompositionStart}
+            onCompositionEnd={onCompositionEnd}
             onKeyDown={onKey}
             placeholder={language === "zh-CN" ? "输入命令或搜索任务…" : "Type a command or search missions…"}
             aria-label={language === "zh-CN" ? "输入命令或搜索任务" : "Type a command or search missions"}

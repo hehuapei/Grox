@@ -95,7 +95,9 @@ use path_sandbox::{
 };
 use percent_encoding::percent_decode_str;
 use prompt_queue_store::PromptQueueStore;
-use provider_profiles::{ProviderApiBackend, GROK_MODELS_BASE_URL_KEY};
+use provider_profiles::{
+    is_relay_section_id, provider_section_id, ProviderApiBackend, GROK_MODELS_BASE_URL_KEY,
+};
 use provider_service::{
     checked_api_key, compatible_models_url, is_blocked_service_host, is_loopback_host,
     normalize_provider_endpoint, ConfigureProviderInput, ProviderService,
@@ -2927,21 +2929,27 @@ fn config_overlay_metadata() -> ConfigOverlayMetadata {
 
 /// Start every CLI child from a clean provider environment, then add only the
 /// provider explicitly selected in Grox.
+///
+/// 路由完全由 config.toml 的 `[model.*]` 段和 `[models] default` 表达。
+/// `GROK_MODELS_BASE_URL` 是 CLI 的另一套全局路由机制，两套并存意味着同一件
+/// 事有两个真相源、会互相矛盾；这里只保留前者，环境里仅注入凭据。
 fn apply_grox_provider_environment(command: &mut Command) -> Result<(), String> {
-    for key in ["XAI_API_KEY", GROK_MODELS_BASE_URL_KEY, "GROK_MODELS_LIST_URL"] {
+    for key in [
+        "XAI_API_KEY",
+        "OPENAI_API_KEY",
+        GROK_MODELS_BASE_URL_KEY,
+        "GROK_MODELS_LIST_URL",
+    ] {
         command.env_remove(key);
     }
     let runtime = provider_service_raw()?
         .runtime_environment()
         .map_err(|error| error.message)?;
-    if let Some(value) = runtime.base_url {
-        command.env(GROK_MODELS_BASE_URL_KEY, value);
-    }
-    if let Some(value) = runtime.models_url {
-        command.env("GROK_MODELS_LIST_URL", value);
-    }
     if let Some(secret) = runtime.api_key {
-        command.env("XAI_API_KEY", secret);
+        command.env(
+            if runtime.compatible { "OPENAI_API_KEY" } else { "XAI_API_KEY" },
+            secret,
+        );
     }
     Ok(())
 }
@@ -7083,83 +7091,86 @@ fn write_provider_backend_overrides(
 }
 
 fn restore_grox_provider_backend_overrides(home: &Path) -> Result<(), String> {
-    let overrides = read_provider_backend_overrides(home)?;
-    if overrides.models.is_empty() {
-        return Ok(());
-    }
+    // v0.3.3 及更早版本把中转配置写进用户自己的 `[model.<模型名>]`，因此需要
+    // 一份备份才能还原。现在 Grox 只写带前缀的自有段，删除即可。这里同时处理
+    // 两件事：把遗留备份还原回去（一次性），以及删掉所有自有段。
+    let legacy = read_provider_backend_overrides(home)?;
     let path = home.join("config.toml");
-    let content = if path.exists() {
-        read_bounded_text(&path, MAX_CONFIG_BYTES)?
-    } else {
-        String::new()
-    };
+    if !path.exists() {
+        return write_provider_backend_overrides(home, &ProviderBackendOverridesFile::default());
+    }
+    let content = read_bounded_text(&path, MAX_CONFIG_BYTES)?;
     let mut document = parse_grok_config_document(&content)?;
     let root = document.as_table_mut();
     let Some(models) = root.get_mut("model").and_then(Item::as_table_like_mut) else {
-        write_provider_backend_overrides(home, &ProviderBackendOverridesFile::default())?;
-        return Ok(());
+        set_models_default_model(&mut document, None)?;
+        document.as_table_mut().remove(GROX_TABLE);
+        atomic_write_private(&path, &document.to_string())?;
+        return write_provider_backend_overrides(home, &ProviderBackendOverridesFile::default());
     };
 
-    for (model_id, backup) in &overrides.models {
+    for (model_id, backup) in &legacy.models {
         let Some(model) = models.get_mut(model_id).and_then(Item::as_table_like_mut) else {
             continue;
         };
-        match backup.env_key.as_deref() {
-            Some(raw) => {
-                model.insert("env_key", config_value_item(raw)?);
-            }
-            None => {
-                model.remove("env_key");
-            }
-        }
-        match backup.base_url.as_deref() {
-            Some(raw) => {
-                model.insert("base_url", config_value_item(raw)?);
-            }
-            None => {
-                model.remove("base_url");
-            }
-        }
-        match backup.api_backend.as_deref() {
-            Some(raw) => {
-                model.insert("api_backend", config_value_item(raw)?);
-            }
-            None => {
-                model.remove("api_backend");
+        for (key, saved) in [
+            ("env_key", backup.env_key.as_deref()),
+            ("base_url", backup.base_url.as_deref()),
+            ("api_backend", backup.api_backend.as_deref()),
+            ("model", backup.model.as_deref()),
+        ] {
+            match saved {
+                Some(raw) => {
+                    model.insert(key, config_value_item(raw)?);
+                }
+                None => {
+                    model.remove(key);
+                }
             }
         }
-        match backup.model.as_deref() {
-            Some(raw) => {
-                model.insert("model", config_value_item(raw)?);
-            }
-            None => {
-                model.remove("model");
-            }
-        }
+        model.remove("supports_reasoning_effort");
     }
-
-    let created = overrides
+    // 只有当 Grox 创建过、且用户此后没有往里加设置时才整段删除。
+    for model_id in legacy
         .models
         .iter()
         .filter_map(|(id, backup)| (!backup.model_existed).then_some(id.clone()))
-        .collect::<Vec<_>>();
-    for model_id in created {
-        let remove = models
+        .collect::<Vec<_>>()
+    {
+        let empty = models
             .get(&model_id)
             .and_then(Item::as_table_like)
             .is_some_and(|model| model.is_empty());
-        if remove {
+        if empty {
             models.remove(&model_id);
         }
+    }
+
+    // Grox 自有段无需备份：整段都是我们写的。
+    for section_id in models
+        .iter()
+        .map(|(id, _)| id.to_string())
+        .filter(|id| is_relay_section_id(id))
+        .collect::<Vec<_>>()
+    {
+        models.remove(&section_id);
     }
     if models.is_empty() {
         root.remove("model");
     }
+    // Grox owns `[models] default` only while a compatible profile is active.
+    // Leaving it behind would keep pointing the CLI at a section we just
+    // removed, so official sessions would start on a dangling model id.
+    set_models_default_model(&mut document, None)?;
+    document.as_table_mut().remove("grox");
     atomic_write_private(&path, &document.to_string())?;
     write_provider_backend_overrides(home, &ProviderBackendOverridesFile::default())
 }
 
-fn apply_grox_provider_backend_overrides(
+/// 写入 Grox 自有的 `[model.*]` 段并把 `[models] default` 指过去。
+///
+/// 不把应用元数据塞进 config.toml：官方 CLI 会为未知字段报警。
+fn apply_grox_provider_sections(
     home: &Path,
     model_ids: &[String],
     base_url: &str,
@@ -7189,40 +7200,172 @@ fn apply_grox_provider_backend_overrides(
         String::new()
     };
     let mut document = parse_grok_config_document(&content)?;
-    let mut backups = BTreeMap::new();
     for model_id in ids {
-        let is_title_alias = model_id == "grok-4.5";
-        let (model, model_existed) = model_table_mut(&mut document, &model_id)?;
-        backups.insert(
-            model_id,
-            ProviderBackendBackup {
-                model_existed,
-                env_key: model.get("env_key").map(ToString::to_string),
-                base_url: model.get("base_url").map(ToString::to_string),
-                api_backend: model.get("api_backend").map(ToString::to_string),
-                model: model.get("model").map(ToString::to_string),
-            },
-        );
+        // 段名是 Grox 自有命名空间，上游真名写在段内。第三方反代暴露
+        // grok-4.5 时段名是 grox-relay-grok-4.5，官方段不受影响。
+        let section_id = provider_section_id(&model_id);
+        let (model, _existed) = model_table_mut(&mut document, &section_id)?;
         // A named env key is the documented credential selector; the actual
         // secret remains solely in the ACP child's managed environment.
-        model.insert("env_key", toml_value("XAI_API_KEY"));
+        // Do not expose a relay key as XAI_API_KEY. Grok Build's official
+        // helper models would otherwise send it to api.x.ai for titles/search.
+        model.insert("env_key", toml_value("OPENAI_API_KEY"));
         model.insert("base_url", toml_value(base_url));
         model.insert("api_backend", toml_value(api_backend));
-        if is_title_alias && primary_model != "grok-4.5" {
-            // Grok Build uses this alias to generate a title before the first
-            // reply. Route that internal request to the profile's actual
-            // model so a gateway that exposes only the selected model does
-            // not abort the whole prompt during title generation.
-            model.insert("model", toml_value(primary_model));
-        } else {
-            model.remove("model");
-        }
+        // 上游请求体里的模型名，与段名无关。
+        model.insert("model", toml_value(&model_id));
+        // CLI 把段名当作 modelId 报告给界面；给它一个可读的显示名，否则模型
+        // 选择器里出现的是带前缀的内部段名。
+        model.insert("name", toml_value(&model_id));
+        // Grok Build gates forwarding `--reasoning-effort` on this flag. Without
+        // it a reasoning-capable gateway is asked for no reasoning at all, and
+        // the session shows an answer with no thinking content.
+        model.insert("supports_reasoning_effort", toml_value(true));
     }
-    // Recovery data must become durable before config.toml changes. If the
-    // process exits or the config write fails afterwards, the next restore can
-    // still reconstruct the exact user-owned fields.
-    write_provider_backend_overrides(home, &ProviderBackendOverridesFile { models: backups })?;
+    // Route explicitly instead of relying on whichever id the CLI defaults to.
+    // This is the documented switch (`[models] default`) and keeps the active
+    // provider readable from config.toml alone.
+    set_models_default_model(&mut document, Some(&provider_section_id(primary_model)))?;
     atomic_write_private(&path, &document.to_string())
+}
+
+const GROX_TABLE: &str = "grox";
+const GROX_ACCOUNT_MODE_KEY: &str = "account_mode";
+const GROX_ACTIVE_PROVIDER_KEY: &str = "active_provider_id";
+
+fn legacy_grox_account_mode(home: &Path) -> Result<Option<String>, String> {
+    let path = home.join("config.toml");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let document = parse_grok_config_document(&read_bounded_text(&path, MAX_CONFIG_BYTES)?)?;
+    Ok(document
+        .as_table()
+        .get(GROX_TABLE)
+        .and_then(Item::as_table_like)
+        .and_then(|grox| grox.get(GROX_ACCOUNT_MODE_KEY))
+        .and_then(|item| item.as_str())
+        .map(str::to_owned))
+}
+
+/// `[models] default` 是否指向 Grox 自有的中转段。
+fn active_provider_route_is_relay(home: &Path) -> Result<bool, String> {
+    let path = home.join("config.toml");
+    if !path.exists() {
+        return Ok(false);
+    }
+    let document = parse_grok_config_document(&read_bounded_text(&path, MAX_CONFIG_BYTES)?)?;
+    Ok(document
+        .as_table()
+        .get("models")
+        .and_then(Item::as_table_like)
+        .and_then(|models| models.get("default"))
+        .and_then(|item| item.as_str())
+        .is_some_and(is_relay_section_id))
+}
+
+/// 从 config.toml 读出当前激活的供应商档案 id。
+///
+/// `[models] default` 指向中转段时，`[grox] active_provider_id` 说明它属于
+/// 哪个档案。返回 `None` 表示当前不是 Grox 中转路由（官方或未配置）。
+fn legacy_active_provider_profile_id(home: &Path) -> Result<Option<String>, String> {
+    let path = home.join("config.toml");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let document = parse_grok_config_document(&read_bounded_text(&path, MAX_CONFIG_BYTES)?)?;
+    let root = document.as_table();
+    let Some(default_id) = root
+        .get("models")
+        .and_then(Item::as_table_like)
+        .and_then(|models| models.get("default"))
+        .and_then(|item| item.as_str())
+    else {
+        return Ok(None);
+    };
+    if !is_relay_section_id(default_id) {
+        return Ok(None);
+    }
+    Ok(root
+        .get(GROX_TABLE)
+        .and_then(Item::as_table_like)
+        .and_then(|grox| grox.get(GROX_ACTIVE_PROVIDER_KEY))
+        .and_then(|item| item.as_str())
+        .map(str::to_string))
+}
+
+/// 把界面上选中的上游模型名解析成 `session/set_model` 实际要用的段 id。
+///
+/// 只有当前默认路由仍指向 Grox 中转时才翻译。单看命名空间段是否存在不够：
+/// 用户手动切回官方后，残留段不能继续劫持 `session/set_model`。
+pub(crate) fn resolve_agent_model_id(home: &Path, model_id: &str) -> Result<String, String> {
+    let section_id = provider_section_id(model_id);
+    if section_id == model_id {
+        return Ok(section_id);
+    }
+    let path = home.join("config.toml");
+    if !path.exists() {
+        return Ok(model_id.to_string());
+    }
+    let document = parse_grok_config_document(&read_bounded_text(&path, MAX_CONFIG_BYTES)?)?;
+    let root = document.as_table();
+    let relay_active = root
+        .get("models")
+        .and_then(Item::as_table_like)
+        .and_then(|models| models.get("default"))
+        .and_then(|item| item.as_str())
+        .is_some_and(is_relay_section_id)
+        && root
+        .get("model")
+        .and_then(Item::as_table_like)
+        .is_some_and(|models| models.contains_key(&section_id));
+    Ok(if relay_active {
+        section_id
+    } else {
+        model_id.to_string()
+    })
+}
+
+/// Set or clear `[models] default`. Grok Build reads this as the model used for
+/// new sessions, so it is the one line that decides the active route.
+fn set_models_default_model(document: &mut Document, model_id: Option<&str>) -> Result<(), String> {
+    let root = document.as_table_mut();
+    let Some(model_id) = model_id else {
+        if let Some(models) = root.get_mut("models").and_then(Item::as_table_like_mut) {
+            let owns_default = models
+                .get("default")
+                .and_then(|item| item.as_str())
+                .is_some_and(is_relay_section_id);
+            if owns_default {
+                models.remove("default");
+            }
+            if models.is_empty() {
+                root.remove("models");
+            }
+        }
+        return Ok(());
+    };
+    if !root.contains_key("models") {
+        root.insert("models", Item::Table(Table::new()));
+    }
+    let models = root
+        .get_mut("models")
+        .and_then(Item::as_table_like_mut)
+        .ok_or_else(|| "Grok config.toml 中的 [models] 不是 TOML 表，无法写入默认模型".to_string())?;
+    models.insert("default", toml_value(model_id));
+    Ok(())
+}
+
+fn clear_legacy_grox_metadata(home: &Path) -> Result<(), String> {
+    let path = home.join("config.toml");
+    if !path.exists() {
+        return Ok(());
+    }
+    let mut document = parse_grok_config_document(&read_bounded_text(&path, MAX_CONFIG_BYTES)?)?;
+    if document.as_table_mut().remove(GROX_TABLE).is_some() {
+        atomic_write_private(&path, &document.to_string())?;
+    }
+    Ok(())
 }
 
 fn read_provider_service_text(path: &Path) -> Result<String, String> {
@@ -7230,7 +7373,7 @@ fn read_provider_service_text(path: &Path) -> Result<String, String> {
 }
 
 fn provider_service_raw() -> Result<ProviderService, String> {
-    Ok(ProviderService::new(
+    let service = ProviderService::new(
         grok_home()?,
         ProviderServiceHostOps {
             read_text: read_provider_service_text,
@@ -7239,9 +7382,15 @@ fn provider_service_raw() -> Result<ProviderService, String> {
             normalize_endpoint: normalize_provider_endpoint,
             restore_auth_overrides: restore_grox_provider_auth_overrides,
             restore_backend_overrides: restore_grox_provider_backend_overrides,
-            apply_backend_overrides: apply_grox_provider_backend_overrides,
+            apply_backend_overrides: apply_grox_provider_sections,
+            compatible_route_active: active_provider_route_is_relay,
+            legacy_active_profile_id: legacy_active_provider_profile_id,
+            legacy_account_mode: legacy_grox_account_mode,
+            clear_legacy_metadata: clear_legacy_grox_metadata,
         },
-    ))
+    );
+    service.migrate_legacy_config_metadata()?;
+    Ok(service)
 }
 
 fn map_provider_service_error(error: ProviderServiceError) -> HostError {
@@ -7567,7 +7716,7 @@ fn ensure_computer_plugin() -> Result<PathBuf, String> {
     fs::create_dir_all(&skill).map_err(|error| format!("无法创建 Computer Use Skill：{error}"))?;
     fs::write(
         root.join("plugin.json"),
-        r#"{"name":"grox-desktop-computer-use","version":"0.3.3","description":"Grox desktop Computer Use harness (Windows full control; macOS/Linux observation-first)"}"#,
+        r#"{"name":"grox-desktop-computer-use","version":"0.3.4","description":"Grox desktop Computer Use harness (Windows full control; macOS/Linux observation-first)"}"#,
     )
     .map_err(|error| format!("无法写入 Computer Use Plugin：{error}"))?;
     fs::write(
@@ -11101,6 +11250,305 @@ OPENAI_API_KEY=******** # keep env comment
         .is_err());
     }
 
+    #[test]
+    fn relay_may_expose_official_model_names_without_taking_the_official_route() {
+        // 第三方 Grok 反代本来就会暴露 grok-4.5/4.6 —— 这是最常见的配置，
+        // 必须能用。段名与上游模型名解耦后，两条链路各走各的。
+        let home = std::env::temp_dir().join(format!(
+            "grox-provider-relay-coexist-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let config = home.join("config.toml");
+        // 用户自有的官方模型配置，必须原样幸存。
+        std::fs::write(
+            &config,
+            "[model.\"grok-4.5\"]\nname = \"Personal official label\"\n",
+        )
+        .unwrap();
+
+        apply_grox_provider_sections(
+            &home,
+            &["grok-4.5".into(), "gpt-5.4".into()],
+            "https://relay.example/v1",
+            "grok-4.5",
+            "chat_completions",
+        )
+        .expect("中转暴露官方模型名必须是合法配置");
+
+        let written = std::fs::read_to_string(&config).unwrap();
+        // 官方段没有被改写。
+        assert!(written.contains("name = \"Personal official label\""), "{written}");
+        assert!(!written.contains("relay.example/v1\"\nname ="), "{written}");
+        // 中转落在 Grox 自有命名空间里，上游真名写在段内。
+        // 含点号的段名必须带引号，否则 TOML 会解析成嵌套表而整段失效。
+        assert!(written.contains("[model.\"grox-relay-grok-4.5\"]"), "{written}");
+        assert!(written.contains("model = \"grok-4.5\""), "{written}");
+        assert!(written.contains("[model.\"grox-relay-gpt-5.4\"]"), "{written}");
+        assert!(written.contains("default = \"grox-relay-grok-4.5\""), "{written}");
+
+        // set_model 必须收到段名，否则请求会落到官方段上。
+        assert_eq!(
+            resolve_agent_model_id(&home, "grok-4.5").unwrap(),
+            "grox-relay-grok-4.5"
+        );
+
+        restore_grox_provider_backend_overrides(&home).unwrap();
+        let restored = std::fs::read_to_string(&config).unwrap();
+        assert!(!restored.contains("grox-relay-"), "{restored}");
+        assert!(!restored.contains("relay.example"), "{restored}");
+        assert!(
+            restored.contains("name = \"Personal official label\""),
+            "用户自有的官方段必须完好：{restored}"
+        );
+        // 切回官方后，同一个模型名解析回官方段。
+        assert_eq!(resolve_agent_model_id(&home, "grok-4.5").unwrap(), "grok-4.5");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn provider_route_contains_only_cli_fields() {
+        let home = std::env::temp_dir().join(format!(
+            "grox-provider-identity-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+
+        apply_grox_provider_sections(
+            &home,
+            &["deepseek-v4-flash".into()],
+            "https://api.deepseek.com/v1",
+            "deepseek-v4-flash",
+            "chat_completions",
+        )
+        .unwrap();
+
+        let written = std::fs::read_to_string(home.join("config.toml")).unwrap();
+        // 段名是内部路由名，界面显示用 name。
+        assert!(written.contains("name = \"deepseek-v4-flash\""), "{written}");
+        assert!(written.contains("env_key = \"OPENAI_API_KEY\""), "{written}");
+        assert!(!written.contains("env_key = \"XAI_API_KEY\""), "{written}");
+        assert!(!written.contains("app_provider_id"), "{written}");
+        assert!(!written.contains("[grox]"), "{written}");
+
+        restore_grox_provider_backend_overrides(&home).unwrap();
+        assert!(!std::fs::read_to_string(home.join("config.toml")).unwrap().contains("[grox]"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn stale_relay_sections_do_not_override_a_user_selected_default() {
+        let home = std::env::temp_dir().join(format!(
+            "grox-provider-user-default-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        apply_grox_provider_sections(
+            &home,
+            &["grok-4.5".into()],
+            "https://relay.example/v1",
+            "grok-4.5",
+            "chat_completions",
+        )
+        .unwrap();
+
+        let path = home.join("config.toml");
+        let mut document = parse_grok_config_document(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        set_models_default_model(&mut document, Some("grok-4.5")).unwrap();
+        std::fs::write(&path, document.to_string()).unwrap();
+
+        assert_eq!(resolve_agent_model_id(&home, "grok-4.5").unwrap(), "grok-4.5");
+        restore_grox_provider_backend_overrides(&home).unwrap();
+        let restored = std::fs::read_to_string(&path).unwrap();
+        assert!(restored.contains("default = \"grok-4.5\""), "{restored}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn legacy_borrowed_sections_are_migrated_to_owned_ones() {
+        // v0.3.3 的布局：中转配置借用了官方段，并且有一份备份文件。升级后
+        // 必须迁移成 Grox 自有段，且把借用的官方段完整还回去。
+        let home = std::env::temp_dir().join(format!(
+            "grox-provider-migrate-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let config = home.join("config.toml");
+        std::fs::write(
+            &config,
+            concat!(
+                "[model.\"grok-4.5\"]\n",
+                "env_key = \"XAI_API_KEY\"\n",
+                "base_url = \"https://old-relay.example/v1\"\n",
+                "api_backend = \"chat_completions\"\n",
+                "model = \"relay-model\"\n",
+            ),
+        )
+        .unwrap();
+        // 旧备份说明 grok-4.5 段本来不存在，是 Grox 创建的。
+        std::fs::write(
+            home.join("grox-provider-backend-overrides.json"),
+            r#"{"models":{"grok-4.5":{"modelExisted":false,"envKey":null,"baseUrl":null,"apiBackend":null,"model":null}}}"#,
+        )
+        .unwrap();
+
+        apply_grox_provider_sections(
+            &home,
+            &["relay-model".into()],
+            "https://new-relay.example/v1",
+            "relay-model",
+            "chat_completions",
+        )
+        .unwrap();
+
+        let written = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            !written.contains("old-relay.example"),
+            "借用官方段的旧写法必须被清除：{written}"
+        );
+        assert!(!written.contains("[model.\"grok-4.5\"]"), "{written}");
+        // 段名不含点号时 TOML 不需要引号，两种写法都接受。
+        assert!(
+            written.contains("[model.grox-relay-relay-model]")
+                || written.contains("[model.\"grox-relay-relay-model\"]"),
+            "{written}"
+        );
+        assert!(!written.contains("[grox]"), "{written}");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn legacy_grox_metadata_is_removed_from_cli_config() {
+        let home = std::env::temp_dir().join(format!(
+            "grox-account-mode-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let config = home.join("config.toml");
+
+        std::fs::write(
+            &config,
+            "[grox]\naccount_mode = \"official\"\nactive_provider_id = \"provider-1\"\n",
+        )
+        .unwrap();
+        assert_eq!(legacy_grox_account_mode(&home).unwrap().as_deref(), Some("official"));
+        clear_legacy_grox_metadata(&home).unwrap();
+        assert!(!std::fs::read_to_string(&config).unwrap().contains("[grox]"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn provider_backend_never_touches_a_user_owned_model_section() {
+        // Grox 只写带前缀的自有段，从不借用用户已有的 `[model.*]`。没有借用
+        // 就不需要备份文件 —— 这正是备份/还原那条影子数据源可以删掉的原因。
+        let home = std::env::temp_dir().join(format!(
+            "grox-provider-no-borrow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let config = home.join("config.toml");
+        // 用户自己配的同名模型，带私有密钥。
+        let user_owned = "[model.\"gpt-5.4\"]\napi_key = \"user-private-key\"\nbase_url = \"https://user-own.example/v1\"\n";
+        std::fs::write(&config, user_owned).unwrap();
+
+        apply_grox_provider_sections(
+            &home,
+            &["gpt-5.4".into()],
+            "https://relay.example/v1",
+            "gpt-5.4",
+            "chat_completions",
+        )
+        .unwrap();
+
+        let written = std::fs::read_to_string(&config).unwrap();
+        assert!(
+            written.contains("api_key = \"user-private-key\"")
+                && written.contains("https://user-own.example/v1"),
+            "用户自有段必须原样保留：{written}"
+        );
+        assert!(written.contains("[model.\"grox-relay-gpt-5.4\"]"), "{written}");
+
+        restore_grox_provider_backend_overrides(&home).unwrap();
+        let restored = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(
+            restored.trim(),
+            user_owned.trim(),
+            "还原后 config.toml 必须逐字回到原样"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn provider_backend_writes_reasoning_gate_and_default_route() {
+        let home = std::env::temp_dir().join(format!(
+            "grox-provider-route-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let config = home.join("config.toml");
+        std::fs::write(&config, "[ui]\nmax_thoughts_width = 120\n").unwrap();
+
+        apply_grox_provider_sections(
+            &home,
+            &["deepseek-v4-flash".into(), "deepseek-v4-pro".into()],
+            "https://api.deepseek.com/v1",
+            "deepseek-v4-flash",
+            "chat_completions",
+        )
+        .unwrap();
+
+        let written = std::fs::read_to_string(&config).unwrap();
+        // 没有这个开关，CLI 不会转发 reasoning effort，会话里就看不到思考内容。
+        assert_eq!(
+            written.matches("supports_reasoning_effort = true").count(),
+            2,
+            "每个中转模型都要带推理开关：{written}"
+        );
+        // 官方文档的切换方式：默认模型指向自己的段，而不是改写官方段。
+        assert!(written.contains("default = \"grox-relay-deepseek-v4-flash\""), "{written}");
+        assert!(!written.contains("[model.\"grok-4.5\"]"), "{written}");
+        assert!(!written.contains("[model.\"grok-4.6\"]"), "{written}");
+        assert!(written.contains("max_thoughts_width = 120"), "用户原有配置必须保留");
+
+        restore_grox_provider_backend_overrides(&home).unwrap();
+        let restored = std::fs::read_to_string(&config).unwrap();
+        assert!(!restored.contains("deepseek"), "还原后不能残留中转配置：{restored}");
+        assert!(!restored.contains("supports_reasoning_effort"), "{restored}");
+        assert!(
+            !restored.contains("default ="),
+            "还原后必须清掉指向已删除段的默认路由：{restored}"
+        );
+        assert!(restored.contains("max_thoughts_width = 120"), "用户原有配置必须保留");
+        std::fs::remove_dir_all(&home).ok();
+    }
     #[test]
     fn compatible_model_auth_override_wins_without_damaging_existing_toml() {
         let mut document = parse_grok_config_document(

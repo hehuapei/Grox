@@ -8,11 +8,31 @@
 use std::{collections::BTreeMap, fs, path::Path};
 
 use serde::{Deserialize, Serialize};
-
 pub(crate) const GROX_PROVIDER_KIND_KEY: &str = "GROX_PROVIDER_KIND";
 pub(crate) const GROX_PROVIDER_PROFILE_ID_KEY: &str = "GROX_PROVIDER_PROFILE_ID";
 pub(crate) const GROK_MODELS_BASE_URL_KEY: &str = "GROK_MODELS_BASE_URL";
 pub(crate) const SECRET_REF_DIRECT_COMPATIBLE: &str = "provider:direct-compatible";
+/// Grox 自有配置段的前缀。
+pub(crate) const RELAY_SECTION_PREFIX: &str = "grox-relay-";
+
+/// 中转档案在 config.toml 里的段名。
+///
+/// 段名只是路由名，上游真实模型名单独写在段内的 `model =` 里 —— 这是 Grok
+/// Build 文档给出的自定义中转写法。两者解耦之后，第三方反代完全可以暴露
+/// `grok-4.5`：它落在 `[model."grox-relay-grok-4.5"]`，官方的
+/// `[model."grok-4.5"]` 原封不动，两条链路互不干扰。
+///
+/// 所有中转段一律带前缀，而不是只给冲突的模型名加。Grox 因此只写自己的段，
+/// 从不借用用户已有的 `[model.*]`；没有借用就不需要备份和还原，`[model.*]`
+/// 里带前缀的段可以直接删除，不必记住它原来是什么样子。
+pub(crate) fn provider_section_id(model_id: &str) -> String {
+    format!("{RELAY_SECTION_PREFIX}{}", model_id.trim())
+}
+
+/// 该段是否由 Grox 写入（因而可以安全整段删除）。
+pub(crate) fn is_relay_section_id(section_id: &str) -> bool {
+    section_id.starts_with(RELAY_SECTION_PREFIX)
+}
 
 #[derive(Clone, Copy, Default, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -90,10 +110,6 @@ impl StoredProviderProfile {
             }
         }
         canonicalize_resident_models(&mut models, &self.available_models);
-        // Grok Build 0.2.x still uses grok-4.5 for session-title generation.
-        if !models.iter().any(|model| model == "grok-4.5") {
-            models.push("grok-4.5".to_string());
-        }
         models
     }
 
@@ -190,6 +206,8 @@ impl ProviderProfileUpdate {
 pub(crate) struct ProviderProfilesFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     active_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_mode: Option<String>,
     #[serde(default)]
     profiles: Vec<StoredProviderProfile>,
 }
@@ -283,6 +301,31 @@ impl ProviderProfilesFile {
 
     pub(crate) fn profile(&self, id: &str) -> Option<&StoredProviderProfile> {
         self.profiles.iter().find(|profile| profile.id == id)
+    }
+
+    pub(crate) fn active_id(&self) -> Option<&str> {
+        self.active_id.as_deref()
+    }
+
+    pub(crate) fn set_active_id(&mut self, id: Option<&str>) {
+        self.active_id = id.map(str::to_owned);
+    }
+
+    pub(crate) fn account_mode(&self) -> Result<&str, String> {
+        match self.account_mode.as_deref() {
+            None => Ok("oauth"),
+            Some("official") => Ok("official"),
+            Some(mode) => Err(format!("未知的账户接入方式：{mode}")),
+        }
+    }
+
+    pub(crate) fn set_account_mode(&mut self, mode: &str) -> Result<(), String> {
+        self.account_mode = match mode {
+            "oauth" | "compatible" => None,
+            "official" => Some("official".to_string()),
+            _ => return Err(format!("未知的账户接入方式：{mode}")),
+        };
+        Ok(())
     }
 
     pub(crate) fn upsert_profile<Normalize>(
@@ -394,25 +437,6 @@ impl ProviderProfilesFile {
         self.profiles.iter().find(|profile| {
             profile.matches_managed_endpoint(id, base, &normalize_endpoint)
         })
-    }
-
-    pub(crate) fn compatible_secret_reference<Normalize>(
-        &self,
-        managed: &BTreeMap<String, String>,
-        normalize_endpoint: Normalize,
-    ) -> Result<String, String>
-    where
-        Normalize: Fn(&str, bool) -> Result<String, String>,
-    {
-        if let Some(profile) = self.profile_for_managed_values(managed, normalize_endpoint) {
-            return Ok(provider_profile_secret_ref(&profile.id));
-        }
-        if let Some(id) = managed.get(GROX_PROVIDER_PROFILE_ID_KEY) {
-            return Err(format!(
-                "活动供应商档案 {id} 不存在，或服务地址与活动元数据不一致"
-            ));
-        }
-        Ok(SECRET_REF_DIRECT_COMPATIBLE.to_string())
     }
 
     pub(crate) fn take_legacy_secrets(&mut self) -> Vec<(String, String)> {
@@ -612,6 +636,7 @@ mod tests {
     fn write_profiles(path: &Path, id: &str, base_url: &str) {
         let value = ProviderProfilesFile {
             active_id: Some(id.into()),
+            account_mode: None,
             profiles: vec![test_profile(id, base_url)],
         };
         fs::write(path, value.to_pretty_json().unwrap()).unwrap();
@@ -772,6 +797,7 @@ mod tests {
         let profile = test_profile("provider-backup", "https://gateway.example/v1");
         let mut value = serde_json::to_value(ProviderProfilesFile {
             active_id: Some(profile.id.clone()),
+            account_mode: None,
             profiles: vec![profile],
         })
         .unwrap();
@@ -821,6 +847,18 @@ mod tests {
     }
 
     #[test]
+    fn runtime_metadata_stays_in_the_owned_profile_file() {
+        let mut profiles = ProviderProfilesFile::default();
+        profiles.set_active_id(Some("provider-primary"));
+        profiles.set_account_mode("official").unwrap();
+
+        let encoded = profiles.to_pretty_json().unwrap();
+        let decoded: ProviderProfilesFile = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded.active_id(), Some("provider-primary"));
+        assert_eq!(decoded.account_mode().unwrap(), "official");
+    }
+
+    #[test]
     fn corrupt_existing_primary_is_preserved_and_blocks_recovery() {
         let root = test_root("corrupt-primary");
         let primary = root.join("grox-providers.json");
@@ -845,102 +883,6 @@ mod tests {
         assert_eq!(fs::read_to_string(&primary).unwrap(), "{corrupt-primary");
         assert!(backup.exists());
         fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn recovery_facade_uses_injected_policy_and_atomic_publisher() {
-        let root = test_root("facade");
-        let primary = root.join("grox-providers.json");
-        let backup = root.join("grox-providers.corrupt-100.bak");
-        write_profiles(&backup, "provider-backup", "HTTPS://gateway.example/v1/");
-        let normalize_calls = AtomicUsize::new(0);
-        let create_calls = AtomicUsize::new(0);
-
-        let recovered = ProviderProfilesFile::read_with_recovery(
-            &primary,
-            &managed("provider-backup", "https://GATEWAY.example/v1"),
-            read_text,
-            |path, content| {
-                create_calls.fetch_add(1, Ordering::Relaxed);
-                create_private(path, content)
-            },
-            |value, _| {
-                normalize_calls.fetch_add(1, Ordering::Relaxed);
-                Ok(value.to_ascii_lowercase().trim_end_matches('/').to_string())
-            },
-        )
-        .unwrap();
-
-        assert!(recovered.profile("provider-backup").is_some());
-        assert_eq!(
-            recovered
-                .compatible_secret_reference(
-                    &managed("provider-backup", "https://GATEWAY.example/v1"),
-                    |value, _| {
-                        Ok(value.to_ascii_lowercase().trim_end_matches('/').to_string())
-                    },
-                )
-                .unwrap(),
-            "provider:provider-backup"
-        );
-        assert_eq!(normalize_calls.load(Ordering::Relaxed), 2);
-        assert_eq!(create_calls.load(Ordering::Relaxed), 1);
-        assert!(primary.exists());
-        assert!(backup.exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn managed_profile_reference_is_single_source_for_v032_metadata() {
-        let mut profiles = ProviderProfilesFile::default();
-        profiles.upsert_profile(
-            ProviderProfileUpdate::new(
-                "provider-test".into(),
-                "Test".into(),
-                "https://gateway.example.com/v1".into(),
-                ProviderApiBackend::Auto,
-            ),
-            false,
-            normalize,
-        );
-        profiles.active_id = Some("provider-test".into());
-        let mut values = BTreeMap::from([
-            (GROX_PROVIDER_KIND_KEY.into(), "compatible".into()),
-            (
-                GROK_MODELS_BASE_URL_KEY.into(),
-                "https://gateway.example.com/v1".into(),
-            ),
-        ]);
-
-        assert_eq!(
-            profiles
-                .compatible_secret_reference(&values, normalize)
-                .unwrap(),
-            SECRET_REF_DIRECT_COMPATIBLE
-        );
-        values.insert(GROX_PROVIDER_PROFILE_ID_KEY.into(), "provider-test".into());
-        assert_eq!(
-            profiles
-                .compatible_secret_reference(&values, normalize)
-                .unwrap(),
-            "provider:provider-test"
-        );
-        values.insert(
-            GROK_MODELS_BASE_URL_KEY.into(),
-            "https://other.example/v1".into(),
-        );
-        assert!(profiles
-            .compatible_secret_reference(&values, normalize)
-            .is_err());
-    }
-
-    #[test]
-    fn missing_profile_row_remains_fail_closed_when_metadata_has_id() {
-        let profiles = ProviderProfilesFile::default();
-        let values = managed("provider-missing", "https://gateway.example.com/v1");
-        assert!(profiles
-            .compatible_secret_reference(&values, normalize)
-            .is_err());
     }
 
     #[test]

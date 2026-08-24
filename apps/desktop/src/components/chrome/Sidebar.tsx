@@ -10,6 +10,7 @@ import type { Session, SessionMeta, SessionStatus } from "../../bridge/types";
 import { BlackHole } from "../fx/BlackHole";
 import { normalizeSessionQuery, sessionMatchesLoadedContent } from "../../lib/sessionSearch";
 import { projectId, samePath } from "../../lib/projectCatalog";
+import { useImeGuard } from "../../lib/ime";
 import { ConfirmDialog } from "../common/ConfirmDialog";
 
 export function Sidebar({ onRequestHide }: { onRequestHide?: () => void } = {}) {
@@ -375,6 +376,7 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
   const [editing, setEditing] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [draft, setDraft] = useState(project.name);
+  const { onCompositionStart, onCompositionEnd, isImeBlocking } = useImeGuard();
   const commit = () => {
     setEditing(false);
     renameProject(project.id, draft);
@@ -399,7 +401,10 @@ function ProjectRow({ project, active, expanded, count, onToggle }: { project: P
             value={draft}
             onChange={(event) => setDraft(event.target.value)}
             onBlur={commit}
+            onCompositionStart={onCompositionStart}
+            onCompositionEnd={onCompositionEnd}
             onKeyDown={(event) => {
+              if (isImeBlocking(event)) return;
               if (event.key === "Enter") event.currentTarget.blur();
             }}
             className="min-w-0 flex-1 border border-line3 bg-void px-1 text-[10.5px] outline-none"
@@ -504,6 +509,7 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
   const [confirmExport, setConfirmExport] = useState(false);
   const displayTitle = missionTitle(meta, language);
   const [draft, setDraft] = useState(displayTitle);
+  const { onCompositionStart, onCompositionEnd, isImeBlocking } = useImeGuard();
   const commit = () => {
     setEditing(false);
     const title = draft.trim();
@@ -524,7 +530,7 @@ function MissionRow({ meta, status, completionUnread, active, tokens, onOpen }: 
         <SessionStatusLight status={status} completionUnread={completionUnread} />
         <span className={status === "idle" || status === "failed" || status === "cancelled" ? "opacity-55" : ""}><BlackHole size={11} spin={status === "running" ? true : status === "idle" || status === "failed" || status === "cancelled" || status === "disconnected" ? false : "slow"} /></span>
         {editing ? (
-          <input autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={commit} onKeyDown={(event) => event.key === "Enter" && commit()} onClick={(event) => event.stopPropagation()} className="min-w-0 flex-1 border border-line3 bg-void px-1 text-[11px] text-fg outline-none" />
+          <input autoFocus value={draft} onChange={(event) => setDraft(event.target.value)} onBlur={commit} onCompositionStart={onCompositionStart} onCompositionEnd={onCompositionEnd} onKeyDown={(event) => { if (isImeBlocking(event)) return; if (event.key === "Enter") commit(); }} onClick={(event) => event.stopPropagation()} className="min-w-0 flex-1 border border-line3 bg-void px-1 text-[11px] text-fg outline-none" />
         ) : (
           <span className={`min-w-0 flex-1 truncate text-[12px] ${meta.title?.trim() ? "text-fg2" : "text-faint italic"}`} title={meta.id}>
             {displayTitle}

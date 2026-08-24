@@ -48,6 +48,7 @@ interface HostActiveBlockSnapshot {
 }
 
 interface InteractionInternals {
+  diagnostics: string[];
   liveAssistantSessions: Set<string>;
   catalogue: Map<string, { id: string; title: string; cwd: string; createdAt: number; updatedAt: number; model: string; turns: number }>;
   projectHostInteraction(interaction: HostInteraction): void;
@@ -56,6 +57,7 @@ interface InteractionInternals {
   projectHostSessionEvent(event: HostSessionEvent): void;
   projectHostActiveBlockSnapshots(snapshots: HostActiveBlockSnapshot[]): void;
   hostEventWaitsForToolMedia(event: HostSessionEvent): boolean;
+  queueStreamAppend(event: Extract<BridgeEvent, { type: "assistant_append" | "thinking_append" }>): void;
   flushStreamAppends(sessionId?: string): void;
 }
 
@@ -70,6 +72,46 @@ function bridgeHarness() {
 }
 
 describe("AcpBridge Host interaction projection", () => {
+  it("keeps repeated GFM divider cells that the model-loop guard would drop", () => {
+    // 多列表格的分隔行会以完全相同的短分片连续到达。丢掉其中任何一个单元，
+    // 列数就对不上，整张表退化成一个段落。
+    const { events, internal } = bridgeHarness();
+    for (let index = 0; index < 6; index += 1) {
+      internal.queueStreamAppend({
+        type: "assistant_append",
+        sessionId: "session-a",
+        blockId: "block-1",
+        delta: "---|",
+      });
+    }
+    internal.flushStreamAppends();
+
+    const appended = events
+      .filter((event) => event.type === "assistant_append")
+      .map((event) => event.delta)
+      .join("");
+    expect(appended).toBe("---|".repeat(6));
+  });
+
+  it("keeps repeated prose chunks lossless", () => {
+    const { events, internal } = bridgeHarness();
+    for (let index = 0; index < 6; index += 1) {
+      internal.queueStreamAppend({
+        type: "assistant_append",
+        sessionId: "session-b",
+        blockId: "block-1",
+        delta: "again ",
+      });
+    }
+    internal.flushStreamAppends();
+
+    const appended = events
+      .filter((event) => event.type === "assistant_append")
+      .map((event) => event.delta)
+      .join("");
+    expect(appended).toBe("again ".repeat(6));
+  });
+
   it("projects early and resumed session summaries idempotently across payload casing", () => {
     const { events, internal } = bridgeHarness();
     internal.catalogue.set("session-a", {
@@ -215,6 +257,20 @@ describe("AcpBridge Host interaction projection", () => {
         event.type === "runtime_notice",
     );
     expect(notice?.notice.id).toBe("error-protocol-CLIENT_CALLBACK_HOST_BYPASSED");
+  });
+
+  it("keeps an unowned late response in diagnostics without alarming the user", () => {
+    const { events, internal } = bridgeHarness();
+    internal.projectHostSessionEvent({
+      streamId: "host-stream-late-response",
+      sequence: 1,
+      generation: 7,
+      receivedAt: 42,
+      projection: { kind: "orphan_response" },
+    });
+
+    expect(events.some((event) => event.type === "runtime_notice")).toBe(false);
+    expect(internal.diagnostics.at(-1)).toContain("ACP_ORPHAN_RESPONSE");
   });
 
   it("projects a Host-created automation session without asking WebView to create it", () => {
@@ -566,5 +622,103 @@ describe("AcpBridge Host interaction projection", () => {
         entry.type === "runtime_notice",
     );
     expect(notice?.notice.id).toBe("error-protocol-ACP_EVENT_REPLAY_GAP");
+  });
+});
+
+describe("AcpBridge live streaming projection", () => {
+  const hostEvent = (
+    sequence: number,
+    updateType: string,
+    update: unknown,
+    blockOps: HostBlockOperation[],
+  ): HostSessionEvent => ({
+    streamId: "host-stream-live",
+    sequence,
+    generation: 1,
+    receivedAt: 1_000 + sequence,
+    sessionId: "session-live",
+    updateType,
+    journalRecoverable: true,
+    projection: {
+      kind: "session_update",
+      channel: "session",
+      sessionId: "session-live",
+      updateType,
+      update,
+      blockOps,
+    },
+  });
+
+  it("emits a tool block as soon as the host reports the call", () => {
+    // 回合进行中工具卡必须立刻出现，不能等到回合结束才一次性冒出来。
+    const { events, internal } = bridgeHarness();
+    internal.projectHostSessionEvent(hostEvent(
+      1,
+      "tool_call",
+      { sessionUpdate: "tool_call", toolCallId: "call-1", title: "search", status: "pending" },
+      [{ action: "open", blockType: "tool", blockId: "tool-block-1", sourceId: "call-1", startedAt: 1_001 }],
+    ));
+
+    const added = events.filter((event) => event.type === "block_add");
+    expect(added).toHaveLength(1);
+    expect(added[0]).toMatchObject({ sessionId: "session-live" });
+  });
+
+  it("emits assistant text incrementally rather than only at turn end", () => {
+    const { events, internal } = bridgeHarness();
+    for (const [sequence, text] of [[1, "第一段"], [2, "第二段"]] as const) {
+      internal.projectHostSessionEvent(hostEvent(
+        sequence,
+        "agent_message_chunk",
+        { sessionUpdate: "agent_message_chunk", content: { type: "text", text } },
+        [{
+          action: sequence === 1 ? "open" : "update",
+          blockType: "assistant",
+          blockId: "assistant-block-1",
+          startedAt: 1_001,
+        }],
+      ));
+    }
+    internal.flushStreamAppends();
+
+    expect(events.some((event) => event.type === "block_add")).toBe(true);
+    const streamed = events
+      .filter((event) => event.type === "assistant_append")
+      .map((event) => event.delta)
+      .join("");
+    expect(streamed).toBe("第一段第二段");
+  });
+
+  it("projects thinking, tools and final text through the same live event path", () => {
+    const { events, internal } = bridgeHarness();
+    internal.projectHostSessionEvent(hostEvent(
+      1,
+      "agent_thought_chunk",
+      { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "先分析" } },
+      [{ action: "open", blockType: "thinking", blockId: "thinking-1", startedAt: 1_001 }],
+    ));
+    internal.projectHostSessionEvent(hostEvent(
+      2,
+      "tool_call",
+      { sessionUpdate: "tool_call", toolCallId: "call-1", title: "web_search", status: "pending" },
+      [
+        { action: "close", blockType: "thinking", blockId: "thinking-1", startedAt: 1_001 },
+        { action: "open", blockType: "tool", blockId: "tool-1", sourceId: "call-1", startedAt: 1_002 },
+      ],
+    ));
+    internal.projectHostSessionEvent(hostEvent(
+      3,
+      "agent_message_chunk",
+      { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "最终答案" } },
+      [{ action: "open", blockType: "assistant", blockId: "assistant-1", startedAt: 1_003 }],
+    ));
+    internal.flushStreamAppends();
+
+    const addedTypes = events
+      .filter((event): event is Extract<BridgeEvent, { type: "block_add" }> => event.type === "block_add")
+      .map((event) => event.block.type);
+    expect(addedTypes).toEqual(["thinking", "tool", "assistant"]);
+    expect(events.some((event) => event.type === "thinking_append" && event.delta === "先分析")).toBe(true);
+    expect(events.some((event) => event.type === "assistant_append" && event.delta === "最终答案")).toBe(true);
   });
 });

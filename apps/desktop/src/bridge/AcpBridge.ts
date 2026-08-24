@@ -36,7 +36,6 @@ import type {
   PromptAttachment,
   SaveProviderProfile,
   FetchProviderModels,
-  NetworkProxyConfig,
   RewindMode,
   RewindPoint,
   RewindResult,
@@ -1060,7 +1059,6 @@ export class AcpBridge implements GrokBridge {
   private recoveredReplaySessions = new Set<string>();
   private automationStartedSessions = new Set<string>();
   private streamAppends = new Map<string, Extract<BridgeEvent, { type: "assistant_append" | "thinking_append" }>>();
-  private repeatedDeltas = new Map<string, { value: string; count: number }>();
   private streamFlushTimer: number | undefined;
   private toolPatches = new Map<string, Extract<BridgeEvent, { type: "tool_patch" }>>();
   private toolFlushTimer: number | undefined;
@@ -1158,23 +1156,9 @@ export class AcpBridge implements GrokBridge {
 
   private queueStreamAppend(event: Extract<BridgeEvent, { type: "assistant_append" | "thinking_append" }>) {
     const key = `${event.type}:${event.sessionId}:${event.blockId}`;
-    // Guard against pathological model loops without touching Markdown syntax.
-    // In particular, GFM table divider rows are long runs of `-`; collapsing
-    // those dashes makes the otherwise valid table become one plain paragraph.
-    const delta = event.delta.replace(/(.{1,16})\1{5,}/gu, (match, unit: string) => (
-      /[|`~*_#[\]():-]/u.test(unit) ? match : `${unit}${unit}…`
-    ));
-    if (!delta) return;
-    const previous = this.repeatedDeltas.get(key);
-    if (previous?.value === delta && delta.trim().length <= 24) {
-      const count = previous.count + 1;
-      this.repeatedDeltas.set(key, { value: delta, count });
-      if (count >= 4) return;
-    } else {
-      this.repeatedDeltas.set(key, { value: delta, count: 1 });
-    }
+    if (!event.delta) return;
     const pending = this.streamAppends.get(key);
-    this.streamAppends.set(key, pending ? { ...pending, delta: pending.delta + delta } : { ...event, delta });
+    this.streamAppends.set(key, pending ? { ...pending, delta: pending.delta + event.delta } : event);
     if (this.streamFlushTimer === undefined) {
       this.streamFlushTimer = window.setTimeout(() => this.flushStreamAppends(), STREAM_FLUSH_MS);
     }
@@ -1839,18 +1823,6 @@ export class AcpBridge implements GrokBridge {
     this.replayCursors.clear();
     this.openToolCalls.clear();
     this.sessionOptions.clear();
-    this.streamAppends.clear();
-    this.repeatedDeltas.clear();
-    this.toolPatches.clear();
-    this.replaying.clear();
-    this.pendingCanonicalReplays.clear();
-    this.canonicalReplaySessions.clear();
-    this.liveAssistantSessions.clear();
-    this.foregroundTurnIds.clear();
-    this.stoppingSessions.clear();
-    this.loadPromises.clear();
-    this.activePromptSessions.clear();
-    this.reconcileHostInteractions([]);
     this.knownSessions.clear();
     this.workflowChildTraces.clear();
     this.cancelledWorkflowRuns.clear();
@@ -2017,12 +1989,10 @@ export class AcpBridge implements GrokBridge {
         this.onNotification(projection.method, projection.params);
         return false;
       case "orphan_response":
-        // 正常响应已由原生 Host 定向交付；进入事件流的响应没有请求归属。
-        this.emitProtocolNotice(
-          "ACP_ORPHAN_RESPONSE",
-          "收到无法归属到当前请求的 ACP 响应",
-          "若会话状态异常，请重新打开该会话",
-        );
+        // 请求本身已由 Host 完成、取消或超时；没有归属的迟到/重复响应不能
+        // 改写任何会话，也不应冒充用户可处理的当前请求错误。
+        this.diagnostics.push("ACP_ORPHAN_RESPONSE：Host 隔离了迟到或重复的 ACP 响应");
+        this.diagnostics = this.diagnostics.slice(-20);
         return false;
       case "protocol_error":
         this.diagnostics.push(`${projection.code}：${projection.message}`);
@@ -2192,12 +2162,9 @@ export class AcpBridge implements GrokBridge {
           patch: {
             type: "thinking",
             live: false,
-            elapsedMs: operation.startedAt ? Date.now() - operation.startedAt : undefined,
+            elapsedMs: !this.replaying.has(sessionId) && operation.startedAt ? Date.now() - operation.startedAt : undefined,
           } as Partial<SessionBlock>,
         });
-      }
-      for (const key of this.repeatedDeltas.keys()) {
-        if (key.includes(`:${sessionId}:${operation.blockId}`)) this.repeatedDeltas.delete(key);
       }
     }
   }
@@ -2764,12 +2731,9 @@ export class AcpBridge implements GrokBridge {
         patch: {
           type: "thinking",
           live: false,
-          elapsedMs: cursor.thinkingStartedAt ? Date.now() - cursor.thinkingStartedAt : undefined,
+          elapsedMs: !this.replaying.has(sessionId) && cursor.thinkingStartedAt ? Date.now() - cursor.thinkingStartedAt : undefined,
         } as Partial<SessionBlock>,
       });
-      for (const key of this.repeatedDeltas.keys()) {
-        if (key.includes(`:${sessionId}:${cursor.thinkingId}`)) this.repeatedDeltas.delete(key);
-      }
       cursor.thinkingId = undefined;
       cursor.thinkingStartedAt = undefined;
     }
@@ -2794,9 +2758,6 @@ export class AcpBridge implements GrokBridge {
         blockId: cursor.assistantId,
         patch: { type: "assistant", streaming: false } as Partial<SessionBlock>,
       });
-      for (const key of this.repeatedDeltas.keys()) {
-        if (key.includes(`:${sessionId}:${cursor.assistantId}`)) this.repeatedDeltas.delete(key);
-      }
       cursor.assistantId = undefined;
     }
   }
@@ -3314,25 +3275,6 @@ export class AcpBridge implements GrokBridge {
     } else {
       await invoke("delete_provider_profile", { id });
     }
-  }
-
-  async getNetworkProxy(): Promise<NetworkProxyConfig> {
-    return invoke<NetworkProxyConfig>("read_network_proxy");
-  }
-
-  async setNetworkProxy(config: NetworkProxyConfig, reconnect = true): Promise<void> {
-    const previous = await this.getNetworkProxy();
-    if (!reconnect) {
-      await invoke<NetworkProxyConfig>("write_network_proxy", { request: config });
-      return;
-    }
-    if (previous.enabled === config.enabled && previous.url === config.url.trim().replace(/\/$/, "")) {
-      await invoke<NetworkProxyConfig>("write_network_proxy", { request: config });
-      return;
-    }
-    await this.reconfigureRuntime(() =>
-      invoke<NetworkProxyConfig>("write_network_proxy", { request: config }),
-    );
   }
 
   async readConfigDocuments(cwd: string): Promise<ConfigDocument[]> {
@@ -4221,52 +4163,16 @@ export class AcpBridge implements GrokBridge {
       cwd: meta?.cwd ?? this.workspace,
       generation: this.acpGeneration,
     });
-    this.clearSessionState(id);
-  }
-
-  private clearSessionState(sessionId: string) {
-    this.catalogue.delete(sessionId);
-    this.activeComputerSessions.delete(sessionId);
-    this.openToolCalls.delete(sessionId);
+    this.catalogue.delete(id);
+    this.activeComputerSessions.delete(id);
+    this.openToolCalls.delete(id);
     for (const key of this.activeComputerToolCalls) {
-      if (key.startsWith(`${sessionId}:`)) this.activeComputerToolCalls.delete(key);
+      if (key.startsWith(`${id}:`)) this.activeComputerToolCalls.delete(key);
     }
-    for (const [key, event] of this.streamAppends) {
-      if (event.sessionId === sessionId) this.streamAppends.delete(key);
-    }
-    for (const key of this.repeatedDeltas.keys()) {
-      if (key.includes(`:${sessionId}:`)) this.repeatedDeltas.delete(key);
-    }
-    for (const [key, event] of this.toolPatches) {
-      if (event.sessionId === sessionId) this.toolPatches.delete(key);
-    }
-    for (const [blockId, interaction] of this.hostInteractions) {
-      if (interaction.sessionId !== sessionId) continue;
-      this.hostInteractions.delete(blockId);
-      this.resolvingInteractions.delete(blockId);
-    }
-    for (const [childSessionId, child] of this.workflowChildTraces) {
-      if (childSessionId === sessionId || child.sessionId === sessionId) {
-        this.workflowChildTraces.delete(childSessionId);
-      }
-    }
-    this.cancelledWorkflowRuns.delete(sessionId);
-    this.replaying.delete(sessionId);
-    this.pendingCanonicalReplays.delete(sessionId);
-    this.canonicalReplaySessions.delete(sessionId);
-    this.activePromptSessions.delete(sessionId);
-    this.liveAssistantSessions.delete(sessionId);
-    this.foregroundTurnIds.delete(sessionId);
-    this.stoppingSessions.delete(sessionId);
-    this.loadPromises.delete(sessionId);
-    this.recoveredReplaySessions.delete(sessionId);
-    this.automationStartedSessions.delete(sessionId);
-    this.knownSessions.delete(sessionId);
-    this.forgetToolImagePersistence(sessionId);
-    this.replayCursors.delete(sessionId);
-    this.sessionOptions.delete(sessionId);
-    this.usage.delete(sessionId);
-    this.forgetRewoundSession(sessionId);
+    this.knownSessions.delete(id);
+    this.forgetToolImagePersistence(id);
+    this.replayCursors.delete(id);
+    this.usage.delete(id);
   }
 
   async closeSession(id: string): Promise<void> {

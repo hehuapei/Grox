@@ -689,12 +689,14 @@ fn truncate_utf8_tail(buffer: &mut Vec<u8>, limit: usize) -> bool {
         buffer.clear();
         return true;
     }
-    let text = String::from_utf8_lossy(buffer);
-    let mut start = text.len().saturating_sub(limit);
-    while start < text.len() && !text.is_char_boundary(start) {
+    // 只按字节裁剪：缓冲区尾部常常是一个被读取分片切断的多字节字符，
+    // 它的剩余字节会随下一片到达。若在这里做 lossy 转换，半个字符会被
+    // 永久替换成 U+FFFD，中文输出就会在每个分片边界上留下乱码。
+    let mut start = buffer.len() - limit;
+    while start < buffer.len() && buffer[start] & 0b1100_0000 == 0b1000_0000 {
         start += 1;
     }
-    *buffer = text.as_bytes()[start..].to_vec();
+    buffer.drain(..start);
     true
 }
 
@@ -775,6 +777,21 @@ mod tests {
         let output = String::from_utf8(output).unwrap();
         assert!(output.ends_with("-tail"));
         assert!(output.len() <= 8);
+    }
+
+    #[test]
+    fn output_truncation_preserves_multibyte_char_split_across_chunks() {
+        // 读取分片会把一个中文字符切成两半，先到的字节必须原样保留，
+        // 否则它在下一片到达前就被替换成 U+FFFD，输出永久乱码。
+        let text = "0123456789你好";
+        let bytes = text.as_bytes();
+        let split = bytes.len() - 2;
+        let mut buffer = bytes[..split].to_vec();
+        truncate_utf8_tail(&mut buffer, 8);
+        buffer.extend_from_slice(&bytes[split..]);
+        truncate_utf8_tail(&mut buffer, 8);
+        let output = String::from_utf8(buffer).expect("被切断的字符必须能被后续分片补全");
+        assert!(output.ends_with("你好"), "实际输出：{output}");
     }
 
     #[test]

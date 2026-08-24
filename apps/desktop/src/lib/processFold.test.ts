@@ -9,6 +9,7 @@ import {
   rememberProcessOpen,
   resolveInitialProcessOpen,
   thinkingIsLive,
+  turnHasInspectableProcess,
   turnHasLiveProcess,
   turnHasLiveText,
 } from "./processFold";
@@ -42,14 +43,40 @@ const tool = (status: "running" | "done"): SessionBlock => ({
   },
 });
 
+const plan = (): SessionBlock => ({
+  type: "plan",
+  id: "plan",
+  ts: 4,
+  steps: [],
+});
+
 afterEach(() => {
   clearProcessOpenMemory();
 });
 
 describe("initialProcessOpen", () => {
-  it("starts open only while the turn is live", () => {
+  it("starts open while the turn is live", () => {
     expect(initialProcessOpen(false)).toBe(true);
-    expect(initialProcessOpen(true)).toBe(false);
+  });
+
+  it("keeps a finished turn open when it has thinking / tools / plan", () => {
+    expect(initialProcessOpen(true, true)).toBe(true);
+  });
+
+  it("folds a finished turn that only produced text", () => {
+    expect(initialProcessOpen(true, false)).toBe(false);
+  });
+});
+
+describe("turnHasInspectableProcess", () => {
+  it("treats thinking, tools and plans as an audit trail", () => {
+    expect(turnHasInspectableProcess([thinking(false), assistant()])).toBe(true);
+    expect(turnHasInspectableProcess([tool("done"), assistant()])).toBe(true);
+    expect(turnHasInspectableProcess([plan(), assistant()])).toBe(true);
+  });
+
+  it("reports nothing to inspect for a pure question-and-answer turn", () => {
+    expect(turnHasInspectableProcess([assistant()])).toBe(false);
   });
 });
 
@@ -62,11 +89,22 @@ describe("nextProcessOpenOnCompleteChange", () => {
     })).toBe(true);
   });
 
-  it("collapses when a live turn finishes (Codex-style)", () => {
+  it("keeps thinking and tool calls visible after the turn finishes", () => {
+    // 回归防护：PR #22 曾无条件折叠，用户因此认为模型没思考、没调用工具。
     expect(nextProcessOpenOnCompleteChange({
       wasComplete: false,
       complete: true,
       currentOpen: true,
+      hasInspectableProcess: true,
+    })).toBe(true);
+  });
+
+  it("collapses a finished turn that only produced text", () => {
+    expect(nextProcessOpenOnCompleteChange({
+      wasComplete: false,
+      complete: true,
+      currentOpen: true,
+      hasInspectableProcess: false,
     })).toBe(false);
   });
 
@@ -91,9 +129,15 @@ describe("process open memory (Virtuoso remount safety)", () => {
     expect(readProcessOpen("s1", "t1")).toBe(true);
   });
 
-  it("defaults to Codex policy when nothing remembered", () => {
+  it("defaults by policy when nothing remembered", () => {
     expect(resolveInitialProcessOpen("s1", "t-missing", true)).toBe(false);
+    expect(resolveInitialProcessOpen("s1", "t-missing", true, true)).toBe(true);
     expect(resolveInitialProcessOpen("s1", "t-missing", false)).toBe(true);
+  });
+
+  it("lets a manual collapse survive even when the turn has an audit trail", () => {
+    rememberProcessOpen("s1", "t1", false);
+    expect(resolveInitialProcessOpen("s1", "t1", true, true)).toBe(false);
   });
 
   it("isolates sessions and turns", () => {

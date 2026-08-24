@@ -38,6 +38,7 @@ export function ConfirmDialog({
   return createPortal(
     <div
       className="fixed inset-0 z-[100] flex items-center justify-center bg-void/80 p-5 backdrop-blur-[3px]"
+      onClick={(event) => event.stopPropagation()}
       onMouseDown={(event) => {
         event.stopPropagation();
         if (event.target === event.currentTarget && !working) onCancel();

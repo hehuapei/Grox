@@ -38,6 +38,11 @@ pub(crate) struct ProviderServiceHostOps {
     pub(crate) normalize_endpoint: fn(&str, bool) -> Result<String, String>,
     pub(crate) restore_auth_overrides: fn(&Path) -> Result<(), String>,
     pub(crate) restore_backend_overrides: fn(&Path) -> Result<(), String>,
+    pub(crate) compatible_route_active: fn(&Path) -> Result<bool, String>,
+    pub(crate) legacy_active_profile_id: fn(&Path) -> Result<Option<String>, String>,
+    pub(crate) legacy_account_mode: fn(&Path) -> Result<Option<String>, String>,
+    pub(crate) clear_legacy_metadata: fn(&Path) -> Result<(), String>,
+    /// `(home, model_ids, base_url, primary_model, api_backend)`
     pub(crate) apply_backend_overrides:
         fn(&Path, &[String], &str, &str, &str) -> Result<(), String>,
 }
@@ -145,8 +150,7 @@ pub(crate) struct ConfigureProviderInput {
 
 pub(crate) struct RuntimeProviderEnvironment {
     pub(crate) api_key: Option<String>,
-    pub(crate) base_url: Option<String>,
-    pub(crate) models_url: Option<String>,
+    pub(crate) compatible: bool,
 }
 
 impl ProviderService {
@@ -165,6 +169,9 @@ impl ProviderService {
         })?;
         let active_id = self
             .active_profile(&profiles)
+            .map_err(|error| {
+                ProviderServiceError::storage("PROVIDER_METADATA_READ_FAILED", error)
+            })?
             .map(|profile| profile.id().to_string());
         let summaries = profiles
             .summaries(|reference, legacy| self.secret_state(reference, legacy))
@@ -299,7 +306,7 @@ impl ProviderService {
         let profiles = self.read_profiles().map_err(|error| {
             ProviderServiceError::storage("PROVIDER_PROFILES_READ_FAILED", error)
         })?;
-        let profile = profiles.profile(id).ok_or_else(|| {
+        let profile = profiles.profile(id).cloned().ok_or_else(|| {
             ProviderServiceError::operation("PROVIDER_PROFILE_NOT_FOUND", "供应商档案不存在")
         })?;
         let secret = self
@@ -355,10 +362,10 @@ impl ProviderService {
         let _transaction = provider_transaction();
         self.migrate_legacy_secrets()
             .map_err(|error| ProviderServiceError::storage("SECRET_MIGRATION_FAILED", error))?;
-        let profiles = self.read_profiles().map_err(|error| {
+        let mut profiles = self.read_profiles().map_err(|error| {
             ProviderServiceError::storage("PROVIDER_PROFILES_READ_FAILED", error)
         })?;
-        let profile = profiles.profile(id).ok_or_else(|| {
+        let profile = profiles.profile(id).cloned().ok_or_else(|| {
             ProviderServiceError::operation("PROVIDER_PROFILE_NOT_FOUND", "供应商档案不存在")
         })?;
         self.require_secret(&provider_profile_secret_ref(profile.id()))
@@ -373,7 +380,8 @@ impl ProviderService {
         let backend = profile
             .api_backend()
             .config_value(profile.name(), profile.base_url());
-        let replacement = compatible_provider_metadata(
+        // 仅校验服务地址；供应商本身写在 config.toml 的 `[model.*]` 段里。
+        compatible_provider_metadata(
             profile.base_url(),
             profile.allow_insecure_http(),
             Some(profile.id()),
@@ -393,10 +401,11 @@ impl ProviderService {
                 primary_model,
                 backend,
             )?;
-            (self.host.atomic_write_private)(
-                &path,
-                &replace_managed_env_block(&current, &replacement),
-            )
+            // 迁移：旧版本在 `.env` 里也记了一份供应商，清空它。
+            (self.host.atomic_write_private)(&path, &replace_managed_env_block(&current, ""))?;
+            profiles.set_active_id(Some(profile.id()));
+            profiles.set_account_mode("compatible")?;
+            self.write_profiles(&profiles)
         })();
         if let Err(error) = transition {
             let rollback = (self.host.atomic_write_private)(&path, &current)
@@ -424,6 +433,9 @@ impl ProviderService {
         })?;
         let was_active = self
             .active_profile(&profiles)
+            .map_err(|error| {
+                ProviderServiceError::storage("PROVIDER_METADATA_READ_FAILED", error)
+            })?
             .is_some_and(|active| active.id() == id);
         let active_environment = if was_active {
             let path = self.env_path();
@@ -478,61 +490,39 @@ impl ProviderService {
     }
 
     pub(crate) fn status(&self) -> Result<ProviderStatusSnapshot, ProviderServiceError> {
-        let values = parse_managed_provider_env(&self.env_path(), self.host.read_text);
-        let legacy_key = values
-            .get("XAI_API_KEY")
-            .filter(|value| !value.trim().is_empty());
-        let base_url = values
-            .get(GROK_MODELS_BASE_URL_KEY)
-            .filter(|value| !value.trim().is_empty())
-            .cloned();
-        let kind = match values.get(GROX_PROVIDER_KIND_KEY).map(String::as_str) {
-            Some("oauth") => "oauth",
-            Some("official") => "official",
-            Some("compatible") => "compatible",
-            Some(kind) => {
-                return Err(ProviderServiceError::protocol(
-                    "PROVIDER_METADATA_INVALID",
-                    format!("未知的 Host 供应商模式：{kind}"),
-                    "若持续出现，请升级 Grok Build CLI 并导出会话诊断",
-                ))
-            }
-            None if base_url.is_some() => "compatible",
-            None if legacy_key.is_some() => "official",
-            None => "oauth",
-        };
-        let secret_backend = if legacy_key.is_some() {
-            SecretBackendKind::LegacyFile
+        let profiles = self.read_profiles().map_err(|error| {
+            ProviderServiceError::storage("PROVIDER_PROFILES_READ_FAILED", error)
+        })?;
+        let active = self.active_profile(&profiles).map_err(|error| {
+            ProviderServiceError::storage("PROVIDER_METADATA_READ_FAILED", error)
+        })?;
+        let kind = if active.is_some() {
+            "compatible"
         } else {
-            let reference = match kind {
-                "official" => Some(SECRET_REF_OFFICIAL_PROVIDER.to_string()),
-                "compatible" => {
-                    let profiles = self.read_profiles().map_err(|error| {
-                        ProviderServiceError::storage("PROVIDER_PROFILES_READ_FAILED", error)
-                    })?;
-                    Some(
-                        profiles
-                            .compatible_secret_reference(&values, self.host.normalize_endpoint)
-                            .map_err(|error| {
-                                ProviderServiceError::protocol(
-                                    "PROVIDER_PROFILE_REFERENCE_INVALID",
-                                    error,
-                                    "重新选择供应商档案，或切回 OAuth 后重试",
-                                )
-                            })?,
-                    )
-                }
-                _ => None,
-            };
-            match reference {
-                Some(reference) => self.secrets.backend(&reference).map_err(|error| {
-                    ProviderServiceError::storage("SECRET_STORE_READ_FAILED", error)
-                })?,
-                None => SecretBackendKind::Missing,
-            }
+            profiles.account_mode().map_err(|error| {
+                ProviderServiceError::storage("PROVIDER_METADATA_READ_FAILED", error)
+            })?
+        };
+        let base_url = active.as_ref().map(|profile| profile.base_url().to_string());
+        let reference = match kind {
+            "official" => Some(SECRET_REF_OFFICIAL_PROVIDER.to_string()),
+            "compatible" => active
+                .as_ref()
+                .map(|profile| provider_profile_secret_ref(profile.id())),
+            _ => None,
+        };
+        let secret_backend = match reference {
+            Some(reference) => self.secrets.backend(&reference).map_err(|error| {
+                ProviderServiceError::storage("SECRET_STORE_READ_FAILED", error)
+            })?,
+            None => SecretBackendKind::Missing,
         };
         Ok(ProviderStatusSnapshot {
-            kind,
+            kind: match kind {
+                "official" => "official",
+                "compatible" => "compatible",
+                _ => "oauth",
+            },
             has_api_key: secret_backend != SecretBackendKind::Missing,
             base_url,
             secret_backend,
@@ -546,6 +536,9 @@ impl ProviderService {
         let _transaction = provider_transaction();
         self.migrate_legacy_secrets()
             .map_err(|error| ProviderServiceError::storage("SECRET_MIGRATION_FAILED", error))?;
+        let mut profiles = self.read_profiles().map_err(|error| {
+            ProviderServiceError::storage("PROVIDER_PROFILES_READ_FAILED", error)
+        })?;
         let path = self.env_path();
         let current = (self.host.read_text)(&path).map_err(|error| {
             ProviderServiceError::storage("PROVIDER_METADATA_READ_FAILED", error)
@@ -556,8 +549,9 @@ impl ProviderService {
             .map(str::trim)
             .filter(|value| !value.is_empty());
         let mut secret_change = None;
-        let replacement = match request.kind.as_str() {
-            "oauth" => String::new(),
+        // 只做凭据校验；供应商本身写在 config.toml 里。
+        match request.kind.as_str() {
+            "oauth" => {}
             "official" => {
                 if let Some(key) = requested_key {
                     checked_api_key(key).map_err(|error| {
@@ -570,7 +564,6 @@ impl ProviderService {
                             ProviderServiceError::storage("SECRET_STORE_READ_FAILED", error)
                         })?;
                 }
-                official_provider_metadata()
             }
             "compatible" => {
                 let base_url = request.base_url.as_deref().unwrap_or_default();
@@ -588,7 +581,7 @@ impl ProviderService {
                 compatible_provider_metadata(base_url, false, None, self.host.normalize_endpoint)
                     .map_err(|error| {
                         ProviderServiceError::operation("PROVIDER_URL_INVALID", error)
-                    })?
+                    })?;
             }
             _ => {
                 return Err(ProviderServiceError::operation(
@@ -611,10 +604,12 @@ impl ProviderService {
         let result = (|| {
             (self.host.restore_auth_overrides)(&self.home)?;
             (self.host.restore_backend_overrides)(&self.home)?;
-            (self.host.atomic_write_private)(
-                &path,
-                &replace_managed_env_block(&current, &replacement),
-            )
+            // `.env` 托管块是旧版本的第二套供应商真相源。这里顺手清空它，
+            // 迁移完成后只保留 Grox 自有档案和 CLI 的实际路由。
+            (self.host.atomic_write_private)(&path, &replace_managed_env_block(&current, ""))?;
+            profiles.set_active_id(None);
+            profiles.set_account_mode(&request.kind)?;
+            self.write_profiles(&profiles)
         })();
         if let Err(error) = result {
             let mut failure = error;
@@ -647,31 +642,29 @@ impl ProviderService {
         let _transaction = provider_transaction();
         self.migrate_legacy_secrets()
             .map_err(|error| ProviderServiceError::storage("SECRET_MIGRATION_FAILED", error))?;
-        let values = parse_managed_provider_env(&self.env_path(), self.host.read_text);
-        let kind = values
-            .get(GROX_PROVIDER_KIND_KEY)
-            .map(String::as_str)
-            .unwrap_or("oauth");
-        let (reference, base_url, models_url) = match kind {
-            "oauth" => (None, None, None),
-            "official" => (Some(SECRET_REF_OFFICIAL_PROVIDER.to_string()), None, None),
-            "compatible" => {
-                let base_url = required_managed_value(&values, GROK_MODELS_BASE_URL_KEY)?;
-                let models_url = required_managed_value(&values, "GROK_MODELS_LIST_URL")?;
-                let profiles = self.read_profiles().map_err(|error| {
-                    ProviderServiceError::storage("PROVIDER_PROFILES_READ_FAILED", error)
-                })?;
-                let reference = profiles
-                    .compatible_secret_reference(&values, self.host.normalize_endpoint)
-                    .map_err(|error| {
-                        ProviderServiceError::protocol(
-                            "PROVIDER_PROFILE_REFERENCE_INVALID",
-                            error,
-                            "重新选择供应商档案，或切回 OAuth 后重试",
-                        )
-                    })?;
-                (Some(reference), Some(base_url), Some(models_url))
-            }
+        let profiles = self.read_profiles().map_err(|error| {
+            ProviderServiceError::storage("PROVIDER_PROFILES_READ_FAILED", error)
+        })?;
+        let active = self.active_profile(&profiles).map_err(|error| {
+            ProviderServiceError::protocol(
+                "PROVIDER_PROFILE_REFERENCE_INVALID",
+                error,
+                "重新选择供应商档案，或切回官方账户后重试",
+            )
+        })?;
+        let kind = if active.is_some() {
+            "compatible"
+        } else {
+            profiles.account_mode().map_err(|error| {
+                ProviderServiceError::storage("PROVIDER_METADATA_READ_FAILED", error)
+            })?
+        };
+        let reference = match kind {
+            "oauth" => None,
+            "official" => Some(SECRET_REF_OFFICIAL_PROVIDER.to_string()),
+            "compatible" => active
+                .as_ref()
+                .map(|profile| provider_profile_secret_ref(profile.id())),
             _ => {
                 return Err(ProviderServiceError::protocol(
                     "PROVIDER_METADATA_INVALID",
@@ -689,8 +682,7 @@ impl ProviderService {
             .map_err(|error| ProviderServiceError::storage("SECRET_STORE_READ_FAILED", error))?;
         Ok(RuntimeProviderEnvironment {
             api_key,
-            base_url,
-            models_url,
+            compatible: kind == "compatible",
         })
     }
 
@@ -698,13 +690,47 @@ impl ProviderService {
         (self.host.restore_auth_overrides)(&self.home)
     }
 
+    pub(crate) fn migrate_legacy_config_metadata(&self) -> Result<(), String> {
+        let _transaction = provider_transaction();
+        let mut profiles = self.read_profiles()?;
+        let mut changed = false;
+        if let Some(id) = (self.host.legacy_active_profile_id)(&self.home)? {
+            if profiles.profile(&id).is_none() {
+                return Err(format!("旧配置引用的供应商档案 {id} 不存在"));
+            }
+            profiles.set_active_id(Some(&id));
+            changed = true;
+        }
+        if let Some(mode) = (self.host.legacy_account_mode)(&self.home)? {
+            profiles.set_account_mode(&mode)?;
+            changed = true;
+        }
+        if changed {
+            self.write_profiles(&profiles)?;
+        }
+        (self.host.clear_legacy_metadata)(&self.home)
+    }
+
     pub(crate) fn synchronize_active_backend(&self) -> Result<(), String> {
         self.synchronize_active_backend_raw()
     }
 
     fn synchronize_active_backend_raw(&self) -> Result<(), String> {
-        let profiles = self.read_profiles()?;
-        if let Some(profile) = self.active_profile(&profiles) {
+        let mut profiles = self.read_profiles()?;
+        let profile = if (self.host.compatible_route_active)(&self.home)? {
+            self.active_profile(&profiles)?
+        } else {
+            let managed = parse_managed_provider_env(&self.env_path(), self.host.read_text);
+            let profile = profiles
+                .profile_for_managed_values(&managed, self.host.normalize_endpoint)
+                .cloned();
+            if let Some(profile) = profile.as_ref() {
+                profiles.set_active_id(Some(profile.id()));
+                self.write_profiles(&profiles)?;
+            }
+            profile
+        };
+        if let Some(profile) = profile {
             let model_ids = profile.compatible_backend_model_ids();
             let primary_model = model_ids
                 .first()
@@ -747,18 +773,26 @@ impl ProviderService {
     fn write_profiles(&self, profiles: &ProviderProfilesFile) -> Result<(), String> {
         let content = profiles
             .to_pretty_json()
-            .map_err(|error| format!("无法序列化供应商档案：{error}"))?;
+            .map_err(|error| format!("无法序列化供应商目录：{error}"))?;
         (self.host.atomic_write_private)(&self.profiles_path(), &content)
     }
 
+    /// 当前路由对应的 Grox 供应商档案。
     fn active_profile(
         &self,
         profiles: &ProviderProfilesFile,
-    ) -> Option<crate::provider_profiles::StoredProviderProfile> {
-        let managed = parse_managed_provider_env(&self.env_path(), self.host.read_text);
+    ) -> Result<Option<crate::provider_profiles::StoredProviderProfile>, String> {
+        if !(self.host.compatible_route_active)(&self.home)? {
+            return Ok(None);
+        }
+        let id = profiles
+            .active_id()
+            .ok_or("当前中转路由没有登记所属供应商档案")?;
         profiles
-            .profile_for_managed_values(&managed, self.host.normalize_endpoint)
+            .profile(id)
             .cloned()
+            .map(Some)
+            .ok_or_else(|| format!("活动供应商档案 {id} 不存在"))
     }
 
     fn secret_state(
@@ -832,11 +866,10 @@ impl ProviderService {
             (SECRET_REF_OFFICIAL_PROVIDER.to_string(), "official", None)
         };
         self.secrets.set(&reference, key)?;
-        let replacement = provider_metadata_from_values(kind, &values, profile_id);
-        (self.host.atomic_write_private)(
-            &env_path,
-            &replace_managed_env_block(&current, &replacement),
-        )
+        // 密钥已进入系统凭据库；托管块的其余字段由 config.toml 承担，
+        // 迁移到此为止，不再重建 `.env`。
+        let _ = (kind, profile_id);
+        (self.host.atomic_write_private)(&env_path, &replace_managed_env_block(&current, ""))
     }
 }
 
@@ -860,23 +893,6 @@ fn valid_profile_id(id: &str) -> bool {
         && id
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
-}
-
-fn required_managed_value(
-    values: &BTreeMap<String, String>,
-    key: &str,
-) -> Result<String, ProviderServiceError> {
-    values
-        .get(key)
-        .filter(|value| !value.trim().is_empty())
-        .cloned()
-        .ok_or_else(|| {
-            ProviderServiceError::protocol(
-                "PROVIDER_METADATA_INVALID",
-                format!("兼容服务缺少运行时元数据 {key}"),
-                "重新选择供应商后重试",
-            )
-        })
 }
 
 pub(crate) fn replace_managed_env_block(content: &str, replacement: &str) -> String {
@@ -959,32 +975,6 @@ pub(crate) fn parse_managed_provider_env(
 
 fn env_value(value: &str) -> String {
     format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-fn provider_metadata_from_values(
-    kind: &str,
-    values: &BTreeMap<String, String>,
-    profile_id: Option<&str>,
-) -> String {
-    let mut lines = vec![format!("{GROX_PROVIDER_KIND_KEY}={}", env_value(kind))];
-    for key in [GROK_MODELS_BASE_URL_KEY, "GROK_MODELS_LIST_URL"] {
-        if let Some(value) = values.get(key).filter(|value| !value.trim().is_empty()) {
-            lines.push(format!("{key}={}", env_value(value)));
-        }
-    }
-    if let Some(profile_id) =
-        profile_id.or_else(|| values.get(GROX_PROVIDER_PROFILE_ID_KEY).map(String::as_str))
-    {
-        lines.push(format!(
-            "{GROX_PROVIDER_PROFILE_ID_KEY}={}",
-            env_value(profile_id)
-        ));
-    }
-    lines.join("\n")
-}
-
-fn official_provider_metadata() -> String {
-    format!("{GROX_PROVIDER_KIND_KEY}={}", env_value("official"))
 }
 
 fn compatible_provider_metadata(
@@ -1175,8 +1165,22 @@ mod tests {
         Ok(())
     }
 
-    fn noop_apply(_: &Path, _: &[String], _: &str, _: &str, _: &str) -> Result<(), String> {
+    fn noop_apply(
+        _: &Path,
+        _: &[String],
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> Result<(), String> {
         Ok(())
+    }
+
+    fn inactive_route(_: &Path) -> Result<bool, String> {
+        Ok(false)
+    }
+
+    fn no_legacy_value(_: &Path) -> Result<Option<String>, String> {
+        Ok(None)
     }
 
     fn test_service(root: &Path) -> ProviderService {
@@ -1190,6 +1194,10 @@ mod tests {
                 restore_auth_overrides: noop_restore,
                 restore_backend_overrides: noop_restore,
                 apply_backend_overrides: noop_apply,
+                compatible_route_active: inactive_route,
+                legacy_active_profile_id: no_legacy_value,
+                legacy_account_mode: no_legacy_value,
+                clear_legacy_metadata: noop_restore,
             },
         )
     }
@@ -1329,8 +1337,8 @@ mod tests {
             .commit_refresh(target, vec!["grok-build".into()])
             .unwrap();
         let persisted = std::fs::read_to_string(root.join("grox-providers.json")).unwrap();
-        assert!(persisted.contains("grok-build"));
-        assert!(!persisted.contains("must-not-persist"));
+        assert!(persisted.contains("grok-build"), "{persisted}");
+        assert!(!persisted.contains("must-not-persist"), "{persisted}");
         std::fs::remove_dir_all(root).unwrap();
     }
 }

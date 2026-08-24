@@ -150,7 +150,11 @@ impl AcpRequestBroker {
                 .filter_map(|(id, request)| (request.generation == generation).then_some(*id))
                 .collect::<Vec<_>>();
             ids.into_iter()
-                .filter_map(|id| state.pending.remove(&id))
+                .filter_map(|id| {
+                    let request = state.pending.remove(&id)?;
+                    remember_retired(&mut state, generation, id);
+                    Some(request)
+                })
                 .collect::<Vec<_>>()
         };
         for request in requests {
@@ -163,9 +167,11 @@ impl AcpRequestBroker {
     pub(crate) async fn reject_all(&self, error: AcpHostError) {
         let requests = {
             let mut state = self.state.lock().await;
-            std::mem::take(&mut state.pending)
-                .into_values()
-                .collect::<Vec<_>>()
+            let pending = std::mem::take(&mut state.pending);
+            for (id, request) in &pending {
+                remember_retired(&mut state, request.generation, *id);
+            }
+            pending.into_values().collect::<Vec<_>>()
         };
         for request in requests {
             let _ = request
@@ -251,6 +257,11 @@ mod tests {
             assert_eq!(
                 first.await.unwrap().unwrap_err().message,
                 "Agent 已退出 · initialize"
+            );
+            assert!(
+                broker
+                    .resolve_response(4, r#"{"jsonrpc":"2.0","id":1,"result":{}}"#)
+                    .await
             );
             assert_eq!(broker.len().await, 1);
 

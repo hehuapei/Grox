@@ -7,6 +7,7 @@ import {
   nextProcessOpenOnCompleteChange,
   rememberProcessOpen,
   resolveInitialProcessOpen,
+  turnHasInspectableProcess,
 } from "../../lib/processFold";
 import { deriveSessionSnapshot } from "../../lib/sessionRuntime";
 import {
@@ -409,7 +410,7 @@ function renderBlock(block: SessionBlock, sessionId: string, processing = false)
 
 function ToolBatch({ blocks }: { blocks: Extract<SessionBlock, { type: "tool" }>[] }) {
   const { language } = useI18n();
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(true);
   const commands = blocks.filter((block) => block.call.kind === "execute" || block.call.kind === "terminal").length;
   const edits = blocks.filter((block) => ["edit", "write", "delete", "move"].includes(block.call.kind)).length;
   const busy = blocks.some((block) => ["pending", "running", "awaiting_permission"].includes(block.call.status));
@@ -461,16 +462,18 @@ interface TurnGroupProps {
 
 function TurnGroup({ turn, sessionId, status, active, workflow, onProcessInspect }: TurnGroupProps) {
   const { language } = useI18n();
+  const compatibleProvider = useDesktop((state) => state.provider.kind === "compatible");
   const complete = isProcessFoldComplete({
     active,
     sessionTerminal: isSessionTerminal(status),
   });
-  // Codex-style: keep the process trail open while live, then auto-collapse
-  // into the one-line summary once the turn finishes. Operators can still
-  // expand the completed trail manually. Persist across Virtuoso remounts so
-  // expand → scroll does not re-collapse and thrash scroll position.
+  // 思考 / 工具 / 计划是审计轨迹：回合结束后仍然默认展开，否则用户会以为
+  // 模型没思考、没调用工具。纯文字回合才折叠成一行摘要。手动选择优先。
+  // Persist across Virtuoso remounts so expand → scroll does not re-collapse
+  // and thrash scroll position.
+  const hasInspectableProcess = turnHasInspectableProcess(turn.blocks);
   const [processOpen, setProcessOpenState] = useState(() =>
-    resolveInitialProcessOpen(sessionId, turn.id, complete),
+    resolveInitialProcessOpen(sessionId, turn.id, complete, hasInspectableProcess),
   );
   const wasCompleteRef = useRef(complete);
   const user = turn.blocks.find((block): block is Extract<SessionBlock, { type: "user" }> => block.type === "user");
@@ -491,13 +494,14 @@ function TurnGroup({ turn, sessionId, status, active, workflow, onProcessInspect
         wasComplete: wasCompleteRef.current,
         complete,
         currentOpen: current,
+        hasInspectableProcess,
       });
       wasCompleteRef.current = complete;
       // Map write is idempotent; keeps remounts aligned with transition policy.
       rememberProcessOpen(sessionId, turn.id, next);
       return next;
     });
-  }, [complete, sessionId, turn.id]);
+  }, [complete, hasInspectableProcess, sessionId, turn.id]);
 
   if (!complete) {
     const liveBlocks = turn.blocks.filter((block) => block !== user);
@@ -556,9 +560,6 @@ function TurnGroup({ turn, sessionId, status, active, workflow, onProcessInspect
       ].filter(Boolean);
   const processSummary = summaryParts.join(" · ");
 
-  const finishedAt = Math.max(user?.ts ?? 0, ...turn.blocks.map((block) => block.type === "tool" ? block.call.endedAt ?? block.ts : block.ts));
-  const turnElapsed = user && finishedAt > user.ts ? finishedAt - user.ts : 0;
-
   return (
     <section className="timeline-turn">
       {user && <UserMsg block={user} rewindPromptIndex={turn.promptIndex >= 0 ? turn.promptIndex : undefined} />}
@@ -585,8 +586,15 @@ function TurnGroup({ turn, sessionId, status, active, workflow, onProcessInspect
             <RenderSequence blocks={process} sessionId={sessionId} processing={false} />
           </div>
         )}
-        {turnElapsed > 0 && <div className="turn-elapsed"><span>{language === "zh-CN" ? `已处理 ${turnElapsed < 1000 ? `${turnElapsed}ms` : `${(turnElapsed / 1000).toFixed(turnElapsed < 10_000 ? 1 : 0)}s`}` : `Processed in ${(turnElapsed / 1000).toFixed(1)}s`}</span><i /></div>}
       </div>}
+      {!deepResearch && active && compatibleProvider && finalAssistant && process.length === 0 && (
+        <div className="mb-3 flex items-center gap-2 font-mono text-[9.5px] text-faint">
+          <Icon name="alert" size={9} className="shrink-0" />
+          <span>{language === "zh-CN"
+            ? "本回合的模型服务未返回思考、工具调用或来源；Grox 不会把正文猜成搜索记录。"
+            : "This model service returned no reasoning, tool calls, or sources; Grox will not invent a search trace from prose."}</span>
+        </div>
+      )}
       {unresolved.map((block) => renderBlock(block, sessionId))}
       {finalAssistant && <AssistantMsg block={finalAssistant} />}
       <TurnChangeCard blocks={turn.blocks} promptIndex={turn.promptIndex} />
@@ -611,7 +619,6 @@ export function Timeline({ session }: { session: Session }) {
   const { language } = useI18n();
   const workflows = useDesktop((state) => state.workflows[session.id] ?? EMPTY_WORKFLOWS);
   const scrollerRef = useRef<HTMLDivElement>(null);
-  const bottomAnchorRef = useRef<HTMLDivElement>(null);
   // Native scroller + turn window (not Virtuoso): expanding process used to make
   // Virtuoso re-range and yank scrollTop to 0 / stick-to-bottom thrash so the
   // operator could not freely scroll. DOM stays bounded via a hard mount cap.
@@ -671,14 +678,17 @@ export function Timeline({ session }: { session: Session }) {
   const scrollToBottom = useCallback(() => {
     const el = scrollerRef.current;
     if (!el) return;
-    // Direct assignment is more reliable than scrollTo during rapid reflows.
+    // One layout write is enough; scrollIntoView here forced a second reflow
+    // for every streamed chunk.
     el.scrollTop = el.scrollHeight;
-    bottomAnchorRef.current?.scrollIntoView({ block: "end", behavior: "auto" });
   }, []);
 
   // Open / hydrate landing: re-apply on every content growth until the user
   // scrolls away. Debounce "done" only after content stops changing.
   useLayoutEffect(() => {
+    // Live growth has its own single scroll effect below. Running both paths
+    // made every token perform duplicate layout and timer work.
+    if (sessionRunning) return;
     if (userTookOverRef.current) return;
     if (turns.length === 0) return;
     scrollToBottom();
@@ -693,7 +703,7 @@ export function Timeline({ session }: { session: Session }) {
         settleTimerRef.current = undefined;
       }
     };
-  }, [contentEpoch, visibleTurns.length, scrollToBottom, turns.length]);
+  }, [contentEpoch, sessionRunning, visibleTurns.length, scrollToBottom, turns.length]);
 
   // New live turn after idle: resume stick-to-bottom for streaming.
   useEffect(() => {
@@ -823,7 +833,7 @@ export function Timeline({ session }: { session: Session }) {
             </div>
           );
         })}
-        <div ref={bottomAnchorRef} className="h-11 shrink-0" aria-hidden="true" />
+        <div className="h-11 shrink-0" aria-hidden="true" />
       </div>
       <RequestNodeRail markers={markers} language={language} scrollerRef={scrollerRef} onJump={jumpToTurn} />
     </div>
