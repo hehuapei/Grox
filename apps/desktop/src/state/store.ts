@@ -31,6 +31,7 @@ import type {
   PreviewFile,
   ProjectPreview,
   ProviderConfig,
+  NetworkProxyConfig,
   ProviderProfileSummary,
   SaveProviderProfile,
   FetchProviderModels,
@@ -328,6 +329,7 @@ interface DesktopState {
   refreshAccount(): Promise<void>;
   refreshModels(): Promise<void>;
   configureProvider(config: ProviderConfig): Promise<void>;
+  configureNetworkProxy(config: NetworkProxyConfig): Promise<void>;
   refreshProviderProfiles(): Promise<void>;
   saveProviderProfile(config: SaveProviderProfile): Promise<ProviderProfileSummary>;
   fetchProviderModels(config: FetchProviderModels): Promise<string[]>;
@@ -2859,6 +2861,24 @@ export const useDesktop = create<DesktopState>((set, get) => {
           code: "PROVIDER_STATUS_REFRESH_FAILED",
         }) });
       });
+    },
+
+    async configureNetworkProxy(config) {
+      const activeId = get().activeId;
+      set({ providerSwitching: true });
+      try {
+        await bridge.setNetworkProxy(config);
+        if (activeId) await bridge.loadSession(activeId);
+        set({ providerSwitching: false, startupError: null });
+      } catch (error) {
+        set({ providerSwitching: false });
+        throw error;
+      }
+      try {
+        await Promise.all([get().refreshAccount(), get().refreshModels()]);
+      } catch (error) {
+        set({ startupError: error instanceof Error ? error.message : String(error) });
+      }
     },
 
     async refreshProviderProfiles() {

@@ -36,6 +36,7 @@ import type {
   PromptAttachment,
   SaveProviderProfile,
   FetchProviderModels,
+  NetworkProxyConfig,
   RewindMode,
   RewindPoint,
   RewindResult,
@@ -3234,6 +3235,25 @@ export class AcpBridge implements GrokBridge {
     // The configuration file is intentionally not touched until it finishes.
     await this.reconfigureRuntime(() => invoke("configure_provider", { request: config }));
     if (config.kind === "oauth" && this.authState.required) await this.authenticate();
+  }
+
+  async getNetworkProxy(): Promise<NetworkProxyConfig> {
+    return invoke<NetworkProxyConfig>("read_network_proxy");
+  }
+
+  async setNetworkProxy(config: NetworkProxyConfig, reconnect = true): Promise<void> {
+    const previous = await this.getNetworkProxy();
+    if (!reconnect) {
+      await invoke<NetworkProxyConfig>("write_network_proxy", { request: config });
+      return;
+    }
+    if (previous.enabled === config.enabled && previous.url === config.url.trim().replace(/\/$/, "")) {
+      await invoke<NetworkProxyConfig>("write_network_proxy", { request: config });
+      return;
+    }
+    await this.reconfigureRuntime(() =>
+      invoke<NetworkProxyConfig>("write_network_proxy", { request: config }),
+    );
   }
 
   async listProviderProfiles(): Promise<ProviderProfilesState> {
