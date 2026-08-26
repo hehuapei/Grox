@@ -65,6 +65,7 @@ import {
 } from "../lib/draftPersistence";
 import { readStoredPermissionMode } from "../lib/permissionMode";
 import { turnHasLiveText } from "../lib/processFold";
+import { OAUTH_QUOTA_REFRESH_MS, shouldRefreshOauthQuota } from "../lib/oauthQuotaRefresh";
 import {
   POST_PROMPT_SETTLE_MS,
   nextQueueDrainParked,
@@ -732,6 +733,7 @@ function providerDefaultModel(profile?: ProviderProfileSummary) {
 /* StrictMode mounts effects twice in dev — subscribe once, ever. */
 let bridgeSubscribed = false;
 let workspaceWatchTimer: number | undefined;
+let billingRefreshTimer: number | undefined;
 let workspaceWatchTick = 0;
 let pendingLaunch: { text: string; attachments: PromptAttachment[] } | undefined;
 let providerRestoreGeneration = 0;
@@ -749,6 +751,7 @@ function scheduleSessionCatalog(metas: SessionMeta[]) {
 if (import.meta.hot) {
   import.meta.hot.dispose(() => {
     if (workspaceWatchTimer !== undefined) window.clearInterval(workspaceWatchTimer);
+    if (billingRefreshTimer !== undefined) window.clearInterval(billingRefreshTimer);
     if (catalogPersistTimer !== undefined) window.clearTimeout(catalogPersistTimer);
     if (composerPersistTimer !== undefined) window.clearTimeout(composerPersistTimer);
     if (workflowPersistTimer !== undefined) window.clearTimeout(workflowPersistTimer);
@@ -2163,6 +2166,19 @@ export const useDesktop = create<DesktopState>((set, get) => {
                 if (workspaceWatchTick % 3 === 0) void get().refreshWorkspaceFiles();
                 if (get().projectPreview.status === "starting") void get().refreshProjectPreview();
               }, 2_000);
+            }
+            if (billingRefreshTimer === undefined) {
+              billingRefreshTimer = window.setInterval(() => {
+                const state = get();
+                if (!shouldRefreshOauthQuota({
+                  visibilityState: document.visibilityState,
+                  authInProgress: state.auth.inProgress,
+                  accountLoading: state.accountLoading,
+                  providerKind: state.provider.kind,
+                  authenticated: Boolean(state.account?.authenticated),
+                })) return;
+                void state.refreshAccount();
+              }, OAUTH_QUOTA_REFRESH_MS);
             }
 
             if (open) void get().openSession(open);
