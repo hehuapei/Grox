@@ -86,6 +86,20 @@ const zh = {
   outputTokens: "输出 Tokens",
   cacheRead: "缓存读取",
   sessionId: "任务 ID",
+  network: "网络",
+  networkDescription: "为 Grox、Grok Build CLI、模型服务和应用更新统一使用本地代理；本机回环服务保持直连。",
+  useLocalProxy: "使用本地代理",
+  proxySupports: "支持 HTTP/HTTPS 本地代理",
+  proxyUrl: "代理地址",
+  proxyAlsoApp: "同时用于整个 Grox 应用",
+  saveAndReconnect: "保存并重连",
+  connecting: "连接中",
+  proxySaved: "已保存并重新连接 Agent",
+  interfaceFont: "界面字体",
+  fontSystem: "中文优化",
+  fontSerif: "宋体风格",
+  fontHint: "代码与终端保持等宽字体。",
+  quotaUsed: "订阅额度已使用 {n}%",
 } as const;
 
 const en: Record<keyof typeof zh, string> = {
@@ -110,6 +124,20 @@ const en: Record<keyof typeof zh, string> = {
   signInRequired: "Account setup required", projectResources: "Project resources", openFilePreview: "Open side preview",
   loading: "Loading", error: "Error", model: "Model", elapsed: "Elapsed", sessionSpan: "Session span", context: "Context", turns: "Turns",
   cost: "Cost", inputTokens: "Input tokens", outputTokens: "Output tokens", cacheRead: "Cache read", sessionId: "Mission ID",
+  network: "Network",
+  networkDescription: "Use one local proxy for Grox, the Grok Build CLI, model providers, and app updates. Loopback services stay direct.",
+  useLocalProxy: "Use local proxy",
+  proxySupports: "Supports local HTTP/HTTPS proxies",
+  proxyUrl: "Proxy URL",
+  proxyAlsoApp: "Also applies to the entire Grox app",
+  saveAndReconnect: "Save & reconnect",
+  connecting: "Connecting",
+  proxySaved: "Saved and reconnected the Agent",
+  interfaceFont: "Interface font",
+  fontSystem: "System",
+  fontSerif: "Serif",
+  fontHint: "Code and terminals keep a monospaced font.",
+  quotaUsed: "{n}% of plan quota used",
 };
 
 export type TranslationKey = keyof typeof zh;

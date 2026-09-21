@@ -519,7 +519,7 @@ fn spawn_command(
     if let Some(path) = crate::process_env::enriched_path_env() {
         command.env("PATH", path);
     }
-    crate::apply_network_proxy_environment(&mut command)
+    crate::network_proxy::apply_network_proxy_environment(&mut command)
         .map_err(TerminalFailure::operation)?;
     // ACP 显式 env 的优先级高于 Host 补齐值，包括 Agent 主动指定 PATH。
     command.envs(request.env.iter().map(|(name, value)| (name, value)));

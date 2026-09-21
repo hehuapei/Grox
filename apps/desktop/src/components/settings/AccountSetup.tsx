@@ -1,10 +1,10 @@
 import { useEffect, useState } from "react";
 import type { ProviderKind } from "../../bridge/types";
-import { bridge } from "../../bridge";
 import { useDesktop } from "../../state/store";
 import { useI18n } from "../../lib/i18n";
 import { formatGroxError, toGroxError } from "../../lib/errorModel";
 import { Icon } from "../fx/Icon";
+import { useModalA11y } from "../../hooks/useModalA11y";
 import { BlackHole } from "../fx/BlackHole";
 
 const providerErrorText = (cause: unknown) => formatGroxError(toGroxError(cause, {
@@ -16,6 +16,8 @@ export function AccountSetup() {
   const { t, language } = useI18n();
   const open = useDesktop((state) => state.accountSetupOpen);
   const configure = useDesktop((state) => state.configureProvider);
+  const loadNetworkProxy = useDesktop((state) => state.loadNetworkProxy);
+  const configureNetworkProxy = useDesktop((state) => state.configureNetworkProxy);
   const saveProviderProfile = useDesktop((state) => state.saveProviderProfile);
   const activateProviderProfile = useDesktop((state) => state.activateProviderProfile);
   const setOpen = useDesktop((state) => state.setAccountSetupOpen);
@@ -39,7 +41,7 @@ export function AccountSetup() {
     if (!open) return;
     let current = true;
     setProxyLoading(true);
-    void bridge.getNetworkProxy().then((value) => {
+    void loadNetworkProxy().then((value) => {
       if (!current) return;
       setProxyEnabled(value.enabled);
       setProxyUrl(value.url);
@@ -49,7 +51,7 @@ export function AccountSetup() {
       if (current) setProxyLoading(false);
     });
     return () => { current = false; };
-  }, [open]);
+  }, [open, loadNetworkProxy]);
 
   if (!open) return null;
 
@@ -63,32 +65,23 @@ export function AccountSetup() {
       }
     };
     return (
-      <div className="settings-shell fixed inset-0 z-[70] flex items-center justify-center bg-void/80 p-5 backdrop-blur-[4px]">
-        <div className="w-full max-w-[620px] rounded-[9px] border border-line3 bg-panel p-6 shadow-2xl animate-fade-up">
-          <div className="flex items-start gap-4">
-            <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-line3 bg-raise"><BlackHole size={22} /></div>
-            <div className="min-w-0 flex-1">
-              <h1 className="text-[17px] font-medium text-fg">{language === "zh-CN" ? "安装官方 Grok Build CLI" : "Install the official Grok Build CLI"}</h1>
-              <p className="mt-1 text-[11px] leading-relaxed text-dim">{language === "zh-CN" ? "Grox 完全使用官方 CLI 的 Agent harness、工具与 ACP，不再内置或维护替代运行时。" : "Grox uses the official CLI's Agent harness, tools, and ACP exclusively, with no bundled replacement runtime."}</p>
-            </div>
-          </div>
-          <div className="mt-6">
-            <RuntimeOption
-              icon="globe"
-              title={language === "zh-CN" ? "安装官方 CLI" : "Install official CLI"}
-              badge={language === "zh-CN" ? "推荐" : "RECOMMENDED"}
-              description={language === "zh-CN" ? "调用 x.ai 官方安装脚本，自动安装到系统标准位置；之后终端和 Grox 共用同一个 CLI、配置和历史。" : "Run x.ai's official installer. Grox and your terminal will share the same CLI, configuration, and history."}
-              disabled={runtimeBusy}
-              onClick={() => void installRuntime()}
-            />
-          </div>
-          <div className="mt-4 flex items-center gap-2 rounded-[5px] border border-line bg-raise px-3 py-2.5 font-mono text-[9.5px] text-dim">
-            <span className={`h-1.5 w-1.5 rounded-full ${runtimeBusy ? "animate-pulse-dot bg-gold" : "bg-acc"}`} />
-            {runtimeBusy ? (language === "zh-CN" ? "正在执行官方安装并重新检测…" : "Running the official installer and detecting the CLI…") : (language === "zh-CN" ? "未检测到官方 grok 命令" : "Official grok command not detected")}
-          </div>
-          {error && <p className="mt-3 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{error}</p>}
-        </div>
-      </div>
+      <RuntimeInstallDialog
+        runtimeBusy={runtimeBusy}
+        installRuntime={() => void installRuntime()}
+        error={error}
+        heading={language === "zh-CN" ? "安装官方 Grok Build CLI" : "Install the official Grok Build CLI"}
+        body={language === "zh-CN"
+          ? "Grox 完全使用官方 CLI 的 Agent harness、工具与 ACP，不再内置或维护替代运行时。"
+          : "Grox uses the official CLI's Agent harness, tools, and ACP exclusively, with no bundled replacement runtime."}
+        optionTitle={language === "zh-CN" ? "安装官方 CLI" : "Install official CLI"}
+        optionBadge={language === "zh-CN" ? "推荐" : "RECOMMENDED"}
+        optionDescription={language === "zh-CN"
+          ? "调用 x.ai 官方安装脚本，自动安装到系统标准位置；之后终端和 Grox 共用同一个 CLI、配置和历史。"
+          : "Run x.ai's official installer. Grox and your terminal will share the same CLI, configuration, and history."}
+        statusLine={runtimeBusy
+          ? (language === "zh-CN" ? "正在执行官方安装并重新检测…" : "Running the official installer and detecting the CLI…")
+          : (language === "zh-CN" ? "未检测到官方 grok 命令" : "Official grok command not detected")}
+      />
     );
   }
 
@@ -98,7 +91,7 @@ export function AccountSetup() {
     setError(null);
     try {
       if (kind === "oauth") {
-        await bridge.setNetworkProxy({ enabled: proxyEnabled, url: proxyUrl }, false);
+        await configureNetworkProxy({ enabled: proxyEnabled, url: proxyUrl }, { reconnect: false });
       }
       if (kind === "compatible") {
         const profile = await saveProviderProfile({
@@ -144,9 +137,16 @@ export function AccountSetup() {
     }
   };
 
+  const dialogRef = useModalA11y(() => setOpen(false));
   return (
     <div className="settings-shell fixed inset-0 z-[70] flex items-center justify-center bg-void/80 p-5 backdrop-blur-[4px]">
-      <div className="w-full max-w-[560px] rounded-[9px] border border-line3 bg-panel p-6 shadow-2xl animate-fade-up">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={t("firstRunTitle")}
+        className="w-full max-w-[560px] rounded-[9px] border border-line3 bg-panel p-6 shadow-2xl animate-fade-up"
+      >
         <div className="flex items-start gap-4">
           <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-line3 bg-raise">
             <BlackHole size={22} />
@@ -194,10 +194,21 @@ export function AccountSetup() {
             {auth.error && <p className="mt-2 text-red">{auth.error}</p>}
             <div className="mt-3 border-t border-line pt-3">
               <div className="flex items-center justify-between gap-3">
-                <div><p className="text-[10.5px] text-fg2">{language === "zh-CN" ? "使用本地代理" : "Use local proxy"}</p><p className="mt-0.5 text-[9px] text-faint">{language === "zh-CN" ? "同时用于整个 Grox 应用" : "Also applies to the entire Grox app"}</p></div>
+                <div>
+                  <p className="text-[10.5px] text-fg2">{t("useLocalProxy")}</p>
+                  <p className="mt-0.5 text-[9px] text-faint">{t("proxyAlsoApp")}</p>
+                </div>
                 <ProxyToggle on={proxyEnabled} onChange={setProxyEnabled} />
               </div>
-              <input value={proxyUrl} onChange={(event) => setProxyUrl(event.target.value)} disabled={!proxyEnabled || proxyLoading} placeholder="http://127.0.0.1:1080" autoComplete="off" spellCheck={false} className="mt-2 h-9 w-full rounded-[4px] border border-line2 bg-void px-3 font-mono text-[10.5px] text-fg outline-none placeholder:text-faint focus:border-acc-dim disabled:opacity-45" />
+              <input
+                value={proxyUrl}
+                onChange={(event) => setProxyUrl(event.target.value)}
+                disabled={!proxyEnabled || proxyLoading}
+                placeholder="http://127.0.0.1:1080"
+                autoComplete="off"
+                spellCheck={false}
+                className="mt-2 h-9 w-full rounded-[4px] border border-line2 bg-void px-3 font-mono text-[10.5px] text-fg outline-none placeholder:text-faint focus:border-acc-dim disabled:opacity-45"
+              />
             </div>
           </div>
         )}
@@ -249,4 +260,45 @@ function Field({ label, value, onChange, placeholder, type = "text" }: { label: 
 
 function KeyField({ label, value, onChange, hidden, onToggle, language }: { label: string; value: string; onChange(value: string): void; hidden: boolean; onToggle(): void; language: string }) {
   return <label className="block"><span className="text-[11px] text-dim">{label}</span><div className="relative mt-1.5"><input type={hidden ? "password" : "text"} value={value} onChange={(event) => onChange(event.target.value)} placeholder="xai-…" autoComplete="off" spellCheck={false} className="h-10 w-full rounded-[6px] border border-line2 bg-void py-0 pl-3 pr-16 font-mono text-[12px] text-fg outline-none placeholder:text-faint focus:border-acc-dim" /><button type="button" onClick={onToggle} className="absolute inset-y-0 right-0 w-14 border-l border-line text-[11px] text-dim hover:text-fg">{hidden ? (language === "zh-CN" ? "显示" : "Show") : (language === "zh-CN" ? "隐藏" : "Hide")}</button></div></label>;
+}
+
+function RuntimeInstallDialog({ runtimeBusy, installRuntime, error, heading, body, optionTitle, optionBadge, optionDescription, statusLine }: {
+  runtimeBusy: boolean;
+  installRuntime(): void;
+  error: string | null;
+  heading: string;
+  body: string;
+  optionTitle: string;
+  optionBadge: string;
+  optionDescription: string;
+  statusLine: string;
+}) {
+  const dialogRef = useModalA11y();
+  return (
+    <div className="settings-shell fixed inset-0 z-[70] flex items-center justify-center bg-void/80 p-5 backdrop-blur-[4px]">
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={heading}
+        className="w-full max-w-[620px] rounded-[9px] border border-line3 bg-panel p-6 shadow-2xl animate-fade-up"
+      >
+        <div className="flex items-start gap-4">
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full border border-line3 bg-raise"><BlackHole size={22} /></div>
+          <div className="min-w-0 flex-1">
+            <h1 className="text-[17px] font-medium text-fg">{heading}</h1>
+            <p className="mt-1 text-[11px] leading-relaxed text-dim">{body}</p>
+          </div>
+        </div>
+        <div className="mt-6">
+          <RuntimeOption icon="globe" title={optionTitle} badge={optionBadge} description={optionDescription} disabled={runtimeBusy} onClick={installRuntime} />
+        </div>
+        <div className="mt-4 flex items-center gap-2 rounded-[5px] border border-line bg-raise px-3 py-2.5 font-mono text-[9.5px] text-dim">
+          <span className={`h-1.5 w-1.5 rounded-full ${runtimeBusy ? "animate-pulse-dot bg-gold" : "bg-acc"}`} />
+          {statusLine}
+        </div>
+        {error && <p className="mt-3 rounded-[4px] border border-red/30 bg-red/5 px-3 py-2 text-[10px] text-red">{error}</p>}
+      </div>
+    </div>
+  );
 }

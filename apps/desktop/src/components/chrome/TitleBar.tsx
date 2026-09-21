@@ -18,20 +18,21 @@ import {
   type OpenApplicationOption,
 } from "../../lib/defaultOpen";
 
+import { currentWindow } from "../../lib/hostActions";
+
 const inTauri = () => "__TAURI_INTERNALS__" in window;
 const isWindows = () => navigator.userAgent.includes("Windows");
 
 async function winCtl(action: "min" | "max" | "close") {
   if (!inTauri()) return;
-  const { getCurrentWindow } = await import("@tauri-apps/api/window");
-  const win = getCurrentWindow();
+  const win = currentWindow();
   if (action === "min") await win.minimize();
   else if (action === "max") await win.toggleMaximize();
   else await win.close();
 }
 
 export function TitleBar() {
-  const { language } = useI18n();
+  const { language, t } = useI18n();
   const activeId = useDesktop((s) => s.activeId);
   const meta = useDesktop((s) => s.sessionIndex.find((m) => m.id === s.activeId));
   const bridgeKind = useDesktop((s) => s.bridgeKind);
@@ -50,6 +51,7 @@ export function TitleBar() {
   const quotaUsed = provider.kind === "oauth" && billing?.creditUsagePercent !== undefined
     ? Math.min(100, Math.max(0, Math.round(billing.creditUsagePercent)))
     : null;
+  const quotaLabel = quotaUsed === null ? "" : t("quotaUsed").replace("{n}", String(quotaUsed));
   const sidebarVisible = usePreferences((s) => s.sidebarVisible);
   const toggleSidebar = usePreferences((s) => s.toggleSidebar);
   const breadcrumbCwd = meta?.cwd ?? draftSession?.cwd;
@@ -103,8 +105,8 @@ export function TitleBar() {
         {quotaUsed !== null && (
           <span
             className="mr-1 flex items-center gap-1.5 font-mono text-[10px] text-dim"
-            title={language === "zh-CN" ? `订阅额度已使用 ${quotaUsed}%` : `${quotaUsed}% of plan quota used`}
-            aria-label={language === "zh-CN" ? `订阅额度已使用 ${quotaUsed}%` : `${quotaUsed}% of plan quota used`}
+            title={quotaLabel}
+            aria-label={quotaLabel}
           >
             <span className="relative h-[3px] w-16 overflow-hidden bg-high">
               <span
